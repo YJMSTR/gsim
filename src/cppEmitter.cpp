@@ -4084,40 +4084,125 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
 
+
+  // A104 R1-S1: lift the per-cycle per-region constant switch (9 ints * 660
+  // regions = ~6000 lines of compare-and-load in a hot path) to function-local
+  // static const arrays indexed by runtime-eligible regionIndex.
+  // Pure refactor: behavior identical to the previous switch; bit-exact.
+  // Function-local statics keep the arrays in the same TU as the function
+  // (emitFuncDecl can roll a new .cpp file; file-scope arrays would leak).
+  int a104EligibleCount = 0;
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    if (region.runtimeEligible) a104EligibleCount ++;
+  }
+
   emitFuncDecl(0, "void S%s::mtRunCoarseRegion(int regionIndex, uint%d_t *coarseActiveWords) {\n", name.c_str(), ACTIVE_WIDTH);
+  // Emit the static const arrays as function-local statics. C++ guarantees
+  // single-time initialization with no per-call cost in the hot path.
+  emitBodyLock(1, "static const int kCoarseRegionTaskCount[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.taskCount);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionBeginActiveWord[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.beginActiveWord);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionActiveWordSpan[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.activeWordSpan);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionLayerCount[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.estimatedLayerCount);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionMemberNodeCount[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.memberNodeCost);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionStaticCost[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.staticCost);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionUsefulWork[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.estimatedUsefulWork);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionMaxParallelWidth[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.estimatedMaxParallelWidth);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionMTaskCount[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%zu", first ? "" : ", ", region.mtasks.size());
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
-  emitBodyLock(1, "int regionTaskCount = 0;\n");
-  emitBodyLock(1, "int regionBeginActiveWord = 0;\n");
-  emitBodyLock(1, "int regionActiveWordSpan = 0;\n");
-  emitBodyLock(1, "int regionLayerCount = 0;\n");
-  emitBodyLock(1, "int regionMemberNodeCount = 0;\n");
-  emitBodyLock(1, "int regionStaticCost = 0;\n");
-  emitBodyLock(1, "int regionUsefulWork = 0;\n");
-  emitBodyLock(1, "int regionMaxParallelWidth = 0;\n");
-  emitBodyLock(1, "int regionMTaskCount = 0;\n");
+  emitBodyLock(1, "if ((unsigned)regionIndex >= %du) return;\n", a104EligibleCount);
+  emitBodyLock(1, "const int regionTaskCount = kCoarseRegionTaskCount[regionIndex];\n");
+  emitBodyLock(1, "const int regionBeginActiveWord = kCoarseRegionBeginActiveWord[regionIndex];\n");
+  emitBodyLock(1, "const int regionActiveWordSpan = kCoarseRegionActiveWordSpan[regionIndex];\n");
+  emitBodyLock(1, "const int regionLayerCount = kCoarseRegionLayerCount[regionIndex];\n");
+  emitBodyLock(1, "const int regionMemberNodeCount = kCoarseRegionMemberNodeCount[regionIndex];\n");
+  emitBodyLock(1, "const int regionStaticCost = kCoarseRegionStaticCost[regionIndex];\n");
+  emitBodyLock(1, "const int regionUsefulWork = kCoarseRegionUsefulWork[regionIndex];\n");
+  emitBodyLock(1, "const int regionMaxParallelWidth = kCoarseRegionMaxParallelWidth[regionIndex];\n");
+  emitBodyLock(1, "const int regionMTaskCount = kCoarseRegionMTaskCount[regionIndex];\n");
   emitBodyLock(1, "int activeMTaskCount = 0;\n");
   emitBodyLock(1, "int activeMTaskStaticCost = 0;\n");
-  emitBodyLock(1, "switch (regionIndex) {\n");
-  regionIndex = 0;
-  for (const MtCoarseRegion& region : coarsePlan.regions) {
-    if (!region.runtimeEligible) continue;
-    emitBodyLock(2, "case %d:\n", regionIndex);
-    emitBodyLock(3, "regionTaskCount = %d;\n", region.taskCount);
-    emitBodyLock(3, "regionBeginActiveWord = %d;\n", region.beginActiveWord);
-    emitBodyLock(3, "regionActiveWordSpan = %d;\n", region.activeWordSpan);
-    emitBodyLock(3, "regionLayerCount = %d;\n", region.estimatedLayerCount);
-    emitBodyLock(3, "regionMemberNodeCount = %d;\n", region.memberNodeCost);
-    emitBodyLock(3, "regionStaticCost = %d;\n", region.staticCost);
-    emitBodyLock(3, "regionUsefulWork = %d;\n", region.estimatedUsefulWork);
-    emitBodyLock(3, "regionMaxParallelWidth = %d;\n", region.estimatedMaxParallelWidth);
-    emitBodyLock(3, "regionMTaskCount = %zu;\n", region.mtasks.size());
-    emitBodyLock(3, "break;\n");
-    regionIndex ++;
-  }
-  emitBodyLock(2, "default:\n");
-  emitBodyLock(3, "return;\n");
-  emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileCoarseRegionInvocations ++;\n");
   emitBodyLock(1, "}\n");
