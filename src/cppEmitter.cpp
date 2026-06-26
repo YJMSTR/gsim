@@ -798,18 +798,20 @@ static bool mtUseProfileOffDirectSerialFallback() {
 }
 
 
+
 // 28c Phase 1A: admission gate for the coarse region under mt-level-dispatch.
 // pure_compute matches mtTaskCanEnterPureBatch; safe-serial cppIds whose only
 // serial_reasons are state_update/reset/async_reset/activate_all_path/
-// array_or_dynamic_index/super_type_SUPER_ASYNC_RESET/unknown_op are also admitted.
-// Worker0-only cppIds are rejected: they fall through to the main-thread serial path.
+// array_or_dynamic_index/super_type_SUPER_ASYNC_RESET are also admitted.
+// Worker0-only side effects (external/memory_write/memory_read_unsupported/special)
+// and future/unknown serial reasons are rejected: they fall through to the
+// main-thread serial path.
 static bool mtTaskCanEnterCoarseDispatch(const std::map<int, MtTaskInfo>& tasks, int cppId) {
   auto iter = tasks.find(cppId);
   if (iter == tasks.end()) return false;
   if (isAlwaysActive(cppId)) return false;
   if (iter->second.taskKind == "pure_compute") return true;
-  if (hasWorker0OnlyReason(iter->second.serialReasons)) return false;
-  return true;
+  return hasOnlyA44DirectFallbackReasons(iter->second.serialReasons);
 }
 
 static bool mtTaskCanEnterPureBatch(const std::map<int, MtTaskInfo>& tasks, int cppId) {
@@ -1630,7 +1632,12 @@ static int mtCoarseProfitableRecommendedWorkers(const MtCoarseRegion& region, in
   while (workerCap > 1) {
     int copyMergeWords = std::max(0, region.activeWordSpan) * workerCap * 2;
     int usefulPerWorker = usefulWork / workerCap;
-    if (usefulPerWorker >= 8 && usefulWork >= copyMergeWords * 4) break;
+    // Track 2 Week 5: be much more conservative about which regions are worth
+    // parallelizing. Require meaningful per-worker work and a large ratio of
+    // useful work to synchronization overhead before suggesting workers.
+    if (mtaskCount >= 8 && region.estimatedMaxParallelWidth >= workerCap &&
+        usefulWork >= 256 && usefulPerWorker >= 64 && usefulWork >= copyMergeWords * 16)
+      break;
     workerCap --;
   }
   return std::max(1, workerCap);
@@ -1654,7 +1661,15 @@ static bool mtCoarseAdmitsRegionForPolicy(const MtCoarseRegion& region,
   int usefulWork = std::max(region.mtaskStaticCostTotal, region.mtaskMemberNodeCostTotal);
   if (usefulWork <= 0) usefulWork = region.estimatedUsefulWork;
   int copyMergeWords = std::max(0, region.activeWordSpan) * workerCount * 2;
-  return workerCount > 1 && usefulWork / workerCount >= 8 && usefulWork >= copyMergeWords * 4;
+  // Track 2 Week 5: be much more conservative about which regions are worth
+  // parallelizing. The per-region barrier/copy/merge cost dominates for small
+  // or low-width regions, so require meaningful per-worker work and a large
+  // ratio of useful work to synchronization overhead.
+  if (static_cast<int>(region.mtasks.size()) < 8) return false;
+  if (region.estimatedMaxParallelWidth < workerCount) return false;
+  if (usefulWork < 256) return false;
+  if (usefulWork / workerCount < 64) return false;
+  return usefulWork >= copyMergeWords * 16;
 }
 
 static std::string mtJoinIntList(const std::vector<int>& values) {
@@ -3106,6 +3121,11 @@ FILE* graph::genHeaderStart() {
   FILE* header = std::fopen((globalConfig.OutputDir + "/" + name + ".h").c_str(), "w");
 
   fprintf(header, "#ifndef %s_H\n#define %s_H\n", name.c_str(), name.c_str());
+  fprintf(header, "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n");
+  fprintf(header, "#ifdef __linux\n");
+  includeLib(header, "pthread.h", true);
+  includeLib(header, "sched.h", true);
+  fprintf(header, "#endif\n");
   /* include all libs */
   includeLib(header, "iostream", true);
   includeLib(header, "vector", true);
@@ -3890,8 +3910,36 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(1, "mtWorkerPoolCoarseActiveWords = nullptr;\n");
   }
   emitBodyLock(1, "mtWorkerPoolThreads.reserve((size_t)mtWorkerPoolThreadCount);\n");
+  emitBodyLock(1, "const char *mtCpuAffinityEnv = getenv(\"GSIM_MT_CPU_AFFINITY\");\n");
+  emitBodyLock(1, "int mtCpuAffinityBase = -1;\n");
+  emitBodyLock(1, "if (mtCpuAffinityEnv != nullptr && mtCpuAffinityEnv[0] != '\\0') {\n");
+  emitBodyLock(2, "if (mtCpuAffinityEnv[0] == 'a' || mtCpuAffinityEnv[0] == 'A') mtCpuAffinityBase = 0;\n");
+  emitBodyLock(2, "else mtCpuAffinityBase = atoi(mtCpuAffinityEnv);\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "std::vector<int> mtAllowedCpus;\n");
+  emitBodyLock(1, "#ifdef __linux\n");
+  emitBodyLock(1, "if (mtCpuAffinityBase >= 0) {\n");
+  emitBodyLock(2, "cpu_set_t mtAllowedSet;\n");
+  emitBodyLock(2, "CPU_ZERO(&mtAllowedSet);\n");
+  emitBodyLock(2, "if (sched_getaffinity(0, sizeof(mtAllowedSet), &mtAllowedSet) == 0) {\n");
+  emitBodyLock(3, "for (int mtCpu = 0; mtCpu < CPU_SETSIZE; mtCpu ++) {\n");
+  emitBodyLock(4, "if (CPU_ISSET(mtCpu, &mtAllowedSet)) mtAllowedCpus.push_back(mtCpu);\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "#endif\n");
   emitBodyLock(1, "for (int worker = 1; worker < mtConfiguredWorkerCount; worker ++) {\n");
   emitBodyLock(2, "mtWorkerPoolThreads.emplace_back([this, worker]() { mtWorkerPoolLoop(worker); });\n");
+  emitBodyLock(2, "std::thread& t = mtWorkerPoolThreads.back();\n");
+  emitBodyLock(2, "#ifdef __linux\n");
+  emitBodyLock(2, "if (!mtAllowedCpus.empty()) {\n");
+  emitBodyLock(3, "int mtCpuIdx = (mtCpuAffinityBase + worker - 1) % (int)mtAllowedCpus.size();\n");
+  emitBodyLock(3, "cpu_set_t mtCpuset;\n");
+  emitBodyLock(3, "CPU_ZERO(&mtCpuset);\n");
+  emitBodyLock(3, "CPU_SET(mtAllowedCpus[mtCpuIdx], &mtCpuset);\n");
+  emitBodyLock(3, "pthread_setaffinity_np(t.native_handle(), sizeof(mtCpuset), &mtCpuset);\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "#endif\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
 
@@ -4781,7 +4829,10 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       emitBodyLock(3, "int activeUsefulCost = activeMTaskStaticCost > 0 ? activeMTaskStaticCost : regionUsefulWork;\n");
       emitBodyLock(3, "while (workerCount > 1) {\n");
       emitBodyLock(4, "int copyMergeWords = regionActiveWordSpan * workerCount * 2;\n");
-      emitBodyLock(4, "if (activeUsefulCost / workerCount >= 8 && activeUsefulCost >= copyMergeWords * 4) break;\n");
+      emitBodyLock(4, "// Track 2 Week 5: mirror the stricter codegen-time admission gate.\n");
+      emitBodyLock(4, "if (regionMTaskCount >= 8 && regionMaxParallelWidth >= workerCount &&\n");
+      emitBodyLock(4, "    activeUsefulCost >= 256 && activeUsefulCost / workerCount >= 64 &&\n");
+      emitBodyLock(4, "    activeUsefulCost >= copyMergeWords * 16) break;\n");
       emitBodyLock(4, "workerCount --;\n");
       emitBodyLock(3, "}\n");
       emitBodyLock(2, "}\n");
