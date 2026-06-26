@@ -172,6 +172,7 @@ struct MtCoarseRegion {
   std::vector<MtCoarseMTask> antichainProbeGroups;   // Track 2 Week 2: report-only inside-component antichain grouping
   int antichainProbeMaxBlockWidth = 0;                  // max chain-cover width across non-serial blocks
   int antichainProbeTotalGroups = 0;                    // total groups incl. serial singletons (may be large)
+  bool antichainProbeDagAcyclic = false;                // Track 2 Week 3: quotient DAG on antichainProbeGroups acyclic
 };
 
 struct MtCoarseRegionPlan {
@@ -979,6 +980,9 @@ static void mtAddCoarseLayers(MtCoarseRegion& region) {
 // chain decomposition (Dilworth).  The resulting groups are stored only for
 // the coarse-region report; region.mtasks is left unchanged so the runtime
 // executor still sees the original ordering-edge components.
+// Forward declaration for Week 3 DAG builder.
+static bool mtBuildAntichainMTaskDAG(MtCoarseRegion& region);
+
 static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
   region.antichainProbeGroups.clear();
   region.antichainProbeMaxBlockWidth = 0;
@@ -1234,9 +1238,72 @@ static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int,
       }
     }
   }
+  bool dagAcyclic = mtBuildAntichainMTaskDAG(region);
+  (void)dagAcyclic;  // Reported via JSON in Week 3; runtime not yet enabled.
 
   region.antichainProbeTotalGroups = static_cast<int>(region.antichainProbeGroups.size());
+
+  // Week 3 gate: quotient DAG must be acyclic for antichain groups to be valid mtasks.
+  // If cyclic, report but do not enable runtime.
+  region.antichainProbeDagAcyclic = dagAcyclic;
 }
+
+
+
+// Track 2 Week 3: build the cross-mtask dependency DAG for antichainProbeGroups.
+// Uses all ordering edges (dependency + active) between different groups.
+// Returns true iff the quotient DAG is acyclic (required for these groups to be
+// schedulable as atomic mtasks).
+static bool mtBuildAntichainMTaskDAG(MtCoarseRegion& region) {
+  std::map<int, int> cppIdToGroup;
+  for (size_t g = 0; g < region.antichainProbeGroups.size(); g++) {
+    for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
+      for (int cppId : layer) cppIdToGroup[cppId] = static_cast<int>(g);
+    }
+  }
+
+  int groupCount = static_cast<int>(region.antichainProbeGroups.size());
+  std::set<std::pair<int, int>> seenEdges;
+  for (int from = region.beginCppId; from < region.endCppId; from++) {
+    for (int to = region.beginCppId; to < region.endCppId; to++) {
+      if (from == to) continue;
+      if (!mtTaskHasOrderingEdgeTo(from, to)) continue;
+      auto fromIter = cppIdToGroup.find(from);
+      auto toIter = cppIdToGroup.find(to);
+      if (fromIter == cppIdToGroup.end() || toIter == cppIdToGroup.end()) continue;
+      if (fromIter->second == toIter->second) continue;
+      int fromGroup = fromIter->second;
+      int toGroup = toIter->second;
+      if (!seenEdges.insert({fromGroup, toGroup}).second) continue;
+      region.antichainProbeGroups[fromGroup].succMTaskIndices.push_back(toGroup);
+      region.antichainProbeGroups[toGroup].predMTaskIndices.push_back(fromGroup);
+      region.antichainProbeGroups[toGroup].upstreamDepCount++;
+    }
+  }
+
+  // Topological sort / cycle detection on the quotient DAG.
+  std::vector<int> indegree(groupCount, 0);
+  for (int g = 0; g < groupCount; g++) {
+    for (int succ : region.antichainProbeGroups[g].succMTaskIndices) {
+      indegree[succ]++;
+    }
+  }
+  std::deque<int> q;
+  for (int g = 0; g < groupCount; g++) {
+    if (indegree[g] == 0) q.push_back(g);
+  }
+  int visited = 0;
+  while (!q.empty()) {
+    int u = q.front(); q.pop_front();
+    visited++;
+    for (int v : region.antichainProbeGroups[u].succMTaskIndices) {
+      if (--indegree[v] == 0) q.push_back(v);
+    }
+  }
+  return visited == groupCount;
+}
+
+
 
 
 static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
@@ -2776,6 +2843,9 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "      \"mtask_count\": %zu,\n", region.mtasks.size());
     fprintf(fp, "      \"antichain_probe_max_block_width\": %d,\n", region.antichainProbeMaxBlockWidth);
     fprintf(fp, "      \"antichain_probe_total_groups\": %d,\n", region.antichainProbeTotalGroups);
+    if (region.antichainProbeTotalGroups > 0) {
+      fprintf(fp, "      \"antichain_probe_dag_is_acyclic\": %s,\n", region.antichainProbeDagAcyclic ? "true" : "false");
+    }
     fprintf(fp, "      \"mtask_static_cost_min\": %d,\n", region.mtaskStaticCostMin);
     fprintf(fp, "      \"mtask_static_cost_max\": %d,\n", region.mtaskStaticCostMax);
     fprintf(fp, "      \"mtask_static_cost_total\": %d,\n", region.mtaskStaticCostTotal);
@@ -2861,6 +2931,30 @@ void graph::dumpMtCoarseRegionReport() {
       }
       fprintf(fp, "]\n");
       fprintf(fp, "        }%s\n", mtaskIdx + 1 == region.mtasks.size() ? "" : ",");
+    }
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"antichain_probe_groups\": [\n");
+    for (size_t mtaskIdx = 0; mtaskIdx < region.antichainProbeGroups.size(); mtaskIdx++) {
+      const MtCoarseMTask& mtask = region.antichainProbeGroups[mtaskIdx];
+      fprintf(fp, "        {\n");
+      fprintf(fp, "          \"index\": %zu,\n", mtaskIdx);
+      fprintf(fp, "          \"task_count\": %d,\n", mtask.taskCount);
+      fprintf(fp, "          \"static_cost\": %d,\n", mtask.staticCost);
+      fprintf(fp, "          \"member_node_cost\": %d,\n", mtask.memberNodeCost);
+      fprintf(fp, "          \"upstream_dep_count\": %d,\n", mtask.upstreamDepCount);
+      fprintf(fp, "          \"pred_mtask_indices\": ");
+      dumpJsonIntArray(fp, mtask.predMTaskIndices);
+      fprintf(fp, ",\n");
+      fprintf(fp, "          \"succ_mtask_indices\": ");
+      dumpJsonIntArray(fp, mtask.succMTaskIndices);
+      fprintf(fp, ",\n");
+      fprintf(fp, "          \"layer_task_cpp_ids\": [");
+      for (size_t layerIdx = 0; layerIdx < mtask.layerTaskCppIds.size(); layerIdx++) {
+        if (layerIdx != 0) fprintf(fp, ", ");
+        dumpJsonIntArray(fp, mtask.layerTaskCppIds[layerIdx]);
+      }
+      fprintf(fp, "]\n");
+      fprintf(fp, "        }%s\n", mtaskIdx + 1 == region.antichainProbeGroups.size() ? "" : ",");
     }
     fprintf(fp, "      ]\n");
     fprintf(fp, "    }%s\n", i + 1 == coarsePlan.regions.size() ? "" : ",");
