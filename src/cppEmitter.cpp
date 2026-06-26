@@ -132,6 +132,10 @@ struct MtCoarseMTask {
   int staticCost = 0;
   int memberNodeCost = 0;
   int orderingEdgeCount = 0;
+  // Track 2 Week 3: per-mtask dependency graph for atomic-counter scheduling.
+  std::vector<int> predMTaskIndices;
+  std::vector<int> succMTaskIndices;
+  int upstreamDepCount = 0;
 };
 
 struct MtCoarseRegion {
