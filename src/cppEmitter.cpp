@@ -1397,6 +1397,8 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
   if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic) {
     // Track 2 Week 4 Slice A: route only the hot region through the new scheduler.
     // Other regions keep the existing per-region barrier path.
+    // Week 5 experiment: expanding to all acyclic regions with groups > mtasks
+    // caused hangs on MT>1, so keep the narrow hot-region gate for now.
     if (region.beginCppId == 61888 && region.endCppId == 63136) {
       region.useAntichainRuntime = true;
     }
