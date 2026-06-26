@@ -11,13 +11,14 @@
 #include <cctype>
 #include <algorithm>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <stack>
 #include <string>
 #include <utility>
 #include <vector>
-
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
 #define MT_PURE_BATCH_SHARD_SIZE 256
@@ -164,6 +165,9 @@ struct MtCoarseRegion {
   std::vector<std::string> blockers;
   std::vector<MtCoarseLayer> layers;
   std::vector<MtCoarseMTask> mtasks;
+  std::vector<MtCoarseMTask> antichainProbeGroups;   // Track 2 Week 2: report-only inside-component antichain grouping
+  int antichainProbeMaxBlockWidth = 0;                  // max chain-cover width across non-serial blocks
+  int antichainProbeTotalGroups = 0;                    // total groups incl. serial singletons (may be large)
 };
 
 struct MtCoarseRegionPlan {
@@ -965,6 +969,272 @@ static void mtAddCoarseLayers(MtCoarseRegion& region) {
   region.estimatedLayerCount = static_cast<int>(region.layers.size());
 }
 
+// Track 2 Week 2: report-only inside-component antichain grouping.
+// Computes dependency-connected components, splits serial/hazard nodes into
+// singleton groups, and covers each contiguous non-serial block with a minimum
+// chain decomposition (Dilworth).  The resulting groups are stored only for
+// the coarse-region report; region.mtasks is left unchanged so the runtime
+// executor still sees the original ordering-edge components.
+static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
+  region.antichainProbeGroups.clear();
+  region.antichainProbeMaxBlockWidth = 0;
+  region.antichainProbeTotalGroups = 0;
+
+  int n = region.endCppId - region.beginCppId;
+  if (n <= 0) return;
+
+  // 1. Union-find on dependency edges only.
+  std::vector<int> parent(n);
+  for (int i = 0; i < n; i++) parent[i] = i;
+  std::function<int(int)> findRoot = [&](int value) -> int {
+    int root = value;
+    while (parent[root] != root) root = parent[root];
+    while (parent[value] != value) {
+      int next = parent[value];
+      parent[value] = root;
+      value = next;
+    }
+    return root;
+  };
+  auto unite = [&](int a, int b) {
+    int rootA = findRoot(a);
+    int rootB = findRoot(b);
+    if (rootA != rootB) parent[rootB] = rootA;
+  };
+
+  for (int from = region.beginCppId; from < region.endCppId; from++) {
+    for (int to = region.beginCppId; to < region.endCppId; to++) {
+      if (from == to) continue;
+      if (!mtTaskHasDependencyEdgeTo(from, to)) continue;
+      unite(from - region.beginCppId, to - region.beginCppId);
+    }
+  }
+
+  std::map<int, std::vector<int>> depComponentByRoot;
+  for (int cppId = region.beginCppId; cppId < region.endCppId; cppId++) {
+    int root = findRoot(cppId - region.beginCppId);
+    depComponentByRoot[root].push_back(cppId);
+  }
+
+  // Build local layer index map.
+  std::map<int, int> layerIndexByCppId;
+  for (size_t layerIdx = 0; layerIdx < region.layers.size(); layerIdx++) {
+    for (int cppId : region.layers[layerIdx].taskCppIds) {
+      layerIndexByCppId[cppId] = static_cast<int>(layerIdx);
+    }
+  }
+
+  auto addSingletonGroup = [&](int cppId) {
+    MtCoarseMTask group;
+    auto layerIter = layerIndexByCppId.find(cppId);
+    if (layerIter != layerIndexByCppId.end()) {
+      while ((int)group.layerTaskCppIds.size() <= layerIter->second) {
+        group.layerTaskCppIds.push_back(std::vector<int>());
+      }
+      group.layerTaskCppIds[layerIter->second].push_back(cppId);
+    }
+    group.taskCount = 1;
+    group.staticCost = mtTaskEstimatedCost(tasks, cppId);
+    auto superIter = cppId2Super.find(cppId);
+    if (superIter != cppId2Super.end() && superIter->second) {
+      group.memberNodeCost = static_cast<int>(superIter->second->member.size());
+    }
+    region.antichainProbeGroups.push_back(group);
+  };
+
+  // Minimum chain cover via Hopcroft-Karp on the transitive closure of a DAG.
+  auto chainCover = [&](const std::vector<int>& block) {
+    if (block.empty()) return;
+    if (block.size() == 1) {
+      addSingletonGroup(block[0]);
+      return;
+    }
+    std::vector<int> verts = block;
+    std::sort(verts.begin(), verts.end());
+    std::map<int, int> idx;
+    for (size_t i = 0; i < verts.size(); i++) idx[verts[i]] = static_cast<int>(i);
+    int m = static_cast<int>(verts.size());
+
+    // Reachability bitset (forward edges only, by cppId order).
+    std::vector<uint64_t> reach(m * ((m + 63) / 64), 0);
+    int words = (m + 63) / 64;
+    auto setBit = [&](int r, int c) {
+      if (r == c) return;
+      if (idx[verts[r]] < idx[verts[c]]) {
+        reach[r * words + (c >> 6)] |= (1ULL << (c & 63));
+      }
+    };
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < m; j++) {
+        if (i == j) continue;
+        if (mtTaskHasDependencyEdgeTo(verts[i], verts[j]) ||
+            mtTaskHasActiveEdgeTo(verts[i], verts[j])) {
+          setBit(i, j);
+        }
+      }
+    }
+
+    // Transitive closure (Warshall via bitsets).
+    for (int k = 0; k < m; k++) {
+      for (int i = 0; i < m; i++) {
+        if (reach[i * words + (k >> 6)] & (1ULL << (k & 63))) {
+          for (int w = 0; w < words; w++) {
+            reach[i * words + w] |= reach[k * words + w];
+          }
+        }
+      }
+    }
+
+    // Build adjacency list from left U to right V.
+    std::vector<std::vector<int>> adj(m);
+    for (int i = 0; i < m; i++) {
+      for (int j = 0; j < m; j++) {
+        if (i == j) continue;
+        if (reach[i * words + (j >> 6)] & (1ULL << (j & 63))) {
+          adj[i].push_back(j);
+        }
+      }
+    }
+
+    // Hopcroft-Karp.
+    std::vector<int> pairU(m, -1), pairV(m, -1), dist(m);
+    std::function<bool()> bfs = [&]() -> bool {
+      std::deque<int> q;
+      for (int u = 0; u < m; u++) {
+        if (pairU[u] == -1) {
+          dist[u] = 0;
+          q.push_back(u);
+        } else {
+          dist[u] = -1;
+        }
+      }
+      bool found = false;
+      while (!q.empty()) {
+        int u = q.front(); q.pop_front();
+        for (int v : adj[u]) {
+          int pu = pairV[v];
+          if (pu != -1 && dist[pu] == -1) {
+            dist[pu] = dist[u] + 1;
+            q.push_back(pu);
+          } else if (pu == -1) {
+            found = true;
+          }
+        }
+      }
+      return found;
+    };
+    std::function<bool(int)> dfs = [&](int u) -> bool {
+      for (int v : adj[u]) {
+        int pu = pairV[v];
+        if (pu == -1 || (dist[pu] == dist[u] + 1 && dfs(pu))) {
+          pairU[u] = v;
+          pairV[v] = u;
+          return true;
+        }
+      }
+      dist[u] = -1;
+      return false;
+    };
+
+    int matching = 0;
+    while (bfs()) {
+      for (int u = 0; u < m; u++) {
+        if (pairU[u] == -1 && dfs(u)) matching++;
+      }
+    }
+    int width = m - matching;
+    if (width > region.antichainProbeMaxBlockWidth) region.antichainProbeMaxBlockWidth = width;
+
+    // Extract chains from matching: pairU[u] = v means u precedes v in a chain.
+    std::map<int, int> nxt;
+    std::set<int> hasPred;
+    for (int u = 0; u < m; u++) {
+      if (pairU[u] != -1) {
+        nxt[u] = pairU[u];
+        hasPred.insert(pairU[u]);
+      }
+    }
+    std::vector<std::vector<int>> chains;
+    for (int u = 0; u < m; u++) {
+      if (hasPred.find(u) == hasPred.end()) {
+        std::vector<int> chain;
+        int cur = u;
+        while (true) {
+          chain.push_back(cur);
+          auto it = nxt.find(cur);
+          if (it == nxt.end()) break;
+          cur = it->second;
+        }
+        chains.push_back(chain);
+      }
+    }
+    // Safety: any unmatched node not in a chain becomes its own chain.
+    std::set<int> covered;
+    for (auto& chain : chains) {
+      for (int x : chain) covered.insert(x);
+    }
+    for (int i = 0; i < m; i++) {
+      if (covered.find(i) == covered.end()) {
+        chains.push_back({i});
+      }
+    }
+
+    for (auto& chain : chains) {
+      MtCoarseMTask group;
+      for (int localIdx : chain) {
+        int cppId = verts[localIdx];
+        auto layerIter = layerIndexByCppId.find(cppId);
+        if (layerIter != layerIndexByCppId.end()) {
+          while ((int)group.layerTaskCppIds.size() <= layerIter->second) {
+            group.layerTaskCppIds.push_back(std::vector<int>());
+          }
+          group.layerTaskCppIds[layerIter->second].push_back(cppId);
+        }
+        group.taskCount++;
+        group.staticCost += mtTaskEstimatedCost(tasks, cppId);
+        auto superIter = cppId2Super.find(cppId);
+        if (superIter != cppId2Super.end() && superIter->second) {
+          group.memberNodeCost += static_cast<int>(superIter->second->member.size());
+        }
+      }
+      region.antichainProbeGroups.push_back(group);
+    }
+  };
+
+  for (auto& kv : depComponentByRoot) {
+    std::vector<int>& comp = kv.second;
+    std::sort(comp.begin(), comp.end());
+
+    std::vector<std::vector<int>> blocks;
+    std::vector<int> curBlock;
+    for (int cppId : comp) {
+      auto iter = tasks.find(cppId);
+      bool isSerial = iter == tasks.end() || iter->second.taskKind != "pure_compute" || !iter->second.serialReasons.empty();
+      if (isSerial) {
+        if (!curBlock.empty()) {
+          blocks.push_back(curBlock);
+          curBlock.clear();
+        }
+        blocks.push_back({cppId});
+      } else {
+        curBlock.push_back(cppId);
+      }
+    }
+    if (!curBlock.empty()) blocks.push_back(curBlock);
+
+    for (auto& block : blocks) {
+      if (block.size() == 1) {
+        addSingletonGroup(block[0]);
+      } else {
+        chainCover(block);
+      }
+    }
+  }
+
+  region.antichainProbeTotalGroups = static_cast<int>(region.antichainProbeGroups.size());
+}
+
+
 static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
   region.mtasks.clear();
   int n = region.endCppId - region.beginCppId;
@@ -1032,6 +1302,16 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
       int groupIndex = groupIndexByRoot[fromRoot];
       region.mtasks[groupIndex].orderingEdgeCount ++;
     }
+  }
+  // Track 2 Week 2: report-only antichain probe.  Does not mutate region.mtasks.
+  // Gated to the hot region by default to keep model regen fast; set
+  // GSIM_MT_ANTICHAIN_PROBE=1 to enable.
+  static bool probeEnabled = []() {
+    const char* env = std::getenv("GSIM_MT_ANTICHAIN_PROBE");
+    return env && env[0] == '1';
+  }();
+  if (probeEnabled && region.beginCppId == 61888 && region.endCppId == 63136) {
+    mtComputeAntichainGroups(region, tasks);
   }
 }
 
@@ -2490,6 +2770,8 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "      \"estimated_layer_count\": %d,\n", region.estimatedLayerCount);
     fprintf(fp, "      \"estimated_max_parallel_width\": %d,\n", region.estimatedMaxParallelWidth);
     fprintf(fp, "      \"mtask_count\": %zu,\n", region.mtasks.size());
+    fprintf(fp, "      \"antichain_probe_max_block_width\": %d,\n", region.antichainProbeMaxBlockWidth);
+    fprintf(fp, "      \"antichain_probe_total_groups\": %d,\n", region.antichainProbeTotalGroups);
     fprintf(fp, "      \"mtask_static_cost_min\": %d,\n", region.mtaskStaticCostMin);
     fprintf(fp, "      \"mtask_static_cost_max\": %d,\n", region.mtaskStaticCostMax);
     fprintf(fp, "      \"mtask_static_cost_total\": %d,\n", region.mtaskStaticCostTotal);
