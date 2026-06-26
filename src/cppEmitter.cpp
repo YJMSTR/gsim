@@ -136,6 +136,8 @@ struct MtCoarseMTask {
   std::vector<int> predMTaskIndices;
   std::vector<int> succMTaskIndices;
   int upstreamDepCount = 0;
+  // Track 2 Week 4: serial/hazard singletons must stay on worker 0 for ordering correctness.
+  bool workerZeroOnly = false;
 };
 
 struct MtCoarseRegion {
@@ -1033,7 +1035,7 @@ static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int,
     }
   }
 
-  auto addSingletonGroup = [&](int cppId) {
+  auto addSingletonGroup = [&](int cppId, bool workerZeroOnly) {
     MtCoarseMTask group;
     auto layerIter = layerIndexByCppId.find(cppId);
     if (layerIter != layerIndexByCppId.end()) {
@@ -1044,6 +1046,7 @@ static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int,
     }
     group.taskCount = 1;
     group.staticCost = mtTaskEstimatedCost(tasks, cppId);
+    group.workerZeroOnly = workerZeroOnly;
     auto superIter = cppId2Super.find(cppId);
     if (superIter != cppId2Super.end() && superIter->second) {
       group.memberNodeCost = static_cast<int>(superIter->second->member.size());
@@ -1055,7 +1058,7 @@ static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int,
   auto chainCover = [&](const std::vector<int>& block) {
     if (block.empty()) return;
     if (block.size() == 1) {
-      addSingletonGroup(block[0]);
+      addSingletonGroup(block[0], false);
       return;
     }
     std::vector<int> verts = block;
@@ -1233,7 +1236,9 @@ static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int,
 
     for (auto& block : blocks) {
       if (block.size() == 1) {
-        addSingletonGroup(block[0]);
+        auto iter = tasks.find(block[0]);
+        bool isSerial = iter == tasks.end() || iter->second.taskKind != "pure_compute" || !iter->second.serialReasons.empty();
+        addSingletonGroup(block[0], isSerial);
       } else {
         chainCover(block);
       }
@@ -5733,17 +5738,11 @@ void graph::cppEmitter() {
       fprintf(header, "std::vector<std::atomic<int>*> mtCoarseMTaskUpstream;\n");
       fprintf(header, "std::vector<int> mtCoarseMTaskCount;\n");
       fprintf(header, "std::vector<std::atomic<uint%d_t>*> mtCoarseRegionSharedFlags;\n", ACTIVE_WIDTH);
-      fprintf(header, "std::vector<int> mtCoarseRegionSharedFlagCount;\n");
       fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskRemaining;\n");
-      fprintf(header, "std::vector<int> mtCoarseMTaskReadyQueue;\n");
-      fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskReadyHead;\n");
-      fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskReadyTail;\n");
     }
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
-    // 28c-2 atomic-spin worker pool: hot atomics on independent cache lines.
-    fprintf(header, "alignas(64) std::atomic<uint64_t> mtWorkerPoolGeneration;\n");
     fprintf(header, "alignas(64) std::atomic<int> mtWorkerPoolDoneCount;\n");
     fprintf(header, "alignas(64) std::atomic<bool> mtWorkerPoolStop;\n");
     fprintf(header, "alignas(64) int mtWorkerPoolCurrentWorkerCount;\n");
