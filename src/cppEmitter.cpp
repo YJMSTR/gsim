@@ -173,6 +173,7 @@ struct MtCoarseRegion {
   int antichainProbeMaxBlockWidth = 0;                  // max chain-cover width across non-serial blocks
   int antichainProbeTotalGroups = 0;                    // total groups incl. serial singletons (may be large)
   bool antichainProbeDagAcyclic = false;                // Track 2 Week 3: quotient DAG on antichainProbeGroups acyclic
+  bool useAntichainRuntime = false;                     // Track 2 Week 4: route this region through atomic-counter scheduler
 };
 
 struct MtCoarseRegionPlan {
@@ -1374,15 +1375,24 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
       region.mtasks[groupIndex].orderingEdgeCount ++;
     }
   }
-  // Track 2 Week 2: report-only antichain probe.  Does not mutate region.mtasks.
-  // Gated to the hot region by default to keep model regen fast; set
-  // GSIM_MT_ANTICHAIN_PROBE=1 to enable.
+  // Track 2 Week 2: report-only antichain probe.
+  // Track 2 Week 4: when GSIM_MT_ANTICHAIN_RUNTIME=1, compute antichain groups
+  // for all runtime-eligible regions and use them as the real mtask set.
+  static bool antichainRuntimeEnabled = []() {
+    const char* env = std::getenv("GSIM_MT_ANTICHAIN_RUNTIME");
+    return env && env[0] == '1';
+  }();
   static bool probeEnabled = []() {
     const char* env = std::getenv("GSIM_MT_ANTICHAIN_PROBE");
     return env && env[0] == '1';
   }();
-  if (probeEnabled && region.beginCppId == 61888 && region.endCppId == 63136) {
+  if (antichainRuntimeEnabled || (probeEnabled && region.beginCppId == 61888 && region.endCppId == 63136)) {
     mtComputeAntichainGroups(region, tasks);
+  }
+  if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic) {
+    // Mark region for the atomic-counter scheduler once it is wired.
+    // Do not replace region.mtasks yet; old emitters would lose pred/succ ordering.
+    region.useAntichainRuntime = true;
   }
 }
 
@@ -2849,7 +2859,10 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "      \"mtask_static_cost_min\": %d,\n", region.mtaskStaticCostMin);
     fprintf(fp, "      \"mtask_static_cost_max\": %d,\n", region.mtaskStaticCostMax);
     fprintf(fp, "      \"mtask_static_cost_total\": %d,\n", region.mtaskStaticCostTotal);
-    fprintf(fp, "      \"mtask_member_node_cost_min\": %d,\n", region.mtaskMemberNodeCostMin);
+    if (region.antichainProbeTotalGroups > 0) {
+      fprintf(fp, "      \"antichain_probe_dag_is_acyclic\": %s,\n", region.antichainProbeDagAcyclic ? "true" : "false");
+      fprintf(fp, "      \"use_antichain_runtime\": %s,\n", region.useAntichainRuntime ? "true" : "false");
+    }
     fprintf(fp, "      \"mtask_member_node_cost_max\": %d,\n", region.mtaskMemberNodeCostMax);
     fprintf(fp, "      \"mtask_member_node_cost_total\": %d,\n", region.mtaskMemberNodeCostTotal);
     fprintf(fp, "      \"estimated_copy_words_at_t4\": %d,\n", 4 * region.activeWordSpan);
@@ -5711,9 +5724,20 @@ void graph::cppEmitter() {
       fprintf(header, "  SCoarseTaskFn fn;\n");
       fprintf(header, "};\n");
       fprintf(header, "bool mtCoarseUseDStatic;\n");
+      fprintf(header, "bool mtCoarseUseAntichainRuntime;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticRoundedWC;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticBeginActiveWord;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticActiveWordSpan;\n");
+      // Track 2 Week 4: per-mtask atomic counters and shared region flags for antichain runtime.
+      fprintf(header, "std::vector<std::atomic<int>*> mtCoarseMTaskState;\n");
+      fprintf(header, "std::vector<std::atomic<int>*> mtCoarseMTaskUpstream;\n");
+      fprintf(header, "std::vector<int> mtCoarseMTaskCount;\n");
+      fprintf(header, "std::vector<std::atomic<uint%d_t>*> mtCoarseRegionSharedFlags;\n", ACTIVE_WIDTH);
+      fprintf(header, "std::vector<int> mtCoarseRegionSharedFlagCount;\n");
+      fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskRemaining;\n");
+      fprintf(header, "std::vector<int> mtCoarseMTaskReadyQueue;\n");
+      fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskReadyHead;\n");
+      fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskReadyTail;\n");
     }
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
