@@ -485,6 +485,11 @@ int main(int argc, char** argv) {
     if (globalConfig.MtCoarseProfitabilityMode == "off") {
       globalConfig.MtCoarseProfitabilityMode = "static";
     }
+    // Track 2 Week 5: cost-based LPT worker assignment measurably improves
+    // dynamic runtime load balance, so default to profitable for mt-level-dispatch.
+    if (globalConfig.MtCoarseWorkerPolicyMode == "static") {
+      globalConfig.MtCoarseWorkerPolicyMode = "profitable";
+    }
     // MtCoarseRuntimeMode default "layered" + MtCoarseWorkerPolicyMode default "static"
     // are exactly what 51-design §5.3 specifies for level-by-level dispatch.
   }
