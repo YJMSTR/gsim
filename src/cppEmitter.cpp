@@ -1395,9 +1395,11 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
     mtComputeAntichainGroups(region, tasks);
   }
   if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic) {
-    // Mark region for the atomic-counter scheduler once it is wired.
-    // Do not replace region.mtasks yet; old emitters would lose pred/succ ordering.
-    region.useAntichainRuntime = true;
+    // Track 2 Week 4 Slice A: route only the hot region through the new scheduler.
+    // Other regions keep the existing per-region barrier path.
+    if (region.beginCppId == 61888 && region.endCppId == 63136) {
+      region.useAntichainRuntime = true;
+    }
   }
 }
 
