@@ -1415,36 +1415,29 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
   if (isHotRegion && (antichainRuntimeEnabled || probeEnabled || sarkarProbe)) {
     mtComputeAntichainGroups(region, tasks);
   }
-  // Track 2 Week 7: V3OrderParallel feasibility probe (report-only).
-  // For each cross-group edge in the antichain quotient DAG, classifies as
-  // dep / need / other.  Edges that are need-only are Sarkar fix-hazards
-  // candidates.  Simulates union-find contraction and reports results.
-  // USAGE: GSIM_MT_SARKAR_PROBE=1 ./build/gsim/gsim ...
+  // Track 2 Week 7: cost-based Sarkar edge-contraction probe (report-only).
+  // Phase 1 (fix-hazards): contract need-only edges (no structural dep).
+  // Phase 2 (cost-based): contract any edge where min(staticCost_u, staticCost_v) < sync_cost.
+  // sync_cost from GSIM_MT_SARKAR_COST env (default 100).
+  // USAGE: GSIM_MT_SARKAR_COST=N GSIM_MT_SARKAR_PROBE=1 ./build/gsim/gsim ...
   if (sarkarProbe && region.antichainProbeGroups.size() >= 2) {
       int groupCount = static_cast<int>(region.antichainProbeGroups.size());
+      int syncCost = 100; { const char* s = getenv("GSIM_MT_SARKAR_COST"); if (s && s[0]) syncCost = atoi(s); }
+      // Group cppIds and costs.
       std::map<int, int> cppIdToGroup;
+      std::vector<int> groupCosts(groupCount, 0);
       for (int g = 0; g < groupCount; g++) {
+        groupCosts[g] = region.antichainProbeGroups[g].staticCost;
         for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
           for (int cppId : layer) cppIdToGroup[cppId] = g;
         }
       }
       std::vector<std::vector<int>> groupCppIds(groupCount);
       for (auto& kv : cppIdToGroup) groupCppIds[kv.second].push_back(kv.first);
-      int totalPairs = 0, depPairs = 0, needPairs = 0, otherPairs = 0;
-      std::vector<int> contractParent(groupCount);
-      for (int g = 0; g < groupCount; g++) contractParent[g] = g;
-      auto cf = [&](int x) -> int {
-        int r = x;
-        while (contractParent[r] != r) r = contractParent[r];
-        while (contractParent[x] != x) {
-          int n = contractParent[x];
-          contractParent[x] = r;
-          x = n;
-        }
-        return r;
-      };
-      auto unite = [&](int a, int b) { contractParent[cf(b)] = cf(a); };
-      // Classify each directed gi->gj pair.
+      // Precompute cross-group edge types and static costs.
+      // For each ordered pair (gi,gj): hasEdge, hasDep, hasNeed, minCost.
+      std::vector<std::vector<int>> hasEdge(groupCount, std::vector<int>(groupCount, 0));
+      std::vector<std::vector<int>> edgeClass(groupCount, std::vector<int>(groupCount, 0)); // 0=need,1=other,2=dep
       for (int gi = 0; gi < groupCount; gi++) {
         for (int gj = 0; gj < groupCount; gj++) {
           if (gi == gj) continue;
@@ -1452,7 +1445,7 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
           for (int from : groupCppIds[gi]) {
             if (anyDep && anyNeed && anyOther) break;
             for (int to : groupCppIds[gj]) {
-              if (mtTaskHasDependencyEdgeTo(from, to)) { anyDep = true; break; }
+              if (!anyDep && mtTaskHasDependencyEdgeTo(from, to)) { anyDep = true; break; }
             }
           }
           if (!anyDep) {
@@ -1464,22 +1457,81 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
               }
             }
           }
-          if (!anyDep && !anyNeed && !anyOther) continue;
-          totalPairs++;
-          if (anyDep) { depPairs++; }
-          else if (anyNeed) { needPairs++; unite(gi, gj); }
-          else { otherPairs++; }
+          if (anyNeed || anyOther || anyDep) {
+            hasEdge[gi][gj] = 1;
+            edgeClass[gi][gj] = anyDep ? 2 : (anyNeed ? 0 : 1);
+          }
         }
       }
-      // Note: needPairs are counted per-direction, but union-find is undirected;
-      // the actual contracted group count is the number of equivalence classes.
-      std::set<int> remaining;
-      for (int g = 0; g < groupCount; g++) remaining.insert(cf(g));
-      int contractedCount = groupCount - static_cast<int>(remaining.size());
-      fprintf(stderr, "[sarkar-probe] region [%d,%d) groups=%d directed_pairs=%d dep=%d need=%d other=%d contracted_groups=%d remaining=%d\n",
+      // ---------- Phase 1: fix-hazards (need-only) ----------
+      std::vector<int> p1Parent(groupCount);
+      for (int g = 0; g < groupCount; g++) p1Parent[g] = g;
+      auto find = [&](auto& p, int x) -> int {
+        int r = x;
+        while (p[r] != r) r = p[r];
+        while (p[x] != x) { int n = p[x]; p[x] = r; x = n; }
+        return r;
+      };
+      auto unite = [&](auto& p, int a, int b) { p[find(p, b)] = find(p, a); };
+      int directedEdges = 0, depEdges = 0, needEdges = 0, otherEdges = 0;
+      for (int gi = 0; gi < groupCount; gi++) {
+        for (int gj = 0; gj < groupCount; gj++) {
+          if (!hasEdge[gi][gj]) continue;
+          directedEdges++;
+          if (edgeClass[gi][gj] == 2) { depEdges++; continue; }
+          if (edgeClass[gi][gj] == 0) { needEdges++; unite(p1Parent, gi, gj); continue; }
+          if (edgeClass[gi][gj] == 1) { otherEdges++; continue; }
+        }
+      }
+      std::set<int> p1Remaining;
+      for (int g = 0; g < groupCount; g++) p1Remaining.insert(find(p1Parent, g));
+      int p1Contracted = groupCount - static_cast<int>(p1Remaining.size());
+      // ---------- Phase 2: cost-based contraction ----------
+      int c2Edges = 0, c2BelowAll = 0;
+      // Pre-pass: count edges below threshold over p1 unions.
+      for (int gi = 0; gi < groupCount; gi++) {
+        for (int gj = 0; gj < groupCount; gj++) {
+          if (!hasEdge[gi][gj]) continue;
+          if (find(p1Parent, gi) == find(p1Parent, gj)) continue;
+          c2Edges++;
+          if (std::min(groupCosts[gi], groupCosts[gj]) < syncCost) c2BelowAll++;
+        }
+      }
+      int c2Contracted = 0;
+      std::vector<int> p2Parent = p1Parent;
+      for (int gi = 0; gi < groupCount; gi++) {
+        for (int gj = 0; gj < groupCount; gj++) {
+          if (!hasEdge[gi][gj]) continue;
+          if (find(p2Parent, gi) == find(p2Parent, gj)) continue;
+          if (std::min(groupCosts[gi], groupCosts[gj]) >= syncCost) continue;
+          c2Contracted++;
+          unite(p2Parent, gi, gj);
+        }
+      }
+      std::set<int> p2Remaining;
+      for (int g = 0; g < groupCount; g++) p2Remaining.insert(find(p2Parent, g));
+      int p2Contracted = groupCount - static_cast<int>(p2Remaining.size()) - p1Contracted;
+      // Report.
+      fprintf(stderr, "[sarkar-probe] region [%d,%d) groups=%d directed=%d dep=%d need=%d other=%d "
+              "fix-hazards_contracted=%d p1_remaining=%d "
+              "cost=%d above=%d below=%d union=%d total=%d final=%d",
               region.beginCppId, region.endCppId,
-              groupCount, totalPairs, depPairs, needPairs, otherPairs,
-              contractedCount, groupCount - contractedCount);
+              groupCount, directedEdges, depEdges, needEdges, otherEdges,
+              p1Contracted, groupCount - p1Contracted,
+              syncCost, c2Edges - c2BelowAll, c2BelowAll, c2Contracted,
+              p1Contracted + p2Contracted, groupCount - p1Contracted - p2Contracted);
+      // Critical path estimate: longest chain in the surviving quotient DAG.
+      if (groupCount - p1Contracted - p2Contracted > 1) {
+        int c = 0;
+        for (int gi = 0; gi < groupCount; gi++) {
+          for (int gj = 0; gj < groupCount; gj++) {
+            if (!hasEdge[gi][gj]) continue;
+            if (find(p2Parent, gi) != find(p2Parent, gj)) c++;
+          }
+        }
+        fprintf(stderr, " remaining_edges=%d", c);
+      }
+      fprintf(stderr, "\n");
     }
   if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic && isHotRegion) {
     region.useAntichainRuntime = true;
