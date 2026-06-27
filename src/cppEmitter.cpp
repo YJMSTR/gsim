@@ -4325,6 +4325,24 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(outerIndent + 2, "break;\n");
     emitBodyLock(outerIndent, "}\n");
   };
+  // Track 2 Week 7: mutex-protected ready queue for antichain scheduler.
+  // Push is called by any worker after a predecessor completes; pop prefers
+  // worker0-only tasks on logical worker 0, then parallel tasks.
+  emitFuncDecl(0, "void S%s::mtCoarseReadyQueuePush(int regionIndex, int mtaskIndex, bool worker0Only) {\n", name.c_str());
+  emitBodyLock(1, "std::lock_guard<std::mutex> lock(mtCoarseReadyQueueMutex);\n");
+  emitBodyLock(1, "if (worker0Only) mtCoarseReadyQueueWorker0[regionIndex].push_back(mtaskIndex);\n");
+  emitBodyLock(1, "else mtCoarseReadyQueueParallel[regionIndex].push_back(mtaskIndex);\n");
+  emitBodyLock(0, "}\n");
+  emitFuncDecl(0, "int S%s::mtCoarseReadyQueuePop(int regionIndex, int worker) {\n", name.c_str());
+  emitBodyLock(1, "std::lock_guard<std::mutex> lock(mtCoarseReadyQueueMutex);\n");
+  emitBodyLock(1, "if (worker == 0) {\n");
+  emitBodyLock(2, "auto &q0 = mtCoarseReadyQueueWorker0[regionIndex];\n");
+  emitBodyLock(2, "if (!q0.empty()) { int m = q0.back(); q0.pop_back(); return m; }\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "auto &q = mtCoarseReadyQueueParallel[regionIndex];\n");
+  emitBodyLock(1, "if (!q.empty()) { int m = q.back(); q.pop_back(); return m; }\n");
+  emitBodyLock(1, "return -1;\n");
+  emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::mtRunCoarseMTaskDynamic(int regionIndex, int worker) {\n", name.c_str());
   emitBodyLock(1, "if (mtCoarseSkeletalMode) return;\n");
@@ -4332,7 +4350,8 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   {
     int regionIndex = 0;
     for (const MtCoarseRegion& region : coarsePlan.regions) {
-      if (!region.runtimeEligible || !region.useAntichainRuntime) {
+      if (!region.runtimeEligible) continue;
+      if (!region.useAntichainRuntime) {
         regionIndex ++;
         continue;
       }
@@ -4361,37 +4380,76 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       emitBodyLock(3, "static const bool kWorkerZeroOnly[%d] = {%s};\n", antichainMTaskCount, mtJoinIntList(workerZeroOnlyFlags).c_str());
       emitBodyLock(3, "uint64_t cycle = mtCoarseRegionCycle[regionIndex][0].load(std::memory_order_acquire);\n");
       emitBodyLock(3, "bool evenCycle = (cycle % 2 == 0);\n");
-      emitBodyLock(3, "while (mtCoarseMTaskRemaining.load(std::memory_order_acquire) > 0) {\n");
-      emitBodyLock(4, "int found = -1;\n");
-      emitBodyLock(4, "for (int m = 0; m < kMTaskCount; m ++) {\n");
-      emitBodyLock(5, "if (kWorkerZeroOnly[m] && worker != 0) continue;\n");
-      emitBodyLock(5, "uint64_t claimed = mtCoarseMTaskClaimGen[regionIndex][m].load(std::memory_order_relaxed);\n");
-      emitBodyLock(5, "if (claimed == cycle) continue;\n");
-      emitBodyLock(5, "int target = evenCycle ? 0 : kUpstream[m];\n");
-      emitBodyLock(5, "if (mtCoarseMTaskUpstream[regionIndex][m].load(std::memory_order_acquire) != target) continue;\n");
-      emitBodyLock(5, "if (mtCoarseMTaskClaimGen[regionIndex][m].compare_exchange_strong(claimed, cycle, std::memory_order_acquire)) { found = m; break; }\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(4, "if (found < 0) {\n");
-      emitBodyLock(5, "if (mtCoarseMTaskRemaining.load(std::memory_order_acquire) == 0) break;\n");
-      emitBodyLock(5, "mtWorkerPoolPause();\n");
-      emitBodyLock(5, "continue;\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(4, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
-      emitBodyLock(5, "mtWorkerCoarseFlags[worker][w] = mtWorkerPoolCoarseActiveWords[w] | mtCoarseRegionSharedFlags[regionIndex][w].load(std::memory_order_acquire);\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(4, "int mtaskIndex = found;\n");
-      emitAntichainMtaskInnerSwitch(region, 4);
-      emitBodyLock(4, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
-      emitBodyLock(5, "mtCoarseRegionSharedFlags[regionIndex][w].fetch_or(mtWorkerCoarseFlags[worker][w], std::memory_order_release);\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(4, "mtCoarseMTaskRemaining.fetch_sub(1, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "for (int s = kSuccOffset[found]; s < kSuccOffset[found + 1]; s ++) {\n");
-      emitBodyLock(5, "int succ = kSuccIndices[s];\n");
-      emitBodyLock(5, "if (evenCycle) {\n");
-      emitBodyLock(6, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
-      emitBodyLock(5, "} else {\n");
-      emitBodyLock(6, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_add(1, std::memory_order_acq_rel);\n");
+      emitBodyLock(3, "if (!mtCoarseUseAntichainQueue) {\n");
+      // Legacy scan-based dispatch: keep for bisection / NEMU mismatch debugging.
+      emitBodyLock(4, "while (mtCoarseMTaskRemaining.load(std::memory_order_acquire) > 0) {\n");
+      emitBodyLock(5, "int found = -1;\n");
+      emitBodyLock(5, "for (int m = 0; m < kMTaskCount; m ++) {\n");
+      emitBodyLock(6, "if (kWorkerZeroOnly[m] && worker != 0) continue;\n");
+      emitBodyLock(6, "uint64_t claimed = mtCoarseMTaskClaimGen[regionIndex][m].load(std::memory_order_relaxed);\n");
+      emitBodyLock(6, "if (claimed == cycle) continue;\n");
+      emitBodyLock(6, "int target = evenCycle ? 0 : kUpstream[m];\n");
+      emitBodyLock(6, "if (mtCoarseMTaskUpstream[regionIndex][m].load(std::memory_order_acquire) != target) continue;\n");
+      emitBodyLock(6, "if (mtCoarseMTaskClaimGen[regionIndex][m].compare_exchange_strong(claimed, cycle, std::memory_order_acquire)) { found = m; break; }\n");
       emitBodyLock(5, "}\n");
+      emitBodyLock(5, "if (found < 0) {\n");
+      emitBodyLock(6, "if (mtCoarseMTaskRemaining.load(std::memory_order_acquire) == 0) break;\n");
+      emitBodyLock(6, "mtWorkerPoolPause();\n");
+      emitBodyLock(6, "continue;\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
+      emitBodyLock(6, "mtWorkerCoarseFlags[worker][w] = mtWorkerPoolCoarseActiveWords[w] | mtCoarseRegionSharedFlags[regionIndex][w].load(std::memory_order_acquire);\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "int mtaskIndex = found;\n");
+      emitAntichainMtaskInnerSwitch(region, 5);
+      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
+      emitBodyLock(6, "mtCoarseRegionSharedFlags[regionIndex][w].fetch_or(mtWorkerCoarseFlags[worker][w], std::memory_order_release);\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "mtCoarseMTaskRemaining.fetch_sub(1, std::memory_order_relaxed);\n");
+      emitBodyLock(5, "for (int s = kSuccOffset[found]; s < kSuccOffset[found + 1]; s ++) {\n");
+      emitBodyLock(6, "int succ = kSuccIndices[s];\n");
+      emitBodyLock(6, "if (evenCycle) {\n");
+      emitBodyLock(7, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
+      emitBodyLock(6, "} else {\n");
+      emitBodyLock(7, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_add(1, std::memory_order_acq_rel);\n");
+      emitBodyLock(6, "}\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(3, "} else {\n");
+      // Ready-queue dispatch: each mtask is pushed once (when ready) and popped once.
+      emitBodyLock(4, "while (true) {\n");
+      emitBodyLock(5, "int found = mtCoarseReadyQueuePop(regionIndex, worker);\n");
+      emitBodyLock(5, "if (found < 0) {\n");
+      emitBodyLock(6, "if (mtCoarseMTaskRemaining.load(std::memory_order_acquire) == 0) {\n");
+      emitBodyLock(7, "std::lock_guard<std::mutex> lock(mtCoarseReadyQueueMutex);\n");
+      emitBodyLock(7, "if (mtCoarseReadyQueueParallel[regionIndex].empty() && mtCoarseReadyQueueWorker0[regionIndex].empty()) break;\n");
+      emitBodyLock(6, "}\n");
+      emitBodyLock(6, "mtWorkerPoolPause();\n");
+      emitBodyLock(6, "continue;\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "mtCoarseMTaskInFlight.fetch_add(1, std::memory_order_relaxed);\n");
+      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
+      emitBodyLock(6, "mtWorkerCoarseFlags[worker][w] = mtWorkerPoolCoarseActiveWords[w] | mtCoarseRegionSharedFlags[regionIndex][w].load(std::memory_order_acquire);\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "int mtaskIndex = found;\n");
+      emitAntichainMtaskInnerSwitch(region, 5);
+      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
+      emitBodyLock(6, "mtCoarseRegionSharedFlags[regionIndex][w].fetch_or(mtWorkerCoarseFlags[worker][w], std::memory_order_release);\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "for (int s = kSuccOffset[found]; s < kSuccOffset[found + 1]; s ++) {\n");
+      emitBodyLock(6, "int succ = kSuccIndices[s];\n");
+      emitBodyLock(6, "bool ready = false;\n");
+      emitBodyLock(6, "if (evenCycle) {\n");
+      emitBodyLock(7, "int old = mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
+      emitBodyLock(7, "ready = (old == 1);\n");
+      emitBodyLock(6, "} else {\n");
+      emitBodyLock(7, "int old = mtCoarseMTaskUpstream[regionIndex][succ].fetch_add(1, std::memory_order_acq_rel);\n");
+      emitBodyLock(7, "ready = (old == kUpstream[succ] - 1);\n");
+      emitBodyLock(6, "}\n");
+      emitBodyLock(6, "if (ready) mtCoarseReadyQueuePush(regionIndex, succ, kWorkerZeroOnly[succ]);\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "mtCoarseMTaskRemaining.fetch_sub(1, std::memory_order_relaxed);\n");
+      emitBodyLock(5, "mtCoarseMTaskInFlight.fetch_sub(1, std::memory_order_relaxed);\n");
       emitBodyLock(4, "}\n");
       emitBodyLock(3, "}\n");
       emitBodyLock(3, "}\n");
@@ -4763,6 +4821,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     std::vector<int> antichainMTaskCountValues;
     std::vector<int> antichainUpstreamOffsets;
     std::vector<int> antichainUpstreamValues;
+    std::vector<int> antichainWorker0OnlyValues;
     antichainUpstreamOffsets.push_back(0);
     for (const MtCoarseRegion& region : coarsePlan.regions) {
       if (!region.runtimeEligible) continue;
@@ -4773,6 +4832,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       if (useAntichain) {
         for (const MtCoarseMTask& mtask : region.antichainProbeGroups) {
           antichainUpstreamValues.push_back(mtask.upstreamDepCount);
+          antichainWorker0OnlyValues.push_back(mtask.workerZeroOnly ? 1 : 0);
         }
       }
       antichainUpstreamOffsets.push_back(static_cast<int>(antichainUpstreamValues.size()));
@@ -4781,6 +4841,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(1, "static const int kCoarseRegionAntichainMTaskCount[%d] = {%s};\n", a104EligibleCount, mtJoinIntList(antichainMTaskCountValues).c_str());
     emitBodyLock(1, "static const int kCoarseRegionAntichainUpstreamOffset[%d] = {%s};\n", a104EligibleCount + 1, mtJoinIntList(antichainUpstreamOffsets).c_str());
     emitBodyLock(1, "static const int kCoarseRegionAntichainUpstreamValues[%zu] = {%s};\n", antichainUpstreamValues.size(), mtJoinIntList(antichainUpstreamValues).c_str());
+    emitBodyLock(1, "static const bool kCoarseRegionAntichainWorker0Only[%zu] = {%s};\n", antichainWorker0OnlyValues.size(), mtJoinIntList(antichainWorker0OnlyValues).c_str());
   }
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
@@ -4939,6 +5000,21 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtCoarseRegionSharedFlags[regionIndex][w].store(0, std::memory_order_relaxed);\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "mtCoarseMTaskRemaining.store(antichainMTaskCount, std::memory_order_relaxed);\n");
+    // Track 2 Week 7: seed the antichain ready queue with source mtasks (zero upstream deps).
+    emitBodyLock(2, "if (mtCoarseUseAntichainQueue) {\n");
+    emitBodyLock(3, "{\n");
+    emitBodyLock(4, "std::lock_guard<std::mutex> lock(mtCoarseReadyQueueMutex);\n");
+    emitBodyLock(4, "mtCoarseReadyQueueParallel[regionIndex].clear();\n");
+    emitBodyLock(4, "mtCoarseReadyQueueWorker0[regionIndex].clear();\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "mtCoarseMTaskInFlight.store(0, std::memory_order_relaxed);\n");
+    emitBodyLock(3, "int antichainUpstreamOffset = kCoarseRegionAntichainUpstreamOffset[regionIndex];\n");
+    emitBodyLock(3, "for (int m = 0; m < antichainMTaskCount; m ++) {\n");
+    emitBodyLock(4, "if (kCoarseRegionAntichainUpstreamValues[antichainUpstreamOffset + m] == 0) {\n");
+    emitBodyLock(5, "mtCoarseReadyQueuePush(regionIndex, m, kCoarseRegionAntichainWorker0Only[antichainUpstreamOffset + m]);\n");
+    emitBodyLock(4, "}\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(2, "}\n");
   emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileCoarseMTaskDispatches += antichainMTaskCount;\n");
   emitBodyLock(3, "mtProfileCoarseWorkerJobs += antichainWorkerCount;\n");
@@ -6045,6 +6121,14 @@ void graph::cppEmitter() {
       fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskRemaining;\n");
       fprintf(header, "std::vector<std::atomic<uint64_t>*> mtCoarseRegionCycle;\n");
       fprintf(header, "uint%d_t* mtWorkerPoolCoarseActiveWords;\n", ACTIVE_WIDTH);
+      // Track 2 Week 7: mutex-protected ready queues for antichain scheduler.
+      // Avoids O(M^2) scan/CAS by pushing ready mtasks once and popping once.
+      // Kept behind GSIM_MT_ANTICHAIN_QUEUE env knob; old scan path still available.
+      fprintf(header, "std::mutex mtCoarseReadyQueueMutex;\n");
+      fprintf(header, "std::vector<std::vector<int>> mtCoarseReadyQueueParallel;\n");
+      fprintf(header, "std::vector<std::vector<int>> mtCoarseReadyQueueWorker0;\n");
+      fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskInFlight;\n");
+      fprintf(header, "bool mtCoarseUseAntichainQueue;\n");
     }
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
@@ -6217,7 +6301,13 @@ void graph::cppEmitter() {
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
   if (useCoarseMt) {
+    // Track 2 Week 7: ready-queue state for antichain scheduler.
+    emitBodyLock(1, "mtCoarseMTaskInFlight.store(0, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "const char *antichainQueueEnv = getenv(\"GSIM_MT_ANTICHAIN_QUEUE\");\n");
+    emitBodyLock(1, "mtCoarseUseAntichainQueue = (antichainQueueEnv == nullptr) || (antichainQueueEnv[0] != '0');\n");
     emitBodyLock(1, "mtProfileCoarseStaticRuntimeEligibleRegions = %d;\n", mtCoarseProfileFacts.runtimeEligibleRegionCount);
+    emitBodyLock(1, "mtCoarseReadyQueueParallel.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, std::vector<int>());\n");
+    emitBodyLock(1, "mtCoarseReadyQueueWorker0.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, std::vector<int>());\n");
     // Track 2 Week 6: claim-generation + even-cycle arrays; cycle counters allocated per-region.
     emitBodyLock(1, "mtCoarseMTaskClaimGen.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
     emitBodyLock(1, "mtCoarseMTaskUpstream.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
@@ -6525,6 +6615,9 @@ void graph::cppEmitter() {
         fprintf(header, "void mtRunCoarseMTaskWorkerList(int worker, int regionIndex, const int *mtaskIndices, int mtaskCount);\n");
         fprintf(header, "void mtRunCoarseMTaskWorkerRange(int worker, int regionIndex, int mtaskBegin, int mtaskEnd);\n");
         fprintf(header, "void mtRunCoarseMTaskDynamic(int regionIndex, int worker);\n");
+        // Track 2 Week 7: antichain ready-queue helpers.
+        fprintf(header, "void mtCoarseReadyQueuePush(int regionIndex, int mtaskIndex, bool worker0Only);\n");
+        fprintf(header, "int mtCoarseReadyQueuePop(int regionIndex, int worker);\n");
         fprintf(header, "int mtCountActiveCoarseMTasks(int regionIndex, uint%d_t *coarseActiveWords, int *activeStaticCost);\n", ACTIVE_WIDTH);
         fprintf(header, "void mtBuildCoarseMTaskWorkerAssignment(int regionIndex, int workerCount, std::vector<std::vector<int>> &assignments, std::vector<uint64_t> &workerStaticCosts, std::vector<uint64_t> &workerTaskCounts);\n");
         fprintf(header, "void mtRunCoarseRegion(int regionIndex, uint%d_t *coarseActiveWords);\n", ACTIVE_WIDTH);
