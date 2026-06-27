@@ -1393,17 +1393,15 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
     const char* env = std::getenv("GSIM_MT_ANTICHAIN_PROBE");
     return env && env[0] == '1';
   }();
-  if (antichainRuntimeEnabled || (probeEnabled && region.beginCppId == 61888 && region.endCppId == 63136)) {
+  // Hot region for antichain even_cycle scheduler: at sns=30 the old [61888,63136]
+  // region no longer exists; pick the new highest-useful-work admitted region
+  // [38872,39056] (mtask_count=12, useful_work=88687, admitted at t8).
+  bool isHotRegion = (region.beginCppId == 38872 && region.endCppId == 39056);
+  if ((antichainRuntimeEnabled && isHotRegion) || (probeEnabled && isHotRegion)) {
     mtComputeAntichainGroups(region, tasks);
   }
-  if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic) {
-    // Track 2 Week 4 Slice A: route only the hot region through the new scheduler.
-    // Other regions keep the existing per-region barrier path.
-    // Week 5 experiment: expanding to all acyclic regions with groups > mtasks
-    // caused hangs on MT>1, so keep the narrow hot-region gate for now.
-    if (region.beginCppId == 61888 && region.endCppId == 63136) {
-      region.useAntichainRuntime = true;
-    }
+  if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic && isHotRegion) {
+    region.useAntichainRuntime = true;
   }
 }
 
@@ -4361,13 +4359,17 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       emitBodyLock(3, "static const int kSuccOffset[%d] = {%s};\n", antichainMTaskCount + 1, mtJoinIntList(succOffsets).c_str());
       emitBodyLock(3, "static const int kSuccIndices[%zu] = {%s};\n", succIndices.size(), mtJoinIntList(succIndices).c_str());
       emitBodyLock(3, "static const bool kWorkerZeroOnly[%d] = {%s};\n", antichainMTaskCount, mtJoinIntList(workerZeroOnlyFlags).c_str());
+      emitBodyLock(3, "uint64_t cycle = mtCoarseRegionCycle[regionIndex][0].load(std::memory_order_acquire);\n");
+      emitBodyLock(3, "bool evenCycle = (cycle % 2 == 0);\n");
       emitBodyLock(3, "while (mtCoarseMTaskRemaining.load(std::memory_order_acquire) > 0) {\n");
       emitBodyLock(4, "int found = -1;\n");
       emitBodyLock(4, "for (int m = 0; m < kMTaskCount; m ++) {\n");
       emitBodyLock(5, "if (kWorkerZeroOnly[m] && worker != 0) continue;\n");
-      emitBodyLock(5, "if (mtCoarseMTaskState[regionIndex][m].load(std::memory_order_relaxed) != 1) continue;\n");
-      emitBodyLock(5, "int expected = 1;\n");
-      emitBodyLock(5, "if (mtCoarseMTaskState[regionIndex][m].compare_exchange_strong(expected, 2, std::memory_order_acquire)) { found = m; break; }\n");
+      emitBodyLock(5, "uint64_t claimed = mtCoarseMTaskClaimGen[regionIndex][m].load(std::memory_order_relaxed);\n");
+      emitBodyLock(5, "if (claimed == cycle) continue;\n");
+      emitBodyLock(5, "int target = evenCycle ? 0 : kUpstream[m];\n");
+      emitBodyLock(5, "if (mtCoarseMTaskUpstream[regionIndex][m].load(std::memory_order_acquire) != target) continue;\n");
+      emitBodyLock(5, "if (mtCoarseMTaskClaimGen[regionIndex][m].compare_exchange_strong(claimed, cycle, std::memory_order_acquire)) { found = m; break; }\n");
       emitBodyLock(4, "}\n");
       emitBodyLock(4, "if (found < 0) {\n");
       emitBodyLock(5, "if (mtCoarseMTaskRemaining.load(std::memory_order_acquire) == 0) break;\n");
@@ -4383,13 +4385,12 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       emitBodyLock(5, "mtCoarseRegionSharedFlags[regionIndex][w].fetch_or(mtWorkerCoarseFlags[worker][w], std::memory_order_release);\n");
       emitBodyLock(4, "}\n");
       emitBodyLock(4, "mtCoarseMTaskRemaining.fetch_sub(1, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "mtCoarseMTaskState[regionIndex][found].store(3, std::memory_order_release);\n");
       emitBodyLock(4, "for (int s = kSuccOffset[found]; s < kSuccOffset[found + 1]; s ++) {\n");
       emitBodyLock(5, "int succ = kSuccIndices[s];\n");
-      emitBodyLock(5, "int prev = mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
-      emitBodyLock(5, "if (prev == 1) {\n");
-      emitBodyLock(6, "int expected = 0;\n");
-      emitBodyLock(6, "mtCoarseMTaskState[regionIndex][succ].compare_exchange_strong(expected, 1, std::memory_order_release);\n");
+      emitBodyLock(5, "if (evenCycle) {\n");
+      emitBodyLock(6, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
+      emitBodyLock(5, "} else {\n");
+      emitBodyLock(6, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_add(1, std::memory_order_acq_rel);\n");
       emitBodyLock(5, "}\n");
       emitBodyLock(4, "}\n");
       emitBodyLock(3, "}\n");
@@ -4917,19 +4918,23 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtProfileLocalActivationDeltaMaxEntries.assign((size_t)antichainWorkerCount, 0);\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "// Lazy-allocate per-region atomic state (first invocation only).\n");
-  emitBodyLock(2, "if (mtCoarseMTaskState[regionIndex] == nullptr) {\n");
-  emitBodyLock(3, "mtCoarseMTaskState[regionIndex] = new std::atomic<int>[antichainMTaskCount];\n");
+  emitBodyLock(2, "if (mtCoarseMTaskClaimGen[regionIndex] == nullptr) {\n");
+  emitBodyLock(3, "mtCoarseMTaskClaimGen[regionIndex] = new std::atomic<uint64_t>[antichainMTaskCount];\n");
   emitBodyLock(3, "mtCoarseMTaskUpstream[regionIndex] = new std::atomic<int>[antichainMTaskCount];\n");
   emitBodyLock(3, "mtCoarseRegionSharedFlags[regionIndex] = new std::atomic<uint%d_t>[regionActiveWordSpan]();\n", ACTIVE_WIDTH);
+  emitBodyLock(3, "mtCoarseRegionCycle[regionIndex] = new std::atomic<uint64_t>[1];\n");
   emitBodyLock(3, "mtCoarseMTaskCount[regionIndex] = antichainMTaskCount;\n");
+  emitBodyLock(3, "mtCoarseRegionCycle[regionIndex][0].store(0, std::memory_order_relaxed);\n");
+  emitBodyLock(3, "// First invocation is odd (cycle=1): upstream must count up to depCount.\n");
+  emitBodyLock(3, "for (int m = 0; m < antichainMTaskCount; m ++) {\n");
+  emitBodyLock(4, "mtCoarseMTaskClaimGen[regionIndex][m].store(0, std::memory_order_relaxed);\n");
+  emitBodyLock(4, "mtCoarseMTaskUpstream[regionIndex][m].store(0, std::memory_order_relaxed);\n");
+  emitBodyLock(4, "}\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "int upstreamOffset = kCoarseRegionAntichainUpstreamOffset[regionIndex];\n");
-  emitBodyLock(2, "for (int m = 0; m < antichainMTaskCount; m ++) {\n");
-  emitBodyLock(3, "mtCoarseMTaskState[regionIndex][m].store(0, std::memory_order_relaxed);\n");
-  emitBodyLock(3, "int upstream = kCoarseRegionAntichainUpstreamValues[upstreamOffset + m];\n");
-  emitBodyLock(3, "mtCoarseMTaskUpstream[regionIndex][m].store(upstream, std::memory_order_relaxed);\n");
-  emitBodyLock(3, "if (upstream == 0) mtCoarseMTaskState[regionIndex][m].store(1, std::memory_order_relaxed);\n");
-  emitBodyLock(2, "}\n");
+  emitBodyLock(2, "// Stamp a new cycle; even cycles decrement upstream to 0, odd cycles increment to depCount.\n");
+  emitBodyLock(2, "uint64_t cycle = ++mtCoarseRegionCycle[regionIndex][0];\n");
+  emitBodyLock(2, "bool evenCycle = (cycle % 2 == 0);\n");
+  emitBodyLock(2, "(void)evenCycle;\n");
   emitBodyLock(2, "for (int w = 0; w < regionActiveWordSpan; w ++) {\n");
   emitBodyLock(3, "mtCoarseRegionSharedFlags[regionIndex][w].store(0, std::memory_order_relaxed);\n");
   emitBodyLock(2, "}\n");
@@ -6031,11 +6036,14 @@ void graph::cppEmitter() {
       fprintf(header, "int mtWorkerPoolCoarseStaticBeginActiveWord;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticActiveWordSpan;\n");
       // Track 2 Week 4: per-mtask atomic counters and shared region flags for antichain runtime.
-      fprintf(header, "std::vector<std::atomic<int>*> mtCoarseMTaskState;\n");
+      // Track 2 Week 6: use a stamped claim-generation counter and even-cycle upstream target
+      // so that neither state[] nor upstream[] need a per-invocation reset loop.
+      fprintf(header, "std::vector<std::atomic<uint64_t>*> mtCoarseMTaskClaimGen;\n");
       fprintf(header, "std::vector<std::atomic<int>*> mtCoarseMTaskUpstream;\n");
       fprintf(header, "std::vector<int> mtCoarseMTaskCount;\n");
       fprintf(header, "std::vector<std::atomic<uint%d_t>*> mtCoarseRegionSharedFlags;\n", ACTIVE_WIDTH);
       fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskRemaining;\n");
+      fprintf(header, "std::vector<std::atomic<uint64_t>*> mtCoarseRegionCycle;\n");
       fprintf(header, "uint%d_t* mtWorkerPoolCoarseActiveWords;\n", ACTIVE_WIDTH);
     }
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
@@ -6210,9 +6218,10 @@ void graph::cppEmitter() {
   emitBodyLock(1, "}\n");
   if (useCoarseMt) {
     emitBodyLock(1, "mtProfileCoarseStaticRuntimeEligibleRegions = %d;\n", mtCoarseProfileFacts.runtimeEligibleRegionCount);
-    // Track 2 Week 4: per-region atomic state for antichain runtime.
-    emitBodyLock(1, "mtCoarseMTaskState.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
+    // Track 2 Week 6: claim-generation + even-cycle arrays; cycle counters allocated per-region.
+    emitBodyLock(1, "mtCoarseMTaskClaimGen.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
     emitBodyLock(1, "mtCoarseMTaskUpstream.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
+    emitBodyLock(1, "mtCoarseRegionCycle.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
     emitBodyLock(1, "mtCoarseMTaskCount.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, 0);\n");
     emitBodyLock(1, "mtCoarseRegionSharedFlags.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
     emitBodyLock(1, "mtCoarseMTaskRemaining.store(0, std::memory_order_relaxed);\n");
