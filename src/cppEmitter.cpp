@@ -918,6 +918,17 @@ static bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId) {
   }
   return false;
 }
+// Track 2 Week 7: check whether fromCppId's SuperNode has a needActivate edge to toCppId.
+// Unlike nextActiveId (which includes always-active), nextNeedActivate tracks the
+// conditional activation edges gated by output change. Used by the Sarkar probe.
+static bool mtTaskHasNeedActivateEdgeTo(int fromCppId, int toCppId) {
+  auto iter = cppId2Super.find(fromCppId);
+  if (iter == cppId2Super.end() || !iter->second) return false;
+  for (Node* member : iter->second->member) {
+    if (member && member->nextNeedActivate.find(toCppId) != member->nextNeedActivate.end()) return true;
+  }
+  return false;
+}
 
 static bool mtTaskHasDependencyEdgeTo(int fromCppId, int toCppId) {
   auto from = cppId2Super.find(fromCppId);
@@ -1393,13 +1404,83 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
     const char* env = std::getenv("GSIM_MT_ANTICHAIN_PROBE");
     return env && env[0] == '1';
   }();
+  static bool sarkarProbe = []() {
+    const char* env = std::getenv("GSIM_MT_SARKAR_PROBE");
+    return env && env[0] == '1';
+  }();
   // Hot region for antichain even_cycle scheduler: at sns=30 the old [61888,63136]
   // region no longer exists; pick the new highest-useful-work admitted region
   // [38872,39056] (mtask_count=12, useful_work=88687, admitted at t8).
   bool isHotRegion = (region.beginCppId == 38872 && region.endCppId == 39056);
-  if ((antichainRuntimeEnabled && isHotRegion) || (probeEnabled && isHotRegion)) {
+  if (isHotRegion && (antichainRuntimeEnabled || probeEnabled || sarkarProbe)) {
     mtComputeAntichainGroups(region, tasks);
   }
+  // Track 2 Week 7: V3OrderParallel feasibility probe (report-only).
+  // For each cross-group edge in the antichain quotient DAG, classifies as
+  // dep / need / other.  Edges that are need-only are Sarkar fix-hazards
+  // candidates.  Simulates union-find contraction and reports results.
+  // USAGE: GSIM_MT_SARKAR_PROBE=1 ./build/gsim/gsim ...
+  if (sarkarProbe && region.antichainProbeGroups.size() >= 2) {
+      int groupCount = static_cast<int>(region.antichainProbeGroups.size());
+      std::map<int, int> cppIdToGroup;
+      for (int g = 0; g < groupCount; g++) {
+        for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
+          for (int cppId : layer) cppIdToGroup[cppId] = g;
+        }
+      }
+      std::vector<std::vector<int>> groupCppIds(groupCount);
+      for (auto& kv : cppIdToGroup) groupCppIds[kv.second].push_back(kv.first);
+      int totalPairs = 0, depPairs = 0, needPairs = 0, otherPairs = 0;
+      std::vector<int> contractParent(groupCount);
+      for (int g = 0; g < groupCount; g++) contractParent[g] = g;
+      auto cf = [&](int x) -> int {
+        int r = x;
+        while (contractParent[r] != r) r = contractParent[r];
+        while (contractParent[x] != x) {
+          int n = contractParent[x];
+          contractParent[x] = r;
+          x = n;
+        }
+        return r;
+      };
+      auto unite = [&](int a, int b) { contractParent[cf(b)] = cf(a); };
+      // Classify each directed gi->gj pair.
+      for (int gi = 0; gi < groupCount; gi++) {
+        for (int gj = 0; gj < groupCount; gj++) {
+          if (gi == gj) continue;
+          bool anyDep = false, anyNeed = false, anyOther = false;
+          for (int from : groupCppIds[gi]) {
+            if (anyDep && anyNeed && anyOther) break;
+            for (int to : groupCppIds[gj]) {
+              if (mtTaskHasDependencyEdgeTo(from, to)) { anyDep = true; break; }
+            }
+          }
+          if (!anyDep) {
+            for (int from : groupCppIds[gi]) {
+              if (anyNeed && anyOther) break;
+              for (int to : groupCppIds[gj]) {
+                if (!anyNeed && mtTaskHasNeedActivateEdgeTo(from, to)) anyNeed = true;
+                if (!anyOther && mtTaskHasActiveEdgeTo(from, to) && !mtTaskHasNeedActivateEdgeTo(from, to)) anyOther = true;
+              }
+            }
+          }
+          if (!anyDep && !anyNeed && !anyOther) continue;
+          totalPairs++;
+          if (anyDep) { depPairs++; }
+          else if (anyNeed) { needPairs++; unite(gi, gj); }
+          else { otherPairs++; }
+        }
+      }
+      // Note: needPairs are counted per-direction, but union-find is undirected;
+      // the actual contracted group count is the number of equivalence classes.
+      std::set<int> remaining;
+      for (int g = 0; g < groupCount; g++) remaining.insert(cf(g));
+      int contractedCount = groupCount - static_cast<int>(remaining.size());
+      fprintf(stderr, "[sarkar-probe] region [%d,%d) groups=%d directed_pairs=%d dep=%d need=%d other=%d contracted_groups=%d remaining=%d\n",
+              region.beginCppId, region.endCppId,
+              groupCount, totalPairs, depPairs, needPairs, otherPairs,
+              contractedCount, groupCount - contractedCount);
+    }
   if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic && isHotRegion) {
     region.useAntichainRuntime = true;
   }
