@@ -1408,11 +1408,15 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
     const char* env = std::getenv("GSIM_MT_SARKAR_PROBE");
     return env && env[0] == '1';
   }();
+  static bool sarkarContract = []() {
+    const char* env = std::getenv("GSIM_MT_SARKAR_CONTRACT");
+    return env && env[0] == '1';
+  }();
   // Hot region for antichain even_cycle scheduler: at sns=30 the old [61888,63136]
   // region no longer exists; pick the new highest-useful-work admitted region
   // [38872,39056] (mtask_count=12, useful_work=88687, admitted at t8).
   bool isHotRegion = (region.beginCppId == 38872 && region.endCppId == 39056);
-  if (isHotRegion && (antichainRuntimeEnabled || probeEnabled || sarkarProbe)) {
+  if (isHotRegion && (antichainRuntimeEnabled || probeEnabled || sarkarProbe || sarkarContract)) {
     mtComputeAntichainGroups(region, tasks);
   }
   // Track 2 Week 7: cost-based Sarkar edge-contraction probe (report-only).
@@ -1533,6 +1537,146 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
       }
       fprintf(stderr, "\n");
     }
+  // Track 2 Week 7: actual Sarkar contraction (apply, not probe).
+  // Gated by GSIM_MT_SARKAR_CONTRACT=1; uses GSIM_MT_SARKAR_COST for threshold.
+  {
+    const char* contractEnv = std::getenv("GSIM_MT_SARKAR_CONTRACT");
+    bool doContract = contractEnv && contractEnv[0] == '1';
+    if (doContract && region.antichainProbeGroups.size() >= 2) {
+      int syncCost = 100;
+      { const char* e = std::getenv("GSIM_MT_SARKAR_COST"); if (e && e[0]) syncCost = atoi(e); }
+      if (syncCost <= 0) syncCost = 100;
+      int G = static_cast<int>(region.antichainProbeGroups.size());
+      // Build group cost vector.
+      std::vector<int> groupCosts(G, 0);
+      for (int g = 0; g < G; g++) groupCosts[g] = region.antichainProbeGroups[g].staticCost;
+      // Build cross-group edge matrix (same as probe Phase 2 pre-pass).
+      std::map<int, int> cppIdToGroup;
+      for (int g = 0; g < G; g++) {
+        for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
+          for (int cppId : layer) cppIdToGroup[cppId] = g;
+        }
+      }
+      std::vector<std::vector<int>> groupCppIds(G);
+      for (auto& kv : cppIdToGroup) groupCppIds[kv.second].push_back(kv.first);
+      // Union-find over cost-below-threshold edges.
+      std::vector<int> parent(G);
+      for (int g = 0; g < G; g++) parent[g] = g;
+      auto find = [&](auto& p, int x) -> int {
+        int r = x; while (p[r] != r) r = p[r];
+        while (p[x] != x) { int n = p[x]; p[x] = r; x = n; }
+        return r;
+      };
+      auto unite = [&](auto& p, int a, int b) { p[find(p, b)] = find(p, a); };
+      for (int gi = 0; gi < G; gi++) {
+        for (int gj = 0; gj < G; gj++) {
+          if (gi == gj) continue;
+          if (find(parent, gi) == find(parent, gj)) continue;
+          // Check if there's any ordering edge between the two groups.
+          bool hasEdge = false;
+          for (int from : groupCppIds[gi]) {
+            if (hasEdge) break;
+            for (int to : groupCppIds[gj]) {
+              if (mtTaskHasOrderingEdgeTo(from, to)) { hasEdge = true; break; }
+            }
+          }
+          if (!hasEdge) continue;
+          int benefit = std::min(groupCosts[gi], groupCosts[gj]);
+          if (benefit < syncCost) unite(parent, gi, gj);
+        }
+      }
+      // Build merged groups.
+      std::map<int, std::vector<int>> rootToGroups;
+      for (int g = 0; g < G; g++) rootToGroups[find(parent, g)].push_back(g);
+      if (static_cast<int>(rootToGroups.size()) == G) {
+        fprintf(stderr, "[sarkar-contract] region [%d,%d) no contraction candidates\n", region.beginCppId, region.endCppId);
+      } else {
+        std::vector<MtCoarseMTask> newGroups;
+        for (auto& kv : rootToGroups) {
+          MtCoarseMTask merged;
+          for (int g : kv.second) {
+            const auto& src = region.antichainProbeGroups[g];
+            merged.taskCount += src.taskCount;
+            merged.staticCost += src.staticCost;
+            merged.memberNodeCost += src.memberNodeCost;
+            merged.workerZeroOnly = merged.workerZeroOnly || src.workerZeroOnly;
+            for (const auto& layer : src.layerTaskCppIds) {
+              for (int cppId : layer) {
+                int layerIdx = -1;
+                for (size_t li = 0; li < region.layers.size(); li++) {
+                  for (int tc : region.layers[li].taskCppIds) {
+                    if (tc == cppId) { layerIdx = static_cast<int>(li); break; }
+                  }
+                  if (layerIdx >= 0) break;
+                }
+                if (layerIdx < 0) continue;
+                while (static_cast<int>(merged.layerTaskCppIds.size()) <= layerIdx) {
+                  merged.layerTaskCppIds.push_back(std::vector<int>());
+                }
+                merged.layerTaskCppIds[layerIdx].push_back(cppId);
+              }
+            }
+          }
+          newGroups.push_back(merged);
+        }
+        int oldCount = G;
+        region.antichainProbeGroups = std::move(newGroups);
+        int newCount = static_cast<int>(region.antichainProbeGroups.size());
+        region.antichainProbeTotalGroups = newCount;
+        // Rebuild quotient DAG for the merged groups.
+        region.antichainProbeDagAcyclic = false;
+        std::map<int, int> newCppIdToGroup;
+        for (int g = 0; g < newCount; g++) {
+          for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
+            for (int cppId : layer) newCppIdToGroup[cppId] = g;
+          }
+        }
+        std::vector<std::vector<int>> newGroupCppIds(newCount);
+        for (auto& kv : newCppIdToGroup) newGroupCppIds[kv.second].push_back(kv.first);
+        for (int g = 0; g < newCount; g++) {
+          region.antichainProbeGroups[g].succMTaskIndices.clear();
+          region.antichainProbeGroups[g].predMTaskIndices.clear();
+          region.antichainProbeGroups[g].upstreamDepCount = 0;
+        }
+        for (int gi = 0; gi < newCount; gi++) {
+          for (int gj = 0; gj < newCount; gj++) {
+            if (gi == gj) continue;
+            bool edge = false;
+            for (int from : newGroupCppIds[gi]) {
+              if (edge) break;
+              for (int to : newGroupCppIds[gj]) {
+                if (mtTaskHasOrderingEdgeTo(from, to)) { edge = true; break; }
+              }
+            }
+            if (edge) {
+              region.antichainProbeGroups[gi].succMTaskIndices.push_back(gj);
+              region.antichainProbeGroups[gj].predMTaskIndices.push_back(gi);
+              region.antichainProbeGroups[gj].upstreamDepCount++;
+            }
+          }
+        }
+        // Verify acyclicity via topological sort.
+        std::vector<int> indegree(newCount, 0);
+        for (int g = 0; g < newCount; g++) {
+          for (int s : region.antichainProbeGroups[g].succMTaskIndices) indegree[s]++;
+        }
+        std::deque<int> q;
+        for (int g = 0; g < newCount; g++) if (indegree[g] == 0) q.push_back(g);
+        int visited = 0;
+        while (!q.empty()) {
+          int u = q.front(); q.pop_front();
+          visited++;
+          for (int v : region.antichainProbeGroups[u].succMTaskIndices) {
+            if (--indegree[v] == 0) q.push_back(v);
+          }
+        }
+        region.antichainProbeDagAcyclic = (visited == newCount);
+        fprintf(stderr, "[sarkar-contract] region [%d,%d) groups %d->%d acyclic=%d\n",
+                region.beginCppId, region.endCppId, oldCount, newCount,
+                region.antichainProbeDagAcyclic ? 1 : 0);
+      }
+    }
+  }
   if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic && isHotRegion) {
     region.useAntichainRuntime = true;
   }
