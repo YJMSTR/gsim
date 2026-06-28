@@ -4141,11 +4141,17 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "uint64_t seenGeneration = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
   emitBodyLock(1, "while (true) {\n");
   emitBodyLock(2, "uint64_t generation = seenGeneration;\n");
+  emitBodyLock(2, "int spinCnt = 0;\n");
   emitBodyLock(2, "while (true) {\n");
   emitBodyLock(3, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
   emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
   emitBodyLock(3, "if (generation != seenGeneration) break;\n");
-  emitBodyLock(3, "mtWorkerPoolPause();\n");
+  emitBodyLock(3, "if (mtWorkerPoolIdleSpinYieldThreshold > 0 && ++spinCnt > mtWorkerPoolIdleSpinYieldThreshold) {\n");
+  emitBodyLock(4, "spinCnt = 0;\n");
+  emitBodyLock(4, "std::this_thread::yield();\n");
+  emitBodyLock(3, "} else {\n");
+  emitBodyLock(4, "mtWorkerPoolPause();\n");
+  emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "seenGeneration = generation;\n");
   emitBodyLock(2, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
@@ -6433,6 +6439,7 @@ void graph::cppEmitter() {
     fprintf(header, "alignas(64) std::atomic<int> mtWorkerPoolDoneCount;\n");
     fprintf(header, "alignas(64) std::atomic<bool> mtWorkerPoolStop;\n");
     fprintf(header, "alignas(64) int mtWorkerPoolCurrentWorkerCount;\n");
+    fprintf(header, "alignas(64) int mtWorkerPoolIdleSpinYieldThreshold;\n");
     fprintf(header, "std::vector<MtWorkerPoolChunk> mtWorkerPoolChunks;\n");
     fprintf(header, "std::vector<std::vector<int>> mtProfileLocalTaskIds;\n");
     fprintf(header, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount;\n");
@@ -6662,6 +6669,10 @@ void graph::cppEmitter() {
     emitBodyLock(1, "mtWorkerPoolGeneration.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolStop.store(false, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "{\n");
+    emitBodyLock(2, "const char* spinEnv = getenv(\"GSIM_MT_IDLE_SPIN_YIELD\");\n");
+    emitBodyLock(2, "mtWorkerPoolIdleSpinYieldThreshold = spinEnv ? atoi(spinEnv) : 0;\n");
+    emitBodyLock(1, "}\n");
     emitBodyLock(1, "mtWorkerPoolCurrentWorkerCount = 0;\n");
     if (useCoarseMt) {
       emitBodyLock(1, "mtWorkerPoolJobKind = 0;\n");
