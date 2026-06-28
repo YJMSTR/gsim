@@ -42,7 +42,7 @@ class graph {
   void genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent);
   void genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId);
   void genResetDecl(FILE* fp);
-  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName);
+  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName = "");
   void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent);
   void genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType);
   void genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType);

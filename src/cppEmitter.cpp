@@ -3749,9 +3749,9 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
     emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
-      std::string orFlag = accumFlagName.empty() ? flagName : accumFlagName;
-      if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-      else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      std::string flagForOr = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
+      if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
     }
     for (auto iter : bitMapInfo) {
       auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second), activeBufferName)
@@ -3776,7 +3776,7 @@ void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inSte
   std::map<uint64_t, ActiveType> bitMapInfo;
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
   if (ACTIVE_MASK(curMask) != 0) {
-    std::string orFlag = accumFlagName.empty() ? flagName : accumFlagName;
+    std::string orFlag = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
     emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
   }
   for (auto iter : bitMapInfo) {
@@ -3869,7 +3869,7 @@ bool Node::isLocal() { // TODO: isArray is OK
 
 static std::map<Node*, std::string> mtRepCutActiveReplacements;
 
-int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName) {
+int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName) {
   switch (inst.infoType) {
     case SUPER_INFO_IF:
       emitBodyLock(indent ++, "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
@@ -3889,8 +3889,8 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
       break;
     case SUPER_INFO_ASSIGN_END:
       if (inst.node->isLocal() || !inst.node->needActivate()) break;
-      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent);
-      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent);
+      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent, accumFlagName);
+      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent, accumFlagName);
       break;
     default:
       break;
@@ -3898,7 +3898,17 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
   return indent;
 }
 
+static bool mtActAccEnabled() {
+  const char* e = std::getenv("GSIM_MT_ACTACC");
+  return e && e[0] == '1';
+}
+
 void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent) { // current indent = 2
+  bool useAccum = mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
+  std::string accumVar;
+  if (useAccum) {
+    emitBodyLock(indent, "uint%d_t %s = 0;\n", ACTIVE_WIDTH, accumVar.c_str());
+  }
   if (super->superType == SUPER_EXTMOD) { // TODO: normalize
     /* save old EXT_OUT*/
     for (size_t i = 1; i < super->member.size(); i ++) {
@@ -3907,12 +3917,12 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       emitBodyLock(indent, "%s %s = %s;\n", widthUType(extOut->width).c_str(), oldName(extOut).c_str(), extOut->name.c_str());
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName);
+      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar);
     }
     for (size_t i = 1; i < super->member.size(); i ++) {
       if (!super->member[i]->needActivate()) continue;
-      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent);
-      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent);
+      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent, accumVar);
+      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent, accumVar);
     }
   } else {
     if (super->superType == SUPER_ASYNC_RESET) {
@@ -3926,7 +3936,7 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       }
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName);
+      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar);
     }
     if (super->superType == SUPER_ASYNC_RESET) {
       if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
@@ -3937,6 +3947,9 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     for (Node* n : super->member) nodeDisplay(n, indent);
     emitBodyLock(-- indent, "}\n");
     emitBodyLock(indent, "#endif\n");
+  }
+  if (useAccum) {
+    emitBodyLock(indent, "%s |= %s;\n", flagName.c_str(), accumVar.c_str());
   }
 }
 
