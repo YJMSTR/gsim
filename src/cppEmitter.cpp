@@ -3907,6 +3907,7 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
   bool useAccum = mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
   std::string accumVar;
   if (useAccum) {
+    accumVar = format("__actac_%d", super->cppId);
     emitBodyLock(indent, "uint%d_t %s = 0;\n", ACTIVE_WIDTH, accumVar.c_str());
   }
   if (super->superType == SUPER_EXTMOD) { // TODO: normalize
