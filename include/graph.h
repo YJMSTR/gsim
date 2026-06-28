@@ -17,9 +17,11 @@ class graph {
   bool __emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const char *nextFuncDef, const char *fmt, ...);
   void emitPrintf();
   void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
-                    std::string activeBufferName, int indent);
+                    std::string activeBufferName, int indent,
+                    const std::string& accumFlagName = "");
   void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
-                          std::string activeBufferName, int indent);
+                          std::string activeBufferName, int indent,
+                          const std::string& accumFlagName = "");
 
   FILE* genHeaderStart();
   void genNodeDef(FILE* fp, Node* node);

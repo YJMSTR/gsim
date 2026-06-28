@@ -3717,7 +3717,8 @@ void graph::genNodeDef(FILE* fp, Node* node) {
 }
 
 void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
-                         std::string activeBufferName, int indent) {
+                         std::string activeBufferName, int indent,
+                         const std::string& accumFlagName) {
   std::string nodeName = node->name;
   auto condName = std::string("cond_") + nodeName;
   bool opt{false};
@@ -3748,8 +3749,9 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
     emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
-      if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagName.c_str(), ACTIVE_WIDTH, condName.c_str() ,ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-      else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      std::string orFlag = accumFlagName.empty() ? flagName : accumFlagName;
+      if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
     }
     for (auto iter : bitMapInfo) {
       auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second), activeBufferName)
@@ -3768,12 +3770,15 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   }
   if (!opt) emitBodyLock(-- indent, "}\n");
 }
-
 void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
-                               std::string activeBufferName, int indent) {
+                               std::string activeBufferName, int indent,
+                               const std::string& accumFlagName) {
   std::map<uint64_t, ActiveType> bitMapInfo;
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
-  if (ACTIVE_MASK(curMask) != 0) emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+  if (ACTIVE_MASK(curMask) != 0) {
+    std::string orFlag = accumFlagName.empty() ? flagName : accumFlagName;
+    emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+  }
   for (auto iter : bitMapInfo) {
     emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName).c_str(), ACTIVE_COMMENT(iter.second).c_str());
   }
@@ -3787,7 +3792,6 @@ void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inSte
   if (inStep) emitBodyLock(indent, "isActivateValid = true;\n");
 #endif
 }
-
 int graph::genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent) {
   nodeNum ++;
   if (!isAlwaysActive(node->cppId)) {
