@@ -3092,9 +3092,107 @@ void graph::dumpMtCoarseRegionReport() {
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt coarse-region report %s", path.c_str());
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  const char* segmentReportEnv = std::getenv("GSIM_MT_SEGMENT_REPORT");
+  bool segmentReportEnabled = segmentReportEnv != nullptr && segmentReportEnv[0] != '\0' && segmentReportEnv[0] != '0';
+  if (segmentReportEnabled) markMtRepCutLiteRuntimeApplied(mtTasks);
   MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
   MtPureBatchPlan fallbackPlan = planMtPureBatchesActiveFrequency(mtTasks, globalConfig.MtRepCutLiteMode == "on");
 
+  struct MtSerialSegmentStats {
+    int segmentCount = 0;
+    int cleanRegionCount = 0;
+    int maxSegmentRegions = 0;
+    int maxSegmentTasks = 0;
+    int maxSegmentStaticCost = 0;
+    int activeBoundaryCount = 0;
+    int orderingBoundaryCount = 0;
+    int gapBoundaryCount = 0;
+    int nonCleanBoundaryCount = 0;
+    uint64_t totalSegmentRegions = 0;
+    uint64_t totalSegmentTasks = 0;
+    uint64_t totalSegmentStaticCost = 0;
+    uint64_t regionCountHist[6] = {0, 0, 0, 0, 0, 0};
+  } segmentStats;
+  auto mtRegionCleanSerialFallback = [&](const MtCoarseRegion& region) -> bool {
+    for (int rcid = region.beginCppId; rcid < region.endCppId; rcid ++) {
+      auto mtIter = mtTasks.find(rcid);
+      if (mtIter == mtTasks.end() || hasWorker0OnlyReason(mtIter->second.serialReasons) || !hasOnlyA44DirectFallbackReasons(mtIter->second.serialReasons)) return false;
+      if (mtIter->second.repcutRuntimeApplied) return false;
+    }
+    return true;
+  };
+  auto mtSegmentHasCrossEdge = [&](int segBeginCppId, int segEndCppId, const MtCoarseRegion& region, bool activeOnly) -> bool {
+    for (int segCppId = segBeginCppId; segCppId < segEndCppId; segCppId ++) {
+      for (int curCppId = region.beginCppId; curCppId < region.endCppId; curCppId ++) {
+        if (activeOnly) {
+          if (mtTaskHasActiveEdgeTo(segCppId, curCppId) || mtTaskHasActiveEdgeTo(curCppId, segCppId)) return true;
+        } else {
+          if (mtTaskHasOrderingEdgeTo(segCppId, curCppId) || mtTaskHasOrderingEdgeTo(curCppId, segCppId)) return true;
+        }
+      }
+    }
+    return false;
+  };
+  auto mtRecordSegment = [&](int regions, int tasks, int staticCost) {
+    if (regions <= 0) return;
+    segmentStats.segmentCount ++;
+    segmentStats.totalSegmentRegions += (uint64_t)regions;
+    segmentStats.totalSegmentTasks += (uint64_t)tasks;
+    segmentStats.totalSegmentStaticCost += (uint64_t)staticCost;
+    segmentStats.maxSegmentRegions = std::max(segmentStats.maxSegmentRegions, regions);
+    segmentStats.maxSegmentTasks = std::max(segmentStats.maxSegmentTasks, tasks);
+    segmentStats.maxSegmentStaticCost = std::max(segmentStats.maxSegmentStaticCost, staticCost);
+    int bucket = regions <= 1 ? 0 : (regions == 2 ? 1 : (regions <= 4 ? 2 : (regions <= 8 ? 3 : (regions <= 16 ? 4 : 5))));
+    segmentStats.regionCountHist[bucket] ++;
+  };
+  bool segmentOpen = false;
+  int segmentBeginCppId = -1;
+  int segmentEndCppId = -1;
+  int segmentRegions = 0;
+  int segmentTasks = 0;
+  int segmentStaticCost = 0;
+  if (segmentReportEnabled) {
+  for (const MtCoarseRegion& region : coarsePlan.regions) {
+    bool clean = region.runtimeEligible && mtRegionCleanSerialFallback(region);
+    if (!clean) {
+      if (segmentOpen) {
+        mtRecordSegment(segmentRegions, segmentTasks, segmentStaticCost);
+        segmentOpen = false;
+        segmentStats.nonCleanBoundaryCount ++;
+      }
+      continue;
+    }
+    segmentStats.cleanRegionCount ++;
+    bool startNew = !segmentOpen;
+    if (segmentOpen) {
+      if (segmentEndCppId != region.beginCppId) {
+        segmentStats.gapBoundaryCount ++;
+        startNew = true;
+      } else if (mtSegmentHasCrossEdge(segmentBeginCppId, segmentEndCppId, region, true)) {
+        segmentStats.activeBoundaryCount ++;
+        startNew = true;
+      } else if (mtSegmentHasCrossEdge(segmentBeginCppId, segmentEndCppId, region, false)) {
+        segmentStats.orderingBoundaryCount ++;
+        startNew = true;
+      }
+    }
+    if (startNew) {
+      if (segmentOpen) mtRecordSegment(segmentRegions, segmentTasks, segmentStaticCost);
+      segmentOpen = true;
+      segmentBeginCppId = region.beginCppId;
+      segmentEndCppId = region.endCppId;
+      segmentRegions = 1;
+      segmentTasks = region.taskCount;
+      segmentStaticCost = region.staticCost;
+    } else {
+      segmentEndCppId = region.endCppId;
+      segmentRegions ++;
+      segmentTasks += region.taskCount;
+      segmentStaticCost += region.staticCost;
+    }
+  }
+  if (segmentOpen) mtRecordSegment(segmentRegions, segmentTasks, segmentStaticCost);
+  }
   int runtimeEligibleCount = 0;
   int maxTaskCount = 0;
   int maxActiveWordSpan = 0;
@@ -3120,6 +3218,25 @@ void graph::dumpMtCoarseRegionReport() {
   fprintf(fp, "  \"candidate_region_count\": %zu,\n", coarsePlan.regions.size());
   fprintf(fp, "  \"runtime_eligible_region_count\": %d,\n", runtimeEligibleCount);
   fprintf(fp, "  \"max_task_count\": %d,\n", maxTaskCount);
+  fprintf(fp, "  \"serial_fallback_segment_summary\": {\n");
+  fprintf(fp, "    \"enabled\": %s,\n", segmentReportEnabled ? "true" : "false");
+  fprintf(fp, "    \"candidate_kind\": \"very_conservative_contiguous_static_bidirectional_boundary_checked\",\n");
+  fprintf(fp, "    \"clean_region_count\": %d,\n", segmentStats.cleanRegionCount);
+  fprintf(fp, "    \"segment_count\": %d,\n", segmentStats.segmentCount);
+  fprintf(fp, "    \"max_segment_regions\": %d,\n", segmentStats.maxSegmentRegions);
+  fprintf(fp, "    \"max_segment_tasks\": %d,\n", segmentStats.maxSegmentTasks);
+  fprintf(fp, "    \"max_segment_static_cost\": %d,\n", segmentStats.maxSegmentStaticCost);
+  fprintf(fp, "    \"total_segment_regions\": %lu,\n", segmentStats.totalSegmentRegions);
+  fprintf(fp, "    \"total_segment_tasks\": %lu,\n", segmentStats.totalSegmentTasks);
+  fprintf(fp, "    \"total_segment_static_cost\": %lu,\n", segmentStats.totalSegmentStaticCost);
+  fprintf(fp, "    \"active_boundary_count\": %d,\n", segmentStats.activeBoundaryCount);
+  fprintf(fp, "    \"ordering_boundary_count\": %d,\n", segmentStats.orderingBoundaryCount);
+  fprintf(fp, "    \"gap_boundary_count\": %d,\n", segmentStats.gapBoundaryCount);
+  fprintf(fp, "    \"non_clean_boundary_count\": %d,\n", segmentStats.nonCleanBoundaryCount);
+  fprintf(fp, "    \"region_count_hist\": {\"1\": %lu, \"2\": %lu, \"3_4\": %lu, \"5_8\": %lu, \"9_16\": %lu, \"17_plus\": %lu}\n",
+          segmentStats.regionCountHist[0], segmentStats.regionCountHist[1], segmentStats.regionCountHist[2],
+          segmentStats.regionCountHist[3], segmentStats.regionCountHist[4], segmentStats.regionCountHist[5]);
+  fprintf(fp, "  },\n");
   fprintf(fp, "  \"max_active_word_span\": %d,\n", maxActiveWordSpan);
   fprintf(fp, "  \"max_parallel_width\": %d,\n", maxParallelWidth);
   fprintf(fp, "  \"blocker_counts\": {");
