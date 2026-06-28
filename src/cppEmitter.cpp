@@ -4200,7 +4200,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     // Track 2 Week 4: per-region atomic state for antichain runtime is initialized
     // in initMtProfile() so it is available even when the worker pool is disabled
     // or only one thread is used.
-    emitBodyLock(1, "mtWorkerPoolCoarseActiveWords = nullptr;\n");
   }
   emitBodyLock(1, "mtWorkerPoolThreads.reserve((size_t)mtWorkerPoolThreadCount);\n");
   emitBodyLock(1, "const char *mtCpuAffinityEnv = getenv(\"GSIM_MT_CPU_AFFINITY\");\n");
@@ -4234,6 +4233,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "#endif\n");
   emitBodyLock(1, "}\n");
+  emitBodyLock(1, "mtWorkerPoolLazyStart = false;\n");
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::stopMtWorkerPool() {\n", name.c_str());
@@ -4381,7 +4381,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   }
   emitBodyLock(1, "if (workerCount == 1) {\n");
   emitBodyLock(2, "mtRunPureBatchWorkerRange(0, beginCppId, endCppId);\n");
-  emitBodyLock(1, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= workerCount) {\n");
+  emitBodyLock(1, "} else if (mtWorkerPoolEnabled && (!mtWorkerPoolLazyStart || (startMtWorkerPool(), true)) && mtWorkerPoolThreadCount + 1 >= workerCount) {\n");
   if (useCoarse) {
     emitBodyLock(2, "mtWorkerPoolJobKind = 0;\n");
   }
@@ -5318,7 +5318,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "if (antichainWorkerCount == 1) {\n");
   emitBodyLock(3, "mtRunCoarseMTaskDynamic(regionIndex, 0);\n");
-  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= antichainWorkerCount) {\n");
+  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && (!mtWorkerPoolLazyStart || (startMtWorkerPool(), true)) && mtWorkerPoolThreadCount + 1 >= antichainWorkerCount) {\n");
   emitBodyLock(3, "mtWorkerPoolJobKind = 5;\n");
   emitBodyLock(3, "mtWorkerPoolCoarseRegionIndex = regionIndex;\n");
   emitBodyLock(3, "mtWorkerPoolCoarseLayerIndex = -1;\n");
@@ -5450,7 +5450,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "const int dstaticRoundedWC = mtaskWorkerCount;\n");
   emitBodyLock(2, "if (dstaticRoundedWC == 1) {\n");
   emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(regionIndex, dstaticRoundedWC, 0, regionBeginActiveWord, regionActiveWordSpan);\n");
-  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= dstaticRoundedWC) {\n");
+  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && (!mtWorkerPoolLazyStart || (startMtWorkerPool(), true)) && mtWorkerPoolThreadCount + 1 >= dstaticRoundedWC) {\n");
   emitBodyLock(3, "mtWorkerPoolJobKind = 3;\n");
   emitBodyLock(3, "mtWorkerPoolCoarseRegionIndex = regionIndex;\n");
   emitBodyLock(3, "mtWorkerPoolCoarseLayerIndex = -1;\n");
@@ -5506,7 +5506,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   } else {
     emitBodyLock(2, "mtRunCoarseMTaskWorkerRange(0, regionIndex, 0, regionMTaskCount);\n");
   }
-  emitBodyLock(1, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtaskWorkerCount) {\n");
+  emitBodyLock(1, "} else if (mtWorkerPoolEnabled && (!mtWorkerPoolLazyStart || (startMtWorkerPool(), true)) && mtWorkerPoolThreadCount + 1 >= mtaskWorkerCount) {\n");
   emitBodyLock(2, "mtWorkerPoolJobKind = 2;\n");
   emitBodyLock(2, "mtWorkerPoolCoarseRegionIndex = regionIndex;\n");
   emitBodyLock(2, "mtWorkerPoolCoarseLayerIndex = -1;\n");
@@ -5626,7 +5626,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "if (layerWorkerCount == 1) {\n");
   emitBodyLock(3, "mtRunCoarseLayerWorkerRange(0, regionIndex, layer, 0, layerTaskCount);\n");
-  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= layerWorkerCount) {\n");
+  emitBodyLock(2, "} else if (mtWorkerPoolEnabled && (!mtWorkerPoolLazyStart || (startMtWorkerPool(), true)) && mtWorkerPoolThreadCount + 1 >= layerWorkerCount) {\n");
   emitBodyLock(3, "mtWorkerPoolJobKind = 1;\n");
   emitBodyLock(3, "mtWorkerPoolCoarseRegionIndex = regionIndex;\n");
   emitBodyLock(3, "mtWorkerPoolCoarseLayerIndex = layer;\n");
@@ -6426,6 +6426,7 @@ void graph::cppEmitter() {
       fprintf(header, "bool mtCoarseUseAntichainQueue;\n");
     }
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
+    fprintf(header, "bool mtWorkerPoolLazyStart;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
     // 28c-2 atomic-spin worker pool: hot atomics on independent cache lines.
@@ -6452,7 +6453,7 @@ void graph::cppEmitter() {
   emitBodyLock(1, "LOG_START = 1;\n");
   emitBodyLock(1, "LOG_END = 0;\n");
   emitBodyLock(1, "initMtProfile();\n");
-  if (useMtHelpers) emitBodyLock(1, "startMtWorkerPool();\n");
+  if (useMtHelpers) emitBodyLock(1, "if (!mtWorkerPoolLazyStart) startMtWorkerPool();\n");
   emitBodyLock(1, "init();\n");
   emitBodyLock(0, "}\n");
 
@@ -6658,6 +6659,8 @@ void graph::cppEmitter() {
   if (useMtHelpers) {
     emitBodyLock(1, "const char *workerPoolEnv = getenv(\"GSIM_MT_WORKER_POOL\");\n");
     emitBodyLock(1, "mtWorkerPoolEnabled = workerPoolEnv == nullptr || workerPoolEnv[0] == '\\0' || workerPoolEnv[0] != '0';\n");
+    emitBodyLock(1, "const char *lazyPoolEnv = getenv(\"GSIM_MT_LAZY_POOL\");\n");
+    emitBodyLock(1, "mtWorkerPoolLazyStart = lazyPoolEnv != nullptr && lazyPoolEnv[0] != '\\0' && lazyPoolEnv[0] != '0';\n");
     emitBodyLock(1, "mtWorkerPoolThreadCount = 0;\n");
     emitBodyLock(1, "mtWorkerPoolGeneration.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolStop.store(false, std::memory_order_relaxed);\n");
