@@ -4128,7 +4128,14 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolPost() {\n", name.c_str());
   emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
-  emitBodyLock(1, "mtWorkerPoolGeneration.fetch_add(1, std::memory_order_release);\n");
+  emitBodyLock(1, "if (mtWorkerPoolSelectiveWake && mtWorkerPoolWakeSlots != nullptr) {\n");
+  emitBodyLock(2, "const int workerCount = mtWorkerPoolCurrentWorkerCount;\n");
+  emitBodyLock(2, "for (int worker = 1; worker < workerCount; worker ++) {\n");
+  emitBodyLock(3, "mtWorkerPoolWakeSlots[worker].generation.fetch_add(1, std::memory_order_release);\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "} else {\n");
+  emitBodyLock(2, "mtWorkerPoolGeneration.fetch_add(1, std::memory_order_release);\n");
+  emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolWaitForDone(int expectedDoneCount) {\n", name.c_str());
@@ -4139,15 +4146,28 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolLoop(int worker) {\n", name.c_str());
   emitBodyLock(1, "uint64_t seenGeneration = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
+  emitBodyLock(1, "uint64_t seenWorkerGeneration = 0;\n");
+  emitBodyLock(1, "if (mtWorkerPoolWakeSlots != nullptr) seenWorkerGeneration = mtWorkerPoolWakeSlots[worker].generation.load(std::memory_order_acquire);\n");
   emitBodyLock(1, "while (true) {\n");
-  emitBodyLock(2, "uint64_t generation = seenGeneration;\n");
-  emitBodyLock(2, "while (true) {\n");
-  emitBodyLock(3, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
-  emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
-  emitBodyLock(3, "if (generation != seenGeneration) break;\n");
-  emitBodyLock(3, "mtWorkerPoolPause();\n");
+  emitBodyLock(2, "if (mtWorkerPoolSelectiveWake && mtWorkerPoolWakeSlots != nullptr) {\n");
+  emitBodyLock(3, "uint64_t generation = seenWorkerGeneration;\n");
+  emitBodyLock(3, "while (true) {\n");
+  emitBodyLock(4, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
+  emitBodyLock(4, "generation = mtWorkerPoolWakeSlots[worker].generation.load(std::memory_order_acquire);\n");
+  emitBodyLock(4, "if (generation != seenWorkerGeneration) break;\n");
+  emitBodyLock(4, "mtWorkerPoolPause();\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(3, "seenWorkerGeneration = generation;\n");
+  emitBodyLock(2, "} else {\n");
+  emitBodyLock(3, "uint64_t generation = seenGeneration;\n");
+  emitBodyLock(3, "while (true) {\n");
+  emitBodyLock(4, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
+  emitBodyLock(4, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
+  emitBodyLock(4, "if (generation != seenGeneration) break;\n");
+  emitBodyLock(4, "mtWorkerPoolPause();\n");
+  emitBodyLock(3, "}\n");
+  emitBodyLock(3, "seenGeneration = generation;\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "seenGeneration = generation;\n");
   emitBodyLock(2, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
   emitBodyLock(2, "const int workerCount = mtWorkerPoolCurrentWorkerCount;\n");
   emitBodyLock(2, "if (worker >= workerCount) continue;\n");
@@ -4192,6 +4212,10 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "mtWorkerPoolChunks.assign((size_t)mtConfiguredWorkerCount, MtWorkerPoolChunk{0, 0});\n");
   emitBodyLock(1, "mtWorkerDeltas.resize((size_t)mtConfiguredWorkerCount);\n");
   emitBodyLock(1, "mtWorkerFlags.resize((size_t)mtConfiguredWorkerCount);\n");
+  emitBodyLock(1, "mtWorkerPoolWakeSlots = new MtWorkerPoolWakeSlot[(size_t)mtConfiguredWorkerCount];\n");
+  emitBodyLock(1, "for (int worker = 0; worker < mtConfiguredWorkerCount; worker ++) {\n");
+  emitBodyLock(2, "mtWorkerPoolWakeSlots[worker].generation.store(0, std::memory_order_relaxed);\n");
+  emitBodyLock(1, "}\n");
   if (useCoarse) {
     emitBodyLock(1, "mtWorkerCoarseFlags.resize((size_t)mtConfiguredWorkerCount);\n");
     if (globalConfig.MtCoarseWorkerPolicyMode == "profitable") {
@@ -4240,10 +4264,17 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "if (mtWorkerPoolThreads.empty()) return;\n");
   emitBodyLock(1, "mtWorkerPoolStop.store(true, std::memory_order_release);\n");
   emitBodyLock(1, "mtWorkerPoolGeneration.fetch_add(1, std::memory_order_release);\n");
+  emitBodyLock(1, "if (mtWorkerPoolWakeSlots != nullptr) {\n");
+  emitBodyLock(2, "for (int worker = 1; worker < mtConfiguredWorkerCount; worker ++) {\n");
+  emitBodyLock(3, "mtWorkerPoolWakeSlots[worker].generation.fetch_add(1, std::memory_order_release);\n");
+  emitBodyLock(2, "}\n");
+  emitBodyLock(1, "}\n");
   emitBodyLock(1, "for (std::thread &worker : mtWorkerPoolThreads) {\n");
   emitBodyLock(2, "if (worker.joinable()) worker.join();\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "mtWorkerPoolThreads.clear();\n");
+  emitBodyLock(1, "delete[] mtWorkerPoolWakeSlots;\n");
+  emitBodyLock(1, "mtWorkerPoolWakeSlots = nullptr;\n");
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord) {\n", name.c_str(), ACTIVE_WIDTH);
@@ -6376,6 +6407,9 @@ void graph::cppEmitter() {
     fprintf(header, "  int begin;\n");
     fprintf(header, "  int end;\n");
     fprintf(header, "};\n");
+    fprintf(header, "struct alignas(64) MtWorkerPoolWakeSlot {\n");
+    fprintf(header, "  std::atomic<uint64_t> generation;\n");
+    fprintf(header, "};\n");
     // ActivationDelta is alignas(64); each per-worker slot lives on its own cache line.
     fprintf(header, "std::vector<ActivationDelta> mtWorkerDeltas;\n");
     fprintf(header, "std::vector<uint%d_t> mtWorkerFlags;\n", ACTIVE_WIDTH);
@@ -6427,12 +6461,14 @@ void graph::cppEmitter() {
     }
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
+    fprintf(header, "bool mtWorkerPoolSelectiveWake;\n");
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
     // 28c-2 atomic-spin worker pool: hot atomics on independent cache lines.
     fprintf(header, "alignas(64) std::atomic<uint64_t> mtWorkerPoolGeneration;\n");
     fprintf(header, "alignas(64) std::atomic<int> mtWorkerPoolDoneCount;\n");
     fprintf(header, "alignas(64) std::atomic<bool> mtWorkerPoolStop;\n");
     fprintf(header, "alignas(64) int mtWorkerPoolCurrentWorkerCount;\n");
+    fprintf(header, "MtWorkerPoolWakeSlot* mtWorkerPoolWakeSlots;\n");
     fprintf(header, "std::vector<MtWorkerPoolChunk> mtWorkerPoolChunks;\n");
     fprintf(header, "std::vector<std::vector<int>> mtProfileLocalTaskIds;\n");
     fprintf(header, "std::vector<uint64_t> mtProfileLocalWorkerTaskCount;\n");
@@ -6658,11 +6694,14 @@ void graph::cppEmitter() {
   if (useMtHelpers) {
     emitBodyLock(1, "const char *workerPoolEnv = getenv(\"GSIM_MT_WORKER_POOL\");\n");
     emitBodyLock(1, "mtWorkerPoolEnabled = workerPoolEnv == nullptr || workerPoolEnv[0] == '\\0' || workerPoolEnv[0] != '0';\n");
+    emitBodyLock(1, "const char *selectiveWakeEnv = getenv(\"GSIM_MT_SELECTIVE_WAKE\");\n");
+    emitBodyLock(1, "mtWorkerPoolSelectiveWake = selectiveWakeEnv != nullptr && selectiveWakeEnv[0] != '\\0' && selectiveWakeEnv[0] != '0';\n");
     emitBodyLock(1, "mtWorkerPoolThreadCount = 0;\n");
     emitBodyLock(1, "mtWorkerPoolGeneration.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolStop.store(false, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolCurrentWorkerCount = 0;\n");
+    emitBodyLock(1, "mtWorkerPoolWakeSlots = nullptr;\n");
     if (useCoarseMt) {
       emitBodyLock(1, "mtWorkerPoolJobKind = 0;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseRegionIndex = -1;\n");
