@@ -3936,8 +3936,62 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
         emitBodyLock(indent, "%s %s;\n", widthUType(n->width).c_str(), n->name.c_str());
       }
     }
-    for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar);
+    // index-based iteration to detect and merge consecutive ASSIGN_END runs
+    for (size_t ii = 0; ii < super->insts.size(); ) {
+      const InstInfo& inst = super->insts[ii];
+      if (inst.infoType != SUPER_INFO_ASSIGN_END) {
+        indent = translateInst(inst, indent, flagName, activeBufferName, accumVar);
+        ii++;
+        continue;
+      }
+      // Find the end of the consecutive ASSIGN_END run.
+      size_t runEnd = ii + 1;
+      while (runEnd < super->insts.size() && super->insts[runEnd].infoType == SUPER_INFO_ASSIGN_END) runEnd++;
+      // Separate into unconditional (array/writer) and conditional nodes.
+      std::vector<Node*> uncondNodes;
+      // Add run-length stat
+      static bool m3stat = [](){ const char* e = getenv("GSIM_MT_M3STAT"); return e && e[0]=='1'; }();
+      if (m3stat && (runEnd - ii) > 1) {
+        int uncond = 0;
+        for (size_t j = ii; j < runEnd; j++) {
+          Node* n = super->insts[j].node;
+          if (!n->isLocal() && n->needActivate() && (n->isArray() || n->type == NODE_WRITER)) uncond++;
+        }
+        fprintf(stderr, "[m3stat] super=%d run_len=%zu uncond=%d combined=%s\n",
+                super->cppId, runEnd - ii, uncond,
+                uncond > 1 ? "YES" : "no");
+      }
+      for (size_t j = ii; j < runEnd; j++) {
+        Node* n = super->insts[j].node;
+        if (n->isLocal() || !n->needActivate()) continue;
+        if (n->isArray() || n->type == NODE_WRITER) uncondNodes.push_back(n);
+        else translateInst(super->insts[j], indent, flagName, activeBufferName, accumVar);
+      }
+      if (uncondNodes.size() > 1) {
+        std::set<int> combinedId;
+        for (Node* n : uncondNodes) {
+          combinedId.insert(n->nextActiveId.begin(), n->nextActiveId.end());
+        }
+        if (!combinedId.empty()) {
+          std::map<uint64_t, ActiveType> bitMapInfo;
+          auto curMask = activeSet2bitMap(combinedId, bitMapInfo, uncondNodes[0]->super->cppId);
+          if (ACTIVE_MASK(curMask) != 0) {
+            std::string orTarget = useAccum ? accumVar : flagName;
+            emitBodyLock(indent, "%s |= 0x%lx; // %s merged-uncond\n", orTarget.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+          }
+          for (auto iter : bitMapInfo) {
+            emitBodyLock(indent, "%s // %s merged-uncond\n",
+                updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName).c_str(),
+                ACTIVE_COMMENT(iter.second).c_str());
+          }
+        }
+      } else if (!uncondNodes.empty()) {
+        for (Node* n : uncondNodes) {
+          if (n->isArray() || n->type == NODE_WRITER) activateUncondNext(n, n->nextActiveId, false, flagName, activeBufferName, indent, accumVar);
+          else activateNext(n, n->nextActiveId, oldName(n), false, flagName, activeBufferName, indent, accumVar);
+        }
+      }
+      ii = runEnd;
     }
     if (super->superType == SUPER_ASYNC_RESET) {
       if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
