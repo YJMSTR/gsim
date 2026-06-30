@@ -6476,17 +6476,25 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
               emitBodyLock(taskIndent, "subchunkProbeWordStaticCost%d_%d += %d;\n", idx, word, mtTaskEstimatedCost(mtTasks, cppId));
               emitBodyLock(--taskIndent, "}\n");
             }
-            emitBodyLock(taskIndent ++, "if (mtProfileEnabled) {\n");
-            emitBodyLock(taskIndent, "std::chrono::steady_clock::time_point mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
-            emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
-            emitBodyLock(taskIndent, "recordMtProfileTask(%d, %s, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count());\n", cppId, mtTasks[cppId].taskKind == "pure_compute" ? "true" : "false");
-            emitBodyLock(--taskIndent, "} else {\n");
-            if (directInlineFallback) {
-              genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent);
+            if (profileOffDirectSerial && !mtUseSubchunkProbe()) {
+              if (directInlineFallback) {
+                genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent);
+              } else {
+                emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
+              }
             } else {
+              emitBodyLock(taskIndent ++, "if (mtProfileEnabled) {\n");
+              emitBodyLock(taskIndent, "std::chrono::steady_clock::time_point mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
               emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
+              emitBodyLock(taskIndent, "recordMtProfileTask(%d, %s, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count());\n", cppId, mtTasks[cppId].taskKind == "pure_compute" ? "true" : "false");
+              emitBodyLock(--taskIndent, "} else {\n");
+              if (directInlineFallback) {
+                genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent);
+              } else {
+                emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
+              }
+              emitBodyLock(--taskIndent, "}\n");
             }
-            emitBodyLock(--taskIndent, "}\n");
           };
           emitBodyLock(wordIndent, "activeFlags[%d] = 0;\n", activeWord);
           emitBodyLock(wordIndent ++, "if (coarseInlineFlag%d_%d) {\n", idx, word);
