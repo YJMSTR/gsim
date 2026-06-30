@@ -6432,11 +6432,13 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           coarseGuard += format("mtCoarseWords%d[%d]", idx, word);
         }
         emitBodyLock(indent ++, "if(unlikely((%s) != 0)) {\n", coarseGuard.c_str());
-        emitBodyLock(indent, "if (mtProfileEnabled) {\n");
-        for (int word = 0; word < region.activeWordSpan; word ++) {
-          emitBodyLock(indent + 1, "if (mtCoarseWords%d[%d] != 0) mtProfileActiveWordCount ++;\n", idx, word);
+        if (!profileOffDirectSerial || mtUseSubchunkProbe()) {
+          emitBodyLock(indent, "if (mtProfileEnabled) {\n");
+          for (int word = 0; word < region.activeWordSpan; word ++) {
+            emitBodyLock(indent + 1, "if (mtCoarseWords%d[%d] != 0) mtProfileActiveWordCount ++;\n", idx, word);
+          }
+          emitBodyLock(indent, "}\n");
         }
-        emitBodyLock(indent, "}\n");
         // A43/A44: default-off/env-on direct serial fallback before mtRunCoarseRegion.
         // Clean regions only: original mtTaskN(flag) bodies and only pure_compute plus
         // the explicit A44 safe-serial allowlist. RepCut cloned helpers are not needed
@@ -6568,6 +6570,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           }
         };
         auto emitCoarseInlineSavedProfile = [&](int profileIndent) {
+          if (profileOffDirectSerial && !mtUseSubchunkProbe()) return;
           emitBodyLock(profileIndent, "if (mtProfileEnabled) {\n");
           emitBodyLock(profileIndent + 1, "int coarseInlineSavedWorkers%d = mtConfiguredWorkerCount;\n", idx);
           emitBodyLock(profileIndent + 1, "if (coarseInlineSavedWorkers%d > %d) coarseInlineSavedWorkers%d = %d;\n", idx, region.taskCount, idx, region.taskCount);
@@ -6593,7 +6596,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           for (int word = 0; word < region.activeWordSpan; word ++) {
             emitBodyLock(indent, "coarseInlineActiveBits%d += __builtin_popcountll((unsigned long long)mtCoarseWords%d[%d]);\n", idx, idx, word);
           }
-          emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSerialFallbackEligible ++;\n");
+          if (!profileOffDirectSerial || mtUseSubchunkProbe()) emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSerialFallbackEligible ++;\n");
           emitBodyLock(indent ++, "if (coarseInlineActiveBits%d <= mtCoarseInlineThreshold) {\n", idx);
           if (!mtUseSubchunkRuntime()) {
             emitCoarseInlineSavedProfile(indent);
