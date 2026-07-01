@@ -846,6 +846,12 @@ static bool mtUseInlineSmallPureBatchBodies() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_INLINE_SMALL_PURE_BATCH_BODIES");
 }
 
+// Default-on guard around inlined small-batch task bodies. When no task bit in
+// the static batch mask is active, skip the generated per-bit branch chain.
+static bool mtUseInlineSmallPureBatchMaskGuard() {
+  return mtCodegenEnvEnabledByDefault("GSIM_MT_INLINE_SMALL_PURE_BATCH_MASK_GUARD");
+}
+
 // Default-off diagnostic codegen: wait-probe instrumentation is useful for
 // scheduler experiments but should not perturb normal generated models.
 static bool mtUseWaitProbeCodegen() {
@@ -6454,6 +6460,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     bool profileOffActiveWordCount = mtUseProfileOffActiveWordCount();
     bool inlineSmallPureBatches = mtUseInlineSmallPureBatches();
     bool inlineSmallPureBatchBodies = mtUseInlineSmallPureBatchBodies();
+    bool inlineSmallPureBatchMaskGuard = mtUseInlineSmallPureBatchMaskGuard();
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
@@ -6799,6 +6806,11 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
             emitBodyLock(indent ++, "if (likely(!mtProfileEnabled && mtMinBatchTasks > %d)) {\n", batchLen);
             uint64_t forcedSinkMask = mtRepCutForcedSinkMaskForBatch(semanticPlan, idx);
             if (forcedSinkMask != 0) emitBodyLock(indent, "oldFlag |= 0x%lx;\n", forcedSinkMask);
+            uint64_t batchActiveMask = forcedSinkMask;
+            for (int batchCppId = idx; batchCppId < batchEnd; batchCppId ++) {
+              batchActiveMask |= (uint64_t)1 << (batchCppId % ACTIVE_WIDTH);
+            }
+            if (inlineSmallPureBatchMaskGuard) emitBodyLock(indent ++, "if (unlikely(oldFlag & 0x%lx)) {\n", batchActiveMask);
             for (int batchCppId = idx; batchCppId < batchEnd; batchCppId ++) {
               uint64_t batchMask = (uint64_t)1 << (batchCppId % ACTIVE_WIDTH);
               emitBodyLock(indent ++, "if (unlikely(oldFlag & 0x%lx)) {\n", batchMask);
@@ -6815,6 +6827,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
               }
               emitBodyLock(--indent, "}\n");
             }
+            if (inlineSmallPureBatchMaskGuard) emitBodyLock(--indent, "}\n");
             emitBodyLock(--indent, "} else {\n");
             emitBodyLock(indent, "mtRunPureBatch(%d, %d, oldFlag);\n", idx, batchEnd);
             emitBodyLock(--indent, "}\n");
