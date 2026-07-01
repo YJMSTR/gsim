@@ -6801,7 +6801,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
             if (forcedSinkMask != 0) emitBodyLock(indent, "oldFlag |= 0x%lx;\n", forcedSinkMask);
             for (int batchCppId = idx; batchCppId < batchEnd; batchCppId ++) {
               uint64_t batchMask = (uint64_t)1 << (batchCppId % ACTIVE_WIDTH);
-              emitBodyLock(indent ++, "if (oldFlag & 0x%lx) {\n", batchMask);
+              emitBodyLock(indent ++, "if (unlikely(oldFlag & 0x%lx)) {\n", batchMask);
               if (mtTasks[batchCppId].repcutRuntimeApplied) {
                 emitBodyLock(indent ++, "{\n");
                 emitBodyLock(indent, "ActivationDelta mtInlineBatchDelta%d;\n", batchCppId);
