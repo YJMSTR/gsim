@@ -50,6 +50,8 @@ static std::map<int, SuperNode*> cppId2Super;
 static std::vector<int> mtProfileRepCutBatchBeginCppIds;
 static std::vector<int> mtProfileRepCutRuntimeCppIds;
 static std::set<int> alwaysActive;
+static std::vector<std::vector<int>> mtStepActiveWordGuards;
+static std::vector<char> mtStepActiveWordGuardable;
 
 static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
 
@@ -850,6 +852,14 @@ static bool mtUseInlineSmallPureBatchBodies() {
 // the static batch mask is active, skip the generated per-bit branch chain.
 static bool mtUseInlineSmallPureBatchMaskGuard() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_INLINE_SMALL_PURE_BATCH_MASK_GUARD");
+}
+
+// Default-on algorithmic fast path: skip subStep function calls whose generated
+// body only consumes currently-zero active-flag words. This suppresses call
+// overhead above the existing in-function sparse guards. Set
+// GSIM_MT_STEP_ACTIVE_WORD_GUARD=0 during codegen to retain the older shape.
+static bool mtUseStepActiveWordGuard() {
+  return mtCodegenEnvEnabledByDefault("GSIM_MT_STEP_ACTIVE_WORD_GUARD");
 }
 
 // Default-off diagnostic codegen: wait-probe instrumentation is useful for
@@ -6462,6 +6472,25 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     bool inlineSmallPureBatchBodies = mtUseInlineSmallPureBatchBodies();
     bool inlineSmallPureBatchMaskGuard = mtUseInlineSmallPureBatchMaskGuard();
     int nextSubStepIdx = 1;
+    mtStepActiveWordGuards.clear();
+    mtStepActiveWordGuardable.clear();
+    int currentSubStepIdx = 0;
+    auto ensureMtSubStepGuard = [&](int subStepIdx) {
+      if ((int)mtStepActiveWordGuards.size() <= subStepIdx) {
+        mtStepActiveWordGuards.resize((size_t)subStepIdx + 1);
+        mtStepActiveWordGuardable.resize((size_t)subStepIdx + 1, 1);
+      }
+    };
+    auto recordMtSubStepGuardWord = [&](int subStepIdx, int activeWord) {
+      ensureMtSubStepGuard(subStepIdx);
+      std::vector<int>& guards = mtStepActiveWordGuards[(size_t)subStepIdx];
+      if (std::find(guards.begin(), guards.end(), activeWord) == guards.end()) guards.push_back(activeWord);
+    };
+    auto markMtSubStepUnguarded = [&](int subStepIdx) {
+      ensureMtSubStepGuard(subStepIdx);
+      mtStepActiveWordGuardable[(size_t)subStepIdx] = 0;
+    };
+    ensureMtSubStepGuard(currentSubStepIdx);
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
     for (int idx = 0; idx < superId; idx ++) {
@@ -6483,6 +6512,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           if (!coarseGuard.empty()) coarseGuard += " | ";
           coarseGuard += format("mtCoarseWords%d[%d]", idx, word);
         }
+        for (int word = 0; word < region.activeWordSpan; word ++) recordMtSubStepGuardWord(currentSubStepIdx, region.beginActiveWord + word);
         emitBodyLock(indent ++, "if(unlikely((%s) != 0)) {\n", coarseGuard.c_str());
         if (!profileOffDirectSerial || mtUseSubchunkProbe()) {
           emitBodyLock(indent, "if (mtProfileEnabled) {\n");
@@ -6787,13 +6817,17 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
         if (prevActiveWhole) {
           bool newFile = __emitSrc(indent ++, true, false, nextFuncDef.c_str(), "if(unlikely(activeFlags[%d] != 0)) {\n", id);
           if (newFile) {
+            currentSubStepIdx = nextSubStepIdx;
+            ensureMtSubStepGuard(currentSubStepIdx);
             nextFuncDef = format("void S%s::subStep%d()", name.c_str(), ++ nextSubStepIdx);
           }
+          recordMtSubStepGuardWord(currentSubStepIdx, id);
           emitBodyLock(indent, "uint%d_t oldFlag = activeFlags[%d];\n", ACTIVE_WIDTH, id);
           emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
           if (!profileOffActiveWordCount) emitBodyLock(indent, "if (mtProfileEnabled) mtProfileActiveWordCount ++;\n");
         } else {
           emitBodyLock(indent, "uint%d_t activeWord%d = activeFlags[%d];\n", ACTIVE_WIDTH, id, id);
+          markMtSubStepUnguarded(currentSubStepIdx);
         }
       }
 
@@ -7031,8 +7065,23 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
     emitBodyLock(2, "return;\n");
     emitBodyLock(1, "}\n");
   }
+  bool stepActiveWordGuard = mtUseStepActiveWordGuard();
   for (int i = 0; i <= subStepIdxMax; i ++) {
-    emitBodyLock(1, "subStep%d();\n", i);
+    bool guardedSubStep = stepActiveWordGuard && i < (int)mtStepActiveWordGuards.size() &&
+                          i < (int)mtStepActiveWordGuardable.size() &&
+                          mtStepActiveWordGuardable[(size_t)i] &&
+                          !mtStepActiveWordGuards[(size_t)i].empty();
+    if (guardedSubStep) {
+      const std::vector<int>& guards = mtStepActiveWordGuards[(size_t)i];
+      std::string guardExpr;
+      for (int activeWord : guards) {
+        if (!guardExpr.empty()) guardExpr += " | ";
+        guardExpr += format("activeFlags[%d]", activeWord);
+      }
+      emitBodyLock(1, "if (unlikely((%s) != 0)) subStep%d();\n", guardExpr.c_str(), i);
+    } else {
+      emitBodyLock(1, "subStep%d();\n", i);
+    }
   }
 
   // Dump before cycles++ so the trace line names the cycle whose substeps just ran.
