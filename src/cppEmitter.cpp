@@ -832,6 +832,13 @@ static bool mtUseProfileOffActiveWordCount() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_PROFILE_OFF_ACTIVE_WORD_COUNT");
 }
 
+// Default-on fast path for pure batches that runtime will force to workerCount=1
+// under the default min-batch threshold. The generated branch preserves runtime
+// lowering of GSIM_MT_MIN_BATCH_TASKS by falling back to mtRunPureBatch().
+static bool mtUseInlineSmallPureBatches() {
+  return mtCodegenEnvEnabledByDefault("GSIM_MT_INLINE_SMALL_PURE_BATCHES");
+}
+
 // Default-off diagnostic codegen: wait-probe instrumentation is useful for
 // scheduler experiments but should not perturb normal generated models.
 static bool mtUseWaitProbeCodegen() {
@@ -6438,6 +6445,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     bool directInlineWorker0Fallback = mtUseDirectInlineWorker0Fallback();
     bool profileOffDirectSerial = mtUseProfileOffDirectSerialFallback();
     bool profileOffActiveWordCount = mtUseProfileOffActiveWordCount();
+    bool inlineSmallPureBatches = mtUseInlineSmallPureBatches();
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
@@ -6777,8 +6785,32 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
       auto batchIter = batchEndByStart.find(idx);
       if (prevActiveWhole && batchIter != batchEndByStart.end()) {
         int batchEnd = batchIter->second;
-        if (batchEnd - idx > 1) {
-          emitBodyLock(indent, "mtRunPureBatch(%d, %d, oldFlag);\n", idx, batchEnd);
+        int batchLen = batchEnd - idx;
+        if (batchLen > 1) {
+          if (inlineSmallPureBatches && batchLen < 16) {
+            emitBodyLock(indent ++, "if (!mtProfileEnabled && mtMinBatchTasks > %d) {\n", batchLen);
+            uint64_t forcedSinkMask = mtRepCutForcedSinkMaskForBatch(semanticPlan, idx);
+            if (forcedSinkMask != 0) emitBodyLock(indent, "oldFlag |= 0x%lx;\n", forcedSinkMask);
+            for (int batchCppId = idx; batchCppId < batchEnd; batchCppId ++) {
+              uint64_t batchMask = (uint64_t)1 << (batchCppId % ACTIVE_WIDTH);
+              emitBodyLock(indent ++, "if (oldFlag & 0x%lx) {\n", batchMask);
+              if (mtTasks[batchCppId].repcutRuntimeApplied) {
+                emitBodyLock(indent ++, "{\n");
+                emitBodyLock(indent, "ActivationDelta mtInlineBatchDelta%d;\n", batchCppId);
+                emitBodyLock(indent, "mtRepCutLiteTask%d(oldFlag, mtInlineBatchDelta%d);\n", batchCppId, batchCppId);
+                emitBodyLock(indent, "mtInlineBatchDelta%d.mergeInto(activeFlags);\n", batchCppId);
+                emitBodyLock(--indent, "}\n");
+              } else {
+                emitBodyLock(indent, "mtTask%d(oldFlag);\n", batchCppId);
+              }
+              emitBodyLock(--indent, "}\n");
+            }
+            emitBodyLock(--indent, "} else {\n");
+            emitBodyLock(indent, "mtRunPureBatch(%d, %d, oldFlag);\n", idx, batchEnd);
+            emitBodyLock(--indent, "}\n");
+          } else {
+            emitBodyLock(indent, "mtRunPureBatch(%d, %d, oldFlag);\n", idx, batchEnd);
+          }
           idx = batchEnd - 1;
           continue;
         }
