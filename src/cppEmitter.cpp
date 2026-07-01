@@ -825,6 +825,13 @@ static bool mtUseProfileOffDirectSerialFallback() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_PROFILE_OFF_DIRECT_SERIAL_FALLBACK");
 }
 
+// Default-on profile-off fast path for non-coarse active-word accounting in
+// generated MT substeps. Set GSIM_MT_PROFILE_OFF_ACTIVE_WORD_COUNT=0 during
+// gsim-gen-cpp to retain the diagnostic counter branch.
+static bool mtUseProfileOffActiveWordCount() {
+  return mtCodegenEnvEnabledByDefault("GSIM_MT_PROFILE_OFF_ACTIVE_WORD_COUNT");
+}
+
 
 // Probe-only: emit extra counters for dynamic work inside the clean coarse
 // serial-inline fallback. Codegen-gated so normal generated models keep the
@@ -6419,6 +6426,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     bool directInlineSerialFallback = mtUseDirectInlineSerialFallback();
     bool directInlineWorker0Fallback = mtUseDirectInlineWorker0Fallback();
     bool profileOffDirectSerial = mtUseProfileOffDirectSerialFallback();
+    bool profileOffActiveWordCount = mtUseProfileOffActiveWordCount();
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
@@ -6749,7 +6757,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           }
           emitBodyLock(indent, "uint%d_t oldFlag = activeFlags[%d];\n", ACTIVE_WIDTH, id);
           emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
-          emitBodyLock(indent, "if (mtProfileEnabled) mtProfileActiveWordCount ++;\n");
+          if (!profileOffActiveWordCount) emitBodyLock(indent, "if (mtProfileEnabled) mtProfileActiveWordCount ++;\n");
         } else {
           emitBodyLock(indent, "uint%d_t activeWord%d = activeFlags[%d];\n", ACTIVE_WIDTH, id, id);
         }
