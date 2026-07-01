@@ -6796,7 +6796,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
         int batchLen = batchEnd - idx;
         if (batchLen > 1) {
           if (inlineSmallPureBatches && batchLen < 16) {
-            emitBodyLock(indent ++, "if (!mtProfileEnabled && mtMinBatchTasks > %d) {\n", batchLen);
+            emitBodyLock(indent ++, "if (likely(!mtProfileEnabled && mtMinBatchTasks > %d)) {\n", batchLen);
             uint64_t forcedSinkMask = mtRepCutForcedSinkMaskForBatch(semanticPlan, idx);
             if (forcedSinkMask != 0) emitBodyLock(indent, "oldFlag |= 0x%lx;\n", forcedSinkMask);
             for (int batchCppId = idx; batchCppId < batchEnd; batchCppId ++) {
