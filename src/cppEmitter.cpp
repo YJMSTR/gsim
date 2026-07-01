@@ -832,6 +832,13 @@ static bool mtUseProfileOffActiveWordCount() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_PROFILE_OFF_ACTIVE_WORD_COUNT");
 }
 
+// Default-off diagnostic codegen: wait-probe instrumentation is useful for
+// scheduler experiments but should not perturb normal generated models.
+static bool mtUseWaitProbeCodegen() {
+  const char* env = std::getenv("GSIM_MT_WAIT_PROBE_CODEGEN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // Probe-only: emit extra counters for dynamic work inside the clean coarse
 // serial-inline fallback. Codegen-gated so normal generated models keep the
@@ -4591,6 +4598,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   markMtRepCutLiteRuntimeApplied(mtTasks);
   int shardCount = mtPureBatchShardCount();
   bool useCoarse = globalConfig.MtBatchFormationMode == "coarse";
+  bool waitProbeCodegen = mtUseWaitProbeCodegen();
   auto emitPureTaskSwitchCases = [&](int shardBegin, int shardEnd, bool workerMode) {
     for (int cppId = shardBegin; cppId < shardEnd; cppId ++) {
       if (mtTasks[cppId].taskKind != "pure_compute") continue;
@@ -4754,7 +4762,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     // flat-array path. Region/wc/begin/span carried on dedicated fields
     // so we don't overload chunk[].begin/.end semantics.
     emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(coarseRegionIndex, mtWorkerPoolCoarseStaticRoundedWC, worker, mtWorkerPoolCoarseStaticBeginActiveWord, mtWorkerPoolCoarseStaticActiveWordSpan);\n");
-    emitBodyLock(3, "if (mtWaitProbeEnabled && (size_t)worker < mtWaitProbeWorkerFinishNs.size()) mtWaitProbeWorkerFinishNs[(size_t)worker] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
+    if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled && (size_t)worker < mtWaitProbeWorkerFinishNs.size()) mtWaitProbeWorkerFinishNs[(size_t)worker] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
     emitBodyLock(2, "} else if (jobKind == 4) {\n");
     emitBodyLock(3, "/* A35-P empty-barrier microbench: worker performs no work */\n");
     emitBodyLock(2, "} else if (jobKind == 5) {\n");
@@ -5059,6 +5067,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
 void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan) {
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
   markMtRepCutLiteRuntimeApplied(mtTasks);
+  bool waitProbeCodegen = mtUseWaitProbeCodegen();
   // 28c-2: shared emitter for `switch (mtaskIndex) { case M: <body>; break; ... }` body.
   // Used by both mtRunCoarseMTaskWorkerList and mtRunCoarseMTaskWorkerRange so the
   // per-mtask semantics stay in sync. Outer caller emits indent N for `switch (mtaskIndex)`.
@@ -6086,10 +6095,10 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtWorkerPoolCurrentWorkerCount = dstaticRoundedWC;\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseBodyBegin;\n");
   emitBodyLock(3, "if (mtProfileEnabled) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
-  emitBodyLock(3, "if (mtWaitProbeEnabled) mtWaitProbePostTp = std::chrono::steady_clock::now();\n");
+  if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled) mtWaitProbePostTp = std::chrono::steady_clock::now();\n");
   emitBodyLock(3, "mtWorkerPoolPost();\n");
   emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(regionIndex, dstaticRoundedWC, 0, regionBeginActiveWord, regionActiveWordSpan);\n");
-  emitBodyLock(3, "if (mtWaitProbeEnabled && !mtWaitProbeWorkerFinishNs.empty()) mtWaitProbeWorkerFinishNs[0] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
+  if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled && !mtWaitProbeWorkerFinishNs.empty()) mtWaitProbeWorkerFinishNs[0] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseWaitBegin;\n");
   emitBodyLock(3, "if (mtProfileEnabled) {\n");
   emitBodyLock(4, "mtPhaseWaitBegin = std::chrono::steady_clock::now();\n");
@@ -6097,26 +6106,28 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "}\n");
   emitBodyLock(3, "mtWorkerPoolWaitForDone(dstaticRoundedWC - 1);\n");
   emitBodyLock(3, "if (mtProfileEnabled) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
-  emitBodyLock(3, "if (mtWaitProbeEnabled) {\n");
-  emitBodyLock(4, "uint64_t mtwpWaitDone = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
-  emitBodyLock(4, "uint64_t mtwpW0 = mtWaitProbeWorkerFinishNs[0];\n");
-  emitBodyLock(4, "uint64_t mtwpMaxFinish = 0, mtwpMaxBg = 0, mtwpMinBg = (uint64_t)-1; int mtwpLast = 0;\n");
-  emitBodyLock(4, "for (int w = 0; w < dstaticRoundedWC; w ++) {\n");
-  emitBodyLock(5, "uint64_t f = mtWaitProbeWorkerFinishNs[(size_t)w];\n");
-  emitBodyLock(5, "mtWaitProbeWorkerFinishSumNs[(size_t)w] += f;\n");
-  emitBodyLock(5, "if (f > mtwpMaxFinish) { mtwpMaxFinish = f; mtwpLast = w; }\n");
-  emitBodyLock(5, "if (w >= 1) { if (f > mtwpMaxBg) mtwpMaxBg = f; if (f < mtwpMinBg) mtwpMinBg = f; }\n");
-  emitBodyLock(4, "}\n");
-  emitBodyLock(4, "if (dstaticRoundedWC <= 1) { mtwpMaxBg = 0; mtwpMinBg = 0; }\n");
-  emitBodyLock(4, "mtWaitProbeDispatchCount ++;\n");
-  emitBodyLock(4, "mtWaitProbeW0BodySumNs += mtwpW0;\n");
-  emitBodyLock(4, "mtWaitProbeWaitSumNs += (mtwpWaitDone >= mtwpW0 ? mtwpWaitDone - mtwpW0 : 0);\n");
-  emitBodyLock(4, "mtWaitProbeMaxFinishSumNs += mtwpMaxFinish;\n");
-  emitBodyLock(4, "mtWaitProbeMinBgFinishSumNs += mtwpMinBg;\n");
-  emitBodyLock(4, "mtWaitProbeTailBeyondW0SumNs += (mtwpMaxBg > mtwpW0 ? mtwpMaxBg - mtwpW0 : 0);\n");
-  emitBodyLock(4, "if (mtwpW0 >= mtwpMaxBg) mtWaitProbeWorker0LastCount ++;\n");
-  emitBodyLock(4, "if ((size_t)mtwpLast < mtWaitProbeWorkerLastHist.size()) mtWaitProbeWorkerLastHist[(size_t)mtwpLast] ++;\n");
-  emitBodyLock(3, "}\n");
+  if (waitProbeCodegen) {
+    emitBodyLock(3, "if (mtWaitProbeEnabled) {\n");
+    emitBodyLock(4, "uint64_t mtwpWaitDone = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
+    emitBodyLock(4, "uint64_t mtwpW0 = mtWaitProbeWorkerFinishNs[0];\n");
+    emitBodyLock(4, "uint64_t mtwpMaxFinish = 0, mtwpMaxBg = 0, mtwpMinBg = (uint64_t)-1; int mtwpLast = 0;\n");
+    emitBodyLock(4, "for (int w = 0; w < dstaticRoundedWC; w ++) {\n");
+    emitBodyLock(5, "uint64_t f = mtWaitProbeWorkerFinishNs[(size_t)w];\n");
+    emitBodyLock(5, "mtWaitProbeWorkerFinishSumNs[(size_t)w] += f;\n");
+    emitBodyLock(5, "if (f > mtwpMaxFinish) { mtwpMaxFinish = f; mtwpLast = w; }\n");
+    emitBodyLock(5, "if (w >= 1) { if (f > mtwpMaxBg) mtwpMaxBg = f; if (f < mtwpMinBg) mtwpMinBg = f; }\n");
+    emitBodyLock(4, "}\n");
+    emitBodyLock(4, "if (dstaticRoundedWC <= 1) { mtwpMaxBg = 0; mtwpMinBg = 0; }\n");
+    emitBodyLock(4, "mtWaitProbeDispatchCount ++;\n");
+    emitBodyLock(4, "mtWaitProbeW0BodySumNs += mtwpW0;\n");
+    emitBodyLock(4, "mtWaitProbeWaitSumNs += (mtwpWaitDone >= mtwpW0 ? mtwpWaitDone - mtwpW0 : 0);\n");
+    emitBodyLock(4, "mtWaitProbeMaxFinishSumNs += mtwpMaxFinish;\n");
+    emitBodyLock(4, "mtWaitProbeMinBgFinishSumNs += mtwpMinBg;\n");
+    emitBodyLock(4, "mtWaitProbeTailBeyondW0SumNs += (mtwpMaxBg > mtwpW0 ? mtwpMaxBg - mtwpW0 : 0);\n");
+    emitBodyLock(4, "if (mtwpW0 >= mtwpMaxBg) mtWaitProbeWorker0LastCount ++;\n");
+    emitBodyLock(4, "if ((size_t)mtwpLast < mtWaitProbeWorkerLastHist.size()) mtWaitProbeWorkerLastHist[(size_t)mtwpLast] ++;\n");
+    emitBodyLock(3, "}\n");
+  }
   emitBodyLock(2, "} else {\n");
   emitBodyLock(3, "std::vector<std::thread> workers;\n");
   emitBodyLock(3, "workers.reserve(dstaticRoundedWC);\n");
@@ -7226,20 +7237,22 @@ void graph::cppEmitter() {
     fprintf(header, "uint64_t mtProfileCoarseLayerSizeHist[6];\n");
     fprintf(header, "uint64_t mtProfileCoarseRegionLayerCountHist[6];\n");
     fprintf(header, "std::vector<uint64_t> mtProfileCoarseSelectedWorkerCountHist;\n");
-    fprintf(header, "bool mtWaitProbeEnabled;\n");
-    fprintf(header, "std::chrono::steady_clock::time_point mtWaitProbePostTp;\n");
-    fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerFinishNs;\n");
-    fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerFinishSumNs;\n");
-    fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerLastHist;\n");
-    fprintf(header, "uint64_t mtWaitProbeDispatchCount;\n");
-    fprintf(header, "uint64_t mtWaitProbeWaitSumNs;\n");
-    fprintf(header, "uint64_t mtWaitProbeW0BodySumNs;\n");
-    fprintf(header, "uint64_t mtWaitProbeTailBeyondW0SumNs;\n");
-    fprintf(header, "uint64_t mtWaitProbeMaxFinishSumNs;\n");
-    fprintf(header, "uint64_t mtWaitProbeMinBgFinishSumNs;\n");
-    fprintf(header, "uint64_t mtWaitProbeWorker0LastCount;\n");
-    fprintf(header, "uint64_t mtWaitProbeEmptyBarrierIters;\n");
-    fprintf(header, "uint64_t mtWaitProbeEmptyBarrierTotalNs;\n");
+    if (mtUseWaitProbeCodegen()) {
+      fprintf(header, "bool mtWaitProbeEnabled;\n");
+      fprintf(header, "std::chrono::steady_clock::time_point mtWaitProbePostTp;\n");
+      fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerFinishNs;\n");
+      fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerFinishSumNs;\n");
+      fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerLastHist;\n");
+      fprintf(header, "uint64_t mtWaitProbeDispatchCount;\n");
+      fprintf(header, "uint64_t mtWaitProbeWaitSumNs;\n");
+      fprintf(header, "uint64_t mtWaitProbeW0BodySumNs;\n");
+      fprintf(header, "uint64_t mtWaitProbeTailBeyondW0SumNs;\n");
+      fprintf(header, "uint64_t mtWaitProbeMaxFinishSumNs;\n");
+      fprintf(header, "uint64_t mtWaitProbeMinBgFinishSumNs;\n");
+      fprintf(header, "uint64_t mtWaitProbeWorker0LastCount;\n");
+      fprintf(header, "uint64_t mtWaitProbeEmptyBarrierIters;\n");
+      fprintf(header, "uint64_t mtWaitProbeEmptyBarrierTotalNs;\n");
+    }
   }
   fprintf(header, "uint64_t mtProfileTaskExecCount[%d];\n", superId);
   fprintf(header, "uint64_t mtProfileTaskWallNs[%d];\n", superId);
@@ -7393,7 +7406,7 @@ void graph::cppEmitter() {
   fprintf(header, "void dumpMtProfileDynamicTraceCycle();\n");
   fprintf(header, "void recordMtProfileDynamicTraceTask(int cppId);\n");
   fprintf(header, "void recordMtProfileWorkerTask(int worker);\n");
-  if (useCoarseMt) {
+  if (useCoarseMt && mtUseWaitProbeCodegen()) {
     fprintf(header, "void runMtWaitProbeEmptyBarrier();\n");
     fprintf(header, "void dumpMtWaitProbe();\n");
   }
@@ -7608,33 +7621,35 @@ void graph::cppEmitter() {
       emitBodyLock(1, "mtWorkerPoolCoarseStaticRoundedWC = 0;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseStaticBeginActiveWord = 0;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseStaticActiveWordSpan = 0;\n");
-      emitBodyLock(1, "const char *waitProbeEnv = getenv(\"GSIM_MT_WAIT_PROBE\");\n");
-      emitBodyLock(1, "mtWaitProbeEnabled = waitProbeEnv != nullptr && waitProbeEnv[0] != '\\0' && waitProbeEnv[0] != '0';\n");
-      emitBodyLock(1, "mtWaitProbeWorkerFinishNs.assign((size_t)mtConfiguredWorkerCount, 0);\n");
-      emitBodyLock(1, "mtWaitProbeWorkerFinishSumNs.assign((size_t)mtConfiguredWorkerCount, 0);\n");
-      emitBodyLock(1, "mtWaitProbeWorkerLastHist.assign((size_t)mtConfiguredWorkerCount, 0);\n");
-      emitBodyLock(1, "mtWaitProbeDispatchCount = 0;\n");
-      emitBodyLock(1, "mtWaitProbeWaitSumNs = 0;\n");
-      emitBodyLock(1, "mtWaitProbeW0BodySumNs = 0;\n");
-      emitBodyLock(1, "mtWaitProbeTailBeyondW0SumNs = 0;\n");
-      emitBodyLock(1, "mtWaitProbeMaxFinishSumNs = 0;\n");
-      emitBodyLock(1, "mtWaitProbeMinBgFinishSumNs = 0;\n");
-      emitBodyLock(1, "mtWaitProbeWorker0LastCount = 0;\n");
-      emitBodyLock(1, "mtWaitProbeEmptyBarrierIters = 0;\n");
-      emitBodyLock(1, "mtWaitProbeEmptyBarrierTotalNs = 0;\n");
+      if (mtUseWaitProbeCodegen()) {
+        emitBodyLock(1, "const char *waitProbeEnv = getenv(\"GSIM_MT_WAIT_PROBE\");\n");
+        emitBodyLock(1, "mtWaitProbeEnabled = waitProbeEnv != nullptr && waitProbeEnv[0] != '\\0' && waitProbeEnv[0] != '0';\n");
+        emitBodyLock(1, "mtWaitProbeWorkerFinishNs.assign((size_t)mtConfiguredWorkerCount, 0);\n");
+        emitBodyLock(1, "mtWaitProbeWorkerFinishSumNs.assign((size_t)mtConfiguredWorkerCount, 0);\n");
+        emitBodyLock(1, "mtWaitProbeWorkerLastHist.assign((size_t)mtConfiguredWorkerCount, 0);\n");
+        emitBodyLock(1, "mtWaitProbeDispatchCount = 0;\n");
+        emitBodyLock(1, "mtWaitProbeWaitSumNs = 0;\n");
+        emitBodyLock(1, "mtWaitProbeW0BodySumNs = 0;\n");
+        emitBodyLock(1, "mtWaitProbeTailBeyondW0SumNs = 0;\n");
+        emitBodyLock(1, "mtWaitProbeMaxFinishSumNs = 0;\n");
+        emitBodyLock(1, "mtWaitProbeMinBgFinishSumNs = 0;\n");
+        emitBodyLock(1, "mtWaitProbeWorker0LastCount = 0;\n");
+        emitBodyLock(1, "mtWaitProbeEmptyBarrierIters = 0;\n");
+        emitBodyLock(1, "mtWaitProbeEmptyBarrierTotalNs = 0;\n");
+      }
     }
   }
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "S%s::~S%s() {\n", name.c_str(), name.c_str());
-  if (useMtHelpers && useCoarseMt) emitBodyLock(1, "runMtWaitProbeEmptyBarrier();\n");
+  if (useMtHelpers && useCoarseMt && mtUseWaitProbeCodegen()) emitBodyLock(1, "runMtWaitProbeEmptyBarrier();\n");
   if (useMtHelpers) emitBodyLock(1, "stopMtWorkerPool();\n");
   emitBodyLock(1, "if (wallfracCommitBrackets + wallfracCombBrackets > 0) {\n");
   emitBodyLock(2, "uint64_t __wf_tot = wallfracCommitCycles + wallfracCombCycles;\n");
   emitBodyLock(2, "fprintf(stderr, \"[wallfrac] commit_cycles=%%lu comb_cycles=%%lu commit_brackets=%%lu comb_brackets=%%lu commit_frac=%%.4f comb_frac=%%.4f\\n\", wallfracCommitCycles, wallfracCombCycles, wallfracCommitBrackets, wallfracCombBrackets, __wf_tot? (double)wallfracCommitCycles/__wf_tot : 0.0, __wf_tot? (double)wallfracCombCycles/__wf_tot : 0.0);\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "dumpMtProfile();\n");
-  if (useCoarseMt) emitBodyLock(1, "dumpMtWaitProbe();\n");
+  if (useCoarseMt && mtUseWaitProbeCodegen()) emitBodyLock(1, "dumpMtWaitProbe();\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) { fclose(mtProfileDynamicTraceFile); mtProfileDynamicTraceFile = nullptr; }\n");
   emitBodyLock(0, "}\n");
 
@@ -7742,7 +7757,7 @@ void graph::cppEmitter() {
   emitBodyLock(2, "fprintf(stderr, \"\\n\");\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
-  if (useCoarseMt) {
+  if (useCoarseMt && mtUseWaitProbeCodegen()) {
     emitFuncDecl(0, "void S%s::runMtWaitProbeEmptyBarrier() {\n", name.c_str());
     emitBodyLock(1, "if (!mtWaitProbeEnabled || !mtWorkerPoolEnabled || mtConfiguredWorkerCount <= 1) return;\n");
     emitBodyLock(1, "int wc = mtConfiguredWorkerCount;\n");
