@@ -839,6 +839,13 @@ static bool mtUseInlineSmallPureBatches() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_INLINE_SMALL_PURE_BATCHES");
 }
 
+// Probe: inside the small-batch inline path, optionally inline each pure task
+// body instead of calling mtTaskN(oldFlag). RepCut helpers still use their
+// dedicated helper because they need cloned-value delta plumbing.
+static bool mtUseInlineSmallPureBatchBodies() {
+  return mtCodegenEnvEnabledByDefault("GSIM_MT_INLINE_SMALL_PURE_BATCH_BODIES");
+}
+
 // Default-off diagnostic codegen: wait-probe instrumentation is useful for
 // scheduler experiments but should not perturb normal generated models.
 static bool mtUseWaitProbeCodegen() {
@@ -6446,6 +6453,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     bool profileOffDirectSerial = mtUseProfileOffDirectSerialFallback();
     bool profileOffActiveWordCount = mtUseProfileOffActiveWordCount();
     bool inlineSmallPureBatches = mtUseInlineSmallPureBatches();
+    bool inlineSmallPureBatchBodies = mtUseInlineSmallPureBatchBodies();
     int nextSubStepIdx = 1;
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
     bool prevActiveWhole = false;
@@ -6800,6 +6808,8 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
                 emitBodyLock(indent, "mtRepCutLiteTask%d(oldFlag, mtInlineBatchDelta%d);\n", batchCppId, batchCppId);
                 emitBodyLock(indent, "mtInlineBatchDelta%d.mergeInto(activeFlags);\n", batchCppId);
                 emitBodyLock(--indent, "}\n");
+              } else if (inlineSmallPureBatchBodies) {
+                genSuperEval(cppId2Super[batchCppId], "oldFlag", "", indent);
               } else {
                 emitBodyLock(indent, "mtTask%d(oldFlag);\n", batchCppId);
               }
