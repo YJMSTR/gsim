@@ -13,11 +13,13 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
+#include <fstream>
 #include <map>
 #include <set>
 #include <stack>
 #include <string>
 #include <tuple>
+#include <sstream>
 #include <utility>
 #include <vector>
 #define ACTIVE_WIDTH 8
@@ -3612,10 +3614,12 @@ void graph::dumpMtCoarseRegionReport() {
   std::vector<int> cycleBatchCleanRegionIds;
   std::vector<int> cycleBatchCppToCleanRegion(superId, -1);
   std::vector<int> cycleBatchCppToRegion(superId, -1);
+  std::vector<int> cycleBatchRegionToClean;
   std::set<std::tuple<int, int, std::string>> cycleBatchEdges;
   std::set<std::tuple<int, int, std::string, std::string>> cycleBatchBarrierEdges;
   std::map<int, std::set<int>> cycleBatchSinkWords;
   if (cycleBatchReportEnabled) {
+    cycleBatchRegionToClean.assign(coarsePlan.regions.size(), -1);
     for (size_t regionIndex = 0; regionIndex < coarsePlan.regions.size(); regionIndex ++) {
       const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
       for (int cppId = region.beginCppId; cppId < region.endCppId; cppId ++) {
@@ -3628,6 +3632,7 @@ void graph::dumpMtCoarseRegionReport() {
       if (!clean) continue;
       int cleanIndex = static_cast<int>(cycleBatchCleanRegionIds.size());
       cycleBatchCleanRegionIds.push_back(static_cast<int>(regionIndex));
+      cycleBatchRegionToClean[regionIndex] = cleanIndex;
       for (int cppId = region.beginCppId; cppId < region.endCppId; cppId ++) {
         if (cppId >= 0 && cppId < superId) cycleBatchCppToCleanRegion[cppId] = cleanIndex;
       }
@@ -3662,6 +3667,86 @@ void graph::dumpMtCoarseRegionReport() {
           if (activeId < 0) continue;
           bool sameWordForward = (activeId / ACTIVE_WIDTH == cppId / ACTIVE_WIDTH) && activeId > cppId;
           if (!sameWordForward && cycleBatchCppToCleanRegion[cppId] >= 0) cycleBatchSinkWords[cycleBatchCppToCleanRegion[cppId]].insert(activeId / ACTIVE_WIDTH);
+        }
+      }
+    }
+  }
+  struct CycleBatchTraceSummary {
+    bool enabled = false;
+    int cycles = 0;
+    std::vector<int> phaseCounts;
+    std::vector<int> batchRegionCounts;
+    std::vector<double> batchableFractions;
+  } cycleBatchTraceSummary;
+  auto cycleBatchPctInt = [](std::vector<int> values, int pct) -> int {
+    if (values.empty()) return 0;
+    std::sort(values.begin(), values.end());
+    return values[(values.size() - 1) * static_cast<size_t>(pct) / 100];
+  };
+  auto cycleBatchPctDouble = [](std::vector<double> values, int pct) -> double {
+    if (values.empty()) return 0.0;
+    std::sort(values.begin(), values.end());
+    return values[(values.size() - 1) * static_cast<size_t>(pct) / 100];
+  };
+  if (cycleBatchReportEnabled) {
+    const char* tracePath = std::getenv("GSIM_MT_CYCLE_BATCH_TRACE");
+    if (tracePath != nullptr && tracePath[0] != '\0') {
+      std::ifstream trace(tracePath);
+      if (trace.good()) {
+        cycleBatchTraceSummary.enabled = true;
+        std::vector<std::set<int>> cleanEdges(cycleBatchCleanRegionIds.size());
+        std::vector<std::set<int>> barrierEdges(cycleBatchCleanRegionIds.size());
+        for (const auto& edge : cycleBatchEdges) {
+          int a = std::get<0>(edge), b = std::get<1>(edge);
+          cleanEdges[a].insert(b);
+          cleanEdges[b].insert(a);
+        }
+        for (const auto& edge : cycleBatchBarrierEdges) barrierEdges[std::get<0>(edge)].insert(std::get<1>(edge));
+        auto edgeWithPending = [&](int cleanRegion, const std::vector<int>& pending) -> bool {
+          for (int p : pending) if (cleanEdges[p].find(cleanRegion) != cleanEdges[p].end()) return true;
+          return false;
+        };
+        auto barrierWithPending = [&](int regionIndex, const std::vector<int>& pending) -> bool {
+          for (int p : pending) if (barrierEdges[p].find(regionIndex) != barrierEdges[p].end()) return true;
+          return false;
+        };
+        auto finishBatch = [&](std::vector<std::vector<int>>& batches, std::vector<int>& pending) {
+          if (!pending.empty()) { batches.push_back(pending); pending.clear(); }
+        };
+        std::string line;
+        while (std::getline(trace, line)) {
+          size_t pos = line.find(" tasks=");
+          if (line.find("[mt-dyn-trace]") == std::string::npos || pos == std::string::npos) continue;
+          std::set<int> activeClean;
+          std::stringstream ss(line.substr(pos + 7));
+          std::string item;
+          while (std::getline(ss, item, ',')) {
+            int cppId = std::atoi(item.c_str());
+            if (cppId >= 0 && cppId < superId && cycleBatchCppToCleanRegion[cppId] >= 0) activeClean.insert(cycleBatchCppToCleanRegion[cppId]);
+          }
+          std::vector<std::vector<int>> batches;
+          std::vector<int> pending;
+          for (size_t regionIndex = 0; regionIndex < coarsePlan.regions.size(); regionIndex ++) {
+            int cleanRegion = cycleBatchRegionToClean[regionIndex];
+            bool isActiveClean = cleanRegion >= 0 && activeClean.find(cleanRegion) != activeClean.end();
+            if (isActiveClean) {
+              if (!pending.empty() && edgeWithPending(cleanRegion, pending)) finishBatch(batches, pending);
+              pending.push_back(cleanRegion);
+            } else if (!pending.empty()) {
+              if ((cleanRegion >= 0 && edgeWithPending(cleanRegion, pending)) || barrierWithPending(static_cast<int>(regionIndex), pending)) finishBatch(batches, pending);
+            }
+          }
+          finishBatch(batches, pending);
+          cycleBatchTraceSummary.cycles ++;
+          cycleBatchTraceSummary.phaseCounts.push_back(static_cast<int>(batches.size()));
+          uint64_t activeCost = 0;
+          for (int cleanRegion : activeClean) activeCost += static_cast<uint64_t>(coarsePlan.regions[cycleBatchCleanRegionIds[cleanRegion]].memberNodeCost);
+          uint64_t batchableCost = 0;
+          for (const auto& batch : batches) {
+            cycleBatchTraceSummary.batchRegionCounts.push_back(static_cast<int>(batch.size()));
+            if (batch.size() > 1) for (int cleanRegion : batch) batchableCost += static_cast<uint64_t>(coarsePlan.regions[cycleBatchCleanRegionIds[cleanRegion]].memberNodeCost);
+          }
+          cycleBatchTraceSummary.batchableFractions.push_back(activeCost == 0 ? 0.0 : static_cast<double>(batchableCost) / static_cast<double>(activeCost));
         }
       }
     }
@@ -3833,7 +3918,20 @@ void graph::dumpMtCoarseRegionReport() {
               cleanRegion, otherRegion, direction.c_str(), kind.c_str(), barrierEdgeIndex + 1 == cycleBatchBarrierEdges.size() ? "" : ",");
       barrierEdgeIndex ++;
     }
-    fprintf(fp, "    ]\n");
+    fprintf(fp, "    ],\n");
+    fprintf(fp, "    \"trace_summary\": {\n");
+    fprintf(fp, "      \"enabled\": %s,\n", cycleBatchTraceSummary.enabled ? "true" : "false");
+    fprintf(fp, "      \"cycles\": %d,\n", cycleBatchTraceSummary.cycles);
+    fprintf(fp, "      \"phase_count_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.phaseCounts, 50));
+    fprintf(fp, "      \"phase_count_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.phaseCounts, 95));
+    fprintf(fp, "      \"phase_count_max\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.phaseCounts, 100));
+    fprintf(fp, "      \"batch_regions_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.batchRegionCounts, 50));
+    fprintf(fp, "      \"batch_regions_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.batchRegionCounts, 95));
+    fprintf(fp, "      \"batch_regions_max\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.batchRegionCounts, 100));
+    fprintf(fp, "      \"batchable_fraction_p50\": %.6f,\n", cycleBatchPctDouble(cycleBatchTraceSummary.batchableFractions, 50));
+    fprintf(fp, "      \"batchable_fraction_p95\": %.6f,\n", cycleBatchPctDouble(cycleBatchTraceSummary.batchableFractions, 95));
+    fprintf(fp, "      \"batchable_fraction_max\": %.6f\n", cycleBatchPctDouble(cycleBatchTraceSummary.batchableFractions, 100));
+    fprintf(fp, "    }\n");
     fprintf(fp, "  },\n");
   }
   fprintf(fp, "  \"regions\": [\n");
