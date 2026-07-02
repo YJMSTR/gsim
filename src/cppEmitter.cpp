@@ -873,6 +873,13 @@ static bool mtUseWaitProbeCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Probe-only: emit static graph data for runtime/cycle clean-region batching
+// validation. Default-off and report-only; normal generated execution is unchanged.
+static bool mtUseCycleBatchReport() {
+  const char* env = std::getenv("GSIM_MT_CYCLE_BATCH_REPORT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // Probe-only: emit extra counters for dynamic work inside the clean coarse
 // serial-inline fallback. Codegen-gated so normal generated models keep the
@@ -3601,6 +3608,48 @@ void graph::dumpMtCoarseRegionReport() {
     }
     return true;
   };
+  bool cycleBatchReportEnabled = mtUseCycleBatchReport();
+  std::vector<int> cycleBatchCleanRegionIds;
+  std::vector<int> cycleBatchCppToCleanRegion(superId, -1);
+  std::set<std::tuple<int, int, std::string>> cycleBatchEdges;
+  std::map<int, std::set<int>> cycleBatchSinkWords;
+  if (cycleBatchReportEnabled) {
+    for (size_t regionIndex = 0; regionIndex < coarsePlan.regions.size(); regionIndex ++) {
+      const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
+      bool clean = region.runtimeEligible && mtRegionCleanSerialFallback(region);
+      if (!clean) continue;
+      int cleanIndex = static_cast<int>(cycleBatchCleanRegionIds.size());
+      cycleBatchCleanRegionIds.push_back(static_cast<int>(regionIndex));
+      for (int cppId = region.beginCppId; cppId < region.endCppId; cppId ++) {
+        if (cppId >= 0 && cppId < superId) cycleBatchCppToCleanRegion[cppId] = cleanIndex;
+      }
+    }
+    auto addCycleBatchEdge = [&](int fromCppId, int toCppId, const char* kind) {
+      if (fromCppId < 0 || fromCppId >= superId || toCppId < 0 || toCppId >= superId) return;
+      int fromRegion = cycleBatchCppToCleanRegion[fromCppId];
+      int toRegion = cycleBatchCppToCleanRegion[toCppId];
+      if (fromRegion < 0 || toRegion < 0 || fromRegion == toRegion) return;
+      cycleBatchEdges.insert(std::make_tuple(fromRegion, toRegion, std::string(kind)));
+    };
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      int fromRegion = cycleBatchCppToCleanRegion[cppId];
+      if (fromRegion < 0) continue;
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || !superIter->second) continue;
+      SuperNode* super = superIter->second;
+      for (SuperNode* next : super->next) if (next && next->cppId >= 0) addCycleBatchEdge(cppId, next->cppId, "order");
+      for (SuperNode* next : super->depNext) if (next && next->cppId >= 0) addCycleBatchEdge(cppId, next->cppId, "order");
+      for (Node* member : super->member) {
+        if (!member) continue;
+        for (int activeId : member->nextNeedActivate) if (activeId >= 0) addCycleBatchEdge(cppId, activeId, "active");
+        for (int activeId : member->nextActiveId) {
+          if (activeId < 0) continue;
+          bool sameWordForward = (activeId / ACTIVE_WIDTH == cppId / ACTIVE_WIDTH) && activeId > cppId;
+          if (!sameWordForward) cycleBatchSinkWords[fromRegion].insert(activeId / ACTIVE_WIDTH);
+        }
+      }
+    }
+  }
   auto mtSegmentHasCrossEdge = [&](int segBeginCppId, int segEndCppId, const MtCoarseRegion& region, bool activeOnly) -> bool {
     for (int segCppId = segBeginCppId; segCppId < segEndCppId; segCppId ++) {
       for (int curCppId = region.beginCppId; curCppId < region.endCppId; curCppId ++) {
@@ -3727,6 +3776,37 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "\"%s\": %d", jsonEscape(blocker.first).c_str(), blocker.second);
   }
   fprintf(fp, "},\n");
+  if (cycleBatchReportEnabled) {
+    fprintf(fp, "  \"cycle_batch_report\": {\n");
+    fprintf(fp, "    \"enabled\": true,\n");
+    fprintf(fp, "    \"candidate_kind\": \"static_clean_region_graph_report_only\",\n");
+    fprintf(fp, "    \"clean_region_count\": %zu,\n", cycleBatchCleanRegionIds.size());
+    fprintf(fp, "    \"directed_edge_count\": %zu,\n", cycleBatchEdges.size());
+    fprintf(fp, "    \"clean_regions\": [\n");
+    for (size_t i = 0; i < cycleBatchCleanRegionIds.size(); i ++) {
+      int regionIndex = cycleBatchCleanRegionIds[i];
+      const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
+      fprintf(fp, "      {\"clean_region_index\": %zu, \"region_index\": %d, \"begin_cpp_id\": %d, \"end_cpp_id\": %d, \"task_count\": %d, \"active_word_span\": %d, \"static_cost\": %d, \"member_node_cost\": %d, \"sink_words\": ",
+              i, regionIndex, region.beginCppId, region.endCppId, region.taskCount, region.activeWordSpan, region.staticCost, region.memberNodeCost);
+      auto sinkIter = cycleBatchSinkWords.find(static_cast<int>(i));
+      if (sinkIter == cycleBatchSinkWords.end()) dumpJsonIntArray(fp, std::set<int>());
+      else dumpJsonIntArray(fp, sinkIter->second);
+      fprintf(fp, "}%s\n", i + 1 == cycleBatchCleanRegionIds.size() ? "" : ",");
+    }
+    fprintf(fp, "    ],\n");
+    fprintf(fp, "    \"directed_edges\": [\n");
+    size_t edgeIndex = 0;
+    for (const auto& edge : cycleBatchEdges) {
+      int fromRegion = std::get<0>(edge);
+      int toRegion = std::get<1>(edge);
+      const std::string& kind = std::get<2>(edge);
+      fprintf(fp, "      {\"from_clean_region\": %d, \"to_clean_region\": %d, \"kind\": \"%s\"}%s\n",
+              fromRegion, toRegion, kind.c_str(), edgeIndex + 1 == cycleBatchEdges.size() ? "" : ",");
+      edgeIndex ++;
+    }
+    fprintf(fp, "    ]\n");
+    fprintf(fp, "  },\n");
+  }
   fprintf(fp, "  \"regions\": [\n");
   for (size_t i = 0; i < coarsePlan.regions.size(); i ++) {
     const MtCoarseRegion& region = coarsePlan.regions[i];
