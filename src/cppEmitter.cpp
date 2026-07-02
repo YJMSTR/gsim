@@ -862,6 +862,10 @@ static bool mtUseStepActiveWordGuard() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_STEP_ACTIVE_WORD_GUARD");
 }
 
+static bool mtUseSplitMixedStepGuards() {
+  return mtCodegenEnvEnabledByDefault("GSIM_MT_SPLIT_MIXED_STEP_GUARDS");
+}
+
 // Default-off diagnostic codegen: wait-probe instrumentation is useful for
 // scheduler experiments but should not perturb normal generated models.
 static bool mtUseWaitProbeCodegen() {
@@ -6471,6 +6475,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     bool inlineSmallPureBatches = mtUseInlineSmallPureBatches();
     bool inlineSmallPureBatchBodies = mtUseInlineSmallPureBatchBodies();
     bool inlineSmallPureBatchMaskGuard = mtUseInlineSmallPureBatchMaskGuard();
+    bool splitMixedStepGuards = mtUseSplitMixedStepGuards();
     int nextSubStepIdx = 1;
     mtStepActiveWordGuards.clear();
     mtStepActiveWordGuardable.clear();
@@ -6489,6 +6494,12 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     auto markMtSubStepUnguarded = [&](int subStepIdx) {
       ensureMtSubStepGuard(subStepIdx);
       mtStepActiveWordGuardable[(size_t)subStepIdx] = 0;
+    };
+    auto currentMtSubStepHasGuardedPrefix = [&]() {
+      return currentSubStepIdx < (int)mtStepActiveWordGuards.size() &&
+             currentSubStepIdx < (int)mtStepActiveWordGuardable.size() &&
+             mtStepActiveWordGuardable[(size_t)currentSubStepIdx] &&
+             !mtStepActiveWordGuards[(size_t)currentSubStepIdx].empty();
     };
     ensureMtSubStepGuard(currentSubStepIdx);
     std::string nextFuncDef = format("void S%s::subStep%d()", name.c_str(), nextSubStepIdx);
@@ -6826,6 +6837,13 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           emitBodyLock(indent, "activeFlags[%d] = 0;\n", id);
           if (!profileOffActiveWordCount) emitBodyLock(indent, "if (mtProfileEnabled) mtProfileActiveWordCount ++;\n");
         } else {
+          if (splitMixedStepGuards && currentMtSubStepHasGuardedPrefix()) {
+            emitBodyLock(0, "}\n");
+            emitFuncDecl(0, "%s {\n", nextFuncDef.c_str());
+            currentSubStepIdx = nextSubStepIdx;
+            ensureMtSubStepGuard(currentSubStepIdx);
+            nextFuncDef = format("void S%s::subStep%d()", name.c_str(), ++ nextSubStepIdx);
+          }
           emitBodyLock(indent, "uint%d_t activeWord%d = activeFlags[%d];\n", ACTIVE_WIDTH, id, id);
           markMtSubStepUnguarded(currentSubStepIdx);
         }
