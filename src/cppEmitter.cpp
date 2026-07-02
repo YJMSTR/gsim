@@ -3611,9 +3611,17 @@ void graph::dumpMtCoarseRegionReport() {
   bool cycleBatchReportEnabled = mtUseCycleBatchReport();
   std::vector<int> cycleBatchCleanRegionIds;
   std::vector<int> cycleBatchCppToCleanRegion(superId, -1);
+  std::vector<int> cycleBatchCppToRegion(superId, -1);
   std::set<std::tuple<int, int, std::string>> cycleBatchEdges;
+  std::set<std::tuple<int, int, std::string, std::string>> cycleBatchBarrierEdges;
   std::map<int, std::set<int>> cycleBatchSinkWords;
   if (cycleBatchReportEnabled) {
+    for (size_t regionIndex = 0; regionIndex < coarsePlan.regions.size(); regionIndex ++) {
+      const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
+      for (int cppId = region.beginCppId; cppId < region.endCppId; cppId ++) {
+        if (cppId >= 0 && cppId < superId) cycleBatchCppToRegion[cppId] = static_cast<int>(regionIndex);
+      }
+    }
     for (size_t regionIndex = 0; regionIndex < coarsePlan.regions.size(); regionIndex ++) {
       const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
       bool clean = region.runtimeEligible && mtRegionCleanSerialFallback(region);
@@ -3626,13 +3634,21 @@ void graph::dumpMtCoarseRegionReport() {
     }
     auto addCycleBatchEdge = [&](int fromCppId, int toCppId, const char* kind) {
       if (fromCppId < 0 || fromCppId >= superId || toCppId < 0 || toCppId >= superId) return;
-      int fromRegion = cycleBatchCppToCleanRegion[fromCppId];
-      int toRegion = cycleBatchCppToCleanRegion[toCppId];
+      int fromCleanRegion = cycleBatchCppToCleanRegion[fromCppId];
+      int toCleanRegion = cycleBatchCppToCleanRegion[toCppId];
+      int fromRegion = cycleBatchCppToRegion[fromCppId];
+      int toRegion = cycleBatchCppToRegion[toCppId];
       if (fromRegion < 0 || toRegion < 0 || fromRegion == toRegion) return;
-      cycleBatchEdges.insert(std::make_tuple(fromRegion, toRegion, std::string(kind)));
+      if (fromCleanRegion >= 0 && toCleanRegion >= 0) {
+        if (fromCleanRegion != toCleanRegion) cycleBatchEdges.insert(std::make_tuple(fromCleanRegion, toCleanRegion, std::string(kind)));
+      } else if (fromCleanRegion >= 0) {
+        cycleBatchBarrierEdges.insert(std::make_tuple(fromCleanRegion, toRegion, std::string("clean_to_region"), std::string(kind)));
+      } else if (toCleanRegion >= 0) {
+        cycleBatchBarrierEdges.insert(std::make_tuple(toCleanRegion, fromRegion, std::string("region_to_clean"), std::string(kind)));
+      }
     };
     for (int cppId = 0; cppId < superId; cppId ++) {
-      int fromRegion = cycleBatchCppToCleanRegion[cppId];
+      int fromRegion = cycleBatchCppToRegion[cppId];
       if (fromRegion < 0) continue;
       auto superIter = cppId2Super.find(cppId);
       if (superIter == cppId2Super.end() || !superIter->second) continue;
@@ -3645,7 +3661,7 @@ void graph::dumpMtCoarseRegionReport() {
         for (int activeId : member->nextActiveId) {
           if (activeId < 0) continue;
           bool sameWordForward = (activeId / ACTIVE_WIDTH == cppId / ACTIVE_WIDTH) && activeId > cppId;
-          if (!sameWordForward) cycleBatchSinkWords[fromRegion].insert(activeId / ACTIVE_WIDTH);
+          if (!sameWordForward && cycleBatchCppToCleanRegion[cppId] >= 0) cycleBatchSinkWords[cycleBatchCppToCleanRegion[cppId]].insert(activeId / ACTIVE_WIDTH);
         }
       }
     }
@@ -3782,6 +3798,7 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "    \"candidate_kind\": \"static_clean_region_graph_report_only\",\n");
     fprintf(fp, "    \"clean_region_count\": %zu,\n", cycleBatchCleanRegionIds.size());
     fprintf(fp, "    \"directed_edge_count\": %zu,\n", cycleBatchEdges.size());
+    fprintf(fp, "    \"barrier_edge_count\": %zu,\n", cycleBatchBarrierEdges.size());
     fprintf(fp, "    \"clean_regions\": [\n");
     for (size_t i = 0; i < cycleBatchCleanRegionIds.size(); i ++) {
       int regionIndex = cycleBatchCleanRegionIds[i];
@@ -3803,6 +3820,18 @@ void graph::dumpMtCoarseRegionReport() {
       fprintf(fp, "      {\"from_clean_region\": %d, \"to_clean_region\": %d, \"kind\": \"%s\"}%s\n",
               fromRegion, toRegion, kind.c_str(), edgeIndex + 1 == cycleBatchEdges.size() ? "" : ",");
       edgeIndex ++;
+    }
+    fprintf(fp, "    ],\n");
+    fprintf(fp, "    \"barrier_edges\": [\n");
+    size_t barrierEdgeIndex = 0;
+    for (const auto& edge : cycleBatchBarrierEdges) {
+      int cleanRegion = std::get<0>(edge);
+      int otherRegion = std::get<1>(edge);
+      const std::string& direction = std::get<2>(edge);
+      const std::string& kind = std::get<3>(edge);
+      fprintf(fp, "      {\"clean_region\": %d, \"other_region\": %d, \"direction\": \"%s\", \"kind\": \"%s\"}%s\n",
+              cleanRegion, otherRegion, direction.c_str(), kind.c_str(), barrierEdgeIndex + 1 == cycleBatchBarrierEdges.size() ? "" : ",");
+      barrierEdgeIndex ++;
     }
     fprintf(fp, "    ]\n");
     fprintf(fp, "  },\n");
