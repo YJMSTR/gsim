@@ -3676,6 +3676,10 @@ void graph::dumpMtCoarseRegionReport() {
     int cycles = 0;
     std::vector<int> phaseCounts;
     std::vector<int> batchRegionCounts;
+    std::vector<int> multiRegionPhaseCounts;
+    std::vector<int> largeRegionPhaseCounts;
+    std::vector<int> largeCostPhaseCounts;
+    std::vector<int> largestPhaseCosts;
     std::vector<double> batchableFractions;
   } cycleBatchTraceSummary;
   auto cycleBatchPctInt = [](std::vector<int> values, int pct) -> int {
@@ -3742,10 +3746,24 @@ void graph::dumpMtCoarseRegionReport() {
           uint64_t activeCost = 0;
           for (int cleanRegion : activeClean) activeCost += static_cast<uint64_t>(coarsePlan.regions[cycleBatchCleanRegionIds[cleanRegion]].memberNodeCost);
           uint64_t batchableCost = 0;
+          int multiRegionPhases = 0;
+          int largeRegionPhases = 0;
+          int largeCostPhases = 0;
+          int largestPhaseCost = 0;
           for (const auto& batch : batches) {
+            int batchCost = 0;
+            for (int cleanRegion : batch) batchCost += coarsePlan.regions[cycleBatchCleanRegionIds[cleanRegion]].memberNodeCost;
+            largestPhaseCost = std::max(largestPhaseCost, batchCost);
+            if (batch.size() > 1) multiRegionPhases ++;
+            if (batch.size() >= 10) largeRegionPhases ++;
+            if (batchCost >= 50000) largeCostPhases ++;
             cycleBatchTraceSummary.batchRegionCounts.push_back(static_cast<int>(batch.size()));
-            if (batch.size() > 1) for (int cleanRegion : batch) batchableCost += static_cast<uint64_t>(coarsePlan.regions[cycleBatchCleanRegionIds[cleanRegion]].memberNodeCost);
+            if (batch.size() > 1) batchableCost += static_cast<uint64_t>(batchCost);
           }
+          cycleBatchTraceSummary.multiRegionPhaseCounts.push_back(multiRegionPhases);
+          cycleBatchTraceSummary.largeRegionPhaseCounts.push_back(largeRegionPhases);
+          cycleBatchTraceSummary.largeCostPhaseCounts.push_back(largeCostPhases);
+          cycleBatchTraceSummary.largestPhaseCosts.push_back(largestPhaseCost);
           cycleBatchTraceSummary.batchableFractions.push_back(activeCost == 0 ? 0.0 : static_cast<double>(batchableCost) / static_cast<double>(activeCost));
         }
       }
@@ -3925,6 +3943,14 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "      \"phase_count_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.phaseCounts, 50));
     fprintf(fp, "      \"phase_count_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.phaseCounts, 95));
     fprintf(fp, "      \"phase_count_max\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.phaseCounts, 100));
+    fprintf(fp, "      \"multi_region_phase_count_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.multiRegionPhaseCounts, 50));
+    fprintf(fp, "      \"multi_region_phase_count_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.multiRegionPhaseCounts, 95));
+    fprintf(fp, "      \"large_region_phase_count_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.largeRegionPhaseCounts, 50));
+    fprintf(fp, "      \"large_region_phase_count_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.largeRegionPhaseCounts, 95));
+    fprintf(fp, "      \"large_cost_phase_count_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.largeCostPhaseCounts, 50));
+    fprintf(fp, "      \"large_cost_phase_count_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.largeCostPhaseCounts, 95));
+    fprintf(fp, "      \"largest_phase_cost_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.largestPhaseCosts, 50));
+    fprintf(fp, "      \"largest_phase_cost_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.largestPhaseCosts, 95));
     fprintf(fp, "      \"batch_regions_p50\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.batchRegionCounts, 50));
     fprintf(fp, "      \"batch_regions_p95\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.batchRegionCounts, 95));
     fprintf(fp, "      \"batch_regions_max\": %d,\n", cycleBatchPctInt(cycleBatchTraceSummary.batchRegionCounts, 100));
