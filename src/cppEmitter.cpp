@@ -882,6 +882,13 @@ static bool mtUseCycleBatchReport() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Probe-only: emit lane-local SCC ready-batch scheduler metadata. Default-off
+// and report-only; normal generated execution is unchanged.
+static bool mtUseReadyBatchReport() {
+  const char* env = std::getenv("GSIM_MT_READY_BATCH_REPORT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // Probe-only: emit extra counters for dynamic work inside the clean coarse
 // serial-inline fallback. Codegen-gated so normal generated models keep the
@@ -4104,6 +4111,378 @@ void graph::dumpMtCoarseRegionReport() {
   fclose(fp);
   printf("[mt-coarse-region] wrote %zu regions (%d runtime eligible) to %s\n",
          coarsePlan.regions.size(), runtimeEligibleCount, path.c_str());
+}
+
+void graph::dumpMtReadyBatchReport() {
+  std::string baseName = globalConfig.InputBaseName.empty() ? name : globalConfig.InputBaseName;
+  std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_ready_batch_lanes.json";
+  FILE* fp = std::fopen(path.c_str(), "w");
+  Assert(fp != nullptr, "failed to open mt ready-batch lane report %s", path.c_str());
+
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
+
+  struct ReadyBatchCapStats {
+    int cap = 1;
+    int staticSerial = 0;
+    int staticMakespan = 0;
+    int staticDispatches = 0;
+    uint64_t traceSerial = 0;
+    uint64_t traceMakespan = 0;
+    uint64_t traceDispatches = 0;
+    int traceCycles = 0;
+    std::vector<int> traceMakespans;
+    std::vector<int> traceDispatchCounts;
+  };
+  struct ReadyBatchScheduleResult {
+    int serial = 0;
+    int makespan = 0;
+    int dispatches = 0;
+  };
+  struct ReadyBatchLaneGraph {
+    std::string name;
+    std::vector<int> regionIndices;
+    bool valid = true;
+    std::string invalidReason;
+    int taskCount = 0;
+    int memberNodeCost = 0;
+    int activeWordSpanSum = 0;
+    std::vector<int> cppIds;
+    std::map<int, int> cppToLocal;
+    std::vector<std::set<int>> localSucc;
+    std::vector<int> sccOfLocal;
+    std::vector<int> sccCost;
+    std::vector<std::set<int>> sccSucc;
+    std::vector<std::set<int>> sccPred;
+    std::vector<int> topo;
+    int largestScc = 0;
+    int sccEdgeCount = 0;
+    std::vector<ReadyBatchCapStats> caps;
+  };
+
+  auto readyBatchPctInt = [](std::vector<int> values, int pct) -> int {
+    if (values.empty()) return 0;
+    std::sort(values.begin(), values.end());
+    return values[(values.size() - 1) * static_cast<size_t>(pct) / 100];
+  };
+  auto addReadyBatchEdge = [](std::vector<std::set<int>>& succ,
+                              const std::map<int, int>& cppToLocal,
+                              int fromCppId, int toCppId) {
+    auto fromIter = cppToLocal.find(fromCppId);
+    if (fromIter == cppToLocal.end()) return;
+    auto toIter = cppToLocal.find(toCppId);
+    if (toIter == cppToLocal.end()) return;
+    if (fromIter->second == toIter->second) return;
+    succ[fromIter->second].insert(toIter->second);
+  };
+
+  auto buildReadyBatchLane = [&](const std::string& laneName, const std::vector<int>& regionIndices) {
+    ReadyBatchLaneGraph lane;
+    lane.name = laneName;
+    lane.regionIndices = regionIndices;
+    for (int regionIndex : regionIndices) {
+      if (regionIndex < 0 || regionIndex >= static_cast<int>(coarsePlan.regions.size())) {
+        lane.valid = false;
+        lane.invalidReason = "region_index_out_of_range";
+        return lane;
+      }
+      const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
+      lane.taskCount += region.taskCount;
+      lane.memberNodeCost += region.memberNodeCost;
+      lane.activeWordSpanSum += region.activeWordSpan;
+      for (int cppId = region.beginCppId; cppId < region.endCppId; cppId ++) {
+        lane.cppToLocal[cppId] = static_cast<int>(lane.cppIds.size());
+        lane.cppIds.push_back(cppId);
+      }
+    }
+    lane.localSucc.assign(lane.cppIds.size(), std::set<int>());
+    for (int cppId : lane.cppIds) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || superIter->second == nullptr) continue;
+      SuperNode* super = superIter->second;
+      for (SuperNode* next : super->next) if (next && next->cppId >= 0) addReadyBatchEdge(lane.localSucc, lane.cppToLocal, cppId, next->cppId);
+      for (SuperNode* next : super->depNext) if (next && next->cppId >= 0) addReadyBatchEdge(lane.localSucc, lane.cppToLocal, cppId, next->cppId);
+      for (Node* member : super->member) {
+        if (!member) continue;
+        for (int activeId : member->nextNeedActivate) if (activeId >= 0) addReadyBatchEdge(lane.localSucc, lane.cppToLocal, cppId, activeId);
+      }
+    }
+
+    int localCount = static_cast<int>(lane.cppIds.size());
+    std::vector<int> index(localCount, -1), lowlink(localCount, 0), stack;
+    std::vector<char> onStack(localCount, 0);
+    int nextIndex = 0;
+    std::vector<std::vector<int>> sccs;
+    std::function<void(int)> strongConnect = [&](int v) {
+      index[v] = lowlink[v] = nextIndex ++;
+      stack.push_back(v);
+      onStack[v] = 1;
+      for (int w : lane.localSucc[v]) {
+        if (index[w] < 0) {
+          strongConnect(w);
+          lowlink[v] = std::min(lowlink[v], lowlink[w]);
+        } else if (onStack[w]) {
+          lowlink[v] = std::min(lowlink[v], index[w]);
+        }
+      }
+      if (lowlink[v] == index[v]) {
+        std::vector<int> component;
+        while (!stack.empty()) {
+          int w = stack.back();
+          stack.pop_back();
+          onStack[w] = 0;
+          component.push_back(w);
+          if (w == v) break;
+        }
+        sccs.push_back(component);
+      }
+    };
+    for (int local = 0; local < localCount; local ++) if (index[local] < 0) strongConnect(local);
+
+    lane.sccOfLocal.assign(localCount, -1);
+    lane.sccCost.assign(sccs.size(), 0);
+    lane.largestScc = 0;
+    for (size_t scc = 0; scc < sccs.size(); scc ++) {
+      lane.largestScc = std::max(lane.largestScc, static_cast<int>(sccs[scc].size()));
+      lane.sccCost[scc] = static_cast<int>(sccs[scc].size());
+      for (int local : sccs[scc]) lane.sccOfLocal[local] = static_cast<int>(scc);
+    }
+    lane.sccSucc.assign(sccs.size(), std::set<int>());
+    lane.sccPred.assign(sccs.size(), std::set<int>());
+    for (int local = 0; local < localCount; local ++) {
+      int fromScc = lane.sccOfLocal[local];
+      for (int toLocal : lane.localSucc[local]) {
+        int toScc = lane.sccOfLocal[toLocal];
+        if (fromScc == toScc) continue;
+        if (lane.sccSucc[fromScc].insert(toScc).second) {
+          lane.sccPred[toScc].insert(fromScc);
+          lane.sccEdgeCount ++;
+        }
+      }
+    }
+    std::vector<int> indegree(sccs.size(), 0);
+    std::deque<int> ready;
+    for (size_t scc = 0; scc < sccs.size(); scc ++) {
+      indegree[scc] = static_cast<int>(lane.sccPred[scc].size());
+      if (indegree[scc] == 0) ready.push_back(static_cast<int>(scc));
+    }
+    while (!ready.empty()) {
+      int scc = ready.front();
+      ready.pop_front();
+      lane.topo.push_back(scc);
+      for (int succ : lane.sccSucc[scc]) {
+        indegree[succ] --;
+        if (indegree[succ] == 0) ready.push_back(succ);
+      }
+    }
+    if (lane.topo.size() != sccs.size()) {
+      lane.valid = false;
+      lane.invalidReason = "condensation_toposort_failed";
+    }
+    return lane;
+  };
+
+  auto scheduleReadyBatchCap = [&](const ReadyBatchLaneGraph& lane, const std::vector<char>& active, int cap) {
+    ReadyBatchScheduleResult result;
+    if (!lane.valid || active.empty()) return result;
+    int sccCount = static_cast<int>(lane.sccCost.size());
+    std::vector<int> criticalPath(sccCount, 0);
+    for (auto iter = lane.topo.rbegin(); iter != lane.topo.rend(); ++ iter) {
+      int scc = *iter;
+      if (!active[scc]) continue;
+      int bestSucc = 0;
+      for (int succ : lane.sccSucc[scc]) if (active[succ]) bestSucc = std::max(bestSucc, criticalPath[succ]);
+      criticalPath[scc] = lane.sccCost[scc] + bestSucc;
+    }
+    std::vector<int> indegree(sccCount, 0), readyTime(sccCount, 0);
+    std::vector<std::tuple<int, int, int>> readyHeap;
+    for (int scc = 0; scc < sccCount; scc ++) {
+      if (!active[scc]) continue;
+      result.serial += lane.sccCost[scc];
+      for (int pred : lane.sccPred[scc]) if (active[pred]) indegree[scc] ++;
+      if (indegree[scc] == 0) readyHeap.push_back(std::make_tuple(criticalPath[scc], lane.sccCost[scc], scc));
+    }
+    std::make_heap(readyHeap.begin(), readyHeap.end());
+    int workerReady[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    while (!readyHeap.empty()) {
+      int worker = 0;
+      for (int w = 1; w < 8; w ++) if (workerReady[w] < workerReady[worker]) worker = w;
+      std::vector<int> chunk;
+      std::vector<std::tuple<int, int, int>> stash;
+      int chunkCost = 0;
+      int chunkReadyTime = 0;
+      while (!readyHeap.empty()) {
+        std::pop_heap(readyHeap.begin(), readyHeap.end());
+        std::tuple<int, int, int> item = readyHeap.back();
+        readyHeap.pop_back();
+        int scc = std::get<2>(item);
+        int cost = lane.sccCost[scc];
+        if (!chunk.empty() && chunkCost + cost > cap) {
+          stash.push_back(item);
+          break;
+        }
+        chunk.push_back(scc);
+        chunkCost += cost;
+        chunkReadyTime = std::max(chunkReadyTime, readyTime[scc]);
+        if (chunkCost >= cap) break;
+      }
+      for (const auto& item : stash) {
+        readyHeap.push_back(item);
+        std::push_heap(readyHeap.begin(), readyHeap.end());
+      }
+      if (chunk.empty()) break;
+      int start = std::max(workerReady[worker], chunkReadyTime);
+      int finish = start + chunkCost;
+      workerReady[worker] = finish;
+      result.dispatches ++;
+      for (int scc : chunk) {
+        for (int succ : lane.sccSucc[scc]) {
+          if (!active[succ]) continue;
+          readyTime[succ] = std::max(readyTime[succ], finish);
+          indegree[succ] --;
+          if (indegree[succ] == 0) {
+            readyHeap.push_back(std::make_tuple(criticalPath[succ], lane.sccCost[succ], succ));
+            std::push_heap(readyHeap.begin(), readyHeap.end());
+          }
+        }
+      }
+    }
+    for (int w = 0; w < 8; w ++) result.makespan = std::max(result.makespan, workerReady[w]);
+    return result;
+  };
+
+  std::vector<ReadyBatchLaneGraph> lanes;
+  lanes.push_back(buildReadyBatchLane("hot_576_583", std::vector<int>{576, 577, 578, 579, 580, 581, 582, 583}));
+  lanes.push_back(buildReadyBatchLane("early_39_44", std::vector<int>{39, 40, 42, 43, 44}));
+  lanes.push_back(buildReadyBatchLane("mid_557_family", std::vector<int>{531, 535, 553, 554, 555, 557, 558, 559, 560, 561, 562, 570, 571}));
+  for (ReadyBatchLaneGraph& lane : lanes) {
+    for (int cap : {1, 2, 4}) {
+      ReadyBatchCapStats stats;
+      stats.cap = cap;
+      if (lane.valid) {
+        std::vector<char> active(lane.sccCost.size(), 1);
+        ReadyBatchScheduleResult staticResult = scheduleReadyBatchCap(lane, active, cap);
+        stats.staticSerial = staticResult.serial;
+        stats.staticMakespan = staticResult.makespan;
+        stats.staticDispatches = staticResult.dispatches;
+      }
+      lane.caps.push_back(stats);
+    }
+  }
+
+  bool traceEnabled = false;
+  int traceCycles = 0;
+  const char* tracePath = std::getenv("GSIM_MT_READY_BATCH_TRACE");
+  if (tracePath != nullptr && tracePath[0] != '\0') {
+    std::ifstream trace(tracePath);
+    if (trace.good()) {
+      traceEnabled = true;
+      std::map<int, std::pair<int, int>> cppToLaneScc;
+      for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) {
+        const ReadyBatchLaneGraph& lane = lanes[laneIdx];
+        if (!lane.valid) continue;
+        for (size_t local = 0; local < lane.cppIds.size(); local ++) cppToLaneScc[lane.cppIds[local]] = std::make_pair(static_cast<int>(laneIdx), lane.sccOfLocal[local]);
+      }
+      std::string line;
+      while (std::getline(trace, line)) {
+        size_t pos = line.find(" tasks=");
+        if (line.find("[mt-dyn-trace]") == std::string::npos || pos == std::string::npos) continue;
+        traceCycles ++;
+        std::vector<std::vector<char>> active(lanes.size());
+        for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) active[laneIdx].assign(lanes[laneIdx].sccCost.size(), 0);
+        std::stringstream ss(line.substr(pos + 7));
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+          int cppId = std::atoi(item.c_str());
+          auto iter = cppToLaneScc.find(cppId);
+          if (iter == cppToLaneScc.end()) continue;
+          int laneIdx = iter->second.first;
+          int scc = iter->second.second;
+          if (laneIdx >= 0 && laneIdx < static_cast<int>(active.size()) && scc >= 0 && scc < static_cast<int>(active[laneIdx].size())) active[laneIdx][scc] = 1;
+        }
+        for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) {
+          ReadyBatchLaneGraph& lane = lanes[laneIdx];
+          if (!lane.valid) continue;
+          bool anyActive = false;
+          for (char value : active[laneIdx]) if (value) { anyActive = true; break; }
+          if (!anyActive) continue;
+          for (ReadyBatchCapStats& stats : lane.caps) {
+            ReadyBatchScheduleResult result = scheduleReadyBatchCap(lane, active[laneIdx], stats.cap);
+            stats.traceCycles ++;
+            stats.traceSerial += static_cast<uint64_t>(result.serial);
+            stats.traceMakespan += static_cast<uint64_t>(result.makespan);
+            stats.traceDispatches += static_cast<uint64_t>(result.dispatches);
+            stats.traceMakespans.push_back(result.makespan);
+            stats.traceDispatchCounts.push_back(result.dispatches);
+          }
+        }
+      }
+    }
+  }
+
+  fprintf(fp, "{\n");
+  fprintf(fp, "  \"format\": \"gsim.mt-ready-batch-lanes.v1\",\n");
+  fprintf(fp, "  \"candidate_kind\": \"report_only_lane_scc_ready_batch\",\n");
+  fprintf(fp, "  \"task_count\": %d,\n", superId);
+  fprintf(fp, "  \"trace\": {\"enabled\": %s, \"path\": ", traceEnabled ? "true" : "false");
+  if (tracePath != nullptr && tracePath[0] != '\0') fprintf(fp, "\"%s\"", jsonEscape(tracePath).c_str());
+  else fprintf(fp, "null");
+  fprintf(fp, ", \"cycles\": %d},\n", traceCycles);
+  fprintf(fp, "  \"lanes\": [\n");
+  for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) {
+    const ReadyBatchLaneGraph& lane = lanes[laneIdx];
+    fprintf(fp, "    {\n");
+    fprintf(fp, "      \"name\": \"%s\",\n", jsonEscape(lane.name).c_str());
+    fprintf(fp, "      \"valid\": %s,\n", lane.valid ? "true" : "false");
+    if (lane.valid) fprintf(fp, "      \"invalid_reason\": null,\n");
+    else fprintf(fp, "      \"invalid_reason\": \"%s\",\n", jsonEscape(lane.invalidReason).c_str());
+    fprintf(fp, "      \"region_indices\": ");
+    dumpJsonIntArray(fp, lane.regionIndices);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"task_count\": %d,\n", lane.taskCount);
+    fprintf(fp, "      \"member_node_cost\": %d,\n", lane.memberNodeCost);
+    fprintf(fp, "      \"active_word_span_sum\": %d,\n", lane.activeWordSpanSum);
+    fprintf(fp, "      \"scc_count\": %zu,\n", lane.sccCost.size());
+    fprintf(fp, "      \"largest_scc\": %d,\n", lane.largestScc);
+    fprintf(fp, "      \"scc_edge_count\": %d,\n", lane.sccEdgeCount);
+    fprintf(fp, "      \"dense_counter_bytes_u8_t8\": %zu,\n", lane.sccCost.size() * static_cast<size_t>(8));
+    fprintf(fp, "      \"regions\": [\n");
+    for (size_t idx = 0; idx < lane.regionIndices.size(); idx ++) {
+      int regionIndex = lane.regionIndices[idx];
+      if (regionIndex >= 0 && regionIndex < static_cast<int>(coarsePlan.regions.size())) {
+        const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
+        fprintf(fp, "        {\"region_index\": %d, \"begin_cpp_id\": %d, \"end_cpp_id\": %d, \"task_count\": %d, \"member_node_cost\": %d, \"active_word_span\": %d}%s\n",
+                regionIndex, region.beginCppId, region.endCppId, region.taskCount, region.memberNodeCost, region.activeWordSpan,
+                idx + 1 == lane.regionIndices.size() ? "" : ",");
+      } else {
+        fprintf(fp, "        {\"region_index\": %d, \"invalid\": true}%s\n", regionIndex, idx + 1 == lane.regionIndices.size() ? "" : ",");
+      }
+    }
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"caps\": [\n");
+    for (size_t capIdx = 0; capIdx < lane.caps.size(); capIdx ++) {
+      const ReadyBatchCapStats& stats = lane.caps[capIdx];
+      fprintf(fp, "        {\n");
+      fprintf(fp, "          \"cap\": %d,\n", stats.cap);
+      fprintf(fp, "          \"static_serial\": %d,\n", stats.staticSerial);
+      fprintf(fp, "          \"static_makespan\": %d,\n", stats.staticMakespan);
+      fprintf(fp, "          \"static_dispatches\": %d,\n", stats.staticDispatches);
+      double staticSpeedup = stats.staticMakespan == 0 ? 0.0 : static_cast<double>(stats.staticSerial) / static_cast<double>(stats.staticMakespan);
+      fprintf(fp, "          \"static_speedup\": %.6f,\n", staticSpeedup);
+      double traceSpeedup = stats.traceMakespan == 0 ? 0.0 : static_cast<double>(stats.traceSerial) / static_cast<double>(stats.traceMakespan);
+      fprintf(fp, "          \"trace\": {\"cycles\": %d, \"serial_total\": %lu, \"makespan_total\": %lu, \"dispatch_total\": %lu, \"aggregate_speedup\": %.6f, \"makespan_p50\": %d, \"makespan_p95\": %d, \"dispatch_p50\": %d, \"dispatch_p95\": %d}\n",
+              stats.traceCycles, stats.traceSerial, stats.traceMakespan, stats.traceDispatches, traceSpeedup,
+              readyBatchPctInt(stats.traceMakespans, 50), readyBatchPctInt(stats.traceMakespans, 95),
+              readyBatchPctInt(stats.traceDispatchCounts, 50), readyBatchPctInt(stats.traceDispatchCounts, 95));
+      fprintf(fp, "        }%s\n", capIdx + 1 == lane.caps.size() ? "" : ",");
+    }
+    fprintf(fp, "      ]\n");
+    fprintf(fp, "    }%s\n", laneIdx + 1 == lanes.size() ? "" : ",");
+  }
+  fprintf(fp, "  ]\n");
+  fprintf(fp, "}\n");
+  fclose(fp);
+  printf("[mt-ready-batch] wrote %zu lanes to %s\n", lanes.size(), path.c_str());
 }
 
 std::pair<int, int> cppId2flagIdx(int cppId) {
@@ -7436,6 +7815,7 @@ void graph::cppEmitter() {
   if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson();
   if (globalConfig.DumpMtRepCutLiteReport || globalConfig.MtRepCutLiteMode == "on") dumpMtRepCutLiteReport();
   if (globalConfig.DumpMtCoarseRegionReport || globalConfig.MtBatchFormationMode == "coarse") dumpMtCoarseRegionReport();
+  if (mtUseReadyBatchReport()) dumpMtReadyBatchReport();
 
   // 28c Phase 1A: remove stale SimTop*.cpp files from previous runs so the
   // linker never sees a cppEmitter file the current run did not regenerate.

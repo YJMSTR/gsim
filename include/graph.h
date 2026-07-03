@@ -100,6 +100,7 @@ class graph {
   void dumpMtScheduleJson();
   void dumpMtRepCutLiteReport();
   void dumpMtCoarseRegionReport();
+  void dumpMtReadyBatchReport();
   void usedBits();
   void traversal();
   void traversalNoTree();
