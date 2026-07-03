@@ -4446,6 +4446,28 @@ void graph::dumpMtReadyBatchReport() {
     fprintf(fp, "      \"largest_scc\": %d,\n", lane.largestScc);
     fprintf(fp, "      \"scc_edge_count\": %d,\n", lane.sccEdgeCount);
     fprintf(fp, "      \"dense_counter_bytes_u8_t8\": %zu,\n", lane.sccCost.size() * static_cast<size_t>(8));
+    fprintf(fp, "      \"scc_costs\": ");
+    dumpJsonIntArray(fp, lane.sccCost);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"topo_order\": ");
+    dumpJsonIntArray(fp, lane.topo);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"scc_edges\": [\n");
+    size_t readyBatchEdgeWritten = 0;
+    for (size_t fromScc = 0; fromScc < lane.sccSucc.size(); fromScc ++) {
+      for (int toScc : lane.sccSucc[fromScc]) {
+        fprintf(fp, "        {\"from\": %zu, \"to\": %d}%s\n",
+                fromScc, toScc, readyBatchEdgeWritten + 1 == static_cast<size_t>(lane.sccEdgeCount) ? "" : ",");
+        readyBatchEdgeWritten ++;
+      }
+    }
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"cpp_to_scc\": [\n");
+    for (size_t local = 0; local < lane.cppIds.size(); local ++) {
+      fprintf(fp, "        {\"cpp_id\": %d, \"scc\": %d}%s\n",
+              lane.cppIds[local], lane.sccOfLocal[local], local + 1 == lane.cppIds.size() ? "" : ",");
+    }
+    fprintf(fp, "      ],\n");
     fprintf(fp, "      \"regions\": [\n");
     for (size_t idx = 0; idx < lane.regionIndices.size(); idx ++) {
       int regionIndex = lane.regionIndices[idx];
