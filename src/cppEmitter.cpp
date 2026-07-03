@@ -4147,6 +4147,18 @@ void graph::dumpMtReadyBatchReport() {
     int taskCount = 0;
     int memberNodeCost = 0;
     int activeWordSpanSum = 0;
+    int envelopeBeginCppId = -1;
+    int envelopeEndCppId = -1;
+    std::vector<std::pair<int, int>> gapIntervals;
+    int gapTaskCount = 0;
+    int gapPureTaskCount = 0;
+    int gapSerialTaskCount = 0;
+    int gapStateUpdateTaskCount = 0;
+    int gapWorker0OnlyTaskCount = 0;
+    int gapOrderLaneToGapEdges = 0;
+    int gapOrderGapToLaneEdges = 0;
+    int gapActiveLaneToGapEdges = 0;
+    int gapActiveGapToLaneEdges = 0;
     std::vector<int> cppIds;
     std::map<int, int> cppToLocal;
     std::vector<std::set<int>> localSucc;
@@ -4194,6 +4206,61 @@ void graph::dumpMtReadyBatchReport() {
         lane.cppToLocal[cppId] = static_cast<int>(lane.cppIds.size());
         lane.cppIds.push_back(cppId);
       }
+    }
+    int previousRegionEnd = -1;
+    for (int regionIndex : regionIndices) {
+      const MtCoarseRegion& region = coarsePlan.regions[regionIndex];
+      if (lane.envelopeBeginCppId < 0 || region.beginCppId < lane.envelopeBeginCppId) lane.envelopeBeginCppId = region.beginCppId;
+      if (region.endCppId > lane.envelopeEndCppId) lane.envelopeEndCppId = region.endCppId;
+      if (previousRegionEnd >= 0 && previousRegionEnd < region.beginCppId) lane.gapIntervals.push_back(std::make_pair(previousRegionEnd, region.beginCppId));
+      previousRegionEnd = region.endCppId;
+    }
+    auto readyBatchIsGapCpp = [&](int cppId) {
+      return cppId >= lane.envelopeBeginCppId && cppId < lane.envelopeEndCppId && lane.cppToLocal.find(cppId) == lane.cppToLocal.end();
+    };
+    for (int cppId = lane.envelopeBeginCppId; cppId < lane.envelopeEndCppId; cppId ++) {
+      if (!readyBatchIsGapCpp(cppId)) continue;
+      auto taskIter = mtTasks.find(cppId);
+      if (taskIter == mtTasks.end()) continue;
+      lane.gapTaskCount ++;
+      if (taskIter->second.taskKind == "pure_compute") lane.gapPureTaskCount ++;
+      else lane.gapSerialTaskCount ++;
+      for (const std::string& reason : taskIter->second.serialReasons) {
+        if (reason == "state_update") lane.gapStateUpdateTaskCount ++;
+      }
+      if (hasWorker0OnlyReason(taskIter->second.serialReasons)) lane.gapWorker0OnlyTaskCount ++;
+    }
+    auto countReadyBatchGapEdges = [&](int fromCppId, SuperNode* super) {
+      if (super == nullptr) return;
+      bool fromLane = lane.cppToLocal.find(fromCppId) != lane.cppToLocal.end();
+      bool fromGap = readyBatchIsGapCpp(fromCppId);
+      if (!fromLane && !fromGap) return;
+      auto countTarget = [&](int toCppId, bool activeEdge) {
+        bool toLane = lane.cppToLocal.find(toCppId) != lane.cppToLocal.end();
+        bool toGap = readyBatchIsGapCpp(toCppId);
+        if (fromLane && toGap) {
+          if (activeEdge) lane.gapActiveLaneToGapEdges ++;
+          else lane.gapOrderLaneToGapEdges ++;
+        } else if (fromGap && toLane) {
+          if (activeEdge) lane.gapActiveGapToLaneEdges ++;
+          else lane.gapOrderGapToLaneEdges ++;
+        }
+      };
+      for (SuperNode* next : super->next) if (next && next->cppId >= 0) countTarget(next->cppId, false);
+      for (SuperNode* next : super->depNext) if (next && next->cppId >= 0) countTarget(next->cppId, false);
+      for (Node* member : super->member) {
+        if (!member) continue;
+        for (int activeId : member->nextNeedActivate) if (activeId >= 0) countTarget(activeId, true);
+      }
+    };
+    for (int cppId : lane.cppIds) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter != cppId2Super.end()) countReadyBatchGapEdges(cppId, superIter->second);
+    }
+    for (int cppId = lane.envelopeBeginCppId; cppId < lane.envelopeEndCppId; cppId ++) {
+      if (!readyBatchIsGapCpp(cppId)) continue;
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter != cppId2Super.end()) countReadyBatchGapEdges(cppId, superIter->second);
     }
     lane.localSucc.assign(lane.cppIds.size(), std::set<int>());
     for (int cppId : lane.cppIds) {
@@ -4442,6 +4509,25 @@ void graph::dumpMtReadyBatchReport() {
     fprintf(fp, "      \"task_count\": %d,\n", lane.taskCount);
     fprintf(fp, "      \"member_node_cost\": %d,\n", lane.memberNodeCost);
     fprintf(fp, "      \"active_word_span_sum\": %d,\n", lane.activeWordSpanSum);
+    fprintf(fp, "      \"envelope_begin_cpp_id\": %d,\n", lane.envelopeBeginCppId);
+    fprintf(fp, "      \"envelope_end_cpp_id\": %d,\n", lane.envelopeEndCppId);
+    fprintf(fp, "      \"gap_intervals\": [\n");
+    for (size_t gapIdx = 0; gapIdx < lane.gapIntervals.size(); gapIdx ++) {
+      fprintf(fp, "        {\"begin_cpp_id\": %d, \"end_cpp_id\": %d, \"task_count\": %d}%s\n",
+              lane.gapIntervals[gapIdx].first, lane.gapIntervals[gapIdx].second,
+              lane.gapIntervals[gapIdx].second - lane.gapIntervals[gapIdx].first,
+              gapIdx + 1 == lane.gapIntervals.size() ? "" : ",");
+    }
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"gap_task_count\": %d,\n", lane.gapTaskCount);
+    fprintf(fp, "      \"gap_pure_task_count\": %d,\n", lane.gapPureTaskCount);
+    fprintf(fp, "      \"gap_serial_task_count\": %d,\n", lane.gapSerialTaskCount);
+    fprintf(fp, "      \"gap_state_update_task_count\": %d,\n", lane.gapStateUpdateTaskCount);
+    fprintf(fp, "      \"gap_worker0_only_task_count\": %d,\n", lane.gapWorker0OnlyTaskCount);
+    fprintf(fp, "      \"gap_order_lane_to_gap_edges\": %d,\n", lane.gapOrderLaneToGapEdges);
+    fprintf(fp, "      \"gap_order_gap_to_lane_edges\": %d,\n", lane.gapOrderGapToLaneEdges);
+    fprintf(fp, "      \"gap_active_lane_to_gap_edges\": %d,\n", lane.gapActiveLaneToGapEdges);
+    fprintf(fp, "      \"gap_active_gap_to_lane_edges\": %d,\n", lane.gapActiveGapToLaneEdges);
     fprintf(fp, "      \"scc_count\": %zu,\n", lane.sccCost.size());
     fprintf(fp, "      \"largest_scc\": %d,\n", lane.largestScc);
     fprintf(fp, "      \"scc_edge_count\": %d,\n", lane.sccEdgeCount);
