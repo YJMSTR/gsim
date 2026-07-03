@@ -4422,6 +4422,15 @@ void graph::dumpMtReadyBatchReport() {
   lanes.push_back(buildReadyBatchLane("hot_576_583", std::vector<int>{576, 577, 578, 579, 580, 581, 582, 583}));
   lanes.push_back(buildReadyBatchLane("early_39_44", std::vector<int>{39, 40, 42, 43, 44}));
   lanes.push_back(buildReadyBatchLane("mid_557_family", std::vector<int>{531, 535, 553, 554, 555, 557, 558, 559, 560, 561, 562, 570, 571}));
+  lanes.push_back(buildReadyBatchLane("region_39", std::vector<int>{39}));
+  lanes.push_back(buildReadyBatchLane("region_40", std::vector<int>{40}));
+  lanes.push_back(buildReadyBatchLane("region_42", std::vector<int>{42}));
+  lanes.push_back(buildReadyBatchLane("region_44", std::vector<int>{44}));
+  lanes.push_back(buildReadyBatchLane("region_576", std::vector<int>{576}));
+  lanes.push_back(buildReadyBatchLane("region_577", std::vector<int>{577}));
+  lanes.push_back(buildReadyBatchLane("region_582", std::vector<int>{582}));
+  lanes.push_back(buildReadyBatchLane("region_583", std::vector<int>{583}));
+  lanes.push_back(buildReadyBatchLane("region_557", std::vector<int>{557}));
   for (ReadyBatchLaneGraph& lane : lanes) {
     for (int cap : {1, 2, 4}) {
       ReadyBatchCapStats stats;
