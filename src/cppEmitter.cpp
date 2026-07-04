@@ -5852,7 +5852,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
           } else {
             emitBodyLock(outerIndent + 4, "mtTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
           }
-          emitBodyLock(outerIndent + 4, "if (unlikely(mtProfileEnabled)) {\n");
+          emitBodyLock(outerIndent + 4, "if (mtProfileEnabled) {\n");
           emitBodyLock(outerIndent + 5, "mtProfileLocalTaskIds[worker].push_back(%d);\n", cppId);
           emitBodyLock(outerIndent + 5, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
           emitBodyLock(outerIndent + 4, "}\n");
@@ -5893,7 +5893,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
         } else {
           emitBodyLock(9, "mtTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
         }
-        emitBodyLock(9, "if (unlikely(mtProfileEnabled)) {\n");
+        emitBodyLock(9, "if (mtProfileEnabled) {\n");
         emitBodyLock(10, "mtProfileLocalTaskIds[worker].push_back(%d);\n", cppId);
         emitBodyLock(10, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
         emitBodyLock(9, "}\n");
@@ -6001,7 +6001,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
           } else {
             emitBodyLock(outerIndent + 4, "mtTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
           }
-          emitBodyLock(outerIndent + 4, "if (unlikely(mtProfileEnabled)) {\n");
+          emitBodyLock(outerIndent + 4, "if (mtProfileEnabled) {\n");
           emitBodyLock(outerIndent + 5, "mtProfileLocalTaskIds[worker].push_back(%d);\n", cppId);
           emitBodyLock(outerIndent + 5, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
           emitBodyLock(outerIndent + 4, "}\n");
@@ -6256,7 +6256,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "const SCoarseTaskRef &r = refs[i];\n");
   emitBodyLock(2, "if (mtWorkerCoarseFlags[worker][r.wordOffset] & r.mask) {\n");
   emitBodyLock(3, "(this->*r.fn)(mtWorkerCoarseFlags[worker][r.wordOffset], mtWorkerDeltas[worker]);\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(3, "if (mtProfileEnabled) {\n");
   emitBodyLock(4, "mtProfileLocalTaskIds[worker].push_back(r.cppId);\n");
   emitBodyLock(4, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
   emitBodyLock(3, "}\n");
@@ -6536,7 +6536,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(1, "static const bool kCoarseRegionAntichainWorker0Only[%zu] = {%s};\n", antichainWorker0OnlyValues.size(), mtJoinIntList(antichainWorker0OnlyValues).c_str());
   }
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "if ((unsigned)regionIndex >= %du) return;\n", a104EligibleCount);
   emitBodyLock(1, "const int regionTaskCount = kCoarseRegionTaskCount[regionIndex];\n");
   emitBodyLock(1, "const int regionBeginActiveWord = kCoarseRegionBeginActiveWord[regionIndex];\n");
@@ -6549,7 +6549,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "const int regionMTaskCount = kCoarseRegionMTaskCount[regionIndex];\n");
   emitBodyLock(1, "int activeMTaskCount = 0;\n");
   emitBodyLock(1, "int activeMTaskStaticCost = 0;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileCoarseRegionInvocations ++;\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
@@ -6591,7 +6591,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       emitBodyLock(3, "}\n");
       emitBodyLock(2, "}\n");
     } else {
-      emitBodyLock(2, "if (unlikely(mtProfileEnabled)) activeMTaskCount = mtCountActiveCoarseMTasks(regionIndex, coarseActiveWords, &activeMTaskStaticCost);\n");
+      emitBodyLock(2, "if (mtProfileEnabled) activeMTaskCount = mtCountActiveCoarseMTasks(regionIndex, coarseActiveWords, &activeMTaskStaticCost);\n");
     }
     emitBodyLock(2, "if (workerCount > regionMTaskCount) workerCount = regionMTaskCount;\n");
     emitBodyLock(2, "if (workerCount < 1) workerCount = 1;\n");
@@ -6606,14 +6606,14 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "coarseRuntimeActiveBits += __builtin_popcount((unsigned int)coarseActiveWords[w]);\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtCoarseMinActiveBits > 0 && coarseRuntimeActiveBits < mtCoarseMinActiveBits) workerCount = 1;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "int batchSizeBucket = regionTaskCount <= 1 ? 0 : (regionTaskCount == 2 ? 1 : (regionTaskCount <= 4 ? 2 : (regionTaskCount <= 8 ? 3 : (regionTaskCount <= 15 ? 4 : 5))));\n");
   emitBodyLock(2, "mtProfileBatchSizeHist[batchSizeBucket] ++;\n");
   emitBodyLock(2, "mtProfilePureBatchCount ++;\n");
   emitBodyLock(2, "mtProfileBatchMemberNodeCount += regionMemberNodeCount;\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled) && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "if (mtProfileCoarseSelectedWorkerCountHist.size() <= (size_t)workerCount) mtProfileCoarseSelectedWorkerCountHist.resize((size_t)workerCount + 1, 0);\n");
   emitBodyLock(2, "mtProfileCoarseSelectedWorkerCountHist[(size_t)workerCount] ++;\n");
   emitBodyLock(2, "mtProfileCoarseEstimatedUsefulWork += regionUsefulWork;\n");
@@ -6627,13 +6627,13 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (workerCount == 1) {\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileSkippedFakeParallelBatchCount ++;\n");
   emitBodyLock(3, "if (mtProfileEffectiveWorkerCountHist.size() <= 1) mtProfileEffectiveWorkerCountHist.resize(2, 0);\n");
   emitBodyLock(3, "mtProfileEffectiveWorkerCountHist[1] ++;\n");
   emitBodyLock(3, "mtProfileRejectConfiguredSingleWorker ++;\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(1, "} else if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "} else if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileTrueParallelBatchCount ++;\n");
   emitBodyLock(2, "if (workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
   emitBodyLock(2, "if (mtProfileEffectiveWorkerCountHist.size() <= (size_t)workerCount) mtProfileEffectiveWorkerCountHist.resize((size_t)workerCount + 1, 0);\n");
@@ -6641,7 +6641,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtWorkerDeltas.size() < (size_t)workerCount) mtWorkerDeltas.resize((size_t)workerCount);\n");
   emitBodyLock(1, "if (mtWorkerCoarseFlags.size() < (size_t)workerCount) mtWorkerCoarseFlags.resize((size_t)workerCount);\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign((size_t)workerCount, 0);\n");
   emitBodyLock(2, "if (mtProfileLocalTaskIds.size() < (size_t)workerCount) mtProfileLocalTaskIds.resize((size_t)workerCount);\n");
   emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) mtProfileLocalTaskIds[worker].clear();\n");
@@ -6663,7 +6663,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtWorkerDeltas[worker].clear();\n");
   emitBodyLock(3, "mtWorkerCoarseFlags[worker].assign(coarseActiveWords, coarseActiveWords + regionActiveWordSpan);\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileLocalWorkerTaskCount.assign((size_t)antichainWorkerCount, 0);\n");
   emitBodyLock(3, "if (mtProfileLocalTaskIds.size() < (size_t)antichainWorkerCount) mtProfileLocalTaskIds.resize((size_t)antichainWorkerCount);\n");
   emitBodyLock(3, "for (int worker = 0; worker < antichainWorkerCount; worker ++) mtProfileLocalTaskIds[worker].clear();\n");
@@ -6707,7 +6707,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(4, "}\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileCoarseMTaskDispatches += antichainMTaskCount;\n");
   emitBodyLock(3, "mtProfileCoarseAntichainDispatches ++;\n");
   emitBodyLock(3, "mtProfileCoarseWorkerJobs += antichainWorkerCount;\n");
@@ -6748,7 +6748,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "for (int word = 0; word < regionActiveWordSpan; word ++) {\n");
   emitBodyLock(3, "coarseActiveWords[word] |= mtCoarseRegionSharedFlags[regionIndex][word].load(std::memory_order_relaxed);\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileCoarseMergeWordScans += (uint64_t)antichainWorkerCount * (uint64_t)regionActiveWordSpan;\n");
   emitBodyLock(3, "for (int worker = 0; worker < antichainWorkerCount; worker ++) {\n");
   emitBodyLock(4, "mtProfileCoarseActivationDeltaEntries += mtProfileLocalActivationDeltaEntries[worker];\n");
@@ -6764,8 +6764,8 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(4, "for (int cppId : mtProfileLocalTaskIds[worker]) { if (cppId >= 0 && cppId < %d) { mtProfileTaskExecCount[cppId] ++; if (mtTraceCycleActive) mtProfileDynamicTraceTaskIds.push_back(cppId); } }\n", superId);
   emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled) && antichainWorkerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(2, "if (mtProfileEnabled && antichainWorkerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(1, "return;\n");
   emitBodyLock(1, "}\n");
   // 28c-2: mtask runtime is a runtime branch (env GSIM_MT_COARSE_RUNTIME=mtask|layered);
@@ -6827,7 +6827,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "mtWorkerDeltas[worker].clear();\n");
   emitBodyLock(2, "mtWorkerCoarseFlags[worker].assign(coarseActiveWords, coarseActiveWords + regionActiveWordSpan);\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileCoarseMTaskDispatches += regionMTaskCount;\n");
   emitBodyLock(2, "mtProfileCoarseWorkerJobs += mtaskWorkerCount;\n");
   emitBodyLock(2, "mtProfileCoarseFlagWordCopies += (uint64_t)mtaskWorkerCount * (uint64_t)regionActiveWordSpan;\n");
@@ -6857,18 +6857,18 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtWorkerPoolCoarseStaticActiveWordSpan = regionActiveWordSpan;\n");
   emitBodyLock(3, "mtWorkerPoolCurrentWorkerCount = dstaticRoundedWC;\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseBodyBegin;\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(3, "if (mtProfileEnabled) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
   if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled) mtWaitProbePostTp = std::chrono::steady_clock::now();\n");
   emitBodyLock(3, "mtWorkerPoolPost();\n");
   emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(regionIndex, dstaticRoundedWC, 0, regionBeginActiveWord, regionActiveWordSpan);\n");
   if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled && !mtWaitProbeWorkerFinishNs.empty()) mtWaitProbeWorkerFinishNs[0] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseWaitBegin;\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(3, "if (mtProfileEnabled) {\n");
   emitBodyLock(4, "mtPhaseWaitBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(4, "mtProfileCoarseBodyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(mtPhaseWaitBegin - mtPhaseBodyBegin).count();\n");
   emitBodyLock(3, "}\n");
   emitBodyLock(3, "mtWorkerPoolWaitForDone(dstaticRoundedWC - 1);\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
+  emitBodyLock(3, "if (mtProfileEnabled) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
   if (waitProbeCodegen) {
     emitBodyLock(3, "if (mtWaitProbeEnabled) {\n");
     emitBodyLock(4, "uint64_t mtwpWaitDone = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
@@ -6922,7 +6922,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   }
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "std::chrono::steady_clock::time_point mtPhaseBodyBegin;\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "mtWorkerPoolPost();\n");
   if (globalConfig.MtCoarseWorkerPolicyMode == "profitable") {
     emitBodyLock(2, "mtRunCoarseMTaskWorkerList(0, regionIndex, mtaskWorkerAssignments[0].data(), (int)mtaskWorkerAssignments[0].size());\n");
@@ -6930,12 +6930,12 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(2, "mtRunCoarseMTaskWorkerRange(0, regionIndex, mtWorkerPoolChunks[0].begin, mtWorkerPoolChunks[0].end);\n");
   }
   emitBodyLock(2, "std::chrono::steady_clock::time_point mtPhaseWaitBegin;\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtPhaseWaitBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(3, "mtProfileCoarseBodyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(mtPhaseWaitBegin - mtPhaseBodyBegin).count();\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtaskWorkerCount - 1);\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
   emitBodyLock(1, "} else {\n");
   emitBodyLock(2, "std::vector<std::thread> workers;\n");
   emitBodyLock(2, "workers.reserve(mtaskWorkerCount);\n");
@@ -6952,7 +6952,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "}\n");  // close `if (mtCoarseUseDStatic) ... else { ... }`
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileMergeBegin;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "for (int worker = 0; worker < mtaskWorkerCount; worker ++) {\n");
   emitBodyLock(2, "for (const ActivationDeltaEntry &entry : mtWorkerDeltas[worker].entries) {\n");
   emitBodyLock(3, "int localWord = entry.idx - regionBeginActiveWord;\n");
@@ -6965,7 +6965,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "for (int word = 0; word < regionActiveWordSpan; word ++) coarseActiveWords[word] |= mtWorkerCoarseFlags[worker][word];\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileCoarseMergeWordScans += (uint64_t)mtaskWorkerCount * (uint64_t)regionActiveWordSpan;\n");
   emitBodyLock(2, "for (int worker = 0; worker < mtaskWorkerCount; worker ++) {\n");
   emitBodyLock(3, "mtProfileCoarseActivationDeltaEntries += mtProfileLocalActivationDeltaEntries[worker];\n");
@@ -6981,12 +6981,12 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "for (int cppId : mtProfileLocalTaskIds[worker]) { if (cppId >= 0 && cppId < %d) { mtProfileTaskExecCount[cppId] ++; if (mtTraceCycleActive) mtProfileDynamicTraceTaskIds.push_back(cppId); } }\n", superId);
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   if (globalConfig.MtCoarseProfitabilityMode == "static") {
-    emitBodyLock(1, "if (unlikely(mtProfileEnabled) && mtaskWorkerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+    emitBodyLock(1, "if (mtProfileEnabled && mtaskWorkerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   } else {
-    emitBodyLock(1, "if (unlikely(mtProfileEnabled) && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+    emitBodyLock(1, "if (mtProfileEnabled && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   }
   emitBodyLock(1, "return;\n");
   emitBodyLock(1, "}\n");  // close `if (mtCoarseUseMTaskRuntime)`
@@ -7018,7 +7018,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "int layerWorkerCount = workerCount;\n");
   emitBodyLock(2, "if (layerWorkerCount > layerTaskCount) layerWorkerCount = layerTaskCount;\n");
   emitBodyLock(2, "if (layerWorkerCount < 1) layerWorkerCount = 1;\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileCoarseLayerDispatches ++;\n");
   emitBodyLock(3, "mtProfileCoarseWorkerJobs += layerWorkerCount;\n");
   emitBodyLock(3, "mtProfileCoarseFlagWordCopies += (uint64_t)workerCount * (uint64_t)regionActiveWordSpan;\n");
@@ -7036,16 +7036,16 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(4, "mtWorkerPoolChunks[(size_t)worker].end = (layerTaskCount * (worker + 1)) / layerWorkerCount;\n");
   emitBodyLock(3, "}\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseBodyBegin;\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(3, "if (mtProfileEnabled) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(3, "mtWorkerPoolPost();\n");
   emitBodyLock(3, "mtRunCoarseLayerWorkerRange(0, regionIndex, layer, mtWorkerPoolChunks[0].begin, mtWorkerPoolChunks[0].end);\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseWaitBegin;\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(3, "if (mtProfileEnabled) {\n");
   emitBodyLock(4, "mtPhaseWaitBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(4, "mtProfileCoarseBodyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(mtPhaseWaitBegin - mtPhaseBodyBegin).count();\n");
   emitBodyLock(3, "}\n");
   emitBodyLock(3, "mtWorkerPoolWaitForDone(layerWorkerCount - 1);\n");
-  emitBodyLock(3, "if (unlikely(mtProfileEnabled)) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
+  emitBodyLock(3, "if (mtProfileEnabled) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
   emitBodyLock(2, "} else {\n");
   emitBodyLock(3, "std::vector<std::thread> workers;\n");
   emitBodyLock(3, "workers.reserve(layerWorkerCount);\n");
@@ -7057,7 +7057,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "for (std::thread &worker : workers) worker.join();\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileMergeBegin;\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
   emitBodyLock(3, "for (int word = 0; word < regionActiveWordSpan; word ++) coarseActiveWords[word] |= mtWorkerCoarseFlags[worker][word];\n");
   emitBodyLock(3, "for (const ActivationDeltaEntry &entry : mtWorkerDeltas[worker].entries) {\n");
@@ -7070,7 +7070,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(4, "for (int word = 0; word < %d; word ++) activeFlags[word] = (uint%d_t)-1;\n", activeFlagNum, ACTIVE_WIDTH);
   emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileCoarseMergeWordScans += (uint64_t)layerWorkerCount * (uint64_t)regionActiveWordSpan;\n");
   emitBodyLock(3, "for (int worker = 0; worker < layerWorkerCount; worker ++) {\n");
   emitBodyLock(4, "mtProfileCoarseActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
@@ -7083,16 +7083,16 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(4, "for (int cppId : mtProfileLocalTaskIds[worker]) { if (cppId >= 0 && cppId < %d) { mtProfileTaskExecCount[cppId] ++; if (mtTraceCycleActive) mtProfileDynamicTraceTaskIds.push_back(cppId); } }\n", superId);
   emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "for (int worker = 0; worker < workerCount; worker ++) {\n");
   emitBodyLock(4, "mtProfileLocalWorkerTaskCount[worker] = 0;\n");
   emitBodyLock(4, "mtProfileLocalTaskIds[worker].clear();\n");
   emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled) && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled && workerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(0, "}\n");
 }
 
