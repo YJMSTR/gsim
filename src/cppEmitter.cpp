@@ -7794,7 +7794,7 @@ void graph::genResetAll() {
 void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::string& serialFastSuffix) {
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
-  emitBodyLock(1, "if (mtProfileEnabled) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "resetAll();\n");
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
@@ -7834,7 +7834,7 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
   // Dump before cycles++ so the trace line names the cycle whose substeps just ran.
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
   emitBodyLock(1, "cycles ++;\n");
-  emitBodyLock(1, "if (mtProfileEnabled) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
+  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
   emitBodyLock(0, "}\n");
 }
 
