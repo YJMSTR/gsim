@@ -7832,7 +7832,7 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
   }
 
   // Dump before cycles++ so the trace line names the cycle whose substeps just ran.
-  emitBodyLock(1, "dumpMtProfileDynamicTraceCycle();\n");
+  emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
   emitBodyLock(1, "cycles ++;\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
   emitBodyLock(0, "}\n");
