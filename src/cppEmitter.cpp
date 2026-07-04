@@ -5342,7 +5342,7 @@ void graph::genMtTaskHelper(SuperNode* super, bool buffered, const std::string& 
 
 void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType) {
   emitFuncDecl(0, "void S%s::mtRepCutLiteTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileRepCutLiteTaskCallsByCppId[%d].fetch_add(1, std::memory_order_relaxed);\n", super->cppId);
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileRepCutLiteTaskCallsByCppId[%d].fetch_add(1, std::memory_order_relaxed);\n", super->cppId);
   std::map<Node*, std::string> replacements = mtRepCutReplacementMap(clones);
   for (const MtRepCutClone& clone : clones) {
     for (const MtRepCutLocalDecl& localDecl : clone.localDecls) {
@@ -5368,7 +5368,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
       emitBodyLock(4, "case %d:\n", cppId);
       if (workerMode) {
         emitBodyLock(5, "if (mtWorkerFlags[worker] & 0x%lx) {\n", (uint64_t)1 << (cppId % ACTIVE_WIDTH));
-        emitBodyLock(6, "if (unlikely(mtProfileEnabled)) {\n");
+        emitBodyLock(6, "if (mtProfileEnabled) {\n");
         if (mtTasks[cppId].repcutRuntimeApplied) {
           emitBodyLock(7, "mtRepCutLiteTask%d(mtWorkerFlags[worker], mtWorkerDeltas[worker]);\n", cppId);
         } else {
@@ -5386,7 +5386,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
         emitBodyLock(5, "}\n");
       } else {
         emitBodyLock(5, "if (activeWord & 0x%lx) {\n", (uint64_t)1 << (cppId % ACTIVE_WIDTH));
-        emitBodyLock(6, "if (unlikely(mtProfileEnabled)) {\n");
+        emitBodyLock(6, "if (mtProfileEnabled) {\n");
         emitBodyLock(7, "std::chrono::steady_clock::time_point mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
         if (mtTasks[cppId].repcutRuntimeApplied) {
           emitBodyLock(7, "ActivationDelta mtDirectDelta;\n");
@@ -5607,12 +5607,12 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "int taskCount = endCppId - beginCppId;\n");
   emitBodyLock(1, "if (taskCount <= 0) return;\n");
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileBatchBegin;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "int workerCount = mtConfiguredWorkerCount;\n");
   emitBodyLock(1, "bool mtSkippedBelowMinBatch = false;\n");
   emitBodyLock(1, "bool mtSkippedForcedSerialBatch = false;\n");
   emitBodyLock(1, "if (taskCount < mtMinBatchTasks) {\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileRejectBelowMinBatch ++;\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileRejectBelowMinBatch ++;\n");
   emitBodyLock(2, "mtSkippedBelowMinBatch = true;\n");
   emitBodyLock(2, "workerCount = 1;\n");
   emitBodyLock(1, "}\n");
@@ -5626,7 +5626,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
       if (batch.forcedSerial) emitBodyLock(2, "case %d:\n", batch.beginCppId);
     }
     emitBodyLock(3, "mtSkippedForcedSerialBatch = true;\n");
-    emitBodyLock(3, "if (unlikely(mtProfileEnabled)) mtProfileRejectDependencyEdge ++;\n");
+    emitBodyLock(3, "if (mtProfileEnabled) mtProfileRejectDependencyEdge ++;\n");
     emitBodyLock(3, "workerCount = 1;\n");
     emitBodyLock(3, "break;\n");
     emitBodyLock(2, "default:\n");
@@ -5634,7 +5634,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(1, "}\n");
   }
   if (!semanticPlan.cutBatches.empty()) {
-    emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+    emitBodyLock(1, "if (mtProfileEnabled) {\n");
     emitBodyLock(2, "switch (beginCppId) {\n");
     for (size_t batchIndex = 0; batchIndex < semanticPlan.cutBatches.size(); batchIndex ++) {
       const MtRepCutBatch& batch = semanticPlan.cutBatches[batchIndex];
@@ -5667,13 +5667,13 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   }
   emitBodyLock(1, "if (workerCount > taskCount) workerCount = taskCount;\n");
   emitBodyLock(1, "if (workerCount < 2) workerCount = 1;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "int batchSizeBucket = taskCount <= 1 ? 0 : (taskCount == 2 ? 1 : (taskCount <= 4 ? 2 : (taskCount <= 8 ? 3 : (taskCount <= 15 ? 4 : 5))));\n");
   emitBodyLock(2, "mtProfileBatchSizeHist[batchSizeBucket] ++;\n");
   emitBodyLock(2, "mtProfilePureBatchCount ++;\n");
   emitBodyLock(1, "}\n");
   if (!semanticPlan.batchPlan.batches.empty()) {
-    emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+    emitBodyLock(1, "if (mtProfileEnabled) {\n");
     emitBodyLock(2, "switch (beginCppId) {\n");
     for (auto batch : semanticPlan.batchPlan.batches) {
       int memberNodeCount = 0;
@@ -5701,9 +5701,9 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(2, "}\n");
     emitBodyLock(1, "}\n");
   }
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled) && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
+  emitBodyLock(1, "if (mtProfileEnabled && mtProfileWorkerTaskCount.size() < (size_t)workerCount) mtProfileWorkerTaskCount.resize((size_t)workerCount, 0);\n");
   emitBodyLock(1, "if (workerCount == 1) {\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(2, "if (mtProfileEnabled) {\n");
   emitBodyLock(3, "mtProfileSkippedFakeParallelBatchCount ++;\n");
   emitBodyLock(3, "if (mtProfileEffectiveWorkerCountHist.size() <= 1) mtProfileEffectiveWorkerCountHist.resize(2, 0);\n");
   emitBodyLock(3, "mtProfileEffectiveWorkerCountHist[1] ++;\n");
@@ -5736,16 +5736,16 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(5, "break;\n");
   emitBodyLock(3, "}\n");
   emitBodyLock(2, "}\n");
-  emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(2, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(2, "return;\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileTrueParallelBatchCount ++;\n");
   emitBodyLock(2, "if (workerCount > mtProfileMaxWorkerCount) mtProfileMaxWorkerCount = workerCount;\n");
   emitBodyLock(2, "if (mtProfileEffectiveWorkerCountHist.size() <= (size_t)workerCount) mtProfileEffectiveWorkerCountHist.resize((size_t)workerCount + 1, 0);\n");
   emitBodyLock(2, "mtProfileEffectiveWorkerCountHist[(size_t)workerCount] ++;\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "mtProfileLocalWorkerTaskCount.assign((size_t)workerCount, 0);\n");
   emitBodyLock(2, "if (mtProfileLocalTaskIds.size() < (size_t)workerCount) mtProfileLocalTaskIds.resize((size_t)workerCount);\n");
   emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) mtProfileLocalTaskIds[worker].clear();\n");
@@ -5781,20 +5781,20 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "}\n");
   if (useCoarse) {
     emitBodyLock(2, "std::chrono::steady_clock::time_point mtPhaseBodyBegin;\n");
-    emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
+    emitBodyLock(2, "if (mtProfileEnabled) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
   }
   emitBodyLock(2, "mtWorkerPoolPost();\n");
   emitBodyLock(2, "mtRunPureBatchWorkerRange(0, mtWorkerPoolChunks[0].begin, mtWorkerPoolChunks[0].end);\n");
   if (useCoarse) {
     emitBodyLock(2, "std::chrono::steady_clock::time_point mtPhaseWaitBegin;\n");
-    emitBodyLock(2, "if (unlikely(mtProfileEnabled)) {\n");
+    emitBodyLock(2, "if (mtProfileEnabled) {\n");
     emitBodyLock(3, "mtPhaseWaitBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(3, "mtProfileCoarseBodyNs += std::chrono::duration_cast<std::chrono::nanoseconds>(mtPhaseWaitBegin - mtPhaseBodyBegin).count();\n");
     emitBodyLock(2, "}\n");
   }
   emitBodyLock(2, "mtWorkerPoolWaitForDone(workerCount - 1);\n");
   if (useCoarse) {
-    emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
+    emitBodyLock(2, "if (mtProfileEnabled) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
   }
   emitBodyLock(1, "} else {\n");
   emitBodyLock(2, "std::vector<std::thread> workers;\n");
@@ -5807,10 +5807,10 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "for (std::thread &worker : workers) worker.join();\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileMergeBegin;\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) activeWord |= mtWorkerFlags[worker];\n");
   emitBodyLock(1, "for (int worker = 0; worker < workerCount; worker ++) mtWorkerDeltas[worker].mergeInto(activeFlags);\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) {\n");
+  emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
   emitBodyLock(3, "mtProfileActivationDeltaEntries += mtWorkerDeltas[worker].entries.size();\n");
   emitBodyLock(3, "if (mtWorkerDeltas[worker].entries.size() > mtProfileActivationDeltaMaxEntriesPerWorker) mtProfileActivationDeltaMaxEntriesPerWorker = mtWorkerDeltas[worker].entries.size();\n");
@@ -5821,9 +5821,9 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(3, "for (int cppId : mtProfileLocalTaskIds[worker]) { if (cppId >= 0 && cppId < %d) { mtProfileTaskExecCount[cppId] ++; if (mtTraceCycleActive) mtProfileDynamicTraceTaskIds.push_back(cppId); } }\n", superId);
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
-  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileMergeWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileMergeBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
+  emitBodyLock(1, "if (mtProfileEnabled) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(0, "}\n");
 }
 
