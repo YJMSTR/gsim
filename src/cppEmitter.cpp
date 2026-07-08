@@ -1440,6 +1440,145 @@ static void mtDenseAddSuperEdges(MtDenseSchedule& schedule,
   }
 }
 
+// v248: faithful Verilator V3OrderParallel edge contraction on the SCC DAG. The key detail that
+// makes contraction tractable (missed by v237's budget-limited BFS that gave 3.2M false cycle
+// rejections) is Verilator's CP-bound-pruned, generation-tagged cycle check: a path fromp~>top
+// cannot exist if fromp.cpRev < top.cpRev+top.step OR fromp.cpFwd+fromp.step > top.cpFwd, so most
+// checks resolve in O(1). Merges the lowest edgeScore (merged local critical path) until liveCount
+// <= maxMTasks (=50*threads) or scoreLimit exceeded. worker0-only SCCs never merge with non-worker0.
+// Emits merged MTasks in Kahn topo order so ids are topo-monotone.
+static uint64_t mtDenseStepCostV(uint64_t c) {
+  if (c <= 1) return c;
+  uint64_t s = 1; while (s < c) s = s + s / 20 + 1; return s;
+}
+static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDenseSchedule& schedule,
+                                                                     int threadCount) {
+  const int n = static_cast<int>(schedule.sccs.size());
+  std::vector<MtDenseMTask> mtasks;
+  if (n == 0) return mtasks;
+  if (threadCount < 1) threadCount = 1;
+  auto sc = [&](int s) -> uint64_t { return (uint64_t)std::max(1, schedule.sccs[(size_t)s].memberNodeCost); };
+  std::vector<int> uf((size_t)n); for (int i = 0; i < n; i ++) uf[(size_t)i] = i;
+  std::function<int(int)> find = [&](int x){ while (uf[(size_t)x]!=x){ uf[(size_t)x]=uf[(size_t)uf[(size_t)x]]; x=uf[(size_t)x]; } return x; };
+  std::vector<uint64_t> gcost((size_t)n), gF((size_t)n, 0), gR((size_t)n, 0);
+  std::vector<bool> gw0((size_t)n);
+  std::vector<std::set<int>> gS((size_t)n), gP((size_t)n);
+  for (int i = 0; i < n; i ++) { gcost[(size_t)i] = sc(i); gw0[(size_t)i] = schedule.sccs[(size_t)i].workerZeroOnly; }
+  for (int u = 0; u < n; u ++) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < n) { gS[(size_t)u].insert(v); gP[(size_t)v].insert(u); }
+  // Forward (to-end) and reverse (from-start) stepped critical paths over the SCC DAG (topo by id).
+  for (int u = n - 1; u >= 0; u --) { uint64_t b = 0; for (int v : gS[(size_t)u]) b = std::max(b, gF[(size_t)v] + mtDenseStepCostV(gcost[(size_t)v])); gF[(size_t)u] = b; }
+  for (int u = 0; u < n; u ++) { uint64_t b = 0; for (int p : gP[(size_t)u]) b = std::max(b, gR[(size_t)p] + mtDenseStepCostV(gcost[(size_t)p])); gR[(size_t)u] = b; }
+  const uint64_t totalCost = [&]{ uint64_t c = 0; for (int i = 0; i < n; i ++) c += sc(i); return c; }();
+  int maxMTasks = std::max(threadCount, 50 * threadCount);
+  { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT"); if (e && e[0]) { int v = std::atoi(e); if (v > threadCount) maxMTasks = v; } }
+  int capMul = 3;
+  { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_CAP"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) capMul = v; } }
+  const uint64_t perMTaskCap = std::max<uint64_t>(1, (totalCost / (uint64_t)maxMTasks) * (uint64_t)capMul);
+  bool sibEnabled = true;
+  { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_SIBLING"); if (e && e[0] == '0') sibEnabled = false; }
+  // CP-bound-pruned, generation-tagged DFS: does a path root(frm)~>root(to) exist (excluding the
+  // direct frm->to edge, which the caller removes temporarily)?
+  std::vector<uint32_t> gen((size_t)n, 0); uint32_t curGen = 0;
+  // Sound interval bounds for pruning (four per group): reverse-CP range [gRmin,gRmax] and
+  // forward-CP range [gFmin,gFmax] over the group's members. During a path search to `to`, a group
+  // x is skipped only if it provably cannot precede ANY member of to (gRmin[x] > gRmax[to] or
+  // gFmax[x] < gFmin[to]) -- conservative, so the DFS never wrongly prunes a real path.
+  std::vector<uint64_t> gRmin((size_t)n), gRmax((size_t)n), gFmin((size_t)n), gFmax((size_t)n);
+  for (int i = 0; i < n; i ++) { gRmin[(size_t)i] = gRmax[(size_t)i] = gR[(size_t)i]; gFmin[(size_t)i] = gFmax[(size_t)i] = gF[(size_t)i]; }
+  std::function<bool(int,int)> pathExists = [&](int frm, int to) -> bool {
+    curGen ++;
+    // Sound target bounds: to's members span reverse-CP up to gRmax and forward-CP down to gFmin.
+    const uint64_t toRmax = gRmax[(size_t)to], toFmin = gFmin[(size_t)to];
+    std::vector<int> st; st.push_back(find(frm));
+    while (!st.empty()) {
+      int x = find(st.back()); st.pop_back();
+      if (x == to) return true;
+      if (gen[(size_t)x] == curGen) continue;
+      gen[(size_t)x] = curGen;
+      // Sound prune: skip x only if EVERY member of x cannot precede ANY member of to: x's earliest
+      // member starts after to's latest (gRmin[x] > toRmax), or x's latest member ends (forward)
+      // before to's earliest (gFmax[x] < toFmin).
+      if (gRmin[(size_t)x] > toRmax) continue;
+      if (gFmax[(size_t)x] < toFmin) continue;
+      for (int s2 : gS[(size_t)x]) { int rs = find(s2); if (rs != x) st.push_back(rs); }
+    }
+    return false;
+  };
+  auto edgeScore = [&](int a, int b) -> uint64_t {
+    return std::max(gF[(size_t)a], gF[(size_t)b]) + std::max(gR[(size_t)a], gR[(size_t)b]) + mtDenseStepCostV(gcost[(size_t)a] + gcost[(size_t)b]);
+  };
+  struct Cand { uint64_t score; int a; int b; bool sibling; };
+  struct Cmp { bool operator()(const Cand&x,const Cand&y) const { return x.score > y.score; } };
+  std::priority_queue<Cand, std::vector<Cand>, Cmp> pq;
+  auto pushEdges = [&](int r) {
+    for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) pq.push({edgeScore(r, rs), r, rs, false}); }
+  };
+  // Sibling candidates: two groups sharing a common predecessor (independent -> cycle-free to merge).
+  // Verilator's SiblingMC. These bypass the diamond-mesh edge-cycle wall (v237/v248 saw ~1M edge
+  // cycle rejections). Seed from each group's successors' shared-parent sets, bounded per node.
+  auto pushSiblings = [&](int r) {
+    // siblings = other successors of r's predecessors (share a common predecessor -> independent).
+    int emitted = 0; const int sibCap = 8;
+    for (int p : gP[(size_t)r]) { int rp = find(p);
+      for (int s2 : gS[(size_t)rp]) { int rs = find(s2);
+        if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({edgeScore(r, rs), r, rs, true}); if (++ emitted >= sibCap) return; } } }
+  };
+  for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
+  int live = n; uint64_t merges = 0, cycRej = 0, sibMerges = 0;
+  while (live > maxMTasks && !pq.empty()) {
+    Cand c = pq.top(); pq.pop();
+    int a = find(c.a), b = find(c.b);
+    if (a == b || gw0[(size_t)a] != gw0[(size_t)b]) continue;
+    if (gcost[(size_t)a] + gcost[(size_t)b] > perMTaskCap) continue;
+    bool cyc;
+    if (c.sibling) {
+      // Sibling merge: no direct edge assumed. Cycle-safe iff neither a~>b nor b~>a.
+      if (gS[(size_t)a].count(b) || gS[(size_t)b].count(a)) continue; // became adjacent; let edge path handle
+      cyc = pathExists(a, b) || pathExists(b, a);
+      if (cyc) { cycRej ++; continue; }
+    } else {
+      if (gS[(size_t)a].find(b) == gS[(size_t)a].end()) continue;
+      // Cycle-safe iff no ALTERNATE path a~>b once the direct edge is excluded.
+      gS[(size_t)a].erase(b); gP[(size_t)b].erase(a);
+      cyc = pathExists(a, b);
+      if (cyc) { gS[(size_t)a].insert(b); gP[(size_t)b].insert(a); cycRej ++; continue; }
+    }
+    // merge b into a
+    uf[(size_t)b] = a; gcost[(size_t)a] += gcost[(size_t)b];
+    gF[(size_t)a] = std::max(gF[(size_t)a], gF[(size_t)b]); gR[(size_t)a] = std::max(gR[(size_t)a], gR[(size_t)b]);
+    gRmin[(size_t)a] = std::min(gRmin[(size_t)a], gRmin[(size_t)b]); gRmax[(size_t)a] = std::max(gRmax[(size_t)a], gRmax[(size_t)b]);
+    gFmin[(size_t)a] = std::min(gFmin[(size_t)a], gFmin[(size_t)b]); gFmax[(size_t)a] = std::max(gFmax[(size_t)a], gFmax[(size_t)b]);
+    for (int s2 : gS[(size_t)b]) { int rs = find(s2); if (rs != a) { gS[(size_t)a].insert(rs); gP[(size_t)rs].insert(a); } }
+    for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) { gP[(size_t)a].insert(rp); gS[(size_t)rp].insert(a); } }
+    gS[(size_t)a].erase(a); gP[(size_t)a].erase(a); gS[(size_t)a].erase(b); gP[(size_t)a].erase(b);
+    live --; merges ++; if (c.sibling) sibMerges ++;
+    pushEdges(a); if (sibEnabled) pushSiblings(a);
+    for (int p : gP[(size_t)a]) { int rp = find(p); if (rp != a && gw0[(size_t)rp] == gw0[(size_t)a] && gcost[(size_t)rp] + gcost[(size_t)a] <= perMTaskCap) pq.push({edgeScore(rp, a), rp, a, false}); }
+  }
+  // Materialize groups in Kahn topo order for monotone ids.
+  std::map<int,int> rootIdx; for (int i = 0; i < n; i ++) { int r = find(i); if (!rootIdx.count(r)) rootIdx[r] = (int)rootIdx.size(); }
+  int R = (int)rootIdx.size();
+  std::vector<std::set<int>> rS((size_t)R), rP((size_t)R);
+  for (int u = 0; u < n; u ++) { int ru = rootIdx[find(u)]; for (int v : schedule.sccs[(size_t)u].succSccs) { if (v < 0 || v >= n) continue; int rv = rootIdx[find(v)]; if (rv != ru) { rS[(size_t)ru].insert(rv); rP[(size_t)rv].insert(ru); } } }
+  std::vector<int> minScc((size_t)R, INT32_MAX);
+  for (int s : schedule.topoSccOrder) { auto it = rootIdx.find(find(s)); if (it != rootIdx.end()) minScc[(size_t)it->second] = std::min(minScc[(size_t)it->second], s); }
+  std::vector<int> indeg((size_t)R, 0); for (int i = 0; i < R; i ++) indeg[(size_t)i] = (int)rP[(size_t)i].size();
+  auto cmp = [&](int a, int b){ if (minScc[(size_t)a] != minScc[(size_t)b]) return minScc[(size_t)a] > minScc[(size_t)b]; return a > b; };
+  std::priority_queue<int, std::vector<int>, decltype(cmp)> rq(cmp);
+  for (int i = 0; i < R; i ++) if (indeg[(size_t)i] == 0) rq.push(i);
+  std::vector<int> rootOrder((size_t)R, -1); int nextId = 0;
+  while (!rq.empty()) { int u = rq.top(); rq.pop(); rootOrder[(size_t)u] = nextId ++; for (int v : rS[(size_t)u]) if (-- indeg[(size_t)v] == 0) rq.push(v); }
+  Assert(nextId == R, "verilator contraction cyclic MTask graph (%d/%d)", nextId, R);
+  mtasks.assign((size_t)R, MtDenseMTask());
+  std::vector<int> sccToMTask((size_t)n, -1);
+  for (int s : schedule.topoSccOrder) { auto it = rootIdx.find(find(s)); if (it == rootIdx.end()) continue; int mi = rootOrder[(size_t)it->second]; MtDenseMTask& mt = mtasks[(size_t)mi]; mt.sccIds.push_back(s); mt.staticCost += schedule.sccs[(size_t)s].staticCost; mt.schedCost += (int)sc(s); mt.taskCount += (int)schedule.sccs[(size_t)s].cppIds.size(); mt.workerZeroOnly = mt.workerZeroOnly || schedule.sccs[(size_t)s].workerZeroOnly; sccToMTask[(size_t)s] = mi; }
+  std::vector<std::set<int>> predSets((size_t)R), succSets((size_t)R);
+  for (int fromScc = 0; fromScc < n; fromScc ++) { int fm = sccToMTask[(size_t)fromScc]; if (fm < 0) continue; for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) { int tm = (toScc >= 0 && toScc < n) ? sccToMTask[(size_t)toScc] : -1; if (tm < 0 || tm == fm) continue; succSets[(size_t)fm].insert(tm); predSets[(size_t)tm].insert(fm); } }
+  for (int mi = 0; mi < R; mi ++) { mtasks[(size_t)mi].predMTasks.assign(predSets[(size_t)mi].begin(), predSets[(size_t)mi].end()); mtasks[(size_t)mi].succMTasks.assign(succSets[(size_t)mi].begin(), succSets[(size_t)mi].end()); }
+  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu maxMTasks=%d\n", n, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, maxMTasks);
+  return mtasks;
+}
+
 static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSchedule& schedule,
                                                                  int threadCount) {
   // Level-bucketed sibling contraction (Verilator-inspired, adapted for gsim's diamond-mesh
@@ -1880,8 +2019,12 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     for (int ri = 0; ri < static_cast<int>(ready.size()); ri ++) {
       int mtaskId = ready[(size_t)ri];
       const MtDenseMTask& mtask = mtasks[(size_t)mtaskId];
+      // Reserve thread 0 for worker0-only (pinned side-effect) MTasks: non-worker0 MTasks start
+      // their thread search at 1 when threadCount>1, so the scheduler does not pile parallel work
+      // onto thread 0 and then serialize the pinned load behind it (the v246 52x imbalance).
+      int workerStart = mtask.workerZeroOnly ? 0 : (threadCount > 1 ? 1 : 0);
       int workerLimit = mtask.workerZeroOnly ? 1 : threadCount;
-      for (int worker = 0; worker < workerLimit; worker ++) {
+      for (int worker = workerStart; worker < workerLimit; worker ++) {
         long long timeBegin = busyUntil[(size_t)worker];
         for (int pred : mtask.predMTasks) {
           if (pred < 0 || pred >= n) continue;
@@ -2240,12 +2383,13 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
     if (threadCount < 1) threadCount = 1;
 
-    if (mtUseDenseCpContraction()) {
+    if (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1') {
+      schedule.mtasks = mtBuildDenseMTasksVerilatorContract(schedule, threadCount);
+    } else if (mtUseDenseCpContraction()) {
       schedule.mtasks = mtBuildDenseMTasksCpContraction(schedule, threadCount);
     } else {
       schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
     }
-    // v243: renumber MTasks by list-schedule (earliest-start) order so the fixed-order runtime
     // executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
     // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.
     bool schedOrder = false;
