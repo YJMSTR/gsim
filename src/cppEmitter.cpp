@@ -1849,6 +1849,73 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
   return std::make_pair(assignment, makespan);
 }
 
+// v243: list-scheduler that returns BOTH the worker assignment AND the schedule order (the
+// sequence in which MTasks are scheduled). Renumbering MTask ids by this order makes the
+// fixed-order runtime (which runs each worker's MTasks in ascending global id) execute them in
+// earliest-start schedule order -- Verilator's static per-worker chain behavior -- with no
+// runtime change. The order is a valid topological order (only ready MTasks are scheduled), so
+// ids stay topo-monotone (succ>from) as the runtime protocol / transitive reduction require.
+static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount,
+                                      std::vector<int>& outAssign, std::vector<int>& outOrder) {
+  if (threadCount < 1) threadCount = 1;
+  const int n = static_cast<int>(mtasks.size());
+  auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
+  outAssign.assign((size_t)n, -1);
+  outOrder.clear(); outOrder.reserve((size_t)n);
+  std::vector<long long> completion((size_t)n, 0);
+  std::vector<long long> busyUntil((size_t)threadCount, 0);
+  std::vector<int> remainingPreds((size_t)n, 0);
+  std::vector<long long> priority((size_t)n, 0);
+  for (int i = 0; i < n; i ++) remainingPreds[(size_t)i] = static_cast<int>(mtasks[(size_t)i].predMTasks.size());
+  for (int i = n - 1; i >= 0; i --) {
+    long long best = 0;
+    for (int succ : mtasks[(size_t)i].succMTasks) if (succ >= 0 && succ < n) best = std::max(best, priority[(size_t)succ]);
+    priority[(size_t)i] = costOf(mtasks[(size_t)i]) + best;
+  }
+  std::vector<int> ready;
+  for (int i = 0; i < n; i ++) if (remainingPreds[(size_t)i] == 0) ready.push_back(i);
+  while (!ready.empty()) {
+    int bestReadyIndex = -1, bestMTask = -1, bestWorker = 0;
+    long long bestTime = std::numeric_limits<long long>::max();
+    for (int ri = 0; ri < static_cast<int>(ready.size()); ri ++) {
+      int mtaskId = ready[(size_t)ri];
+      const MtDenseMTask& mtask = mtasks[(size_t)mtaskId];
+      int workerLimit = mtask.workerZeroOnly ? 1 : threadCount;
+      for (int worker = 0; worker < workerLimit; worker ++) {
+        long long timeBegin = busyUntil[(size_t)worker];
+        for (int pred : mtask.predMTasks) {
+          if (pred < 0 || pred >= n) continue;
+          long long predEnd = completion[(size_t)pred];
+          int predWorker = outAssign[(size_t)pred];
+          if (predWorker >= 0 && predWorker != worker) predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
+          if (predEnd > timeBegin) timeBegin = predEnd;
+        }
+        if (timeBegin < bestTime ||
+            (timeBegin == bestTime && bestMTask >= 0 && priority[(size_t)mtaskId] > priority[(size_t)bestMTask]) ||
+            (timeBegin == bestTime && bestMTask >= 0 && priority[(size_t)mtaskId] == priority[(size_t)bestMTask] && mtaskId < bestMTask)) {
+          bestTime = timeBegin; bestReadyIndex = ri; bestMTask = mtaskId; bestWorker = worker;
+        }
+      }
+    }
+    if (bestMTask < 0) break;
+    outAssign[(size_t)bestMTask] = bestWorker;
+    completion[(size_t)bestMTask] = bestTime + std::max(1, costOf(mtasks[(size_t)bestMTask]));
+    busyUntil[(size_t)bestWorker] = completion[(size_t)bestMTask];
+    outOrder.push_back(bestMTask);
+    ready[(size_t)bestReadyIndex] = ready.back(); ready.pop_back();
+    for (int succ : mtasks[(size_t)bestMTask].succMTasks) {
+      if (succ < 0 || succ >= n) continue;
+      if (-- remainingPreds[(size_t)succ] == 0) ready.push_back(succ);
+    }
+  }
+  // Any unscheduled (shouldn't happen for a DAG) appended in id order.
+  if (static_cast<int>(outOrder.size()) != n) {
+    std::vector<char> seen((size_t)n, 0);
+    for (int m : outOrder) seen[(size_t)m] = 1;
+    for (int i = 0; i < n; i ++) if (!seen[(size_t)i]) { outOrder.push_back(i); if (outAssign[(size_t)i] < 0) outAssign[(size_t)i] = mtasks[(size_t)i].workerZeroOnly ? 0 : 0; }
+  }
+}
+
 static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {
   MtDenseSchedule schedule;
   schedule.codegenEnabled = codegenEnabled;
@@ -2178,10 +2245,47 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     } else {
       schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
     }
+    // v243: renumber MTasks by list-schedule (earliest-start) order so the fixed-order runtime
+    // executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
+    // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.
+    bool schedOrder = false;
+    { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_ORDER"); schedOrder = e && e[0] && e[0] != '0'; }
+    std::vector<int> schedOrderAssign;
+    if (schedOrder && static_cast<int>(schedule.mtasks.size()) > 1) {
+      std::vector<int> assignTmp, orderTmp;
+      mtBuildDenseScheduleOrder(schedule.mtasks, threadCount, assignTmp, orderTmp);
+      const int n = static_cast<int>(schedule.mtasks.size());
+      if (static_cast<int>(orderTmp.size()) == n) {
+        std::vector<int> newId((size_t)n, -1);
+        for (int newPos = 0; newPos < n; newPos ++) newId[(size_t)orderTmp[(size_t)newPos]] = newPos;
+        std::vector<MtDenseMTask> reordered((size_t)n);
+        schedOrderAssign.assign((size_t)n, 0);
+        for (int oldId = 0; oldId < n; oldId ++) {
+          int ni = newId[(size_t)oldId];
+          reordered[(size_t)ni] = schedule.mtasks[(size_t)oldId];
+          schedOrderAssign[(size_t)ni] = assignTmp[(size_t)oldId];
+        }
+        // Remap pred/succ MTask ids to new numbering.
+        for (int ni = 0; ni < n; ni ++) {
+          for (int& p : reordered[(size_t)ni].predMTasks) if (p >= 0 && p < n) p = newId[(size_t)p];
+          for (int& s : reordered[(size_t)ni].succMTasks) if (s >= 0 && s < n) s = newId[(size_t)s];
+          std::sort(reordered[(size_t)ni].predMTasks.begin(), reordered[(size_t)ni].predMTasks.end());
+          std::sort(reordered[(size_t)ni].succMTasks.begin(), reordered[(size_t)ni].succMTasks.end());
+        }
+        schedule.mtasks.swap(reordered);
+        fprintf(stderr, "[mt-dense-schedorder] renumbered %d MTasks by list-schedule order\n", n);
+      }
+    }
     int nMTasks = static_cast<int>(schedule.mtasks.size());
     schedule.mtaskThreadAssign.resize(nMTasks);
     bool lptAssign = false;
     { const char* e = std::getenv("GSIM_MT_DENSE_LPT_ASSIGN"); lptAssign = e && e[0] && e[0] != '0'; }
+    if (!lptAssign && !schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
+      // v243: schedule-order ids WITHOUT LPT -> use the list-scheduler's own (earliest-free)
+      // assignment, co-designed with the order. With LPT on, we instead keep schedule-order ids
+      // (reduced stalls) but override with cost-balanced LPT assignment below.
+      for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : schedOrderAssign[(size_t)i];
+    }
     if (lptAssign && nMTasks > 0) {
       // LPT (longest-processing-time) balancing by real dense work (schedCost=member cost, else
       // staticCost). Sorts non-worker0 MTasks by descending cost, greedily assigns each to the
@@ -2197,6 +2301,8 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
         int best = 0; for (int t = 1; t < threadCount; t ++) if (loads[(size_t)t] < loads[(size_t)best]) best = t;
         schedule.mtaskThreadAssign[(size_t)i] = best; loads[(size_t)best] += mtCost(i);
       }
+    } else if (!schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
+      // schedule-order assignment already installed above; nothing to do.
     } else if (mtUseDensePackThreadsAssignment() && nMTasks > 0) {
       std::vector<int> packAssign = mtBuildDensePackThreadsAssignment(schedule.mtasks, threadCount).first;
       bool ok = true;
@@ -2208,6 +2314,12 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
       }
     } else {
       for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : (i % threadCount);
+    }
+    // v243: verify MTask ids are topologically monotone (every edge from<to) after any renumber.
+    for (int mi = 0; mi < nMTasks; mi ++) {
+      for (int s : schedule.mtasks[(size_t)mi].succMTasks) {
+        Assert(s > mi, "dense MTask id order not topo-monotone: edge %d->%d", mi, s);
+      }
     }
   }
 
