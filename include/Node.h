@@ -158,9 +158,19 @@ class Node {
   bool nodeIsRoot = false;
 
 /* used in cppEmitter */
+  struct ActivationOriginRecord {
+    int fromCppId = -1;
+    int toCppId = -1;
+    int sourceNodeId = -1;
+    int targetNodeId = -1;
+    NodeType sourceNodeType = NODE_INVALID;
+    NodeType targetNodeType = NODE_INVALID;
+    std::string sourceNodeName;
+    std::string targetNodeName;
+    std::string reason;
+  };
   std::set<int> nextActiveId;
   std::set<int> nextNeedActivate;
-
   void updateInfo(TypeInfo* info);
   void setType(int _width, bool _sign) {
     width = _width;
@@ -289,6 +299,8 @@ class Node {
   bool anyExtEdge();
   bool needActivate();
   bool anyNextActive();
+  const std::vector<ActivationOriginRecord>& activationOrigins() const;
+  void recordNextActiveOrigin(int toCppId, Node* targetNode, const char* reason);
   void updateActivate();
   void updateNeedActivate(std::set<int>& alwaysActive);
   void removeConnection();

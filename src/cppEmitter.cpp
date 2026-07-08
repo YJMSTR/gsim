@@ -14,13 +14,16 @@
 #include <deque>
 #include <functional>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <set>
+#include <queue>
 #include <stack>
 #include <string>
 #include <tuple>
 #include <sstream>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
@@ -35,6 +38,34 @@
 #ifdef DIFFTEST_PER_SIG
 FILE* sigFile = nullptr;
 #endif
+
+static bool generatedOutputFilesEqual(const std::string& lhsPath, const std::string& rhsPath) {
+  std::ifstream lhs(lhsPath, std::ios::binary);
+  std::ifstream rhs(rhsPath, std::ios::binary);
+  if (!lhs.good() || !rhs.good()) return false;
+  static constexpr size_t kBufferSize = 1 << 16;
+  std::vector<char> lhsBuffer(kBufferSize);
+  std::vector<char> rhsBuffer(kBufferSize);
+  while (lhs.good() || rhs.good()) {
+    lhs.read(lhsBuffer.data(), static_cast<std::streamsize>(lhsBuffer.size()));
+    rhs.read(rhsBuffer.data(), static_cast<std::streamsize>(rhsBuffer.size()));
+    std::streamsize lhsCount = lhs.gcount();
+    std::streamsize rhsCount = rhs.gcount();
+    if (lhsCount != rhsCount) return false;
+    if (lhsCount == 0) break;
+    if (!std::equal(lhsBuffer.begin(), lhsBuffer.begin() + lhsCount, rhsBuffer.begin())) return false;
+  }
+  return true;
+}
+
+static void commitStableOutputFile(const std::string& tmpPath, const std::string& finalPath) {
+  if (tmpPath.empty()) return;
+  if (generatedOutputFilesEqual(tmpPath, finalPath)) {
+    assert(std::remove(tmpPath.c_str()) == 0);
+    return;
+  }
+  assert(std::rename(tmpPath.c_str(), finalPath.c_str()) == 0);
+}
 
 #define RESET_NAME(node) (node->name + "$RESET")
 #define emitFuncDecl(indent, ...) __emitSrc(indent, true, true, NULL, __VA_ARGS__)
@@ -56,6 +87,7 @@ static std::vector<std::vector<int>> mtStepActiveWordGuards;
 static std::vector<char> mtStepActiveWordGuardable;
 
 static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
+static std::map<Node*, std::pair<int, int>> super2DenseResetId;  // dense uint & async reset
 
 extern int maxConcatNum;
 bool nameExist(std::string str);
@@ -116,6 +148,15 @@ struct MtTaskInfo {
   int repcutCutInEdges = 0;
   int repcutCutOutEdges = 0;
 };
+
+struct MtStateUpdateTraceInfo {
+  bool hasStateUpdate = false;
+  bool localSafeCandidate = false;
+  bool runtimeSafeCandidate = false;
+  std::string targetWriterConflictKind = "none";
+  std::vector<std::string> runtimeBlockReasons;
+};
+
 
 struct MtRepCutEdge {
   int fromCppId = -1;
@@ -197,6 +238,72 @@ struct MtCoarseProfileFacts {
   int runtimeMTaskCount = 0;
   int layerSizeHist[6] = {0, 0, 0, 0, 0, 0};
   int regionLayerCountHist[6] = {0, 0, 0, 0, 0, 0};
+};
+
+struct MtDenseEdge {
+  int fromCppId = -1;
+  int toCppId = -1;
+  std::string kind;
+};
+
+struct MtDenseScc {
+  std::vector<int> cppIds;
+  std::vector<int> predSccs;
+  std::vector<int> succSccs;
+  int staticCost = 0;
+  int memberNodeCost = 0;
+  int worker0OnlyTaskCount = 0;
+  int alwaysActiveTaskCount = 0;
+  int internalEdgeCount = 0;
+  int internalDependencyEdgeCount = 0;
+  int internalActiveEdgeCount = 0;
+  int internalNeedActivateEdgeCount = 0;
+  int incomingEdgeCount = 0;
+  int outgoingEdgeCount = 0;
+  bool workerZeroOnly = false;
+  bool isAlwaysActive = false;
+};
+struct MtDenseMTask {
+  std::vector<int> sccIds;
+  std::vector<int> predMTasks;
+  std::vector<int> succMTasks;
+  int staticCost = 0;
+  int taskCount = 0;
+  bool workerZeroOnly = false;
+  // v236: real dense scheduling cost (sum of member-node work of contained SCCs).
+  // staticCost is ~1 for serial tasks, a weak PackThreads signal; schedCost drives
+  // the CP-contraction path's priority/end-time when > 0, else falls back to staticCost.
+  int schedCost = 0;
+};
+
+struct MtDenseLayer {
+  std::vector<int> sccIds;
+  bool workerZeroOnly = false;
+  int taskCount = 0;
+  int staticCost = 0;
+};
+
+struct MtDenseSchedule {
+  bool codegenEnabled = false;
+  bool valid = false;
+  std::string fallbackReason = "not_built";
+  int taskCount = 0;
+  int edgeCount = 0;
+  int dependencyEdgeCount = 0;
+  int activeEdgeCount = 0;
+  int needActivateEdgeCount = 0;
+  int cycleSccCount = 0;
+  int maxSccSize = 0;
+  std::vector<std::vector<int>> succCppIds;
+  std::vector<std::vector<int>> predCppIds;
+  std::vector<MtDenseEdge> edges;
+  std::vector<MtDenseScc> sccs;
+  std::vector<MtDenseLayer> layers;
+  std::vector<MtDenseMTask> mtasks;
+  std::vector<int> mtaskThreadAssign;
+  std::vector<int> topoSccOrder;
+  std::vector<int> worker0OnlyCppIds;
+  std::vector<int> alwaysActiveCppIds;
 };
 
 struct MtCoarseMTaskAssignment {
@@ -317,6 +424,17 @@ static const char* superTypeName(SuperType type) {
   }
   return "SUPER_UNKNOWN";
 }
+static const char* superInfoName(SuperInfo info) {
+  switch (info) {
+    case SUPER_INFO_IF: return "if";
+    case SUPER_INFO_ELSE: return "else";
+    case SUPER_INFO_DEDENT: return "dedent";
+    case SUPER_INFO_STR: return "str";
+    case SUPER_INFO_ASSIGN_BEG: return "assign_beg";
+    case SUPER_INFO_ASSIGN_END: return "assign_end";
+  }
+  return "unknown";
+}
 
 static std::string jsonEscape(const std::string& str) {
   std::string ret;
@@ -337,6 +455,7 @@ static std::string jsonEscape(const std::string& str) {
   }
   return ret;
 }
+
 
 static void dumpJsonIntArray(FILE* fp, const std::set<int>& values) {
   fprintf(fp, "[");
@@ -380,6 +499,95 @@ static void dumpJsonStringArray(FILE* fp, const std::vector<std::string>& values
     fprintf(fp, "\"%s\"", jsonEscape(value).c_str());
   }
   fprintf(fp, "]");
+}
+
+static bool mtUseDenseActivationOrigins() {
+  const char* env = std::getenv("GSIM_MT_DENSE_ACTIVATION_ORIGINS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool mtUseDenseMemberMetadata() {
+  const char* env = std::getenv("GSIM_MT_DENSE_MEMBER_METADATA");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// v198: When enabled, exclude backward (cross-cycle) activation edges from the dense SCC graph.
+// Backward activation edges are next-cycle activations that create false within-cycle cycles.
+static bool mtUseDenseForwardActivationOnly() {
+  const char* env = std::getenv("GSIM_MT_DENSE_FORWARD_ACTIVATION_ONLY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// v194: dump member-node and instruction-ownership metadata for a single dense task.
+// Reads already-computed super->insts (populated by instsGenerator before cppEmitter);
+// never calls StmtTree::compute and never mutates super->insts.
+static void dumpMtDenseMemberMetadataForTask(FILE* fp, SuperNode* super) {
+  fprintf(fp, ", \"member_nodes\": [");
+  bool first = true;
+  for (Node* node : super->member) {
+    if (!node) continue;
+    if (!first) fprintf(fp, ", ");
+    first = false;
+    fprintf(fp, "{\"node_id\": %d, \"node_name\": \"%s\", \"node_type\": \"%s\"}",
+            node->id, jsonEscape(node->name).c_str(), nodeTypeName(node->type));
+  }
+  fprintf(fp, "], \"instruction_ownership\": [");
+  first = true;
+  for (const InstInfo& inst : super->insts) {
+    if (!first) fprintf(fp, ", ");
+    first = false;
+    fprintf(fp, "{\"kind\": \"%s\", \"inst\": \"%s\"", superInfoName(inst.infoType), jsonEscape(inst.inst).c_str());
+    // Only ASSIGN_BEG/ASSIGN_END constructors initialize InstInfo::node;
+    // the string constructor leaves it uninitialized, so check infoType first.
+    if ((inst.infoType == SUPER_INFO_ASSIGN_BEG || inst.infoType == SUPER_INFO_ASSIGN_END) && inst.node) {
+      fprintf(fp, ", \"owner_node_id\": %d, \"owner_node_name\": \"%s\", \"owner_node_type\": \"%s\"",
+              inst.node->id, jsonEscape(inst.node->name).c_str(), nodeTypeName(inst.node->type));
+    }
+    fprintf(fp, "}");
+  }
+  fprintf(fp, "]");
+}
+
+static bool mtDenseActivationOriginEdgeEligible(int fromCppId, int toCppId) {
+  return fromCppId >= 0 && toCppId >= 0 && fromCppId < superId && toCppId < superId && fromCppId != toCppId;
+}
+
+static void dumpMtDenseActivationOriginRecord(FILE* fp,
+                                             const Node::ActivationOriginRecord& origin,
+                                             const char* kind,
+                                             bool& first) {
+  if (!mtDenseActivationOriginEdgeEligible(origin.fromCppId, origin.toCppId)) return;
+  if (!first) fprintf(fp, ",\n");
+  first = false;
+  fprintf(fp, "    {\"from_cpp_id\": %d, \"to_cpp_id\": %d, \"kind\": \"%s\", ", origin.fromCppId, origin.toCppId, kind);
+  fprintf(fp, "\"reason\": \"%s\", ", jsonEscape(origin.reason).c_str());
+  fprintf(fp, "\"source_node_id\": %d, \"source_node_name\": \"%s\", \"source_node_type\": \"%s\", ",
+          origin.sourceNodeId, jsonEscape(origin.sourceNodeName).c_str(), nodeTypeName(origin.sourceNodeType));
+  fprintf(fp, "\"target_node_id\": %d, \"target_node_name\": \"%s\", \"target_node_type\": \"%s\"}",
+          origin.targetNodeId, jsonEscape(origin.targetNodeName).c_str(), nodeTypeName(origin.targetNodeType));
+}
+
+static void dumpMtDenseActivationOrigins(FILE* fp) {
+  bool enabled = mtUseDenseActivationOrigins();
+  fprintf(fp, "  \"activation_origin_capture_enabled\": %s,\n", enabled ? "true" : "false");
+  fprintf(fp, "  \"activation_origins\": [\n");
+  bool first = true;
+  if (enabled) {
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || !superIter->second) continue;
+      for (Node* member : superIter->second->member) {
+        if (!member) continue;
+        for (const Node::ActivationOriginRecord& origin : member->activationOrigins()) {
+          dumpMtDenseActivationOriginRecord(fp, origin, "active", first);
+          if (!isAlwaysActive(origin.toCppId)) {
+            dumpMtDenseActivationOriginRecord(fp, origin, "need_activate", first);
+          }
+        }
+      }
+    }
+  }
+  fprintf(fp, "\n  ],\n");
 }
 
 static void addCppIdIfExecutable(std::set<int>& ids, SuperNode* super) {
@@ -809,6 +1017,7 @@ static bool mtCodegenEnvEnabledByDefault(const char* name) {
   return env == nullptr || env[0] == '\0' || env[0] != '0';
 }
 
+
 static bool mtUseDirectInlineFallback() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_DIRECT_INLINE_FALLBACK");
 }
@@ -868,6 +1077,7 @@ static bool mtUseSplitMixedStepGuards() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_SPLIT_MIXED_STEP_GUARDS");
 }
 
+
 // Default-off diagnostic codegen: wait-probe instrumentation is useful for
 // scheduler experiments but should not perturb normal generated models.
 static bool mtUseWaitProbeCodegen() {
@@ -886,6 +1096,74 @@ static bool mtUseCycleBatchReport() {
 // and report-only; normal generated execution is unchanged.
 static bool mtUseReadyBatchReport() {
   const char* env = std::getenv("GSIM_MT_READY_BATCH_REPORT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Probe-only: evaluate a gap-inclusive envelope SCC schedule over an existing
+// dynamic trace. Default-off and report-only; it does not emit runtime code.
+static bool mtUseEnvelopeLocalEval() {
+  const char* env = std::getenv("GSIM_MT_ENVELOPE_LOCAL_EVAL");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Probe-only: decompose local envelope-eval pressure into serial reasons,
+// active-word concentration, and counterfactual schedules. Default-off and
+// report-only; normal generated execution is unchanged.
+static bool mtUseEnvelopeLocalEvalDiagnostics() {
+  const char* env = std::getenv("GSIM_MT_ENVELOPE_LOCAL_EVAL_DIAGNOSTICS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Probe-only: include generated runtime support for state-update dynamic hit
+// trace lines. Default-off at codegen; emitted models still require
+// GSIM_MT_DYNAMIC_STATE_TRACE=1 alongside GSIM_MT_DYNAMIC_TRACE at runtime.
+static bool mtUseDynamicStateTraceCodegen() {
+  const char* env = std::getenv("GSIM_MT_DYNAMIC_STATE_TRACE_CODEGEN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Default-off v181 codegen: emit a whole-design dense schedule report and,
+// when the graph is acyclic, dense runtime wrappers selected by GSIM_MT_EXECUTOR=dense.
+static bool mtUseDenseExecutorCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_EXECUTOR_CODEGEN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool mtUseDenseXThreadDepsOnly() {
+  const char* env = std::getenv("GSIM_MT_DENSE_XTHREAD_DEPS_ONLY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool mtUseDenseTransitiveReduceEdges() {
+  const char* env = std::getenv("GSIM_MT_DENSE_TRANSITIVE_REDUCE_EDGES");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool mtUseDenseSplitWorker0MTasks() {
+  const char* env = std::getenv("GSIM_MT_DENSE_SPLIT_WORKER0_MTASKS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+// v236: Verilator-style critical-path MTask contraction. Default-off. Replaces the
+// fixed 30-SCC topological chunking in mtBuildDenseMTasks with edge/sibling-score
+// contraction bounded by cpLimit and maxMTasks (see docs/verilator-partition-spec.md).
+static bool mtUseDenseCpContraction() {
+  const char* env = std::getenv("GSIM_MT_DENSE_CP_CONTRACTION");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// v236: wire the Verilator-like PackThreads DAG-aware assignment (already used only
+// for the report) into the codegen mtaskThreadAssign, replacing i % threadCount.
+static bool mtUseDensePackThreadsAssignment() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// v239: dense runtime work-stealing. Default-off. Replaces the fixed ascending-id per-thread
+// MTask execution (which spin-stalls on cross-thread deps) with owner-affine ready deques +
+// steal-from-tail: a worker runs any READY assigned MTask, steals when idle. Lifts scaling
+// past the ~3x cap of the fixed-order executor. See docs/codex-dense-direction.md.
+static bool mtUseDenseWorkSteal() {
+  const char* env = std::getenv("GSIM_MT_DENSE_WORKSTEAL");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
@@ -1063,13 +1341,43 @@ static void mtAddCoarseBlocker(MtCoarseRegion& region, const std::string& blocke
   }
 }
 
-static bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId) {
+static std::unordered_map<uint64_t, bool> mtDependencyEdgeCache;
+static std::unordered_map<uint64_t, bool> mtActiveEdgeCache;
+
+static uint64_t mtEdgeCacheKey(int fromCppId, int toCppId) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(fromCppId)) << 32) |
+         static_cast<uint32_t>(toCppId);
+}
+
+static bool mtTaskHasActiveEdgeToUncached(int fromCppId, int toCppId) {
   auto iter = cppId2Super.find(fromCppId);
   if (iter == cppId2Super.end() || !iter->second) return false;
   for (Node* member : iter->second->member) {
     if (member && member->nextActiveId.find(toCppId) != member->nextActiveId.end()) return true;
   }
   return false;
+}
+
+static bool mtTaskHasDependencyEdgeToUncached(int fromCppId, int toCppId) {
+  auto from = cppId2Super.find(fromCppId);
+  auto to = cppId2Super.find(toCppId);
+  if (from == cppId2Super.end() || to == cppId2Super.end() || !from->second || !to->second) return false;
+  if (hasCppId(from->second->next, toCppId) || hasCppId(from->second->depNext, toCppId) ||
+      hasCppId(to->second->prev, fromCppId) || hasCppId(to->second->depPrev, fromCppId)) {
+    return true;
+  }
+  return false;
+}
+
+
+static bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId) {
+  if (!globalConfig.MtContextCache) return mtTaskHasActiveEdgeToUncached(fromCppId, toCppId);
+  uint64_t key = mtEdgeCacheKey(fromCppId, toCppId);
+  auto iter = mtActiveEdgeCache.find(key);
+  if (iter != mtActiveEdgeCache.end()) return iter->second;
+  bool value = mtTaskHasActiveEdgeToUncached(fromCppId, toCppId);
+  mtActiveEdgeCache.emplace(key, value);
+  return value;
 }
 // Track 2 Week 7: check whether fromCppId's SuperNode has a needActivate edge to toCppId.
 // Unlike nextActiveId (which includes always-active), nextNeedActivate tracks the
@@ -1084,18 +1392,839 @@ static bool mtTaskHasNeedActivateEdgeTo(int fromCppId, int toCppId) {
 }
 
 static bool mtTaskHasDependencyEdgeTo(int fromCppId, int toCppId) {
-  auto from = cppId2Super.find(fromCppId);
-  auto to = cppId2Super.find(toCppId);
-  if (from == cppId2Super.end() || to == cppId2Super.end() || !from->second || !to->second) return false;
-  if (hasCppId(from->second->next, toCppId) || hasCppId(from->second->depNext, toCppId) ||
-      hasCppId(to->second->prev, fromCppId) || hasCppId(to->second->depPrev, fromCppId)) {
-    return true;
-  }
-  return false;
+  if (!globalConfig.MtContextCache) return mtTaskHasDependencyEdgeToUncached(fromCppId, toCppId);
+  uint64_t key = mtEdgeCacheKey(fromCppId, toCppId);
+  auto iter = mtDependencyEdgeCache.find(key);
+  if (iter != mtDependencyEdgeCache.end()) return iter->second;
+  bool value = mtTaskHasDependencyEdgeToUncached(fromCppId, toCppId);
+  mtDependencyEdgeCache.emplace(key, value);
+  return value;
 }
 
 static bool mtTaskHasOrderingEdgeTo(int fromCppId, int toCppId) {
   return mtTaskHasDependencyEdgeTo(fromCppId, toCppId) || mtTaskHasActiveEdgeTo(fromCppId, toCppId);
+}
+
+static void mtDenseAddEdge(MtDenseSchedule& schedule,
+                           std::vector<std::set<int>>& succSets,
+                           std::vector<std::set<int>>& predSets,
+                           std::set<std::tuple<int, int, std::string>>& edgeKinds,
+                           int fromCppId, int toCppId, const std::string& kind) {
+  if (fromCppId < 0 || toCppId < 0 || fromCppId >= schedule.taskCount || toCppId >= schedule.taskCount) return;
+  if (fromCppId == toCppId) return;
+  std::tuple<int, int, std::string> key(fromCppId, toCppId, kind);
+  if (!edgeKinds.insert(key).second) return;
+  MtDenseEdge edge;
+  edge.fromCppId = fromCppId;
+  edge.toCppId = toCppId;
+  edge.kind = kind;
+  schedule.edges.push_back(edge);
+  if (kind == "dependency") schedule.dependencyEdgeCount ++;
+  else if (kind == "active") schedule.activeEdgeCount ++;
+  else if (kind == "need_activate") schedule.needActivateEdgeCount ++;
+  if (succSets[(size_t)fromCppId].insert(toCppId).second) {
+    predSets[(size_t)toCppId].insert(fromCppId);
+  }
+}
+
+static void mtDenseAddSuperEdges(MtDenseSchedule& schedule,
+                                 std::vector<std::set<int>>& succSets,
+                                 std::vector<std::set<int>>& predSets,
+                                 std::set<std::tuple<int, int, std::string>>& edgeKinds,
+                                 int fromCppId, const std::set<SuperNode*>& supers,
+                                 const std::string& kind) {
+  for (SuperNode* super : supers) {
+    if (super && super->cppId >= 0) {
+      mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, fromCppId, super->cppId, kind);
+    }
+  }
+}
+
+static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSchedule& schedule,
+                                                                 int threadCount) {
+  // Level-bucketed sibling contraction (Verilator-inspired, adapted for gsim's diamond-mesh
+  // dependency graph where pure edge contraction stalls: v237 edge-only contraction hit
+  // 3.23M cycle rejections vs 27.8k merges). Each SCC gets a critical-path LEVEL = longest
+  // dependency depth from a source. SCCs at the same level are mutually independent (no edge
+  // between them), so grouping same-level SCCs is ALWAYS cycle-free (sibling contraction).
+  // Within a level, non-worker0 SCCs are bucketed across threads balancing member-node cost
+  // (LPT); worker0-only SCCs form their own separate MTask (never mixed with parallel SCCs,
+  // preserving the v235 worker0 boundary). One MTask per (level, bucket). MTask ids follow
+  // (level, bucket) order, and every SCC edge goes to a strictly greater level, so ids are
+  // topologically monotone (succ>from) as the runtime protocol / transitive reduction require.
+  const int nSccs = static_cast<int>(schedule.sccs.size());
+  std::vector<MtDenseMTask> mtasks;
+  if (nSccs == 0) return mtasks;
+  if (threadCount < 1) threadCount = 1;
+  auto sccCost = [&](int s) -> int { return std::max(1, schedule.sccs[(size_t)s].memberNodeCost); };
+
+  // 1. Critical-path level per SCC. schedule.topoSccOrder is a valid topological order, so a
+  //    single forward relaxation computes the longest-path depth.
+  std::vector<int> level((size_t)nSccs, 0);
+  int maxLevel = 0;
+  for (int s : schedule.topoSccOrder) {
+    int lv = level[(size_t)s];
+    if (lv > maxLevel) maxLevel = lv;
+    for (int t : schedule.sccs[(size_t)s].succSccs) {
+      if (t < 0 || t >= nSccs) continue;
+      if (level[(size_t)t] < lv + 1) { level[(size_t)t] = lv + 1; if (lv + 1 > maxLevel) maxLevel = lv + 1; }
+    }
+  }
+  const int numLevels = maxLevel + 1;
+
+  // 2. Group SCC ids by level, preserving topo order within a level.
+  std::vector<std::vector<int>> levelSccs((size_t)numLevels);
+  for (int s : schedule.topoSccOrder) levelSccs[(size_t)level[(size_t)s]].push_back(s);
+
+  // 3. Per level: emit worker0-only SCCs as one dedicated MTask, and bucket the parallel
+  //    SCCs into <=threadCount MTasks balancing member cost. Ids assigned in emission order.
+  std::vector<int> sccToMTask((size_t)nSccs, -1);
+  auto emitBucket = [&](const std::vector<int>& members, bool isW0) {
+    if (members.empty()) return;
+    int mi = static_cast<int>(mtasks.size());
+    mtasks.emplace_back();
+    MtDenseMTask& mt = mtasks.back();
+    mt.workerZeroOnly = isW0;
+    std::vector<int> sorted = members;
+    std::sort(sorted.begin(), sorted.end()); // topo (ascending scc id) for deterministic emission
+    for (int s : sorted) {
+      mt.sccIds.push_back(s);
+      mt.staticCost += schedule.sccs[(size_t)s].staticCost;
+      mt.schedCost += sccCost(s);
+      mt.taskCount += static_cast<int>(schedule.sccs[(size_t)s].cppIds.size());
+      sccToMTask[(size_t)s] = mi;
+    }
+  };
+  for (int lv = 0; lv < numLevels; lv ++) {
+    std::vector<int> normal, w0;
+    for (int s : levelSccs[(size_t)lv]) {
+      if (schedule.sccs[(size_t)s].workerZeroOnly) w0.push_back(s); else normal.push_back(s);
+    }
+    if (!w0.empty()) emitBucket(w0, true); // worker0-only: its own MTask (no contamination)
+    // LPT bucketing of parallel SCCs by descending cost.
+    std::sort(normal.begin(), normal.end(), [&](int a, int b) { return sccCost(a) != sccCost(b) ? sccCost(a) > sccCost(b) : a < b; });
+    std::vector<std::vector<int>> buckets((size_t)threadCount);
+    std::vector<long long> bucketLoad((size_t)threadCount, 0);
+    for (int s : normal) {
+      int best = 0;
+      for (int t = 1; t < threadCount; t ++) if (bucketLoad[(size_t)t] < bucketLoad[(size_t)best]) best = t;
+      buckets[(size_t)best].push_back(s); bucketLoad[(size_t)best] += sccCost(s);
+    }
+    for (int t = 0; t < threadCount; t ++) emitBucket(buckets[(size_t)t], false);
+  }
+
+  // 3b. v240 phase-2: band/edge contraction on the level-bucket MTask graph. Level-bucketing
+  //     (phase 1) gives depth==numLevels (~333) with many cross-level cross-thread deps. To reach
+  //     Verilator's depth ~15 shape, merge each MTask with a successor MTask when they are within
+  //     the same worker AND merging creates no cycle, using union-find + bounded reachability on the
+  //     (small, ~few-thousand) MTask graph. Gated by GSIM_MT_DENSE_BAND_CONTRACT (levels per band);
+  //     0/unset disables (pure level-bucket). Cycle checks are cheap here vs v237's 45k-node graph.
+  int bandContract = 0;
+  { const char* env = std::getenv("GSIM_MT_DENSE_BAND_CONTRACT"); if (env && env[0]) bandContract = std::atoi(env); }
+  if (bandContract > 0 && static_cast<int>(mtasks.size()) > threadCount) {
+    const int nm = static_cast<int>(mtasks.size());
+    // Build the level-bucket MTask DAG (adjacency) for contraction.
+    std::vector<int> mtLevel((size_t)nm, 0);
+    for (int mi = 0; mi < nm; mi ++) {
+      int lv = 0; for (int s : mtasks[(size_t)mi].sccIds) lv = std::max(lv, level[(size_t)s]); mtLevel[(size_t)mi] = lv;
+    }
+    std::vector<int> sccToMT((size_t)nSccs, -1);
+    for (int mi = 0; mi < nm; mi ++) for (int s : mtasks[(size_t)mi].sccIds) sccToMT[(size_t)s] = mi;
+    std::vector<std::set<int>> bSucc((size_t)nm), bPred((size_t)nm);
+    for (int fromScc = 0; fromScc < nSccs; fromScc ++) {
+      int fm = sccToMT[(size_t)fromScc]; if (fm < 0) continue;
+      for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) {
+        int tm = (toScc >= 0 && toScc < nSccs) ? sccToMT[(size_t)toScc] : -1;
+        if (tm < 0 || tm == fm) continue;
+        bSucc[(size_t)fm].insert(tm); bPred[(size_t)tm].insert(fm);
+      }
+    }
+    std::vector<int> uf((size_t)nm); for (int i = 0; i < nm; i ++) uf[(size_t)i] = i;
+    std::function<int(int)> find = [&](int x){ while (uf[(size_t)x]!=x){ uf[(size_t)x]=uf[(size_t)uf[(size_t)x]]; x=uf[(size_t)x]; } return x; };
+    std::vector<long long> gcost((size_t)nm, 0); std::vector<bool> gw0((size_t)nm, false); std::vector<int> gbase((size_t)nm, 0);
+    for (int mi = 0; mi < nm; mi ++) { gcost[(size_t)mi] = mtasks[(size_t)mi].schedCost; gw0[(size_t)mi] = mtasks[(size_t)mi].workerZeroOnly; gbase[(size_t)mi] = mtLevel[(size_t)mi]; }
+    long long total = 0; for (int mi = 0; mi < nm; mi ++) total += gcost[(size_t)mi];
+    const long long capCost = std::max<long long>(1, (total / std::max(1, 50 * threadCount)) * 3);
+    auto reachB = [&](int from, int to, int budget) -> bool {
+      if (from == to) return true;
+      std::vector<int> st; st.push_back(from); std::set<int> seen; seen.insert(from); int steps = 0;
+      while (!st.empty()) { int g = st.back(); st.pop_back(); if (++steps > budget) return true;
+        for (int s : bSucc[(size_t)g]) { int rs = find(s); if (rs == to) return true; if (seen.insert(rs).second) st.push_back(rs); } }
+      return false;
+    };
+    auto mergeB = [&](int a, int b){ a=find(a); b=find(b); if(a==b) return; uf[(size_t)b]=a; gcost[(size_t)a]+=gcost[(size_t)b]; gw0[(size_t)a]=gw0[(size_t)a]||gw0[(size_t)b];
+      for (int s : bSucc[(size_t)b]){ int rs=find(s); if(rs!=a){ bSucc[(size_t)a].insert(rs); bPred[(size_t)rs].insert(a);} }
+      for (int p : bPred[(size_t)b]){ int rp=find(p); if(rp!=a){ bPred[(size_t)a].insert(rp); bSucc[(size_t)rp].insert(a);} }
+      bSucc[(size_t)a].erase(a); bPred[(size_t)a].erase(a); bSucc[(size_t)a].erase(b); bPred[(size_t)a].erase(b); };
+    // Contract a->b (b a successor of a) when within the band window, same w0, cost ok, cycle-safe.
+    bool changed = true; int mergeCount = 0; const int cycBudget = 4000;
+    while (changed) { changed = false;
+      for (int mi = 0; mi < nm; mi ++) { int a = find(mi); if (a != mi) continue;
+        int chosen = -1;
+        for (int s : bSucc[(size_t)a]) { int rs = find(s); if (rs == a) continue;
+          if (gw0[(size_t)a] != gw0[(size_t)rs]) continue;
+          if (gbase[(size_t)rs] - gbase[(size_t)a] > bandContract) continue; // band window
+          if (gcost[(size_t)a] + gcost[(size_t)rs] > capCost) continue;
+          bool cyc = false; for (int s2 : bSucc[(size_t)a]) { int rs2 = find(s2); if (rs2 == rs || rs2 == a) continue; if (reachB(rs2, rs, cycBudget)) { cyc = true; break; } }
+          if (cyc) continue; chosen = rs; break; }
+        if (chosen >= 0) { mergeB(a, chosen); mergeCount ++; changed = true; }
+      }
+    }
+    // Rebuild mtasks from union-find groups, in topological (Kahn) order for monotone ids.
+    std::map<int,int> rootTmp; for (int mi = 0; mi < nm; mi ++) { int r = find(mi); if (!rootTmp.count(r)) rootTmp[r] = static_cast<int>(rootTmp.size()); }
+    int R = static_cast<int>(rootTmp.size());
+    std::vector<std::set<int>> rSucc((size_t)R), rPred((size_t)R);
+    for (int mi = 0; mi < nm; mi ++) { int ra = rootTmp[find(mi)]; for (int s : bSucc[(size_t)find(mi)]) { int rs = rootTmp[find(s)]; if (rs != ra) { rSucc[(size_t)ra].insert(rs); rPred[(size_t)rs].insert(ra); } } }
+    std::vector<int> rIndeg((size_t)R, 0); for (int i = 0; i < R; i ++) rIndeg[(size_t)i] = static_cast<int>(rPred[(size_t)i].size());
+    std::vector<int> minBase((size_t)R, INT32_MAX); for (int mi = 0; mi < nm; mi ++) { int ri = rootTmp[find(mi)]; minBase[(size_t)ri] = std::min(minBase[(size_t)ri], gbase[(size_t)mi]); }
+    auto cmpB = [&](int a, int b){ if (minBase[(size_t)a] != minBase[(size_t)b]) return minBase[(size_t)a] > minBase[(size_t)b]; return a > b; };
+    std::priority_queue<int, std::vector<int>, decltype(cmpB)> rq(cmpB);
+    for (int i = 0; i < R; i ++) if (rIndeg[(size_t)i] == 0) rq.push(i);
+    std::vector<int> rootOrder((size_t)R, -1); int nextR = 0;
+    while (!rq.empty()) { int u = rq.top(); rq.pop(); rootOrder[(size_t)u] = nextR ++; for (int v : rSucc[(size_t)u]) if (-- rIndeg[(size_t)v] == 0) rq.push(v); }
+    Assert(nextR == R, "dense band contraction produced a cyclic MTask graph (%d of %d)", nextR, R);
+    std::vector<MtDenseMTask> newMtasks((size_t)R);
+    for (int mi = 0; mi < nm; mi ++) {
+      int ri = rootOrder[(size_t)rootTmp[find(mi)]]; MtDenseMTask& nt = newMtasks[(size_t)ri]; const MtDenseMTask& ot = mtasks[(size_t)mi];
+      for (int s : ot.sccIds) nt.sccIds.push_back(s);
+      nt.staticCost += ot.staticCost; nt.schedCost += ot.schedCost; nt.taskCount += ot.taskCount; nt.workerZeroOnly = nt.workerZeroOnly || ot.workerZeroOnly;
+    }
+    for (int ri = 0; ri < R; ri ++) std::sort(newMtasks[(size_t)ri].sccIds.begin(), newMtasks[(size_t)ri].sccIds.end());
+    fprintf(stderr, "[mt-dense-band] band=%d level-bucket-mtasks=%d -> contracted=%d merges=%d\n", bandContract, nm, R, mergeCount);
+    mtasks.swap(newMtasks);
+    // Rebuild sccToMTask for the new mtasks (used by the DAG build below).
+    std::fill(sccToMTask.begin(), sccToMTask.end(), -1);
+    for (int mi = 0; mi < static_cast<int>(mtasks.size()); mi ++) for (int s : mtasks[(size_t)mi].sccIds) sccToMTask[(size_t)s] = mi;
+  }
+
+  // 4. Build the MTask dependency DAG from SCC edges (ids are topologically monotone).
+  const int nMTasks = static_cast<int>(mtasks.size());
+  std::vector<std::set<int>> predSets((size_t)nMTasks), succSets((size_t)nMTasks);
+  for (int fromScc = 0; fromScc < nSccs; fromScc ++) {
+    int fromMTask = sccToMTask[(size_t)fromScc];
+    if (fromMTask < 0) continue;
+    for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) {
+      int toMTask = (toScc >= 0 && toScc < nSccs) ? sccToMTask[(size_t)toScc] : -1;
+      if (toMTask < 0 || toMTask == fromMTask) continue;
+      Assert(toMTask > fromMTask, "dense level-bucket contraction backward MTask edge %d->%d (lv %d->%d)",
+             fromMTask, toMTask, level[(size_t)fromScc], level[(size_t)toScc]);
+      succSets[(size_t)fromMTask].insert(toMTask);
+      predSets[(size_t)toMTask].insert(fromMTask);
+    }
+  }
+  for (int mi = 0; mi < nMTasks; mi ++) {
+    mtasks[(size_t)mi].predMTasks.assign(predSets[(size_t)mi].begin(), predSets[(size_t)mi].end());
+    mtasks[(size_t)mi].succMTasks.assign(succSets[(size_t)mi].begin(), succSets[(size_t)mi].end());
+  }
+  fprintf(stderr, "[mt-dense-levelbucket] levels=%d mtasks=%d threads=%d\n", numLevels, nMTasks, threadCount);
+  return mtasks;
+}
+
+static std::vector<MtDenseMTask> mtBuildDenseMTasks(const MtDenseSchedule& schedule,
+                                                    bool preserveWorkerZeroOnlyBoundary) {
+  const int nSccs = static_cast<int>(schedule.sccs.size());
+  const int maxSccsPerMTask = 30;
+  std::vector<MtDenseMTask> mtasks;
+  std::vector<int> sccToMTask((size_t)nSccs, -1);
+  if (preserveWorkerZeroOnlyBoundary) {
+    MtDenseMTask current;
+    auto flushCurrent = [&]() {
+      if (current.sccIds.empty()) return;
+      mtasks.push_back(current);
+      current = MtDenseMTask();
+    };
+    for (int sccId : schedule.topoSccOrder) {
+      if (sccId < 0 || sccId >= nSccs) continue;
+      const MtDenseScc& scc = schedule.sccs[(size_t)sccId];
+      if (!current.sccIds.empty() &&
+          (static_cast<int>(current.sccIds.size()) >= maxSccsPerMTask || current.workerZeroOnly != scc.workerZeroOnly)) {
+        flushCurrent();
+      }
+      sccToMTask[(size_t)sccId] = static_cast<int>(mtasks.size());
+      current.sccIds.push_back(sccId);
+      current.staticCost += scc.staticCost;
+      current.taskCount += static_cast<int>(scc.cppIds.size());
+      current.workerZeroOnly = current.workerZeroOnly || scc.workerZeroOnly;
+    }
+    flushCurrent();
+  } else {
+    for (int begin = 0; begin < static_cast<int>(schedule.topoSccOrder.size()); begin += maxSccsPerMTask) {
+      int end = std::min(begin + maxSccsPerMTask, static_cast<int>(schedule.topoSccOrder.size()));
+      int mtaskId = static_cast<int>(mtasks.size());
+      MtDenseMTask mtask;
+      for (int orderIndex = begin; orderIndex < end; orderIndex ++) {
+        int sccId = schedule.topoSccOrder[(size_t)orderIndex];
+        Assert(sccId >= 0 && sccId < nSccs, "dense schedule topo index out of range");
+        sccToMTask[(size_t)sccId] = mtaskId;
+        mtask.sccIds.push_back(sccId);
+        mtask.staticCost += schedule.sccs[(size_t)sccId].staticCost;
+        mtask.taskCount += static_cast<int>(schedule.sccs[(size_t)sccId].cppIds.size());
+        mtask.workerZeroOnly = mtask.workerZeroOnly || schedule.sccs[(size_t)sccId].workerZeroOnly;
+      }
+      mtasks.push_back(mtask);
+    }
+  }
+  std::vector<std::set<int>> predSets(mtasks.size()), succSets(mtasks.size());
+  for (int fromScc = 0; fromScc < nSccs; fromScc ++) {
+    int fromMTask = sccToMTask[(size_t)fromScc];
+    if (fromMTask < 0) continue;
+    for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) {
+      int toMTask = toScc >= 0 && toScc < nSccs ? sccToMTask[(size_t)toScc] : -1;
+      if (toMTask < 0 || toMTask == fromMTask) continue;
+      succSets[(size_t)fromMTask].insert(toMTask);
+      predSets[(size_t)toMTask].insert(fromMTask);
+    }
+  }
+  for (size_t i = 0; i < mtasks.size(); i ++) {
+    mtasks[i].predMTasks.assign(predSets[i].begin(), predSets[i].end());
+    mtasks[i].succMTasks.assign(succSets[i].begin(), succSets[i].end());
+  }
+  return mtasks;
+}
+
+static std::vector<std::vector<int>> mtBuildDenseRuntimeSuccs(const std::vector<MtDenseMTask>& mtasks,
+                                                             const std::vector<int>& assignment,
+                                                             bool xthreadDepsOnly,
+                                                             int* sameThreadElidedCount = nullptr) {
+  const int nMTasks = static_cast<int>(mtasks.size());
+  std::vector<std::vector<int>> runtimeSuccs((size_t)nMTasks);
+  if (sameThreadElidedCount != nullptr) *sameThreadElidedCount = 0;
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+    int srcThread = mtaskId < static_cast<int>(assignment.size()) ? assignment[(size_t)mtaskId] : -1;
+    for (int succ : mtasks[(size_t)mtaskId].succMTasks) {
+      if (succ < 0 || succ >= nMTasks) continue;
+      int dstThread = succ < static_cast<int>(assignment.size()) ? assignment[(size_t)succ] : -1;
+      if (xthreadDepsOnly && srcThread >= 0 && dstThread >= 0 && srcThread == dstThread) {
+        if (sameThreadElidedCount != nullptr) (*sameThreadElidedCount) ++;
+        continue;
+      }
+      runtimeSuccs[(size_t)mtaskId].push_back(succ);
+    }
+    std::sort(runtimeSuccs[(size_t)mtaskId].begin(), runtimeSuccs[(size_t)mtaskId].end());
+    runtimeSuccs[(size_t)mtaskId].erase(std::unique(runtimeSuccs[(size_t)mtaskId].begin(), runtimeSuccs[(size_t)mtaskId].end()), runtimeSuccs[(size_t)mtaskId].end());
+  }
+  return runtimeSuccs;
+}
+
+static int mtDenseRuntimeEdgeCount(const std::vector<std::vector<int>>& runtimeSuccs) {
+  int edgeCount = 0;
+  for (const std::vector<int>& succs : runtimeSuccs) edgeCount += static_cast<int>(succs.size());
+  return edgeCount;
+}
+
+static int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& runtimeSuccs,
+                                               const std::vector<int>& assignment) {
+  const int nMTasks = static_cast<int>(runtimeSuccs.size());
+  if (nMTasks <= 1) return 0;
+  std::vector<std::vector<int>> effectiveSuccs = runtimeSuccs;
+  int maxWorker = -1;
+  for (int worker : assignment) maxWorker = std::max(maxWorker, worker);
+  if (maxWorker >= 0) {
+    std::vector<int> previousOnWorker((size_t)maxWorker + 1, -1);
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+      int worker = mtaskId < static_cast<int>(assignment.size()) ? assignment[(size_t)mtaskId] : -1;
+      if (worker < 0 || worker > maxWorker) continue;
+      int previous = previousOnWorker[(size_t)worker];
+      if (previous >= 0) effectiveSuccs[(size_t)previous].push_back(mtaskId);
+      previousOnWorker[(size_t)worker] = mtaskId;
+    }
+  }
+  for (std::vector<int>& succs : effectiveSuccs) {
+    std::sort(succs.begin(), succs.end());
+    succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+  }
+  for (int from = 0; from < nMTasks; from ++) {
+    for (int succ : effectiveSuccs[(size_t)from]) {
+      if (succ <= from || succ >= nMTasks) return 0;
+    }
+  }
+  const int wordCount = (nMTasks + 63) / 64;
+  std::vector<std::vector<uint64_t>> reachable((size_t)nMTasks, std::vector<uint64_t>((size_t)wordCount, 0));
+  auto setReachable = [&](int from, int to) {
+    reachable[(size_t)from][(size_t)to >> 6] |= (uint64_t{1} << (to & 63));
+  };
+  auto isReachable = [&](int from, int to) -> bool {
+    return (reachable[(size_t)from][(size_t)to >> 6] & (uint64_t{1} << (to & 63))) != 0;
+  };
+  for (int from = nMTasks - 1; from >= 0; from --) {
+    for (int succ : effectiveSuccs[(size_t)from]) {
+      setReachable(from, succ);
+      for (int word = 0; word < wordCount; word ++) {
+        reachable[(size_t)from][(size_t)word] |= reachable[(size_t)succ][(size_t)word];
+      }
+    }
+  }
+  int removed = 0;
+  for (int from = 0; from < nMTasks; from ++) {
+    std::vector<int> kept;
+    kept.reserve(runtimeSuccs[(size_t)from].size());
+    for (int succ : runtimeSuccs[(size_t)from]) {
+      bool redundant = false;
+      for (int alt : effectiveSuccs[(size_t)from]) {
+        if (alt == succ) continue;
+        if (isReachable(alt, succ)) {
+          redundant = true;
+          break;
+        }
+      }
+      if (redundant) removed ++;
+      else kept.push_back(succ);
+    }
+    runtimeSuccs[(size_t)from].swap(kept);
+  }
+  return removed;
+}
+
+static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const std::vector<MtDenseMTask>& mtasks,
+                                                                          int threadCount) {
+  if (threadCount < 1) threadCount = 1;
+  // v236: prefer the real dense scheduling cost when present; fall back to staticCost.
+  auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
+  std::vector<int> assignment(mtasks.size(), -1);
+  std::vector<int> completion(mtasks.size(), 0);
+  std::vector<int> busyUntil((size_t)threadCount, 0);
+  std::vector<int> remainingPreds(mtasks.size(), 0);
+  std::vector<int> priority(mtasks.size(), 0);
+  for (size_t i = 0; i < mtasks.size(); i ++) remainingPreds[i] = static_cast<int>(mtasks[i].predMTasks.size());
+  for (size_t i = mtasks.size(); i > 0; i --) {
+    size_t mtaskId = i - 1;
+    int bestSuccPriority = 0;
+    for (int succ : mtasks[mtaskId].succMTasks) {
+      if (succ >= 0 && succ < static_cast<int>(mtasks.size())) bestSuccPriority = std::max(bestSuccPriority, priority[(size_t)succ]);
+    }
+    priority[mtaskId] = costOf(mtasks[mtaskId]) + bestSuccPriority;
+  }
+  std::vector<int> ready;
+  for (size_t i = 0; i < mtasks.size(); i ++) {
+    if (remainingPreds[i] == 0) ready.push_back(static_cast<int>(i));
+  }
+  int scheduled = 0;
+  while (!ready.empty()) {
+    int bestReadyIndex = -1;
+    int bestMTask = -1;
+    int bestWorker = 0;
+    int bestTime = std::numeric_limits<int>::max();
+    for (int readyIndex = 0; readyIndex < static_cast<int>(ready.size()); readyIndex ++) {
+      int mtaskId = ready[(size_t)readyIndex];
+      const MtDenseMTask& mtask = mtasks[(size_t)mtaskId];
+      int workerLimit = mtask.workerZeroOnly ? 1 : threadCount;
+      for (int worker = 0; worker < workerLimit; worker ++) {
+        int timeBegin = busyUntil[(size_t)worker];
+        for (int pred : mtask.predMTasks) {
+          if (pred < 0 || pred >= static_cast<int>(mtasks.size())) continue;
+          int predEnd = completion[(size_t)pred];
+          int predWorker = assignment[(size_t)pred];
+          if (predWorker >= 0 && predWorker != worker) predEnd += (costOf(mtasks[(size_t)pred]) * 30) / 100;
+          if (predEnd > timeBegin) timeBegin = predEnd;
+        }
+        if (timeBegin < bestTime ||
+            (timeBegin == bestTime && bestMTask >= 0 && priority[(size_t)mtaskId] > priority[(size_t)bestMTask]) ||
+            (timeBegin == bestTime && bestMTask >= 0 && priority[(size_t)mtaskId] == priority[(size_t)bestMTask] && mtaskId < bestMTask)) {
+          bestTime = timeBegin;
+          bestReadyIndex = readyIndex;
+          bestMTask = mtaskId;
+          bestWorker = worker;
+        }
+      }
+    }
+    if (bestMTask < 0) break;
+    const MtDenseMTask& mtask = mtasks[(size_t)bestMTask];
+    assignment[(size_t)bestMTask] = bestWorker;
+    int endTime = bestTime + std::max(1, costOf(mtask));
+    completion[(size_t)bestMTask] = endTime;
+    busyUntil[(size_t)bestWorker] = endTime;
+    ready[(size_t)bestReadyIndex] = ready.back();
+    ready.pop_back();
+    scheduled ++;
+    for (int succ : mtask.succMTasks) {
+      if (succ < 0 || succ >= static_cast<int>(mtasks.size())) continue;
+      int& deps = remainingPreds[(size_t)succ];
+      deps --;
+      if (deps == 0) ready.push_back(succ);
+    }
+  }
+  int makespan = 0;
+  for (int endTime : completion) makespan = std::max(makespan, endTime);
+  if (scheduled != static_cast<int>(mtasks.size())) makespan = -1;
+  return std::make_pair(assignment, makespan);
+}
+
+static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {
+  MtDenseSchedule schedule;
+  schedule.codegenEnabled = codegenEnabled;
+  schedule.taskCount = superId;
+  schedule.succCppIds.assign((size_t)superId, std::vector<int>());
+  schedule.predCppIds.assign((size_t)superId, std::vector<int>());
+  std::vector<std::set<int>> succSets((size_t)superId);
+  std::vector<std::set<int>> predSets((size_t)superId);
+  std::set<std::tuple<int, int, std::string>> edgeKinds;
+
+  // Phase 1: Add dependency edges only.
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    auto superIter = cppId2Super.find(cppId);
+    if (superIter == cppId2Super.end() || !superIter->second) continue;
+    SuperNode* super = superIter->second;
+    mtDenseAddSuperEdges(schedule, succSets, predSets, edgeKinds, cppId, super->next, "dependency");
+    mtDenseAddSuperEdges(schedule, succSets, predSets, edgeKinds, cppId, super->depNext, "dependency");
+  }
+
+  // v198: When GSIM_MT_DENSE_FORWARD_ACTIVATION_ONLY=1, compute a dependency-only
+  // topological rank and only add activation edges that are forward (rank[from] < rank[to]).
+  // Backward activation edges are cross-cycle (next-cycle) activations that create false
+  // cycles in the within-cycle SCC graph. Excluding them makes the graph acyclic.
+  std::vector<int> depTopoRank;
+  bool forwardActivationOnly = mtUseDenseForwardActivationOnly();
+  if (forwardActivationOnly) {
+    std::vector<int> depInDegree((size_t)superId, 0);
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      for (int succ : succSets[(size_t)cppId]) {
+        depInDegree[(size_t)succ] ++;
+      }
+    }
+    std::vector<int> readyQueue;
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      if (depInDegree[(size_t)cppId] == 0) readyQueue.push_back(cppId);
+    }
+    depTopoRank.assign((size_t)superId, 0);
+    size_t rankCounter = 0;
+    size_t queueHead = 0;
+    while (queueHead < readyQueue.size()) {
+      int node = readyQueue[queueHead ++];
+      depTopoRank[(size_t)node] = static_cast<int>(rankCounter ++);
+      for (int succ : succSets[(size_t)node]) {
+        if (-- depInDegree[(size_t)succ] == 0) readyQueue.push_back(succ);
+      }
+    }
+    Assert(rankCounter == (size_t)superId, "dependency graph has cycles; cannot compute topo rank for forward-activation filter");
+  }
+
+  // Phase 2: Add activation edges (filtered by topo rank if enabled).
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    auto superIter = cppId2Super.find(cppId);
+    if (superIter == cppId2Super.end() || !superIter->second) continue;
+    SuperNode* super = superIter->second;
+    for (Node* member : super->member) {
+      if (!member) continue;
+      for (int toCppId : member->nextActiveId) {
+        if (forwardActivationOnly && (depTopoRank[(size_t)cppId] >= depTopoRank[(size_t)toCppId])) continue;
+        mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, toCppId, "active");
+      }
+      for (int toCppId : member->nextNeedActivate) {
+        if (forwardActivationOnly && (depTopoRank[(size_t)cppId] >= depTopoRank[(size_t)toCppId])) continue;
+        mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, toCppId, "need_activate");
+      }
+    }
+  }
+
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    schedule.succCppIds[(size_t)cppId].assign(succSets[(size_t)cppId].begin(), succSets[(size_t)cppId].end());
+    schedule.predCppIds[(size_t)cppId].assign(predSets[(size_t)cppId].begin(), predSets[(size_t)cppId].end());
+  }
+  schedule.edgeCount = static_cast<int>(schedule.edges.size());
+
+  std::vector<char> visited((size_t)superId, 0);
+  std::vector<int> order;
+  order.reserve((size_t)superId);
+  for (int start = 0; start < superId; start ++) {
+    if (visited[(size_t)start]) continue;
+    std::vector<std::pair<int, size_t>> stack;
+    stack.push_back({start, 0});
+    visited[(size_t)start] = 1;
+    while (!stack.empty()) {
+      int node = stack.back().first;
+      size_t& nextIndex = stack.back().second;
+      const std::vector<int>& succs = schedule.succCppIds[(size_t)node];
+      if (nextIndex < succs.size()) {
+        int succ = succs[nextIndex ++];
+        if (!visited[(size_t)succ]) {
+          visited[(size_t)succ] = 1;
+          stack.push_back({succ, 0});
+        }
+      } else {
+        order.push_back(node);
+        stack.pop_back();
+      }
+    }
+  }
+
+  std::vector<int> sccOf((size_t)superId, -1);
+  for (int orderIndex = static_cast<int>(order.size()) - 1; orderIndex >= 0; orderIndex --) {
+    int start = order[(size_t)orderIndex];
+    if (sccOf[(size_t)start] >= 0) continue;
+    int sccId = static_cast<int>(schedule.sccs.size());
+    MtDenseScc scc;
+    std::vector<int> stack;
+    stack.push_back(start);
+    sccOf[(size_t)start] = sccId;
+    while (!stack.empty()) {
+      int node = stack.back();
+      stack.pop_back();
+      scc.cppIds.push_back(node);
+      auto taskIter = tasks.find(node);
+      if (taskIter != tasks.end() && hasWorker0OnlyReason(taskIter->second.serialReasons)) {
+        scc.workerZeroOnly = true;
+        scc.worker0OnlyTaskCount ++;
+        schedule.worker0OnlyCppIds.push_back(node);
+      }
+      if (isAlwaysActive(node)) {
+        scc.isAlwaysActive = true;
+        scc.alwaysActiveTaskCount ++;
+        schedule.alwaysActiveCppIds.push_back(node);
+      }
+      scc.staticCost += mtTaskEstimatedCost(tasks, node);
+      auto superIter = cppId2Super.find(node);
+      if (superIter != cppId2Super.end() && superIter->second) {
+        scc.memberNodeCost += static_cast<int>(superIter->second->member.size());
+      }
+      const std::vector<int>& preds = schedule.predCppIds[(size_t)node];
+      for (int pred : preds) {
+        if (sccOf[(size_t)pred] < 0) {
+          sccOf[(size_t)pred] = sccId;
+          stack.push_back(pred);
+        }
+      }
+    }
+    std::sort(scc.cppIds.begin(), scc.cppIds.end());
+    if (static_cast<int>(scc.cppIds.size()) > schedule.maxSccSize) schedule.maxSccSize = static_cast<int>(scc.cppIds.size());
+    if (scc.cppIds.size() > 1) schedule.cycleSccCount ++;
+    schedule.sccs.push_back(scc);
+  }
+
+  std::sort(schedule.worker0OnlyCppIds.begin(), schedule.worker0OnlyCppIds.end());
+  schedule.worker0OnlyCppIds.erase(std::unique(schedule.worker0OnlyCppIds.begin(), schedule.worker0OnlyCppIds.end()), schedule.worker0OnlyCppIds.end());
+  std::sort(schedule.alwaysActiveCppIds.begin(), schedule.alwaysActiveCppIds.end());
+  schedule.alwaysActiveCppIds.erase(std::unique(schedule.alwaysActiveCppIds.begin(), schedule.alwaysActiveCppIds.end()), schedule.alwaysActiveCppIds.end());
+
+  std::vector<std::set<int>> sccSuccSets(schedule.sccs.size());
+  std::vector<std::set<int>> sccPredSets(schedule.sccs.size());
+  for (int from = 0; from < superId; from ++) {
+    int fromScc = sccOf[(size_t)from];
+    for (int to : schedule.succCppIds[(size_t)from]) {
+      int toScc = sccOf[(size_t)to];
+      if (fromScc < 0 || toScc < 0 || fromScc == toScc) continue;
+      if (sccSuccSets[(size_t)fromScc].insert(toScc).second) {
+        sccPredSets[(size_t)toScc].insert(fromScc);
+      }
+    }
+  }
+  for (size_t sccId = 0; sccId < schedule.sccs.size(); sccId ++) {
+    schedule.sccs[sccId].succSccs.assign(sccSuccSets[sccId].begin(), sccSuccSets[sccId].end());
+    schedule.sccs[sccId].predSccs.assign(sccPredSets[sccId].begin(), sccPredSets[sccId].end());
+  }
+
+  for (const MtDenseEdge& edge : schedule.edges) {
+    int fromScc = sccOf[(size_t)edge.fromCppId];
+    int toScc = sccOf[(size_t)edge.toCppId];
+    if (fromScc < 0 || toScc < 0) continue;
+    if (fromScc == toScc) {
+      MtDenseScc& scc = schedule.sccs[(size_t)fromScc];
+      scc.internalEdgeCount ++;
+      if (edge.kind == "dependency") scc.internalDependencyEdgeCount ++;
+      else if (edge.kind == "active") scc.internalActiveEdgeCount ++;
+      else if (edge.kind == "need_activate") scc.internalNeedActivateEdgeCount ++;
+    } else {
+      schedule.sccs[(size_t)fromScc].outgoingEdgeCount ++;
+      schedule.sccs[(size_t)toScc].incomingEdgeCount ++;
+    }
+  }
+
+  // v201b: Coarsen SCC DAG by merging chains (edges A->B where A has 1 succ
+  // and B has 1 pred). This reduces layer depth and barrier count without
+  // reducing parallelism. Inspired by Verilator's V3OrderParallel edge contraction.
+  {
+    int n = static_cast<int>(schedule.sccs.size());
+    std::vector<int> parent(n);
+    for (int i = 0; i < n; i++) parent[i] = i;
+    auto find = [&](int x) -> int {
+      while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+      return x;
+    };
+    auto effOutDeg = [&](int root) -> int {
+      std::set<int> uniqueSuccs;
+      for (int s : schedule.sccs[root].succSccs) { int rs = find(s); if (rs != root) uniqueSuccs.insert(rs); }
+      return static_cast<int>(uniqueSuccs.size());
+    };
+    auto effInDeg = [&](int root) -> int {
+      std::set<int> uniquePreds;
+      for (int p : schedule.sccs[root].predSccs) { int rp = find(p); if (rp != root) uniquePreds.insert(rp); }
+      return static_cast<int>(uniquePreds.size());
+    };
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (int i = 0; i < n; i++) {
+        if (find(i) != i) continue;
+        if (effOutDeg(i) != 1) continue;
+        int succ = -1;
+        for (int s : schedule.sccs[i].succSccs) { int rs = find(s); if (rs != i) { succ = rs; break; } }
+        if (succ < 0 || find(succ) != succ) continue;
+        if (effInDeg(succ) != 1) continue;
+        if (schedule.sccs[i].workerZeroOnly != schedule.sccs[succ].workerZeroOnly) continue;
+        parent[i] = succ;
+        changed = true;
+      }
+    }
+    std::vector<int> remap(n, -1);
+    int newCount = 0;
+    for (int i = 0; i < n; i++) { if (find(i) == i) remap[i] = newCount++; }
+    if (newCount < n) {
+      std::vector<MtDenseScc> newSccs(newCount);
+      for (int i = 0; i < n; i++) {
+        int newId = remap[find(i)];
+        MtDenseScc& ns = newSccs[newId];
+        ns.cppIds.insert(ns.cppIds.end(), schedule.sccs[i].cppIds.begin(), schedule.sccs[i].cppIds.end());
+        ns.staticCost += schedule.sccs[i].staticCost;
+        ns.memberNodeCost += schedule.sccs[i].memberNodeCost;
+        ns.workerZeroOnly = schedule.sccs[i].workerZeroOnly;
+        ns.worker0OnlyTaskCount += schedule.sccs[i].worker0OnlyTaskCount;
+        ns.alwaysActiveTaskCount += schedule.sccs[i].alwaysActiveTaskCount;
+        ns.isAlwaysActive = ns.isAlwaysActive || schedule.sccs[i].isAlwaysActive;
+      }
+      for (auto& ns : newSccs) std::sort(ns.cppIds.begin(), ns.cppIds.end());
+      std::vector<std::set<int>> newSuccSets(newCount), newPredSets(newCount);
+      for (int i = 0; i < n; i++) {
+        int fromNew = remap[find(i)];
+        for (int succ : schedule.sccs[i].succSccs) {
+          int toRoot = find(succ);
+          if (toRoot == find(i)) continue;
+          int toNew = remap[toRoot];
+          newSuccSets[fromNew].insert(toNew);
+          newPredSets[toNew].insert(fromNew);
+        }
+      }
+      for (int i = 0; i < newCount; i++) {
+        newSccs[i].succSccs.assign(newSuccSets[i].begin(), newSuccSets[i].end());
+        newSccs[i].predSccs.assign(newPredSets[i].begin(), newPredSets[i].end());
+        newSccs[i].incomingEdgeCount = static_cast<int>(newSccs[i].predSccs.size());
+        newSccs[i].outgoingEdgeCount = static_cast<int>(newSccs[i].succSccs.size());
+      }
+      schedule.sccs = newSccs;
+    }
+  }
+
+  std::vector<int> indegree(schedule.sccs.size(), 0);
+  std::set<int> ready;
+  for (size_t sccId = 0; sccId < schedule.sccs.size(); sccId ++) {
+    indegree[sccId] = static_cast<int>(schedule.sccs[sccId].predSccs.size());
+    if (indegree[sccId] == 0) ready.insert(static_cast<int>(sccId));
+  }
+  while (!ready.empty()) {
+    int worker0Scc = -1;
+    for (int sccId : ready) {
+      if (schedule.sccs[(size_t)sccId].workerZeroOnly) {
+        worker0Scc = sccId;
+        break;
+      }
+    }
+    MtDenseLayer layer;
+    if (worker0Scc >= 0) {
+      layer.sccIds.push_back(worker0Scc);
+      layer.workerZeroOnly = true;
+    } else {
+      for (int sccId : ready) layer.sccIds.push_back(sccId);
+    }
+    std::sort(layer.sccIds.begin(), layer.sccIds.end(), [&](int lhs, int rhs) {
+      return schedule.sccs[(size_t)lhs].cppIds.front() < schedule.sccs[(size_t)rhs].cppIds.front();
+    });
+    for (int sccId : layer.sccIds) {
+      ready.erase(sccId);
+      schedule.topoSccOrder.push_back(sccId);
+      layer.taskCount += static_cast<int>(schedule.sccs[(size_t)sccId].cppIds.size());
+      layer.staticCost += schedule.sccs[(size_t)sccId].staticCost;
+    }
+    for (int sccId : layer.sccIds) {
+      for (int succScc : schedule.sccs[(size_t)sccId].succSccs) {
+        indegree[(size_t)succScc] --;
+        if (indegree[(size_t)succScc] == 0) ready.insert(succScc);
+      }
+    }
+    schedule.layers.push_back(layer);
+  }
+  // Split wide layers so no single worker function exceeds Clang limits.
+  {
+    const int MAX_SCCS_PER_WORKER = 256;
+    std::vector<MtDenseLayer> splitLayers;
+    for (const MtDenseLayer& layer : schedule.layers) {
+      if ((int)layer.sccIds.size() <= MAX_SCCS_PER_WORKER) {
+        splitLayers.push_back(layer);
+      } else {
+        for (int i = 0; i < (int)layer.sccIds.size(); i += MAX_SCCS_PER_WORKER) {
+          MtDenseLayer sub;
+          int end = std::min(i + MAX_SCCS_PER_WORKER, (int)layer.sccIds.size());
+          sub.sccIds.assign(layer.sccIds.begin() + i, layer.sccIds.begin() + end);
+          sub.workerZeroOnly = layer.workerZeroOnly;
+          for (int sccId : sub.sccIds) {
+            sub.taskCount += static_cast<int>(schedule.sccs[(size_t)sccId].cppIds.size());
+            sub.staticCost += schedule.sccs[(size_t)sccId].staticCost;
+          }
+          splitLayers.push_back(sub);
+        }
+      }
+    }
+    schedule.layers = splitLayers;
+  }
+  // Dense dependency executor: form MTasks and assign them to worker threads.
+  // Default path: fixed 30-SCC topological chunking + round-robin assignment.
+  // v236 (GSIM_MT_DENSE_CP_CONTRACTION): Verilator-style critical-path edge contraction.
+  // v236 (GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT): DAG-aware list-scheduling assignment.
+  {
+    int threadCount = 8;
+    const char* threadsEnv = std::getenv("GSIM_THREADS");
+    if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
+    if (threadCount < 1) threadCount = 1;
+
+    if (mtUseDenseCpContraction()) {
+      schedule.mtasks = mtBuildDenseMTasksCpContraction(schedule, threadCount);
+    } else {
+      schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
+    }
+    int nMTasks = static_cast<int>(schedule.mtasks.size());
+    schedule.mtaskThreadAssign.resize(nMTasks);
+    bool lptAssign = false;
+    { const char* e = std::getenv("GSIM_MT_DENSE_LPT_ASSIGN"); lptAssign = e && e[0] && e[0] != '0'; }
+    if (lptAssign && nMTasks > 0) {
+      // LPT (longest-processing-time) balancing by real dense work (schedCost=member cost, else
+      // staticCost). Sorts non-worker0 MTasks by descending cost, greedily assigns each to the
+      // least-loaded worker. worker0-only MTasks pinned to thread 0. Fixes the severe imbalance
+      // seen with round-robin/PackThreads on coarse graphs where cost is concentrated.
+      auto mtCost = [&](int i) { return schedule.mtasks[(size_t)i].schedCost > 0 ? schedule.mtasks[(size_t)i].schedCost : schedule.mtasks[(size_t)i].staticCost; };
+      std::vector<int> order; order.reserve(nMTasks);
+      for (int i = 0; i < nMTasks; i ++) if (!schedule.mtasks[(size_t)i].workerZeroOnly) order.push_back(i);
+      std::sort(order.begin(), order.end(), [&](int a, int b){ int ca=mtCost(a), cb=mtCost(b); return ca != cb ? ca > cb : a < b; });
+      std::vector<long long> loads((size_t)threadCount, 0);
+      for (int i = 0; i < nMTasks; i ++) if (schedule.mtasks[(size_t)i].workerZeroOnly) { schedule.mtaskThreadAssign[(size_t)i] = 0; loads[0] += mtCost(i); }
+      for (int i : order) {
+        int best = 0; for (int t = 1; t < threadCount; t ++) if (loads[(size_t)t] < loads[(size_t)best]) best = t;
+        schedule.mtaskThreadAssign[(size_t)i] = best; loads[(size_t)best] += mtCost(i);
+      }
+    } else if (mtUseDensePackThreadsAssignment() && nMTasks > 0) {
+      std::vector<int> packAssign = mtBuildDensePackThreadsAssignment(schedule.mtasks, threadCount).first;
+      bool ok = true;
+      for (int i = 0; i < nMTasks; i ++) { if (packAssign[(size_t)i] < 0) { ok = false; break; } }
+      if (ok) {
+        for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : packAssign[(size_t)i];
+      } else {
+        for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : (i % threadCount);
+      }
+    } else {
+      for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : (i % threadCount);
+    }
+  }
+
+  if (!codegenEnabled) {
+    schedule.valid = false;
+    schedule.fallbackReason = "codegen_disabled";
+  } else if (schedule.cycleSccCount != 0) {
+    schedule.valid = false;
+    schedule.fallbackReason = "cycle_scc";
+  } else if (schedule.topoSccOrder.size() != schedule.sccs.size()) {
+    schedule.valid = false;
+    schedule.fallbackReason = "scc_topology_incomplete";
+  } else {
+    schedule.valid = true;
+    schedule.fallbackReason = "none";
+  }
+  return schedule;
 }
 
 static void mtAddCoarseLayers(MtCoarseRegion& region) {
@@ -1876,6 +3005,50 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
 
 static void mtFinalizeCoarseProfitability(MtCoarseRegion& region);
 
+struct MtCoarsePlannerTimerStats {
+  uint64_t regionBuildUs = 0;
+  uint64_t scanBeginEnterUs = 0;
+  uint64_t scanBeginSameWordUs = 0;
+  uint64_t scanEndEnterUs = 0;
+  uint64_t scanEndSameWordUs = 0;
+  uint64_t scanReverseIntoRegionUs = 0;
+  uint64_t regionCostUs = 0;
+  uint64_t taskScanUs = 0;
+  uint64_t edgeScanUs = 0;
+  uint64_t blockerFinalizeUs = 0;
+  uint64_t layerUs = 0;
+  uint64_t mtaskUs = 0;
+  uint64_t profitabilityUs = 0;
+};
+
+static MtCoarsePlannerTimerStats mtCoarsePlannerTimerStats;
+
+static struct timeval mtCoarsePlannerTimerStart() {
+  if (!globalConfig.MtReportTimers) {
+    struct timeval empty = {0, 0};
+    return empty;
+  }
+  return getTime();
+}
+
+static uint64_t mtCoarsePlannerElapsedUs(struct timeval start, struct timeval end) {
+  int64_t elapsedUs = (static_cast<int64_t>(end.tv_sec - start.tv_sec) * 1000000ll) +
+                      static_cast<int64_t>(end.tv_usec - start.tv_usec);
+  if (elapsedUs < 0) elapsedUs = 0;
+  return static_cast<uint64_t>(elapsedUs);
+}
+
+static void mtCoarsePlannerTimerAdd(uint64_t& totalUs, struct timeval start) {
+  if (!globalConfig.MtReportTimers) return;
+  totalUs += mtCoarsePlannerElapsedUs(start, getTime());
+}
+
+static void logMtReportTimerUs(const char* name, uint64_t elapsedUs) {
+  if (!globalConfig.MtReportTimers) return;
+  printf("[mt-report-timer] %s = %llu ms\n", name, static_cast<unsigned long long>(elapsedUs / 1000ull));
+}
+
+
 static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks, int beginCppId, int endCppId) {
   MtCoarseRegion region;
   region.beginCppId = beginCppId;
@@ -1884,12 +3057,14 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
   region.endActiveWord = (endCppId - 1) / ACTIVE_WIDTH + 1;
   region.taskCount = endCppId - beginCppId;
   region.activeWordSpan = region.endActiveWord - region.beginActiveWord;
+  struct timeval mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
   region.staticCost = mtBatchEstimatedCost(tasks, beginCppId, endCppId);
   region.memberNodeCost = mtBatchMemberNodeCost(beginCppId, endCppId);
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.regionCostUs, mtCoarsePlannerPhaseStart);
+  mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
   region.expectedActiveCost = region.staticCost;
   region.estimatedUsefulWork = std::max(region.staticCost, region.memberNodeCost);
   region.pureTaskCount = region.taskCount;
-
   for (int cppId = beginCppId; cppId < endCppId; cppId ++) {
     auto iter = tasks.find(cppId);
     bool isPure = iter != tasks.end() && iter->second.taskKind == "pure_compute";
@@ -1912,6 +3087,8 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
     }
     if (isAlwaysActive(cppId)) mtAddCoarseBlocker(region, "codegen_runtime_limit");
   }
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.taskScanUs, mtCoarsePlannerPhaseStart);
+  mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
 
   for (int from = beginCppId; from < endCppId; from ++) {
     for (int to = beginCppId; to < endCppId; to ++) {
@@ -1925,12 +3102,14 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
         if (to > from) region.sameCycleActivationHazardCount ++;
         if (from > to) mtAddCoarseBlocker(region, "active_visibility_edge");
       }
-      if (mtCanCutEdge(tasks, from, to)) {
+      if (from / ACTIVE_WIDTH == to / ACTIVE_WIDTH && mtCanCutEdge(tasks, from, to)) {
         region.replicationCandidateCount ++;
         region.repcutLiteCouldHelp = true;
       }
     }
   }
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.edgeScanUs, mtCoarsePlannerPhaseStart);
+  mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
 
   if (beginCppId % ACTIVE_WIDTH != 0 || endCppId % ACTIVE_WIDTH != 0) {
     mtAddCoarseBlocker(region, "codegen_runtime_limit");
@@ -1946,6 +3125,8 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
   }
 
   region.runtimeEligible = region.blockers.empty();
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.blockerFinalizeUs, mtCoarsePlannerPhaseStart);
+  mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
   mtAddCoarseLayers(region);
   if (region.layers.empty()) {
     region.runtimeEligible = false;
@@ -1954,8 +3135,13 @@ static MtCoarseRegion mtBuildCoarseRegion(const std::map<int, MtTaskInfo>& tasks
     mtAddCoarseBlocker(region, "codegen_runtime_limit");
     region.runtimeEligible = false;
   }
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.layerUs, mtCoarsePlannerPhaseStart);
+  mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
   if (region.runtimeEligible) mtAddCoarseMTasks(region, tasks);
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.mtaskUs, mtCoarsePlannerPhaseStart);
+  mtCoarsePlannerPhaseStart = mtCoarsePlannerTimerStart();
   mtFinalizeCoarseProfitability(region);
+  mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.profitabilityUs, mtCoarsePlannerPhaseStart);
   return region;
 }
 
@@ -1992,30 +3178,79 @@ static bool mtCoarseWordHasReverseOrderingEdgeIntoRegion(int beginCppId, int wor
   return false;
 }
 
+
 static MtCoarseRegionPlan planMtCoarseRegions(const std::map<int, MtTaskInfo>& tasks) {
   MtCoarseRegionPlan plan;
+  struct timeval mtCoarsePlannerStart = mtCoarsePlannerTimerStart();
+  if (globalConfig.MtReportTimers) mtCoarsePlannerTimerStats = MtCoarsePlannerTimerStats();
   bool levelDispatch = mtIsLevelDispatchMode();
   for (int beginWord = 0; beginWord * ACTIVE_WIDTH < superId; beginWord ++) {
     int beginCppId = beginWord * ACTIVE_WIDTH;
-    if (!mtCoarseWordCanEnterRegion(tasks, beginCppId)) continue;
-    if (levelDispatch && mtCoarseWordHasSameWordReverseOrderingEdge(beginCppId)) continue;
+    struct timeval mtCoarsePlannerScanStart = mtCoarsePlannerTimerStart();
+    bool beginCanEnter = mtCoarseWordCanEnterRegion(tasks, beginCppId);
+    mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.scanBeginEnterUs, mtCoarsePlannerScanStart);
+    if (!beginCanEnter) continue;
+    if (levelDispatch) {
+      mtCoarsePlannerScanStart = mtCoarsePlannerTimerStart();
+      bool beginHasSameWordReverseOrderingEdge = mtCoarseWordHasSameWordReverseOrderingEdge(beginCppId);
+      mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.scanBeginSameWordUs, mtCoarsePlannerScanStart);
+      if (beginHasSameWordReverseOrderingEdge) continue;
+    }
     int endWord = beginWord;
     while (endWord * ACTIVE_WIDTH < superId) {
       int wordBegin = endWord * ACTIVE_WIDTH;
-      if (!mtCoarseWordCanEnterRegion(tasks, wordBegin)) break;
+      mtCoarsePlannerScanStart = mtCoarsePlannerTimerStart();
+      bool endCanEnter = mtCoarseWordCanEnterRegion(tasks, wordBegin);
+      mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.scanEndEnterUs, mtCoarsePlannerScanStart);
+      if (!endCanEnter) break;
       if (levelDispatch) {
-        if (mtCoarseWordHasSameWordReverseOrderingEdge(wordBegin)) break;
-        if (mtCoarseWordHasReverseOrderingEdgeIntoRegion(beginCppId, wordBegin)) break;
+        mtCoarsePlannerScanStart = mtCoarsePlannerTimerStart();
+        bool endHasSameWordReverseOrderingEdge = mtCoarseWordHasSameWordReverseOrderingEdge(wordBegin);
+        mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.scanEndSameWordUs, mtCoarsePlannerScanStart);
+        if (endHasSameWordReverseOrderingEdge) break;
+        mtCoarsePlannerScanStart = mtCoarsePlannerTimerStart();
+        bool hasReverseOrderingEdgeIntoRegion = mtCoarseWordHasReverseOrderingEdgeIntoRegion(beginCppId, wordBegin);
+        mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.scanReverseIntoRegionUs, mtCoarsePlannerScanStart);
+        if (hasReverseOrderingEdgeIntoRegion) break;
         if ((endWord + 1) - beginWord > MT_LEVEL_DISPATCH_REGION_SPAN_CAP) break;
       }
       endWord ++;
     }
     int endCppId = endWord * ACTIVE_WIDTH;
     if (endCppId - beginCppId >= ACTIVE_WIDTH) {
+      struct timeval mtCoarsePlannerBuildStart = mtCoarsePlannerTimerStart();
       MtCoarseRegion region = mtBuildCoarseRegion(tasks, beginCppId, endCppId);
+      mtCoarsePlannerTimerAdd(mtCoarsePlannerTimerStats.regionBuildUs, mtCoarsePlannerBuildStart);
       plan.regions.push_back(region);
       beginWord = std::max(beginWord, endWord - 1);
     }
+  }
+  if (globalConfig.MtReportTimers) {
+    uint64_t totalUs = mtCoarsePlannerElapsedUs(mtCoarsePlannerStart, getTime());
+    uint64_t scanOtherUs = totalUs > mtCoarsePlannerTimerStats.regionBuildUs ?
+                           totalUs - mtCoarsePlannerTimerStats.regionBuildUs : 0;
+    uint64_t scanAttributedUs = mtCoarsePlannerTimerStats.scanBeginEnterUs +
+                                mtCoarsePlannerTimerStats.scanBeginSameWordUs +
+                                mtCoarsePlannerTimerStats.scanEndEnterUs +
+                                mtCoarsePlannerTimerStats.scanEndSameWordUs +
+                                mtCoarsePlannerTimerStats.scanReverseIntoRegionUs;
+    uint64_t scanUnattributedUs = scanOtherUs > scanAttributedUs ? scanOtherUs - scanAttributedUs : 0;
+    logMtReportTimerUs("coarse-planner.total", totalUs);
+    logMtReportTimerUs("coarse-planner.scan-other", scanOtherUs);
+    logMtReportTimerUs("coarse-planner.scan-begin-enter", mtCoarsePlannerTimerStats.scanBeginEnterUs);
+    logMtReportTimerUs("coarse-planner.scan-begin-same-word", mtCoarsePlannerTimerStats.scanBeginSameWordUs);
+    logMtReportTimerUs("coarse-planner.scan-end-enter", mtCoarsePlannerTimerStats.scanEndEnterUs);
+    logMtReportTimerUs("coarse-planner.scan-end-same-word", mtCoarsePlannerTimerStats.scanEndSameWordUs);
+    logMtReportTimerUs("coarse-planner.scan-reverse-into-region", mtCoarsePlannerTimerStats.scanReverseIntoRegionUs);
+    logMtReportTimerUs("coarse-planner.scan-unattributed", scanUnattributedUs);
+    logMtReportTimerUs("coarse-planner.region-build", mtCoarsePlannerTimerStats.regionBuildUs);
+    logMtReportTimerUs("coarse-planner.region-cost", mtCoarsePlannerTimerStats.regionCostUs);
+    logMtReportTimerUs("coarse-planner.task-scan", mtCoarsePlannerTimerStats.taskScanUs);
+    logMtReportTimerUs("coarse-planner.edge-scan", mtCoarsePlannerTimerStats.edgeScanUs);
+    logMtReportTimerUs("coarse-planner.blocker-finalize", mtCoarsePlannerTimerStats.blockerFinalizeUs);
+    logMtReportTimerUs("coarse-planner.layers", mtCoarsePlannerTimerStats.layerUs);
+    logMtReportTimerUs("coarse-planner.mtasks", mtCoarsePlannerTimerStats.mtaskUs);
+    logMtReportTimerUs("coarse-planner.profitability", mtCoarsePlannerTimerStats.profitabilityUs);
   }
   return plan;
 }
@@ -3104,6 +4339,34 @@ static std::set<std::string> collectAllMtStateTargetNames(const std::map<int, Mt
   return names;
 }
 
+static std::vector<MtStateUpdateTraceInfo> buildMtStateUpdateTraceInfo(const std::map<int, MtTaskInfo>& mtTasks) {
+  std::vector<MtStateUpdateTraceInfo> infos(superId);
+  std::set<std::string> allStateTargetNames = collectAllMtStateTargetNames(mtTasks);
+  MtStateTargetWriterUniverse stateTargetWriterUniverse = collectMtStateTargetWriters(mtTasks);
+  for (const auto& iter : mtTasks) {
+    int cppId = iter.first;
+    if (cppId < 0 || cppId >= superId) continue;
+    auto superIter = cppId2Super.find(cppId);
+    if (superIter == cppId2Super.end() || superIter->second == nullptr) continue;
+    const MtBoundaryInfo& boundary = iter.second.boundary;
+    MtStateUpdateTraceInfo& info = infos[cppId];
+    info.hasStateUpdate = boundary.hasStateUpdate;
+    if (!boundary.hasStateUpdate) continue;
+    std::string rhsTimingClass = mtStateUpdateRhsTimingClass(boundary);
+    bool rhsReadsSameCycleTarget = mtStateUpdateHasSameCycleTargetRead(boundary, allStateTargetNames);
+    std::vector<std::string> blockReasons = mtStateUpdateBlockReasons(boundary, superIter->second, rhsTimingClass, rhsReadsSameCycleTarget);
+    std::string candidateKind = mtStateUpdateCandidateKind(boundary, blockReasons);
+    MtStateTargetWriterInfo stateTargetWriterInfo = mtStateUpdateWriterInfo(boundary, stateTargetWriterUniverse.targetWriters);
+    info.targetWriterConflictKind = mtStateUpdateTargetWriterConflictKind(
+        boundary, stateTargetWriterInfo, stateTargetWriterUniverse.hasIncompleteWriterUniverse);
+    info.runtimeBlockReasons = mtStateUpdateRuntimeBlockReasons(candidateKind, info.targetWriterConflictKind, stateTargetWriterInfo);
+    info.localSafeCandidate = candidateKind == "safe_candidate";
+    info.runtimeSafeCandidate = info.localSafeCandidate && info.runtimeBlockReasons.empty();
+  }
+  return infos;
+}
+
+
 static void applyRepCutLiteSelection(std::map<int, MtTaskInfo>& tasks) {
   int remainingBudget = globalConfig.MtRepCutCopyBudget;
   bool enabled = globalConfig.MtRepCutLiteMode == "on";
@@ -3183,6 +4446,71 @@ static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelection() {
   return tasks;
 }
 
+struct MtContextCacheState {
+  bool hasRepCutTasks = false;
+  bool hasRepCutSelectedTasks = false;
+  std::map<int, MtTaskInfo> repCutTasks;
+  bool hasCoarseRegionPlan = false;
+  bool hasStateUpdateTraceInfo = false;
+  MtCoarseRegionPlan coarseRegionPlan;
+  std::vector<MtStateUpdateTraceInfo> stateUpdateTraceInfo;
+  std::map<int, MtTaskInfo> repCutSelectedTasks;
+};
+
+static MtContextCacheState mtContextCache;
+
+static void resetMtContextCache() {
+  mtContextCache = MtContextCacheState();
+  mtDependencyEdgeCache.clear();
+  mtActiveEdgeCache.clear();
+}
+
+static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutForInvocation() {
+  if (!globalConfig.MtContextCache) return buildMtTaskInfoMapWithRepCut();
+  if (!mtContextCache.hasRepCutTasks) {
+    mtContextCache.repCutTasks = buildMtTaskInfoMapWithRepCut();
+    mtContextCache.hasRepCutTasks = true;
+  }
+  return mtContextCache.repCutTasks;
+}
+
+static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelectionForInvocation() {
+  if (!globalConfig.MtContextCache) return buildMtTaskInfoMapWithRepCutSelection();
+  if (!mtContextCache.hasRepCutSelectedTasks) {
+    std::map<int, MtTaskInfo> tasks = buildMtTaskInfoMapWithRepCutForInvocation();
+    applyRepCutLiteSelection(tasks);
+    mtContextCache.repCutSelectedTasks = std::move(tasks);
+    mtContextCache.hasRepCutSelectedTasks = true;
+  }
+  return mtContextCache.repCutSelectedTasks;
+}
+
+static MtCoarseRegionPlan planMtCoarseRegionsForInvocation(const std::map<int, MtTaskInfo>& tasks) {
+  if (!globalConfig.MtContextCache) return planMtCoarseRegions(tasks);
+  if (!mtContextCache.hasCoarseRegionPlan) {
+    mtContextCache.coarseRegionPlan = planMtCoarseRegions(tasks);
+    mtContextCache.hasCoarseRegionPlan = true;
+  }
+  return mtContextCache.coarseRegionPlan;
+}
+
+static std::vector<MtStateUpdateTraceInfo> buildMtStateUpdateTraceInfoForInvocation(const std::map<int, MtTaskInfo>& tasks) {
+  if (!globalConfig.MtContextCache) return buildMtStateUpdateTraceInfo(tasks);
+  if (!mtContextCache.hasStateUpdateTraceInfo) {
+    mtContextCache.stateUpdateTraceInfo = buildMtStateUpdateTraceInfo(tasks);
+    mtContextCache.hasStateUpdateTraceInfo = true;
+  }
+  return mtContextCache.stateUpdateTraceInfo;
+}
+
+static void logMtReportTimer(const char* name, struct timeval start, struct timeval end) {
+  if (!globalConfig.MtReportTimers) return;
+  int64_t elapsedUs = (static_cast<int64_t>(end.tv_sec - start.tv_sec) * 1000000ll) + static_cast<int64_t>(end.tv_usec - start.tv_usec);
+  if (elapsedUs < 0) elapsedUs = 0;
+  printf("[mt-report-timer] %s = %llu ms\n", name, static_cast<unsigned long long>(elapsedUs / 1000ll));
+}
+
+
 static bool mtRepCutLiteRuntimeHelperModeEnabled() {
   if (globalConfig.MtHelperMode == "mt") return true;
   return globalConfig.MtHelperMode == "mt-level-dispatch" && mtUseLevelDispatchRepCutRuntime();
@@ -3239,7 +4567,8 @@ void graph::dumpMtScheduleJson() {
   std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_schedule.json";
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt schedule json %s", path.c_str());
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCut();
+  struct timeval mtReportTimerStart = getTime();
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutForInvocation();
   std::set<std::string> allStateTargetNames = collectAllMtStateTargetNames(mtTasks);
   MtStateTargetWriterUniverse stateTargetWriterUniverse = collectMtStateTargetWriters(mtTasks);
 
@@ -3395,6 +4724,519 @@ void graph::dumpMtScheduleJson() {
   fprintf(fp, "}\n");
   fclose(fp);
   printf("[mt-schedule] wrote %d tasks to %s\n", superId, path.c_str());
+  logMtReportTimer("schedule", mtReportTimerStart, getTime());
+}
+
+void graph::dumpMtDenseScheduleJson() {
+  std::string baseName = globalConfig.InputBaseName.empty() ? name : globalConfig.InputBaseName;
+  std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_dense_schedule.json";
+  FILE* fp = std::fopen(path.c_str(), "w");
+  Assert(fp != nullptr, "failed to open mt dense schedule json %s", path.c_str());
+  struct timeval mtReportTimerStart = getTime();
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+  markMtRepCutLiteRuntimeApplied(mtTasks);
+  MtDenseSchedule schedule = buildMtDenseSchedule(mtTasks, mtUseDenseExecutorCodegen());
+
+  int maxLayerWidth = 0;
+  int worker0OnlyLayerCount = 0;
+  for (const MtDenseLayer& layer : schedule.layers) {
+    if (layer.taskCount > maxLayerWidth) maxLayerWidth = layer.taskCount;
+    if (layer.workerZeroOnly) worker0OnlyLayerCount ++;
+  }
+
+  int denseMTaskCount = static_cast<int>(schedule.mtasks.size());
+  int denseMTaskEdgeCount = 0;
+  int denseMTaskCrossThreadEdgeCount = 0;
+  int denseMTaskSameThreadEdgeCount = 0;
+  int denseMTaskMaxPredCount = 0;
+  int denseMTaskMaxSuccCount = 0;
+  int denseMTaskMaxStaticCost = 0;
+  int denseMTaskMaxTaskCount = 0;
+  int denseThreadCount = 0;
+  for (int worker : schedule.mtaskThreadAssign) denseThreadCount = std::max(denseThreadCount, worker + 1);
+  std::vector<int> denseWorkerStaticCosts((size_t)denseThreadCount, 0);
+  std::vector<int> denseWorkerTaskCounts((size_t)denseThreadCount, 0);
+  std::vector<int> denseWorkerMTaskCounts((size_t)denseThreadCount, 0);
+  std::vector<int> denseMTaskOrder((size_t)denseMTaskCount);
+  for (int i = 0; i < denseMTaskCount; i ++) {
+    denseMTaskOrder[(size_t)i] = i;
+    const MtDenseMTask& mtask = schedule.mtasks[(size_t)i];
+    int predCount = static_cast<int>(mtask.predMTasks.size());
+    int succCount = static_cast<int>(mtask.succMTasks.size());
+    denseMTaskMaxPredCount = std::max(denseMTaskMaxPredCount, predCount);
+    denseMTaskMaxSuccCount = std::max(denseMTaskMaxSuccCount, succCount);
+    denseMTaskMaxStaticCost = std::max(denseMTaskMaxStaticCost, mtask.staticCost);
+    denseMTaskMaxTaskCount = std::max(denseMTaskMaxTaskCount, mtask.taskCount);
+    denseMTaskEdgeCount += succCount;
+    int worker = i < static_cast<int>(schedule.mtaskThreadAssign.size()) ? schedule.mtaskThreadAssign[(size_t)i] : -1;
+    if (worker >= 0 && worker < denseThreadCount) {
+      denseWorkerStaticCosts[(size_t)worker] += mtask.staticCost;
+      denseWorkerTaskCounts[(size_t)worker] += mtask.taskCount;
+      denseWorkerMTaskCounts[(size_t)worker] ++;
+    }
+    for (int succ : mtask.succMTasks) {
+      int succWorker = succ >= 0 && succ < static_cast<int>(schedule.mtaskThreadAssign.size()) ? schedule.mtaskThreadAssign[(size_t)succ] : -1;
+      if (worker >= 0 && succWorker >= 0 && worker == succWorker) denseMTaskSameThreadEdgeCount ++;
+      else denseMTaskCrossThreadEdgeCount ++;
+    }
+  }
+  bool denseXThreadDepsOnly = mtUseDenseXThreadDepsOnly();
+  bool denseTransitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
+  int denseRuntimeSameThreadEdgeElidedCount = 0;
+  std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(schedule.mtasks, schedule.mtaskThreadAssign, denseXThreadDepsOnly, &denseRuntimeSameThreadEdgeElidedCount);
+  int denseRuntimeDependencyEdgeCountBeforeTransitiveReduce = mtDenseRuntimeEdgeCount(denseRuntimeSuccs);
+  int denseRuntimeTransitiveEdgeElidedCount = denseTransitiveReduceEdges ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, schedule.mtaskThreadAssign) : 0;
+  int denseRuntimeDependencyEdgeCount = mtDenseRuntimeEdgeCount(denseRuntimeSuccs);
+  auto denseTopBy = [&](auto metric) {
+    std::vector<int> top = denseMTaskOrder;
+    std::sort(top.begin(), top.end(), [&](int lhs, int rhs) {
+      int lhsMetric = metric(schedule.mtasks[(size_t)lhs]);
+      int rhsMetric = metric(schedule.mtasks[(size_t)rhs]);
+      if (lhsMetric != rhsMetric) return lhsMetric > rhsMetric;
+      return lhs < rhs;
+    });
+    if (top.size() > 20) top.resize(20);
+    return top;
+  };
+  std::vector<int> denseTopPredMTasks = denseTopBy([](const MtDenseMTask& mtask) { return static_cast<int>(mtask.predMTasks.size()); });
+  std::vector<int> denseTopSuccMTasks = denseTopBy([](const MtDenseMTask& mtask) { return static_cast<int>(mtask.succMTasks.size()); });
+  std::vector<int> denseTopStaticCostMTasks = denseTopBy([](const MtDenseMTask& mtask) { return mtask.staticCost; });
+  struct DenseAssignmentStats {
+    std::vector<int> workerStaticCosts;
+    std::vector<int> workerTaskCounts;
+    std::vector<int> workerMTaskCounts;
+    int crossThreadEdgeCount = 0;
+    int sameThreadEdgeCount = 0;
+    int maxWorkerStaticCost = 0;
+    int minWorkerStaticCost = 0;
+    int predictedMakespan = 0;
+  };
+  auto computeDenseAssignmentStats = [&](const std::vector<int>& assignment) {
+    DenseAssignmentStats stats;
+    stats.workerStaticCosts.assign((size_t)denseThreadCount, 0);
+    stats.workerTaskCounts.assign((size_t)denseThreadCount, 0);
+    stats.workerMTaskCounts.assign((size_t)denseThreadCount, 0);
+    for (int i = 0; i < denseMTaskCount; i ++) {
+      int worker = i < static_cast<int>(assignment.size()) ? assignment[(size_t)i] : -1;
+      if (worker >= 0 && worker < denseThreadCount) {
+        const MtDenseMTask& mtask = schedule.mtasks[(size_t)i];
+        stats.workerStaticCosts[(size_t)worker] += mtask.staticCost;
+        stats.workerTaskCounts[(size_t)worker] += mtask.taskCount;
+        stats.workerMTaskCounts[(size_t)worker] ++;
+      }
+    }
+    for (int i = 0; i < denseMTaskCount; i ++) {
+      int worker = i < static_cast<int>(assignment.size()) ? assignment[(size_t)i] : -1;
+      for (int succ : schedule.mtasks[(size_t)i].succMTasks) {
+        int succWorker = succ >= 0 && succ < static_cast<int>(assignment.size()) ? assignment[(size_t)succ] : -1;
+        if (worker >= 0 && succWorker >= 0 && worker == succWorker) stats.sameThreadEdgeCount ++;
+        else stats.crossThreadEdgeCount ++;
+      }
+    }
+    if (!stats.workerStaticCosts.empty()) {
+      stats.maxWorkerStaticCost = *std::max_element(stats.workerStaticCosts.begin(), stats.workerStaticCosts.end());
+      stats.minWorkerStaticCost = *std::min_element(stats.workerStaticCosts.begin(), stats.workerStaticCosts.end());
+    }
+    return stats;
+  };
+  auto computeDenseAssignmentMakespan = [&](const std::vector<int>& assignment) {
+    std::vector<int> completion((size_t)denseMTaskCount, 0);
+    std::vector<int> busyUntil((size_t)denseThreadCount, 0);
+    for (int mtaskId : denseMTaskOrder) {
+      if (mtaskId < 0 || mtaskId >= denseMTaskCount) continue;
+      int worker = assignment[(size_t)mtaskId];
+      if (worker < 0 || worker >= denseThreadCount) return -1;
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      int timeBegin = busyUntil[(size_t)worker];
+      for (int pred : mtask.predMTasks) {
+        if (pred < 0 || pred >= denseMTaskCount) continue;
+        int predWorker = assignment[(size_t)pred];
+        int predEnd = completion[(size_t)pred];
+        if (predWorker >= 0 && predWorker != worker) predEnd += (schedule.mtasks[(size_t)pred].staticCost * 30) / 100;
+        if (predEnd > timeBegin) timeBegin = predEnd;
+      }
+      int endTime = timeBegin + std::max(1, mtask.staticCost);
+      completion[(size_t)mtaskId] = endTime;
+      busyUntil[(size_t)worker] = endTime;
+    }
+    int makespan = 0;
+    for (int endTime : completion) makespan = std::max(makespan, endTime);
+    return makespan;
+  };
+  auto buildDenseLptAssignment = [&]() {
+    std::vector<int> assignment((size_t)denseMTaskCount, -1);
+    std::vector<int> loads((size_t)denseThreadCount, 0);
+    std::vector<int> order = denseMTaskOrder;
+    std::sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+      const MtDenseMTask& lm = schedule.mtasks[(size_t)lhs];
+      const MtDenseMTask& rm = schedule.mtasks[(size_t)rhs];
+      if (lm.workerZeroOnly != rm.workerZeroOnly) return lm.workerZeroOnly > rm.workerZeroOnly;
+      if (lm.staticCost != rm.staticCost) return lm.staticCost > rm.staticCost;
+      return lhs < rhs;
+    });
+    for (int mtaskId : order) {
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      int bestWorker = 0;
+      if (!mtask.workerZeroOnly && denseThreadCount > 1) {
+        bestWorker = 0;
+        for (int worker = 1; worker < denseThreadCount; worker ++) {
+          if (loads[(size_t)worker] < loads[(size_t)bestWorker]) bestWorker = worker;
+        }
+      }
+      assignment[(size_t)mtaskId] = bestWorker;
+      if (bestWorker >= 0 && bestWorker < denseThreadCount) loads[(size_t)bestWorker] += mtask.staticCost;
+    }
+    return assignment;
+  };
+  auto buildDensePredAffinityAssignment = [&]() {
+    std::vector<int> assignment((size_t)denseMTaskCount, -1);
+    std::vector<int> loads((size_t)denseThreadCount, 0);
+    for (int mtaskId = 0; mtaskId < denseMTaskCount; mtaskId ++) {
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      int bestWorker = 0;
+      if (!mtask.workerZeroOnly && denseThreadCount > 1) {
+        int bestPredAffinity = -1;
+        for (int worker = 0; worker < denseThreadCount; worker ++) {
+          int predAffinity = 0;
+          for (int pred : mtask.predMTasks) {
+            if (pred >= 0 && pred < static_cast<int>(assignment.size()) && assignment[(size_t)pred] == worker) predAffinity ++;
+          }
+          if (predAffinity > bestPredAffinity ||
+              (predAffinity == bestPredAffinity && loads[(size_t)worker] < loads[(size_t)bestWorker])) {
+            bestPredAffinity = predAffinity;
+            bestWorker = worker;
+          }
+        }
+      }
+      assignment[(size_t)mtaskId] = bestWorker;
+      if (bestWorker >= 0 && bestWorker < denseThreadCount) loads[(size_t)bestWorker] += mtask.staticCost;
+    }
+    return assignment;
+  };
+  DenseAssignmentStats denseCurrentAssignmentStats = computeDenseAssignmentStats(schedule.mtaskThreadAssign);
+  denseCurrentAssignmentStats.predictedMakespan = computeDenseAssignmentMakespan(schedule.mtaskThreadAssign);
+  std::vector<int> denseLptAssignment = buildDenseLptAssignment();
+  DenseAssignmentStats denseLptAssignmentStats = computeDenseAssignmentStats(denseLptAssignment);
+  denseLptAssignmentStats.predictedMakespan = computeDenseAssignmentMakespan(denseLptAssignment);
+  std::vector<int> densePredAffinityAssignment = buildDensePredAffinityAssignment();
+  DenseAssignmentStats densePredAffinityAssignmentStats = computeDenseAssignmentStats(densePredAffinityAssignment);
+  densePredAffinityAssignmentStats.predictedMakespan = computeDenseAssignmentMakespan(densePredAffinityAssignment);
+  auto densePackThreadsProjection = mtBuildDensePackThreadsAssignment(schedule.mtasks, denseThreadCount);
+  DenseAssignmentStats densePackThreadsAssignmentStats = computeDenseAssignmentStats(densePackThreadsProjection.first);
+  densePackThreadsAssignmentStats.predictedMakespan = densePackThreadsProjection.second;
+  struct DenseWorker0MixStats {
+    int worker0OnlyMTaskCount = 0;
+    int contaminatedMTaskCount = 0;
+    int worker0OnlyTaskCount = 0;
+    int contaminatedTaskCount = 0;
+    int contaminatedStaticCost = 0;
+  };
+  auto computeDenseWorker0MixStats = [&](const std::vector<MtDenseMTask>& mtasks) {
+    DenseWorker0MixStats stats;
+    for (const MtDenseMTask& mtask : mtasks) {
+      int worker0OnlyTasks = 0;
+      for (int sccId : mtask.sccIds) {
+        if (sccId < 0 || sccId >= static_cast<int>(schedule.sccs.size())) continue;
+        worker0OnlyTasks += schedule.sccs[(size_t)sccId].worker0OnlyTaskCount;
+      }
+      if (mtask.workerZeroOnly) stats.worker0OnlyMTaskCount ++;
+      stats.worker0OnlyTaskCount += worker0OnlyTasks;
+      if (worker0OnlyTasks > 0 && worker0OnlyTasks < mtask.taskCount) {
+        stats.contaminatedMTaskCount ++;
+        stats.contaminatedTaskCount += mtask.taskCount;
+        stats.contaminatedStaticCost += mtask.staticCost;
+      }
+    }
+    return stats;
+  };
+  auto computeProjectedDenseAssignmentStats = [&](const std::vector<MtDenseMTask>& mtasks, const std::vector<int>& assignment) {
+    DenseAssignmentStats stats;
+    stats.workerStaticCosts.assign((size_t)denseThreadCount, 0);
+    stats.workerTaskCounts.assign((size_t)denseThreadCount, 0);
+    stats.workerMTaskCounts.assign((size_t)denseThreadCount, 0);
+    for (size_t i = 0; i < mtasks.size(); i ++) {
+      int worker = i < assignment.size() ? assignment[i] : -1;
+      if (worker >= 0 && worker < denseThreadCount) {
+        const MtDenseMTask& mtask = mtasks[i];
+        stats.workerStaticCosts[(size_t)worker] += mtask.staticCost;
+        stats.workerTaskCounts[(size_t)worker] += mtask.taskCount;
+        stats.workerMTaskCounts[(size_t)worker] ++;
+      }
+    }
+    for (size_t i = 0; i < mtasks.size(); i ++) {
+      int worker = i < assignment.size() ? assignment[i] : -1;
+      for (int succ : mtasks[i].succMTasks) {
+        int succWorker = succ >= 0 && succ < static_cast<int>(assignment.size()) ? assignment[(size_t)succ] : -1;
+        if (worker >= 0 && succWorker >= 0 && worker == succWorker) stats.sameThreadEdgeCount ++;
+        else stats.crossThreadEdgeCount ++;
+      }
+    }
+    if (!stats.workerStaticCosts.empty()) {
+      stats.maxWorkerStaticCost = *std::max_element(stats.workerStaticCosts.begin(), stats.workerStaticCosts.end());
+      stats.minWorkerStaticCost = *std::min_element(stats.workerStaticCosts.begin(), stats.workerStaticCosts.end());
+    }
+    return stats;
+  };
+  auto computeProjectedDenseAssignmentMakespan = [&](const std::vector<MtDenseMTask>& mtasks, const std::vector<int>& assignment) {
+    std::vector<int> completion(mtasks.size(), 0);
+    std::vector<int> busyUntil((size_t)denseThreadCount, 0);
+    for (size_t mtaskId = 0; mtaskId < mtasks.size(); mtaskId ++) {
+      int worker = mtaskId < assignment.size() ? assignment[mtaskId] : -1;
+      if (worker < 0 || worker >= denseThreadCount) return -1;
+      const MtDenseMTask& mtask = mtasks[mtaskId];
+      int timeBegin = busyUntil[(size_t)worker];
+      for (int pred : mtask.predMTasks) {
+        if (pred < 0 || pred >= static_cast<int>(mtasks.size())) continue;
+        int predWorker = assignment[(size_t)pred];
+        int predEnd = completion[(size_t)pred];
+        if (predWorker >= 0 && predWorker != worker) predEnd += (mtasks[(size_t)pred].staticCost * 30) / 100;
+        if (predEnd > timeBegin) timeBegin = predEnd;
+      }
+      int endTime = timeBegin + std::max(1, mtask.staticCost);
+      completion[mtaskId] = endTime;
+      busyUntil[(size_t)worker] = endTime;
+    }
+    int makespan = 0;
+    for (int endTime : completion) makespan = std::max(makespan, endTime);
+    return makespan;
+  };
+  auto buildProjectedDenseCurrentAssignment = [&](const std::vector<MtDenseMTask>& mtasks) {
+    std::vector<int> assignment(mtasks.size(), 0);
+    for (size_t i = 0; i < mtasks.size(); i ++) {
+      assignment[i] = mtasks[i].workerZeroOnly ? 0 : (static_cast<int>(i) % denseThreadCount);
+    }
+    return assignment;
+  };
+  DenseWorker0MixStats denseWorker0MixStats = computeDenseWorker0MixStats(schedule.mtasks);
+  std::vector<MtDenseMTask> denseWorker0SplitMTasks = mtBuildDenseMTasks(schedule, true);
+  int denseWorker0SplitEdgeCount = 0;
+  for (const MtDenseMTask& mtask : denseWorker0SplitMTasks) denseWorker0SplitEdgeCount += static_cast<int>(mtask.succMTasks.size());
+  DenseWorker0MixStats denseWorker0SplitMixStats = computeDenseWorker0MixStats(denseWorker0SplitMTasks);
+  std::vector<int> denseWorker0SplitCurrentAssignment = buildProjectedDenseCurrentAssignment(denseWorker0SplitMTasks);
+  DenseAssignmentStats denseWorker0SplitCurrentStats = computeProjectedDenseAssignmentStats(denseWorker0SplitMTasks, denseWorker0SplitCurrentAssignment);
+  denseWorker0SplitCurrentStats.predictedMakespan = computeProjectedDenseAssignmentMakespan(denseWorker0SplitMTasks, denseWorker0SplitCurrentAssignment);
+  auto denseWorker0SplitPackThreadsProjection = mtBuildDensePackThreadsAssignment(denseWorker0SplitMTasks, denseThreadCount);
+  DenseAssignmentStats denseWorker0SplitPackThreadsStats = computeProjectedDenseAssignmentStats(denseWorker0SplitMTasks, denseWorker0SplitPackThreadsProjection.first);
+  denseWorker0SplitPackThreadsStats.predictedMakespan = denseWorker0SplitPackThreadsProjection.second;
+
+  fprintf(fp, "{\n");
+  fprintf(fp, "  \"format\": \"gsim.mt-dense-schedule.v1\",\n");
+  fprintf(fp, "  \"codegen_enabled\": %s,\n", schedule.codegenEnabled ? "true" : "false");
+  fprintf(fp, "  \"valid\": %s,\n", schedule.valid ? "true" : "false");
+  fprintf(fp, "  \"fallback_reason\": \"%s\",\n", jsonEscape(schedule.fallbackReason).c_str());
+  fprintf(fp, "  \"dense_xthread_deps_only_enabled\": %s,\n", denseXThreadDepsOnly ? "true" : "false");
+  fprintf(fp, "  \"dense_transitive_reduce_edges_enabled\": %s,\n", denseTransitiveReduceEdges ? "true" : "false");
+  fprintf(fp, "  \"dense_split_worker0_mtasks_enabled\": %s,\n", mtUseDenseSplitWorker0MTasks() ? "true" : "false");
+  fprintf(fp, "  \"dense_runtime_dependency_edge_count\": %d,\n", denseRuntimeDependencyEdgeCount);
+  fprintf(fp, "  \"dense_runtime_dependency_edge_count_before_transitive_reduce\": %d,\n", denseRuntimeDependencyEdgeCountBeforeTransitiveReduce);
+  fprintf(fp, "  \"dense_runtime_same_thread_edge_elided_count\": %d,\n", denseRuntimeSameThreadEdgeElidedCount);
+  fprintf(fp, "  \"dense_runtime_transitive_edge_elided_count\": %d,\n", denseRuntimeTransitiveEdgeElidedCount);
+  fprintf(fp, "  \"task_count\": %d,\n", schedule.taskCount);
+  fprintf(fp, "  \"active_width\": %d,\n", ACTIVE_WIDTH);
+  fprintf(fp, "  \"edge_count\": %d,\n", schedule.edgeCount);
+  fprintf(fp, "  \"dependency_edge_count\": %d,\n", schedule.dependencyEdgeCount);
+  fprintf(fp, "  \"active_edge_count\": %d,\n", schedule.activeEdgeCount);
+  fprintf(fp, "  \"need_activate_edge_count\": %d,\n", schedule.needActivateEdgeCount);
+  fprintf(fp, "  \"scc_count\": %zu,\n", schedule.sccs.size());
+  fprintf(fp, "  \"cycle_scc_count\": %d,\n", schedule.cycleSccCount);
+  fprintf(fp, "  \"max_scc_size\": %d,\n", schedule.maxSccSize);
+  fprintf(fp, "  \"dense_counter_bytes_u8_t8\": %zu,\n", schedule.sccs.size() * (size_t)8);
+  fprintf(fp, "  \"layer_count\": %zu,\n", schedule.layers.size());
+  fprintf(fp, "  \"max_layer_width\": %d,\n", maxLayerWidth);
+  fprintf(fp, "  \"worker0_only_layer_count\": %d,\n", worker0OnlyLayerCount);
+  fprintf(fp, "  \"dense_mtask_count\": %d,\n", denseMTaskCount);
+  fprintf(fp, "  \"dense_mtask_edge_count\": %d,\n", denseMTaskEdgeCount);
+  fprintf(fp, "  \"dense_mtask_cross_thread_edge_count\": %d,\n", denseMTaskCrossThreadEdgeCount);
+  fprintf(fp, "  \"dense_mtask_same_thread_edge_count\": %d,\n", denseMTaskSameThreadEdgeCount);
+  fprintf(fp, "  \"dense_mtask_max_pred_count\": %d,\n", denseMTaskMaxPredCount);
+  fprintf(fp, "  \"dense_mtask_max_succ_count\": %d,\n", denseMTaskMaxSuccCount);
+  fprintf(fp, "  \"dense_mtask_max_static_cost\": %d,\n", denseMTaskMaxStaticCost);
+  fprintf(fp, "  \"dense_mtask_max_task_count\": %d,\n", denseMTaskMaxTaskCount);
+  fprintf(fp, "  \"dense_worker0_only_mtask_count\": %d,\n", denseWorker0MixStats.worker0OnlyMTaskCount);
+  fprintf(fp, "  \"dense_worker0_contaminated_mtask_count\": %d,\n", denseWorker0MixStats.contaminatedMTaskCount);
+  fprintf(fp, "  \"dense_worker0_contaminated_task_count\": %d,\n", denseWorker0MixStats.contaminatedTaskCount);
+  fprintf(fp, "  \"dense_worker0_contaminated_static_cost\": %d,\n", denseWorker0MixStats.contaminatedStaticCost);
+  fprintf(fp, "  \"dense_worker0_split_mtask_count\": %zu,\n", denseWorker0SplitMTasks.size());
+  fprintf(fp, "  \"dense_worker0_split_edge_count\": %d,\n", denseWorker0SplitEdgeCount);
+  fprintf(fp, "  \"dense_worker0_split_worker0_only_mtask_count\": %d,\n", denseWorker0SplitMixStats.worker0OnlyMTaskCount);
+  fprintf(fp, "  \"dense_worker0_split_contaminated_mtask_count\": %d,\n", denseWorker0SplitMixStats.contaminatedMTaskCount);
+  fprintf(fp, "  \"dense_worker0_split_contaminated_task_count\": %d,\n", denseWorker0SplitMixStats.contaminatedTaskCount);
+  fprintf(fp, "  \"dense_worker0_split_contaminated_static_cost\": %d,\n", denseWorker0SplitMixStats.contaminatedStaticCost);
+  fprintf(fp, "  \"dense_worker_static_costs\": ");
+  dumpJsonIntArray(fp, denseWorkerStaticCosts);
+  fprintf(fp, ",\n");
+  fprintf(fp, "  \"dense_worker_task_counts\": ");
+  dumpJsonIntArray(fp, denseWorkerTaskCounts);
+  fprintf(fp, ",\n");
+  fprintf(fp, "  \"dense_worker_mtask_counts\": ");
+  dumpJsonIntArray(fp, denseWorkerMTaskCounts);
+  fprintf(fp, ",\n");
+  auto dumpDenseMTaskSummaryArray = [&](const char* key, const std::vector<int>& indices) {
+    fprintf(fp, "  \"%s\": [\n", key);
+    for (size_t rank = 0; rank < indices.size(); rank ++) {
+      int mtaskId = indices[rank];
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      int worker = mtaskId < static_cast<int>(schedule.mtaskThreadAssign.size()) ? schedule.mtaskThreadAssign[(size_t)mtaskId] : -1;
+      fprintf(fp, "    {\"rank\": %zu, \"mtask_id\": %d, \"thread\": %d, \"pred_count\": %zu, \"succ_count\": %zu, \"static_cost\": %d, \"task_count\": %d}%s\n",
+              rank, mtaskId, worker, mtask.predMTasks.size(), mtask.succMTasks.size(), mtask.staticCost, mtask.taskCount,
+              rank + 1 == indices.size() ? "" : ",");
+    }
+    fprintf(fp, "  ],\n");
+  };
+  dumpDenseMTaskSummaryArray("dense_top_pred_mtasks", denseTopPredMTasks);
+  dumpDenseMTaskSummaryArray("dense_top_succ_mtasks", denseTopSuccMTasks);
+  dumpDenseMTaskSummaryArray("dense_top_static_cost_mtasks", denseTopStaticCostMTasks);
+  auto dumpDenseAssignmentStats = [&](const char* key, const DenseAssignmentStats& stats) {
+    fprintf(fp, "  \"%s\": {\n", key);
+    fprintf(fp, "    \"cross_thread_edge_count\": %d,\n", stats.crossThreadEdgeCount);
+    fprintf(fp, "    \"same_thread_edge_count\": %d,\n", stats.sameThreadEdgeCount);
+    fprintf(fp, "    \"max_worker_static_cost\": %d,\n", stats.maxWorkerStaticCost);
+    fprintf(fp, "    \"min_worker_static_cost\": %d,\n", stats.minWorkerStaticCost);
+    fprintf(fp, "    \"predicted_makespan\": %d,\n", stats.predictedMakespan);
+    fprintf(fp, "    \"worker_static_costs\": ");
+    dumpJsonIntArray(fp, stats.workerStaticCosts);
+    fprintf(fp, ",\n");
+    fprintf(fp, "    \"worker_task_counts\": ");
+    dumpJsonIntArray(fp, stats.workerTaskCounts);
+    fprintf(fp, ",\n");
+    fprintf(fp, "    \"worker_mtask_counts\": ");
+    dumpJsonIntArray(fp, stats.workerMTaskCounts);
+    fprintf(fp, "\n  },\n");
+  };
+  dumpDenseAssignmentStats("dense_assignment_current", denseCurrentAssignmentStats);
+  dumpDenseAssignmentStats("dense_assignment_lpt", denseLptAssignmentStats);
+  dumpDenseAssignmentStats("dense_assignment_pred_affinity", densePredAffinityAssignmentStats);
+  dumpDenseAssignmentStats("dense_assignment_packthreads", densePackThreadsAssignmentStats);
+  dumpDenseAssignmentStats("dense_worker0_split_assignment_current", denseWorker0SplitCurrentStats);
+  dumpDenseAssignmentStats("dense_worker0_split_assignment_packthreads", denseWorker0SplitPackThreadsStats);
+  fprintf(fp, "  \"worker0_only_cpp_ids\": ");
+  dumpJsonIntArray(fp, schedule.worker0OnlyCppIds);
+  fprintf(fp, ",\n");
+  fprintf(fp, "  \"always_active_cpp_ids\": ");
+  dumpJsonIntArray(fp, schedule.alwaysActiveCppIds);
+  fprintf(fp, ",\n");
+
+  fprintf(fp, "  \"tasks\": [\n");
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    SuperNode* super = cppId2Super[cppId];
+    MtTaskInfo& mtTask = mtTasks[cppId];
+    int activeWord;
+    uint64_t activeMask;
+    std::tie(activeWord, activeMask) = setIdxMask(cppId);
+    fprintf(fp, "    {\"cpp_id\": %d, \"scan_index\": %d, \"super_id\": %d, \"super_type\": \"%s\", ", cppId, cppId, super->id, superTypeName(super->superType));
+    fprintf(fp, "\"task_kind\": \"%s\", \"serial_reasons\": ", mtTask.taskKind.c_str());
+    dumpJsonStringArray(fp, mtTask.serialReasons);
+    fprintf(fp, ", \"worker0_only\": %s, \"is_always_active\": %s, ",
+            hasWorker0OnlyReason(mtTask.serialReasons) ? "true" : "false",
+            isAlwaysActive(cppId) ? "true" : "false");
+    fprintf(fp, "\"active_word\": %d, \"active_mask\": \"0x%" PRIx64 "\", ", activeWord, activeMask);
+    fprintf(fp, "\"static_cost\": %d, \"member_node_cost\": %zu, ", mtTaskEstimatedCost(mtTasks, cppId), super->member.size());
+    fprintf(fp, "\"pred_cpp_ids\": ");
+    dumpJsonIntArray(fp, schedule.predCppIds[(size_t)cppId]);
+    fprintf(fp, ", \"succ_cpp_ids\": ");
+    dumpJsonIntArray(fp, schedule.succCppIds[(size_t)cppId]);
+    fprintf(fp, ", \"boundary\": {\"has_state_update\": %s, \"has_memory_write\": %s, \"has_reset\": %s, \"has_external\": %s, \"has_special\": %s}, ",
+            mtTask.boundary.hasStateUpdate ? "true" : "false",
+            mtTask.boundary.hasMemoryWrite ? "true" : "false",
+            mtTask.boundary.hasReset ? "true" : "false",
+            mtTask.boundary.hasExternal ? "true" : "false",
+            mtTask.boundary.hasSpecial ? "true" : "false");
+    fprintf(fp, "\"repcut_runtime_applied\": %s", mtTask.repcutRuntimeApplied ? "true" : "false");
+    if (mtUseDenseMemberMetadata()) {
+      dumpMtDenseMemberMetadataForTask(fp, super);
+    }
+    fprintf(fp, "}");
+    fprintf(fp, "%s\n", cppId + 1 == superId ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+
+  fprintf(fp, "  \"edges\": [\n");
+  for (size_t i = 0; i < schedule.edges.size(); i ++) {
+    const MtDenseEdge& edge = schedule.edges[i];
+    fprintf(fp, "    {\"from_cpp_id\": %d, \"to_cpp_id\": %d, \"kind\": \"%s\"}%s\n",
+            edge.fromCppId, edge.toCppId, edge.kind.c_str(), i + 1 == schedule.edges.size() ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+  dumpMtDenseActivationOrigins(fp);
+
+  fprintf(fp, "  \"sccs\": [\n");
+  for (size_t sccId = 0; sccId < schedule.sccs.size(); sccId ++) {
+    const MtDenseScc& scc = schedule.sccs[sccId];
+    fprintf(fp, "    {\"scc_id\": %zu, \"cpp_ids\": ", sccId);
+    dumpJsonIntArray(fp, scc.cppIds);
+    fprintf(fp, ", \"task_count\": %zu, \"static_cost\": %d, \"member_node_cost\": %d, \"worker0_only\": %s, \"worker0_only_task_count\": %d, \"is_always_active\": %s, \"always_active_task_count\": %d, \"is_trivial\": %s, \"internal_edge_count\": %d, \"internal_dependency_edge_count\": %d, \"internal_active_edge_count\": %d, \"internal_need_activate_edge_count\": %d, \"incoming_edge_count\": %d, \"outgoing_edge_count\": %d, \"pred_sccs\": ",
+            scc.cppIds.size(), scc.staticCost, scc.memberNodeCost,
+            scc.workerZeroOnly ? "true" : "false", scc.worker0OnlyTaskCount,
+            scc.isAlwaysActive ? "true" : "false", scc.alwaysActiveTaskCount,
+            scc.cppIds.size() == 1 ? "true" : "false",
+            scc.internalEdgeCount, scc.internalDependencyEdgeCount, scc.internalActiveEdgeCount,
+            scc.internalNeedActivateEdgeCount, scc.incomingEdgeCount, scc.outgoingEdgeCount);
+    dumpJsonIntArray(fp, scc.predSccs);
+    fprintf(fp, ", \"succ_sccs\": ");
+    dumpJsonIntArray(fp, scc.succSccs);
+    fprintf(fp, "}%s\n", sccId + 1 == schedule.sccs.size() ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+
+  fprintf(fp, "  \"layers\": [\n");
+  for (size_t layerId = 0; layerId < schedule.layers.size(); layerId ++) {
+    const MtDenseLayer& layer = schedule.layers[layerId];
+    fprintf(fp, "    {\"layer_id\": %zu, \"scc_ids\": ", layerId);
+    dumpJsonIntArray(fp, layer.sccIds);
+    fprintf(fp, ", \"worker0_only\": %s, \"task_count\": %d, \"static_cost\": %d}%s\n",
+            layer.workerZeroOnly ? "true" : "false", layer.taskCount, layer.staticCost,
+            layerId + 1 == schedule.layers.size() ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+  std::vector<int> cycleSccIds;
+  for (size_t sccId = 0; sccId < schedule.sccs.size(); sccId ++) {
+    if (schedule.sccs[sccId].cppIds.size() > 1) cycleSccIds.push_back(static_cast<int>(sccId));
+  }
+  std::sort(cycleSccIds.begin(), cycleSccIds.end(), [&](int lhs, int rhs) {
+    const MtDenseScc& lhsScc = schedule.sccs[(size_t)lhs];
+    const MtDenseScc& rhsScc = schedule.sccs[(size_t)rhs];
+    if (lhsScc.cppIds.size() != rhsScc.cppIds.size()) return lhsScc.cppIds.size() > rhsScc.cppIds.size();
+    if (lhsScc.internalEdgeCount != rhsScc.internalEdgeCount) return lhsScc.internalEdgeCount > rhsScc.internalEdgeCount;
+    return lhs < rhs;
+  });
+
+  fprintf(fp, "  \"cycle_scc_top_by_task_count\": [\n");
+  size_t topCycleLimit = std::min<size_t>(cycleSccIds.size(), 20);
+  for (size_t rank = 0; rank < topCycleLimit; rank ++) {
+    int sccId = cycleSccIds[rank];
+    const MtDenseScc& scc = schedule.sccs[(size_t)sccId];
+    fprintf(fp, "    {\"rank\": %zu, \"scc_id\": %d, \"task_count\": %zu, \"static_cost\": %d, \"member_node_cost\": %d, \"worker0_only_task_count\": %d, \"always_active_task_count\": %d, \"internal_edge_count\": %d, \"internal_dependency_edge_count\": %d, \"internal_active_edge_count\": %d, \"internal_need_activate_edge_count\": %d, \"incoming_edge_count\": %d, \"outgoing_edge_count\": %d}%s\n",
+            rank, sccId, scc.cppIds.size(), scc.staticCost, scc.memberNodeCost,
+            scc.worker0OnlyTaskCount, scc.alwaysActiveTaskCount, scc.internalEdgeCount,
+            scc.internalDependencyEdgeCount, scc.internalActiveEdgeCount,
+            scc.internalNeedActivateEdgeCount, scc.incomingEdgeCount, scc.outgoingEdgeCount,
+            rank + 1 == topCycleLimit ? "" : ",");
+  }
+  fprintf(fp, "  ],\n");
+
+  fprintf(fp, "  \"cycle_sccs\": [\n");
+  for (size_t rank = 0; rank < cycleSccIds.size(); rank ++) {
+    int sccId = cycleSccIds[rank];
+    const MtDenseScc& scc = schedule.sccs[(size_t)sccId];
+    std::vector<int> cppSample;
+    size_t sampleCount = std::min<size_t>(scc.cppIds.size(), 32);
+    cppSample.insert(cppSample.end(), scc.cppIds.begin(), scc.cppIds.begin() + sampleCount);
+    fprintf(fp, "    {\"scc_id\": %d, \"cpp_id_sample\": ", sccId);
+    dumpJsonIntArray(fp, cppSample);
+    fprintf(fp, ", \"worker0_only\": %s, \"worker0_only_task_count\": %d, \"always_active_task_count\": %d, \"task_count\": %zu, \"static_cost\": %d, \"member_node_cost\": %d, \"internal_edge_count\": %d, \"internal_dependency_edge_count\": %d, \"internal_active_edge_count\": %d, \"internal_need_activate_edge_count\": %d, \"incoming_edge_count\": %d, \"outgoing_edge_count\": %d}%s\n",
+            scc.workerZeroOnly ? "true" : "false", scc.worker0OnlyTaskCount, scc.alwaysActiveTaskCount,
+            scc.cppIds.size(), scc.staticCost, scc.memberNodeCost, scc.internalEdgeCount,
+            scc.internalDependencyEdgeCount, scc.internalActiveEdgeCount,
+            scc.internalNeedActivateEdgeCount, scc.incomingEdgeCount, scc.outgoingEdgeCount,
+            rank + 1 == cycleSccIds.size() ? "" : ",");
+  }
+  fprintf(fp, "  ]\n");
+  fprintf(fp, "}\n");
+  fclose(fp);
+  printf("[mt-dense-schedule] wrote %d tasks, %d edges, %zu sccs, valid=%d fallback=%s to %s\n",
+         schedule.taskCount, schedule.edgeCount, schedule.sccs.size(), schedule.valid ? 1 : 0,
+         schedule.fallbackReason.c_str(), path.c_str());
+  logMtReportTimer("dense-schedule", mtReportTimerStart, getTime());
 }
 
 void graph::dumpMtRepCutLiteReport() {
@@ -3402,7 +5244,8 @@ void graph::dumpMtRepCutLiteReport() {
   std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_repcut_lite.json";
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt repcut-lite report %s", path.c_str());
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  struct timeval mtReportTimerStart = getTime();
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   bool appliedToRuntime = markMtRepCutLiteRuntimeApplied(mtTasks);
   MtPureBatchPlan uncutPlan = planMtPureBatches(mtTasks, false);
   MtPureBatchPlan cutPlan = planMtPureBatches(mtTasks, globalConfig.MtRepCutLiteMode == "on");
@@ -3580,6 +5423,7 @@ void graph::dumpMtRepCutLiteReport() {
   fclose(fp);
   printf("[mt-repcut-lite] wrote %d tasks (%d selected, cost %d) to %s\n",
          superId, selectedCount, selectedCost, path.c_str());
+  logMtReportTimer("repcut-lite", mtReportTimerStart, getTime());
 }
 
 void graph::dumpMtCoarseRegionReport() {
@@ -3587,12 +5431,22 @@ void graph::dumpMtCoarseRegionReport() {
   std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_coarse_regions.json";
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt coarse-region report %s", path.c_str());
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  struct timeval mtReportTimerStart = getTime();
+  struct timeval mtCoarsePhaseStart = mtReportTimerStart;
+  auto mtCoarseLogPhase = [&](const char* name) {
+    struct timeval now = getTime();
+    logMtReportTimer(name, mtCoarsePhaseStart, now);
+    mtCoarsePhaseStart = now;
+  };
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+  mtCoarseLogPhase("coarse-region.task-map");
   const char* segmentReportEnv = std::getenv("GSIM_MT_SEGMENT_REPORT");
   bool segmentReportEnabled = segmentReportEnv != nullptr && segmentReportEnv[0] != '\0' && segmentReportEnv[0] != '0';
   if (segmentReportEnabled) markMtRepCutLiteRuntimeApplied(mtTasks);
-  MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
+  MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation(mtTasks);
+  mtCoarseLogPhase("coarse-region.plan-regions");
   MtPureBatchPlan fallbackPlan = planMtPureBatchesActiveFrequency(mtTasks, globalConfig.MtRepCutLiteMode == "on");
+  mtCoarseLogPhase("coarse-region.fallback-plan");
 
   struct MtSerialSegmentStats {
     int segmentCount = 0;
@@ -3860,6 +5714,7 @@ void graph::dumpMtCoarseRegionReport() {
     maxParallelWidth = std::max(maxParallelWidth, region.estimatedMaxParallelWidth);
     for (const std::string& blocker : region.blockers) blockerCounts[blocker] ++;
   }
+  mtCoarseLogPhase("coarse-region.metadata");
 
   fprintf(fp, "{\n");
   fprintf(fp, "  \"format\": \"gsim.mt-coarse-region-report.v2\",\n");
@@ -3968,6 +5823,7 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "  },\n");
   }
   fprintf(fp, "  \"regions\": [\n");
+  mtCoarseLogPhase("coarse-region.header-json");
   for (size_t i = 0; i < coarsePlan.regions.size(); i ++) {
     const MtCoarseRegion& region = coarsePlan.regions[i];
     fprintf(fp, "    {\n");
@@ -4106,11 +5962,14 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "      ]\n");
     fprintf(fp, "    }%s\n", i + 1 == coarsePlan.regions.size() ? "" : ",");
   }
+  mtCoarseLogPhase("coarse-region.regions-json");
   fprintf(fp, "  ]\n");
   fprintf(fp, "}\n");
   fclose(fp);
+  mtCoarseLogPhase("coarse-region.close");
   printf("[mt-coarse-region] wrote %zu regions (%d runtime eligible) to %s\n",
          coarsePlan.regions.size(), runtimeEligibleCount, path.c_str());
+  logMtReportTimer("coarse-region", mtReportTimerStart, getTime());
 }
 
 void graph::dumpMtReadyBatchReport() {
@@ -4118,9 +5977,11 @@ void graph::dumpMtReadyBatchReport() {
   std::string path = globalConfig.OutputDir + "/" + baseName + "_mt_ready_batch_lanes.json";
   FILE* fp = std::fopen(path.c_str(), "w");
   Assert(fp != nullptr, "failed to open mt ready-batch lane report %s", path.c_str());
+  struct timeval mtReportTimerStart = getTime();
 
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
-  MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+  std::vector<MtStateUpdateTraceInfo> stateUpdateTraceInfo = buildMtStateUpdateTraceInfoForInvocation(mtTasks);
+  MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation(mtTasks);
 
   struct ReadyBatchCapStats {
     int cap = 1;
@@ -4138,6 +5999,36 @@ void graph::dumpMtReadyBatchReport() {
     int serial = 0;
     int makespan = 0;
     int dispatches = 0;
+  };
+  struct ReadyBatchLocalEvalResult {
+    int serial = 0;
+    int makespan = 0;
+    int dispatches = 0;
+    int activeSccs = 0;
+    int activeTasks = 0;
+    int selectedTasks = 0;
+    int gapTasks = 0;
+    int serialTasks = 0;
+    int serialTaskDispatches = 0;
+  };
+  struct ReadyBatchLocalEvalStats {
+    int workerCap = 4;
+    int chunkCap = 4;
+    int traceCycles = 0;
+    uint64_t traceSerial = 0;
+    uint64_t traceMakespan = 0;
+    uint64_t traceDispatches = 0;
+    uint64_t traceActiveSccs = 0;
+    uint64_t traceActiveTasks = 0;
+    uint64_t traceSelectedTasks = 0;
+    uint64_t traceGapTasks = 0;
+    uint64_t traceSerialTasks = 0;
+    uint64_t traceSerialTaskDispatches = 0;
+    uint64_t traceActiveWordOrVolume = 0;
+    std::vector<int> traceMakespans;
+    std::vector<int> traceDispatchCounts;
+    std::vector<int> traceSerialTaskDispatchCounts;
+    std::vector<int> traceActiveWordOrVolumes;
   };
   struct ReadyBatchLaneGraph {
     std::string name;
@@ -4169,7 +6060,46 @@ void graph::dumpMtReadyBatchReport() {
     std::vector<int> topo;
     int largestScc = 0;
     int sccEdgeCount = 0;
+    std::vector<int> sccSerialTaskCount;
     std::vector<ReadyBatchCapStats> caps;
+    int envelopeTaskCount = 0;
+    int envelopeSelectedTaskCount = 0;
+    int envelopeGapTaskCount = 0;
+    int envelopePureTaskCount = 0;
+    int envelopeSerialTaskCount = 0;
+    int envelopeStateUpdateTaskCount = 0;
+    int envelopeWorker0OnlyTaskCount = 0;
+    std::vector<int> envelopeCppIds;
+    std::map<int, int> envelopeCppToLocal;
+    std::vector<std::set<int>> envelopeLocalSucc;
+    std::vector<int> envelopeSccOfLocal;
+    std::vector<int> envelopeSccCost;
+    std::vector<std::set<int>> envelopeSccSucc;
+    std::vector<std::set<int>> envelopeSccPred;
+    std::vector<int> envelopeTopo;
+    int envelopeLargestScc = 0;
+    int envelopeSccEdgeCount = 0;
+    std::vector<int> envelopeSccSerialTaskCount;
+    std::vector<int> envelopeSccSelectedTaskCount;
+    std::vector<int> envelopeSccGapTaskCount;
+    std::vector<std::map<std::string, int>> envelopeSccSerialReasonTaskCount;
+    std::map<std::string, int> envelopeSerialReasonTaskCount;
+    std::map<std::string, uint64_t> envelopeTraceSerialReasonTaskCount;
+    std::map<int, uint64_t> envelopeTraceActiveWordHits;
+    int envelopeStateUpdateBlockedTaskCount = 0;
+    int envelopeStateUpdateLocalSafeOnlyTaskCount = 0;
+    int envelopeStateUpdateRuntimeSafeTaskCount = 0;
+    std::map<std::string, int> envelopeStateUpdateTargetWriterConflictTaskCount;
+    std::map<std::string, int> envelopeStateUpdateRuntimeBlockReasonTaskCount;
+    uint64_t envelopeTraceStateUpdateBlockedHits = 0;
+    uint64_t envelopeTraceStateUpdateLocalSafeOnlyHits = 0;
+    uint64_t envelopeTraceStateUpdateRuntimeSafeHits = 0;
+    std::map<std::string, uint64_t> envelopeTraceStateUpdateTargetWriterConflictHits;
+    std::map<std::string, uint64_t> envelopeTraceStateUpdateRuntimeBlockReasonHits;
+    ReadyBatchLocalEvalStats envelopeLocalEvalSelectedOnly;
+    ReadyBatchLocalEvalStats envelopeLocalEvalSerialWorker0;
+    ReadyBatchLocalEvalStats envelopeLocalEval;
+    std::vector<ReadyBatchCapStats> envelopeCaps;
   };
 
   auto readyBatchPctInt = [](std::vector<int> values, int pct) -> int {
@@ -4177,6 +6107,63 @@ void graph::dumpMtReadyBatchReport() {
     std::sort(values.begin(), values.end());
     return values[(values.size() - 1) * static_cast<size_t>(pct) / 100];
   };
+  auto readyBatchPrimarySerialReason = [](const MtTaskInfo* task) -> std::string {
+    if (task == nullptr || task->serialReasons.empty()) return "unknown";
+    return task->serialReasons[0];
+  };
+  auto dumpReadyBatchStringIntCountArray = [](FILE* out, const std::map<std::string, int>& values) {
+    fprintf(out, "[");
+    bool first = true;
+    for (const auto& kv : values) {
+      if (!first) fprintf(out, ", ");
+      first = false;
+      fprintf(out, "{\"name\": \"%s\", \"count\": %d}", jsonEscape(kv.first).c_str(), kv.second);
+    }
+    fprintf(out, "]");
+  };
+  auto dumpReadyBatchStringUint64CountArray = [](FILE* out, const std::map<std::string, uint64_t>& values) {
+    fprintf(out, "[");
+    bool first = true;
+    for (const auto& kv : values) {
+      if (!first) fprintf(out, ", ");
+      first = false;
+      fprintf(out, "{\"name\": \"%s\", \"count\": %lu}", jsonEscape(kv.first).c_str(), kv.second);
+    }
+    fprintf(out, "]");
+  };
+  auto readyBatchStateInfoForCpp = [&](int cppId) -> const MtStateUpdateTraceInfo* {
+    if (cppId < 0 || cppId >= static_cast<int>(stateUpdateTraceInfo.size())) return nullptr;
+    const MtStateUpdateTraceInfo& info = stateUpdateTraceInfo[cppId];
+    if (!info.hasStateUpdate) return nullptr;
+    return &info;
+  };
+  auto accumulateReadyBatchStateUpdateStatic = [&](ReadyBatchLaneGraph& lane, int cppId) {
+    const MtStateUpdateTraceInfo* info = readyBatchStateInfoForCpp(cppId);
+    if (info == nullptr) return;
+    if (info->runtimeSafeCandidate) lane.envelopeStateUpdateRuntimeSafeTaskCount ++;
+    else if (info->localSafeCandidate) lane.envelopeStateUpdateLocalSafeOnlyTaskCount ++;
+    else lane.envelopeStateUpdateBlockedTaskCount ++;
+    lane.envelopeStateUpdateTargetWriterConflictTaskCount[info->targetWriterConflictKind.empty() ? "none" : info->targetWriterConflictKind] ++;
+    if (info->runtimeBlockReasons.empty()) {
+      lane.envelopeStateUpdateRuntimeBlockReasonTaskCount["none"] ++;
+    } else {
+      for (const std::string& reason : info->runtimeBlockReasons) lane.envelopeStateUpdateRuntimeBlockReasonTaskCount[reason] ++;
+    }
+  };
+  auto accumulateReadyBatchStateUpdateTrace = [&](ReadyBatchLaneGraph& lane, int cppId) {
+    const MtStateUpdateTraceInfo* info = readyBatchStateInfoForCpp(cppId);
+    if (info == nullptr) return;
+    if (info->runtimeSafeCandidate) lane.envelopeTraceStateUpdateRuntimeSafeHits ++;
+    else if (info->localSafeCandidate) lane.envelopeTraceStateUpdateLocalSafeOnlyHits ++;
+    else lane.envelopeTraceStateUpdateBlockedHits ++;
+    lane.envelopeTraceStateUpdateTargetWriterConflictHits[info->targetWriterConflictKind.empty() ? "none" : info->targetWriterConflictKind] ++;
+    if (info->runtimeBlockReasons.empty()) {
+      lane.envelopeTraceStateUpdateRuntimeBlockReasonHits["none"] ++;
+    } else {
+      for (const std::string& reason : info->runtimeBlockReasons) lane.envelopeTraceStateUpdateRuntimeBlockReasonHits[reason] ++;
+    }
+  };
+
   auto addReadyBatchEdge = [](std::vector<std::set<int>>& succ,
                               const std::map<int, int>& cppToLocal,
                               int fromCppId, int toCppId) {
@@ -4186,6 +6173,92 @@ void graph::dumpMtReadyBatchReport() {
     if (toIter == cppToLocal.end()) return;
     if (fromIter->second == toIter->second) return;
     succ[fromIter->second].insert(toIter->second);
+  };
+
+  auto computeReadyBatchScc = [&](const std::vector<int>& cppIds,
+                                  const std::vector<std::set<int>>& localSucc,
+                                  std::vector<int>& sccOfLocal,
+                                  std::vector<int>& sccCost,
+                                  std::vector<std::set<int>>& sccSucc,
+                                  std::vector<std::set<int>>& sccPred,
+                                  std::vector<int>& topo,
+                                  int& largestScc,
+                                  int& sccEdgeCount,
+                                  bool& valid,
+                                  std::string& invalidReason) {
+    int localCount = static_cast<int>(cppIds.size());
+    std::vector<int> index(localCount, -1), lowlink(localCount, 0), stack;
+    std::vector<char> onStack(localCount, 0);
+    int nextIndex = 0;
+    std::vector<std::vector<int>> sccs;
+    std::function<void(int)> strongConnect = [&](int v) {
+      index[v] = lowlink[v] = nextIndex ++;
+      stack.push_back(v);
+      onStack[v] = 1;
+      for (int w : localSucc[v]) {
+        if (index[w] < 0) {
+          strongConnect(w);
+          lowlink[v] = std::min(lowlink[v], lowlink[w]);
+        } else if (onStack[w]) {
+          lowlink[v] = std::min(lowlink[v], index[w]);
+        }
+      }
+      if (lowlink[v] == index[v]) {
+        std::vector<int> component;
+        while (!stack.empty()) {
+          int w = stack.back();
+          stack.pop_back();
+          onStack[w] = 0;
+          component.push_back(w);
+          if (w == v) break;
+        }
+        sccs.push_back(component);
+      }
+    };
+    for (int local = 0; local < localCount; local ++) if (index[local] < 0) strongConnect(local);
+
+    sccOfLocal.assign(localCount, -1);
+    sccCost.assign(sccs.size(), 0);
+    largestScc = 0;
+    for (size_t scc = 0; scc < sccs.size(); scc ++) {
+      largestScc = std::max(largestScc, static_cast<int>(sccs[scc].size()));
+      sccCost[scc] = static_cast<int>(sccs[scc].size());
+      for (int local : sccs[scc]) sccOfLocal[local] = static_cast<int>(scc);
+    }
+    sccSucc.assign(sccs.size(), std::set<int>());
+    sccPred.assign(sccs.size(), std::set<int>());
+    sccEdgeCount = 0;
+    for (int local = 0; local < localCount; local ++) {
+      int fromScc = sccOfLocal[local];
+      for (int toLocal : localSucc[local]) {
+        int toScc = sccOfLocal[toLocal];
+        if (fromScc == toScc) continue;
+        if (sccSucc[fromScc].insert(toScc).second) {
+          sccPred[toScc].insert(fromScc);
+          sccEdgeCount ++;
+        }
+      }
+    }
+    std::vector<int> indegree(sccs.size(), 0);
+    std::deque<int> ready;
+    topo.clear();
+    for (size_t scc = 0; scc < sccs.size(); scc ++) {
+      indegree[scc] = static_cast<int>(sccPred[scc].size());
+      if (indegree[scc] == 0) ready.push_back(static_cast<int>(scc));
+    }
+    while (!ready.empty()) {
+      int scc = ready.front();
+      ready.pop_front();
+      topo.push_back(scc);
+      for (int succ : sccSucc[scc]) {
+        indegree[succ] --;
+        if (indegree[succ] == 0) ready.push_back(succ);
+      }
+    }
+    if (topo.size() != sccs.size()) {
+      valid = false;
+      if (invalidReason.empty()) invalidReason = "condensation_toposort_failed";
+    }
   };
 
   auto buildReadyBatchLane = [&](const std::string& laneName, const std::vector<int>& regionIndices) {
@@ -4275,99 +6348,114 @@ void graph::dumpMtReadyBatchReport() {
       }
     }
 
-    int localCount = static_cast<int>(lane.cppIds.size());
-    std::vector<int> index(localCount, -1), lowlink(localCount, 0), stack;
-    std::vector<char> onStack(localCount, 0);
-    int nextIndex = 0;
-    std::vector<std::vector<int>> sccs;
-    std::function<void(int)> strongConnect = [&](int v) {
-      index[v] = lowlink[v] = nextIndex ++;
-      stack.push_back(v);
-      onStack[v] = 1;
-      for (int w : lane.localSucc[v]) {
-        if (index[w] < 0) {
-          strongConnect(w);
-          lowlink[v] = std::min(lowlink[v], lowlink[w]);
-        } else if (onStack[w]) {
-          lowlink[v] = std::min(lowlink[v], index[w]);
-        }
-      }
-      if (lowlink[v] == index[v]) {
-        std::vector<int> component;
-        while (!stack.empty()) {
-          int w = stack.back();
-          stack.pop_back();
-          onStack[w] = 0;
-          component.push_back(w);
-          if (w == v) break;
-        }
-        sccs.push_back(component);
-      }
-    };
-    for (int local = 0; local < localCount; local ++) if (index[local] < 0) strongConnect(local);
+    computeReadyBatchScc(lane.cppIds, lane.localSucc, lane.sccOfLocal,
+                         lane.sccCost, lane.sccSucc, lane.sccPred, lane.topo,
+                         lane.largestScc, lane.sccEdgeCount, lane.valid,
+                         lane.invalidReason);
+    lane.sccSerialTaskCount.assign(lane.sccCost.size(), 0);
+    for (size_t local = 0; local < lane.cppIds.size(); local ++) {
+      int scc = lane.sccOfLocal[local];
+      if (scc < 0 || scc >= static_cast<int>(lane.sccCost.size())) continue;
+      auto taskIter = mtTasks.find(lane.cppIds[local]);
+      bool isPure = taskIter != mtTasks.end() && taskIter->second.taskKind == "pure_compute";
+      if (!isPure) lane.sccSerialTaskCount[scc] ++;
+    }
 
-    lane.sccOfLocal.assign(localCount, -1);
-    lane.sccCost.assign(sccs.size(), 0);
-    lane.largestScc = 0;
-    for (size_t scc = 0; scc < sccs.size(); scc ++) {
-      lane.largestScc = std::max(lane.largestScc, static_cast<int>(sccs[scc].size()));
-      lane.sccCost[scc] = static_cast<int>(sccs[scc].size());
-      for (int local : sccs[scc]) lane.sccOfLocal[local] = static_cast<int>(scc);
-    }
-    lane.sccSucc.assign(sccs.size(), std::set<int>());
-    lane.sccPred.assign(sccs.size(), std::set<int>());
-    for (int local = 0; local < localCount; local ++) {
-      int fromScc = lane.sccOfLocal[local];
-      for (int toLocal : lane.localSucc[local]) {
-        int toScc = lane.sccOfLocal[toLocal];
-        if (fromScc == toScc) continue;
-        if (lane.sccSucc[fromScc].insert(toScc).second) {
-          lane.sccPred[toScc].insert(fromScc);
-          lane.sccEdgeCount ++;
+    for (int cppId = lane.envelopeBeginCppId; cppId < lane.envelopeEndCppId; cppId ++) {
+      if (cppId2Super.find(cppId) == cppId2Super.end()) continue;
+      lane.envelopeCppToLocal[cppId] = static_cast<int>(lane.envelopeCppIds.size());
+      lane.envelopeCppIds.push_back(cppId);
+      lane.envelopeTaskCount ++;
+      if (lane.cppToLocal.find(cppId) != lane.cppToLocal.end()) lane.envelopeSelectedTaskCount ++;
+      else lane.envelopeGapTaskCount ++;
+      auto taskIter = mtTasks.find(cppId);
+      if (taskIter != mtTasks.end() && taskIter->second.taskKind == "pure_compute") {
+        lane.envelopePureTaskCount ++;
+      } else {
+        lane.envelopeSerialTaskCount ++;
+      }
+      if (taskIter != mtTasks.end()) {
+        for (const std::string& reason : taskIter->second.serialReasons) {
+          if (reason == "state_update") lane.envelopeStateUpdateTaskCount ++;
         }
+        if (hasWorker0OnlyReason(taskIter->second.serialReasons)) lane.envelopeWorker0OnlyTaskCount ++;
       }
     }
-    std::vector<int> indegree(sccs.size(), 0);
-    std::deque<int> ready;
-    for (size_t scc = 0; scc < sccs.size(); scc ++) {
-      indegree[scc] = static_cast<int>(lane.sccPred[scc].size());
-      if (indegree[scc] == 0) ready.push_back(static_cast<int>(scc));
-    }
-    while (!ready.empty()) {
-      int scc = ready.front();
-      ready.pop_front();
-      lane.topo.push_back(scc);
-      for (int succ : lane.sccSucc[scc]) {
-        indegree[succ] --;
-        if (indegree[succ] == 0) ready.push_back(succ);
+    lane.envelopeLocalSucc.assign(lane.envelopeCppIds.size(), std::set<int>());
+    auto addReadyBatchEnvelopeEdge = [&](int fromCppId, int toCppId) {
+      auto fromIter = lane.envelopeCppToLocal.find(fromCppId);
+      if (fromIter == lane.envelopeCppToLocal.end()) return;
+      auto toIter = lane.envelopeCppToLocal.find(toCppId);
+      if (toIter == lane.envelopeCppToLocal.end()) return;
+      if (fromIter->second == toIter->second) return;
+      lane.envelopeLocalSucc[fromIter->second].insert(toIter->second);
+    };
+    for (int cppId : lane.envelopeCppIds) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || superIter->second == nullptr) continue;
+      SuperNode* super = superIter->second;
+      for (SuperNode* next : super->next) if (next && next->cppId >= 0) addReadyBatchEnvelopeEdge(cppId, next->cppId);
+      for (SuperNode* next : super->depNext) if (next && next->cppId >= 0) addReadyBatchEnvelopeEdge(cppId, next->cppId);
+      for (Node* member : super->member) {
+        if (!member) continue;
+        for (int activeId : member->nextNeedActivate) if (activeId >= 0) addReadyBatchEnvelopeEdge(cppId, activeId);
       }
     }
-    if (lane.topo.size() != sccs.size()) {
-      lane.valid = false;
-      lane.invalidReason = "condensation_toposort_failed";
+    computeReadyBatchScc(lane.envelopeCppIds, lane.envelopeLocalSucc,
+                         lane.envelopeSccOfLocal, lane.envelopeSccCost,
+                         lane.envelopeSccSucc, lane.envelopeSccPred,
+                         lane.envelopeTopo, lane.envelopeLargestScc,
+                         lane.envelopeSccEdgeCount, lane.valid,
+                         lane.invalidReason);
+    lane.envelopeSccSerialTaskCount.assign(lane.envelopeSccCost.size(), 0);
+    lane.envelopeSccSelectedTaskCount.assign(lane.envelopeSccCost.size(), 0);
+    lane.envelopeSccGapTaskCount.assign(lane.envelopeSccCost.size(), 0);
+    lane.envelopeSccSerialReasonTaskCount.assign(lane.envelopeSccCost.size(), std::map<std::string, int>());
+    for (size_t local = 0; local < lane.envelopeCppIds.size(); local ++) {
+      int cppId = lane.envelopeCppIds[local];
+      int scc = lane.envelopeSccOfLocal[local];
+      if (scc < 0 || scc >= static_cast<int>(lane.envelopeSccCost.size())) continue;
+      auto taskIter = mtTasks.find(cppId);
+      const MtTaskInfo* taskInfo = taskIter == mtTasks.end() ? nullptr : &taskIter->second;
+      accumulateReadyBatchStateUpdateStatic(lane, cppId);
+      bool isPure = taskInfo != nullptr && taskInfo->taskKind == "pure_compute";
+      if (!isPure) {
+        lane.envelopeSccSerialTaskCount[scc] ++;
+        std::string reason = readyBatchPrimarySerialReason(taskInfo);
+        lane.envelopeSccSerialReasonTaskCount[scc][reason] ++;
+        lane.envelopeSerialReasonTaskCount[reason] ++;
+      }
+      if (lane.cppToLocal.find(cppId) != lane.cppToLocal.end()) lane.envelopeSccSelectedTaskCount[scc] ++;
+      else lane.envelopeSccGapTaskCount[scc] ++;
     }
     return lane;
   };
 
-  auto scheduleReadyBatchCap = [&](const ReadyBatchLaneGraph& lane, const std::vector<char>& active, int cap) {
+  auto scheduleReadyBatchGraphCap = [&](const std::vector<int>& sccCost,
+                                        const std::vector<std::set<int>>& sccSucc,
+                                        const std::vector<std::set<int>>& sccPred,
+                                        const std::vector<int>& topo,
+                                        bool valid,
+                                        const std::vector<char>& active,
+                                        int cap) {
     ReadyBatchScheduleResult result;
-    if (!lane.valid || active.empty()) return result;
-    int sccCount = static_cast<int>(lane.sccCost.size());
+    if (!valid || active.empty()) return result;
+    int sccCount = static_cast<int>(sccCost.size());
     std::vector<int> criticalPath(sccCount, 0);
-    for (auto iter = lane.topo.rbegin(); iter != lane.topo.rend(); ++ iter) {
+    for (auto iter = topo.rbegin(); iter != topo.rend(); ++ iter) {
       int scc = *iter;
       if (!active[scc]) continue;
       int bestSucc = 0;
-      for (int succ : lane.sccSucc[scc]) if (active[succ]) bestSucc = std::max(bestSucc, criticalPath[succ]);
-      criticalPath[scc] = lane.sccCost[scc] + bestSucc;
+      for (int succ : sccSucc[scc]) if (active[succ]) bestSucc = std::max(bestSucc, criticalPath[succ]);
+      criticalPath[scc] = sccCost[scc] + bestSucc;
     }
     std::vector<int> indegree(sccCount, 0), readyTime(sccCount, 0);
     std::vector<std::tuple<int, int, int>> readyHeap;
     for (int scc = 0; scc < sccCount; scc ++) {
       if (!active[scc]) continue;
-      result.serial += lane.sccCost[scc];
-      for (int pred : lane.sccPred[scc]) if (active[pred]) indegree[scc] ++;
-      if (indegree[scc] == 0) readyHeap.push_back(std::make_tuple(criticalPath[scc], lane.sccCost[scc], scc));
+      result.serial += sccCost[scc];
+      for (int pred : sccPred[scc]) if (active[pred]) indegree[scc] ++;
+      if (indegree[scc] == 0) readyHeap.push_back(std::make_tuple(criticalPath[scc], sccCost[scc], scc));
     }
     std::make_heap(readyHeap.begin(), readyHeap.end());
     int workerReady[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -4383,7 +6471,7 @@ void graph::dumpMtReadyBatchReport() {
         std::tuple<int, int, int> item = readyHeap.back();
         readyHeap.pop_back();
         int scc = std::get<2>(item);
-        int cost = lane.sccCost[scc];
+        int cost = sccCost[scc];
         if (!chunk.empty() && chunkCost + cost > cap) {
           stash.push_back(item);
           break;
@@ -4403,12 +6491,12 @@ void graph::dumpMtReadyBatchReport() {
       workerReady[worker] = finish;
       result.dispatches ++;
       for (int scc : chunk) {
-        for (int succ : lane.sccSucc[scc]) {
+        for (int succ : sccSucc[scc]) {
           if (!active[succ]) continue;
           readyTime[succ] = std::max(readyTime[succ], finish);
           indegree[succ] --;
           if (indegree[succ] == 0) {
-            readyHeap.push_back(std::make_tuple(criticalPath[succ], lane.sccCost[succ], succ));
+            readyHeap.push_back(std::make_tuple(criticalPath[succ], sccCost[succ], succ));
             std::push_heap(readyHeap.begin(), readyHeap.end());
           }
         }
@@ -4416,6 +6504,147 @@ void graph::dumpMtReadyBatchReport() {
     }
     for (int w = 0; w < 8; w ++) result.makespan = std::max(result.makespan, workerReady[w]);
     return result;
+  };
+  auto scheduleReadyBatchCap = [&](const ReadyBatchLaneGraph& lane, const std::vector<char>& active, int cap) {
+    return scheduleReadyBatchGraphCap(lane.sccCost, lane.sccSucc, lane.sccPred, lane.topo, lane.valid, active, cap);
+  };
+  auto scheduleReadyBatchEnvelopeCap = [&](const ReadyBatchLaneGraph& lane, const std::vector<char>& active, int cap) {
+    return scheduleReadyBatchGraphCap(lane.envelopeSccCost, lane.envelopeSccSucc, lane.envelopeSccPred,
+                                      lane.envelopeTopo, lane.valid, active, cap);
+  };
+  std::vector<int> readyBatchEmptyCounts;
+  auto scheduleReadyBatchLocalEvalGraph = [&](bool valid,
+                                             const std::vector<int>& sccCost,
+                                             const std::vector<std::set<int>>& sccSucc,
+                                             const std::vector<std::set<int>>& sccPred,
+                                             const std::vector<int>& topo,
+                                             const std::vector<int>& sccSerialTaskCount,
+                                             const std::vector<int>& sccSelectedTaskCount,
+                                             const std::vector<int>& sccGapTaskCount,
+                                             const std::vector<char>& active,
+                                             int workerCap, int chunkCap, bool serialOnWorker0) {
+    ReadyBatchLocalEvalResult result;
+    if (!valid || active.empty()) return result;
+    int sccCount = static_cast<int>(sccCost.size());
+    if (sccCount <= 0) return result;
+    int workers = std::max(1, std::min(workerCap, 8));
+    int maxChunkCost = std::max(1, chunkCap);
+    std::vector<int> criticalPath(sccCount, 0);
+    for (auto iter = topo.rbegin(); iter != topo.rend(); ++ iter) {
+      int scc = *iter;
+      if (scc < 0 || scc >= sccCount || !active[scc]) continue;
+      int bestSucc = 0;
+      for (int succ : sccSucc[scc]) if (succ >= 0 && succ < sccCount && active[succ]) bestSucc = std::max(bestSucc, criticalPath[succ]);
+      criticalPath[scc] = sccCost[scc] + bestSucc;
+    }
+    std::vector<int> indegree(sccCount, 0), readyTime(sccCount, 0), workerReady(workers, 0);
+    std::vector<std::tuple<int, int, int>> readyHeap;
+    for (int scc = 0; scc < sccCount; scc ++) {
+      if (!active[scc]) continue;
+      result.serial += sccCost[scc];
+      result.activeSccs ++;
+      result.activeTasks += sccCost[scc];
+      if (!sccSelectedTaskCount.empty() && scc < static_cast<int>(sccSelectedTaskCount.size())) result.selectedTasks += sccSelectedTaskCount[scc];
+      else result.selectedTasks += sccCost[scc];
+      if (scc < static_cast<int>(sccGapTaskCount.size())) result.gapTasks += sccGapTaskCount[scc];
+      if (scc < static_cast<int>(sccSerialTaskCount.size())) result.serialTasks += sccSerialTaskCount[scc];
+      for (int pred : sccPred[scc]) if (pred >= 0 && pred < sccCount && active[pred]) indegree[scc] ++;
+      if (indegree[scc] == 0) readyHeap.push_back(std::make_tuple(criticalPath[scc], sccCost[scc], scc));
+    }
+    std::make_heap(readyHeap.begin(), readyHeap.end());
+    while (!readyHeap.empty()) {
+      std::vector<int> chunk;
+      std::vector<std::tuple<int, int, int>> stash;
+      int chunkCost = 0;
+      int chunkReadyTime = 0;
+      int chunkSerialTasks = 0;
+      bool chunkSerial = false;
+      while (!readyHeap.empty()) {
+        std::pop_heap(readyHeap.begin(), readyHeap.end());
+        std::tuple<int, int, int> item = readyHeap.back();
+        readyHeap.pop_back();
+        int scc = std::get<2>(item);
+        int cost = sccCost[scc];
+        int itemSerialTasks = scc < static_cast<int>(sccSerialTaskCount.size()) ? sccSerialTaskCount[scc] : 0;
+        bool itemSerial = itemSerialTasks > 0;
+        if (!chunk.empty()) {
+          if (serialOnWorker0 && itemSerial != chunkSerial) {
+            stash.push_back(item);
+            break;
+          }
+          if (chunkCost + cost > maxChunkCost) {
+            stash.push_back(item);
+            break;
+          }
+        } else {
+          chunkSerial = itemSerial;
+        }
+        chunk.push_back(scc);
+        chunkCost += cost;
+        chunkReadyTime = std::max(chunkReadyTime, readyTime[scc]);
+        chunkSerialTasks += itemSerialTasks;
+        if (chunkCost >= maxChunkCost) break;
+      }
+      for (const auto& item : stash) {
+        readyHeap.push_back(item);
+        std::push_heap(readyHeap.begin(), readyHeap.end());
+      }
+      if (chunk.empty()) break;
+      int worker = 0;
+      if (!(serialOnWorker0 && chunkSerial)) {
+        for (int w = 1; w < workers; w ++) if (workerReady[w] < workerReady[worker]) worker = w;
+      }
+      int start = std::max(workerReady[worker], chunkReadyTime);
+      int finish = start + chunkCost;
+      workerReady[worker] = finish;
+      result.dispatches ++;
+      if (chunkSerialTasks > 0) result.serialTaskDispatches ++;
+      for (int scc : chunk) {
+        for (int succ : sccSucc[scc]) {
+          if (succ < 0 || succ >= sccCount || !active[succ]) continue;
+          readyTime[succ] = std::max(readyTime[succ], finish);
+          indegree[succ] --;
+          if (indegree[succ] == 0) {
+            readyHeap.push_back(std::make_tuple(criticalPath[succ], sccCost[succ], succ));
+            std::push_heap(readyHeap.begin(), readyHeap.end());
+          }
+        }
+      }
+    }
+    for (int w = 0; w < workers; w ++) result.makespan = std::max(result.makespan, workerReady[w]);
+    return result;
+  };
+  auto scheduleReadyBatchEnvelopeLocalEval = [&](const ReadyBatchLaneGraph& lane, const std::vector<char>& active,
+                                                int workerCap, int chunkCap, bool serialOnWorker0) {
+    return scheduleReadyBatchLocalEvalGraph(lane.valid, lane.envelopeSccCost, lane.envelopeSccSucc, lane.envelopeSccPred,
+                                            lane.envelopeTopo, lane.envelopeSccSerialTaskCount,
+                                            lane.envelopeSccSelectedTaskCount, lane.envelopeSccGapTaskCount,
+                                            active, workerCap, chunkCap, serialOnWorker0);
+  };
+  auto scheduleReadyBatchSelectedOnlyLocalEval = [&](const ReadyBatchLaneGraph& lane, const std::vector<char>& active,
+                                                    int workerCap, int chunkCap) {
+    return scheduleReadyBatchLocalEvalGraph(lane.valid, lane.sccCost, lane.sccSucc, lane.sccPred, lane.topo,
+                                            lane.sccSerialTaskCount, readyBatchEmptyCounts, readyBatchEmptyCounts,
+                                            active, workerCap, chunkCap, false);
+  };
+  auto accumulateReadyBatchLocalEvalStats = [&](ReadyBatchLocalEvalStats& evalStats,
+                                               const ReadyBatchLocalEvalResult& evalResult,
+                                               int activeWordVolume) {
+    evalStats.traceCycles ++;
+    evalStats.traceSerial += static_cast<uint64_t>(evalResult.serial);
+    evalStats.traceMakespan += static_cast<uint64_t>(evalResult.makespan);
+    evalStats.traceDispatches += static_cast<uint64_t>(evalResult.dispatches);
+    evalStats.traceActiveSccs += static_cast<uint64_t>(evalResult.activeSccs);
+    evalStats.traceActiveTasks += static_cast<uint64_t>(evalResult.activeTasks);
+    evalStats.traceSelectedTasks += static_cast<uint64_t>(evalResult.selectedTasks);
+    evalStats.traceGapTasks += static_cast<uint64_t>(evalResult.gapTasks);
+    evalStats.traceSerialTasks += static_cast<uint64_t>(evalResult.serialTasks);
+    evalStats.traceSerialTaskDispatches += static_cast<uint64_t>(evalResult.serialTaskDispatches);
+    evalStats.traceActiveWordOrVolume += static_cast<uint64_t>(activeWordVolume);
+    evalStats.traceMakespans.push_back(evalResult.makespan);
+    evalStats.traceDispatchCounts.push_back(evalResult.dispatches);
+    evalStats.traceSerialTaskDispatchCounts.push_back(evalResult.serialTaskDispatches);
+    evalStats.traceActiveWordOrVolumes.push_back(activeWordVolume);
   };
 
   std::vector<ReadyBatchLaneGraph> lanes;
@@ -4443,10 +6672,23 @@ void graph::dumpMtReadyBatchReport() {
         stats.staticDispatches = staticResult.dispatches;
       }
       lane.caps.push_back(stats);
+
+      ReadyBatchCapStats envelopeStats;
+      envelopeStats.cap = cap;
+      if (lane.valid) {
+        std::vector<char> active(lane.envelopeSccCost.size(), 1);
+        ReadyBatchScheduleResult staticResult = scheduleReadyBatchEnvelopeCap(lane, active, cap);
+        envelopeStats.staticSerial = staticResult.serial;
+        envelopeStats.staticMakespan = staticResult.makespan;
+        envelopeStats.staticDispatches = staticResult.dispatches;
+      }
+      lane.envelopeCaps.push_back(envelopeStats);
     }
   }
 
   bool traceEnabled = false;
+  bool envelopeLocalEvalDiagnosticsEnabled = mtUseEnvelopeLocalEvalDiagnostics();
+  bool envelopeLocalEvalEnabled = mtUseEnvelopeLocalEval() || envelopeLocalEvalDiagnosticsEnabled;
   int traceCycles = 0;
   const char* tracePath = std::getenv("GSIM_MT_READY_BATCH_TRACE");
   if (tracePath != nullptr && tracePath[0] != '\0') {
@@ -4454,10 +6696,14 @@ void graph::dumpMtReadyBatchReport() {
     if (trace.good()) {
       traceEnabled = true;
       std::map<int, std::pair<int, int>> cppToLaneScc;
+      std::map<int, std::vector<std::pair<int, int>>> cppToEnvelopeLaneScc;
       for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) {
         const ReadyBatchLaneGraph& lane = lanes[laneIdx];
         if (!lane.valid) continue;
         for (size_t local = 0; local < lane.cppIds.size(); local ++) cppToLaneScc[lane.cppIds[local]] = std::make_pair(static_cast<int>(laneIdx), lane.sccOfLocal[local]);
+        for (size_t local = 0; local < lane.envelopeCppIds.size(); local ++) {
+          cppToEnvelopeLaneScc[lane.envelopeCppIds[local]].push_back(std::make_pair(static_cast<int>(laneIdx), lane.envelopeSccOfLocal[local]));
+        }
       }
       std::string line;
       while (std::getline(trace, line)) {
@@ -4465,31 +6711,96 @@ void graph::dumpMtReadyBatchReport() {
         if (line.find("[mt-dyn-trace]") == std::string::npos || pos == std::string::npos) continue;
         traceCycles ++;
         std::vector<std::vector<char>> active(lanes.size());
-        for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) active[laneIdx].assign(lanes[laneIdx].sccCost.size(), 0);
+        std::vector<std::vector<char>> envelopeActive(lanes.size());
+        std::vector<std::set<int>> envelopeActiveWords(lanes.size());
+        std::vector<std::set<int>> activeWords(lanes.size());
+        for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) {
+          active[laneIdx].assign(lanes[laneIdx].sccCost.size(), 0);
+          envelopeActive[laneIdx].assign(lanes[laneIdx].envelopeSccCost.size(), 0);
+        }
         std::stringstream ss(line.substr(pos + 7));
         std::string item;
         while (std::getline(ss, item, ',')) {
           int cppId = std::atoi(item.c_str());
           auto iter = cppToLaneScc.find(cppId);
-          if (iter == cppToLaneScc.end()) continue;
-          int laneIdx = iter->second.first;
-          int scc = iter->second.second;
-          if (laneIdx >= 0 && laneIdx < static_cast<int>(active.size()) && scc >= 0 && scc < static_cast<int>(active[laneIdx].size())) active[laneIdx][scc] = 1;
+          if (iter != cppToLaneScc.end()) {
+            int laneIdx = iter->second.first;
+            int scc = iter->second.second;
+            if (laneIdx >= 0 && laneIdx < static_cast<int>(active.size()) && scc >= 0 && scc < static_cast<int>(active[laneIdx].size())) {
+              active[laneIdx][scc] = 1;
+              activeWords[laneIdx].insert(cppId / ACTIVE_WIDTH);
+            }
+          }
+          auto envelopeIter = cppToEnvelopeLaneScc.find(cppId);
+          if (envelopeIter != cppToEnvelopeLaneScc.end()) {
+            int activeWord = cppId / ACTIVE_WIDTH;
+            for (const auto& laneScc : envelopeIter->second) {
+              int laneIdx = laneScc.first;
+              int scc = laneScc.second;
+              if (laneIdx >= 0 && laneIdx < static_cast<int>(envelopeActive.size()) && scc >= 0 && scc < static_cast<int>(envelopeActive[laneIdx].size())) {
+                envelopeActive[laneIdx][scc] = 1;
+                envelopeActiveWords[laneIdx].insert(activeWord);
+                accumulateReadyBatchStateUpdateTrace(lanes[laneIdx], cppId);
+              }
+            }
+          }
         }
         for (size_t laneIdx = 0; laneIdx < lanes.size(); laneIdx ++) {
           ReadyBatchLaneGraph& lane = lanes[laneIdx];
           if (!lane.valid) continue;
           bool anyActive = false;
           for (char value : active[laneIdx]) if (value) { anyActive = true; break; }
-          if (!anyActive) continue;
-          for (ReadyBatchCapStats& stats : lane.caps) {
-            ReadyBatchScheduleResult result = scheduleReadyBatchCap(lane, active[laneIdx], stats.cap);
-            stats.traceCycles ++;
-            stats.traceSerial += static_cast<uint64_t>(result.serial);
-            stats.traceMakespan += static_cast<uint64_t>(result.makespan);
-            stats.traceDispatches += static_cast<uint64_t>(result.dispatches);
-            stats.traceMakespans.push_back(result.makespan);
-            stats.traceDispatchCounts.push_back(result.dispatches);
+          if (anyActive) {
+            for (ReadyBatchCapStats& stats : lane.caps) {
+              ReadyBatchScheduleResult result = scheduleReadyBatchCap(lane, active[laneIdx], stats.cap);
+              stats.traceCycles ++;
+              stats.traceSerial += static_cast<uint64_t>(result.serial);
+              stats.traceMakespan += static_cast<uint64_t>(result.makespan);
+              stats.traceDispatches += static_cast<uint64_t>(result.dispatches);
+              stats.traceMakespans.push_back(result.makespan);
+              stats.traceDispatchCounts.push_back(result.dispatches);
+            }
+          }
+          bool anyEnvelopeActive = false;
+          for (char value : envelopeActive[laneIdx]) if (value) { anyEnvelopeActive = true; break; }
+          if (anyEnvelopeActive) {
+            for (ReadyBatchCapStats& stats : lane.envelopeCaps) {
+              ReadyBatchScheduleResult result = scheduleReadyBatchEnvelopeCap(lane, envelopeActive[laneIdx], stats.cap);
+              stats.traceCycles ++;
+              stats.traceSerial += static_cast<uint64_t>(result.serial);
+              stats.traceMakespan += static_cast<uint64_t>(result.makespan);
+              stats.traceDispatches += static_cast<uint64_t>(result.dispatches);
+              stats.traceMakespans.push_back(result.makespan);
+              stats.traceDispatchCounts.push_back(result.dispatches);
+            }
+          }
+          if (envelopeLocalEvalEnabled && anyEnvelopeActive) {
+            ReadyBatchLocalEvalResult evalResult = scheduleReadyBatchEnvelopeLocalEval(lane, envelopeActive[laneIdx],
+                                                                                      lane.envelopeLocalEval.workerCap,
+                                                                                      lane.envelopeLocalEval.chunkCap,
+                                                                                      false);
+            int activeWordVolume = laneIdx < envelopeActiveWords.size() ? static_cast<int>(envelopeActiveWords[laneIdx].size()) : 0;
+            accumulateReadyBatchLocalEvalStats(lane.envelopeLocalEval, evalResult, activeWordVolume);
+            if (envelopeLocalEvalDiagnosticsEnabled) {
+              ReadyBatchLocalEvalResult selectedOnlyResult = scheduleReadyBatchSelectedOnlyLocalEval(lane, active[laneIdx],
+                                                                                                    lane.envelopeLocalEvalSelectedOnly.workerCap,
+                                                                                                    lane.envelopeLocalEvalSelectedOnly.chunkCap);
+              int selectedOnlyActiveWordVolume = laneIdx < activeWords.size() ? static_cast<int>(activeWords[laneIdx].size()) : 0;
+              accumulateReadyBatchLocalEvalStats(lane.envelopeLocalEvalSelectedOnly, selectedOnlyResult, selectedOnlyActiveWordVolume);
+              ReadyBatchLocalEvalResult serialWorker0Result = scheduleReadyBatchEnvelopeLocalEval(lane, envelopeActive[laneIdx],
+                                                                                                 lane.envelopeLocalEvalSerialWorker0.workerCap,
+                                                                                                 lane.envelopeLocalEvalSerialWorker0.chunkCap,
+                                                                                                 true);
+              accumulateReadyBatchLocalEvalStats(lane.envelopeLocalEvalSerialWorker0, serialWorker0Result, activeWordVolume);
+              for (int activeWord : envelopeActiveWords[laneIdx]) lane.envelopeTraceActiveWordHits[activeWord] ++;
+              for (size_t scc = 0; scc < envelopeActive[laneIdx].size(); scc ++) {
+                if (!envelopeActive[laneIdx][scc]) continue;
+                if (scc >= lane.envelopeSccSerialReasonTaskCount.size()) continue;
+                for (const auto& kv : lane.envelopeSccSerialReasonTaskCount[scc]) {
+                  lane.envelopeTraceSerialReasonTaskCount[kv.first] += static_cast<uint64_t>(kv.second);
+                }
+              }
+            }
           }
         }
       }
@@ -4541,6 +6852,28 @@ void graph::dumpMtReadyBatchReport() {
     fprintf(fp, "      \"largest_scc\": %d,\n", lane.largestScc);
     fprintf(fp, "      \"scc_edge_count\": %d,\n", lane.sccEdgeCount);
     fprintf(fp, "      \"dense_counter_bytes_u8_t8\": %zu,\n", lane.sccCost.size() * static_cast<size_t>(8));
+    fprintf(fp, "      \"envelope_task_count\": %d,\n", lane.envelopeTaskCount);
+    fprintf(fp, "      \"envelope_selected_task_count\": %d,\n", lane.envelopeSelectedTaskCount);
+    fprintf(fp, "      \"envelope_gap_task_count\": %d,\n", lane.envelopeGapTaskCount);
+    fprintf(fp, "      \"envelope_pure_task_count\": %d,\n", lane.envelopePureTaskCount);
+    fprintf(fp, "      \"envelope_serial_task_count\": %d,\n", lane.envelopeSerialTaskCount);
+    fprintf(fp, "      \"envelope_state_update_task_count\": %d,\n", lane.envelopeStateUpdateTaskCount);
+      fprintf(fp, "      \"state_update_group\": {\n");
+      fprintf(fp, "        \"blocked_task_count\": %d,\n", lane.envelopeStateUpdateBlockedTaskCount);
+      fprintf(fp, "        \"local_safe_only_task_count\": %d,\n", lane.envelopeStateUpdateLocalSafeOnlyTaskCount);
+      fprintf(fp, "        \"runtime_safe_task_count\": %d,\n", lane.envelopeStateUpdateRuntimeSafeTaskCount);
+      fprintf(fp, "        \"target_writer_conflict_task_counts\": ");
+      dumpReadyBatchStringIntCountArray(fp, lane.envelopeStateUpdateTargetWriterConflictTaskCount);
+      fprintf(fp, ",\n");
+      fprintf(fp, "        \"runtime_block_reason_task_counts\": ");
+      dumpReadyBatchStringIntCountArray(fp, lane.envelopeStateUpdateRuntimeBlockReasonTaskCount);
+      fprintf(fp, "\n");
+      fprintf(fp, "      },\n");
+    fprintf(fp, "      \"envelope_worker0_only_task_count\": %d,\n", lane.envelopeWorker0OnlyTaskCount);
+    fprintf(fp, "      \"envelope_scc_count\": %zu,\n", lane.envelopeSccCost.size());
+    fprintf(fp, "      \"envelope_largest_scc\": %d,\n", lane.envelopeLargestScc);
+    fprintf(fp, "      \"envelope_scc_edge_count\": %d,\n", lane.envelopeSccEdgeCount);
+    fprintf(fp, "      \"envelope_dense_counter_bytes_u8_t8\": %zu,\n", lane.envelopeSccCost.size() * static_cast<size_t>(8));
     fprintf(fp, "      \"scc_costs\": ");
     dumpJsonIntArray(fp, lane.sccCost);
     fprintf(fp, ",\n");
@@ -4561,6 +6894,28 @@ void graph::dumpMtReadyBatchReport() {
     for (size_t local = 0; local < lane.cppIds.size(); local ++) {
       fprintf(fp, "        {\"cpp_id\": %d, \"scc\": %d}%s\n",
               lane.cppIds[local], lane.sccOfLocal[local], local + 1 == lane.cppIds.size() ? "" : ",");
+    }
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"envelope_scc_costs\": ");
+    dumpJsonIntArray(fp, lane.envelopeSccCost);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"envelope_topo_order\": ");
+    dumpJsonIntArray(fp, lane.envelopeTopo);
+    fprintf(fp, ",\n");
+    fprintf(fp, "      \"envelope_scc_edges\": [\n");
+    size_t readyBatchEnvelopeEdgeWritten = 0;
+    for (size_t fromScc = 0; fromScc < lane.envelopeSccSucc.size(); fromScc ++) {
+      for (int toScc : lane.envelopeSccSucc[fromScc]) {
+        fprintf(fp, "        {\"from\": %zu, \"to\": %d}%s\n",
+                fromScc, toScc, readyBatchEnvelopeEdgeWritten + 1 == static_cast<size_t>(lane.envelopeSccEdgeCount) ? "" : ",");
+        readyBatchEnvelopeEdgeWritten ++;
+      }
+    }
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"envelope_cpp_to_scc\": [\n");
+    for (size_t local = 0; local < lane.envelopeCppIds.size(); local ++) {
+      fprintf(fp, "        {\"cpp_id\": %d, \"scc\": %d}%s\n",
+              lane.envelopeCppIds[local], lane.envelopeSccOfLocal[local], local + 1 == lane.envelopeCppIds.size() ? "" : ",");
     }
     fprintf(fp, "      ],\n");
     fprintf(fp, "      \"regions\": [\n");
@@ -4593,13 +6948,155 @@ void graph::dumpMtReadyBatchReport() {
               readyBatchPctInt(stats.traceDispatchCounts, 50), readyBatchPctInt(stats.traceDispatchCounts, 95));
       fprintf(fp, "        }%s\n", capIdx + 1 == lane.caps.size() ? "" : ",");
     }
-    fprintf(fp, "      ]\n");
+    fprintf(fp, "      ],\n");
+    fprintf(fp, "      \"envelope_caps\": [\n");
+    for (size_t capIdx = 0; capIdx < lane.envelopeCaps.size(); capIdx ++) {
+      const ReadyBatchCapStats& stats = lane.envelopeCaps[capIdx];
+      fprintf(fp, "        {\n");
+      fprintf(fp, "          \"cap\": %d,\n", stats.cap);
+      fprintf(fp, "          \"static_serial\": %d,\n", stats.staticSerial);
+      fprintf(fp, "          \"static_makespan\": %d,\n", stats.staticMakespan);
+      fprintf(fp, "          \"static_dispatches\": %d,\n", stats.staticDispatches);
+      double staticSpeedup = stats.staticMakespan == 0 ? 0.0 : static_cast<double>(stats.staticSerial) / static_cast<double>(stats.staticMakespan);
+      fprintf(fp, "          \"static_speedup\": %.6f,\n", staticSpeedup);
+      double traceSpeedup = stats.traceMakespan == 0 ? 0.0 : static_cast<double>(stats.traceSerial) / static_cast<double>(stats.traceMakespan);
+      fprintf(fp, "          \"trace\": {\"cycles\": %d, \"serial_total\": %lu, \"makespan_total\": %lu, \"dispatch_total\": %lu, \"aggregate_speedup\": %.6f, \"makespan_p50\": %d, \"makespan_p95\": %d, \"dispatch_p50\": %d, \"dispatch_p95\": %d}\n",
+              stats.traceCycles, stats.traceSerial, stats.traceMakespan, stats.traceDispatches, traceSpeedup,
+              readyBatchPctInt(stats.traceMakespans, 50), readyBatchPctInt(stats.traceMakespans, 95),
+              readyBatchPctInt(stats.traceDispatchCounts, 50), readyBatchPctInt(stats.traceDispatchCounts, 95));
+      fprintf(fp, "        }%s\n", capIdx + 1 == lane.envelopeCaps.size() ? "" : ",");
+    }
+    fprintf(fp, "      ],\n");
+    const ReadyBatchLocalEvalStats& evalStats = lane.envelopeLocalEval;
+    double localEvalSpeedup = evalStats.traceMakespan == 0 ? 0.0 : static_cast<double>(evalStats.traceSerial) / static_cast<double>(evalStats.traceMakespan);
+    double localEvalSerialFraction = evalStats.traceActiveTasks == 0 ? 0.0 : static_cast<double>(evalStats.traceSerialTasks) / static_cast<double>(evalStats.traceActiveTasks);
+    fprintf(fp, "      \"envelope_local_eval\": {\n");
+    fprintf(fp, "        \"enabled\": %s,\n", envelopeLocalEvalEnabled ? "true" : "false");
+    fprintf(fp, "        \"worker_cap\": %d,\n", evalStats.workerCap);
+    fprintf(fp, "        \"chunk_cap\": %d,\n", evalStats.chunkCap);
+    fprintf(fp, "        \"trace_cycles\": %d,\n", evalStats.traceCycles);
+    fprintf(fp, "        \"trace_serial_total\": %lu,\n", evalStats.traceSerial);
+    fprintf(fp, "        \"trace_makespan_total\": %lu,\n", evalStats.traceMakespan);
+    fprintf(fp, "        \"trace_dispatch_total\": %lu,\n", evalStats.traceDispatches);
+    fprintf(fp, "        \"trace_active_scc_total\": %lu,\n", evalStats.traceActiveSccs);
+    fprintf(fp, "        \"trace_active_task_total\": %lu,\n", evalStats.traceActiveTasks);
+    fprintf(fp, "        \"trace_selected_task_total\": %lu,\n", evalStats.traceSelectedTasks);
+    fprintf(fp, "        \"trace_gap_task_total\": %lu,\n", evalStats.traceGapTasks);
+    fprintf(fp, "        \"trace_serial_task_total\": %lu,\n", evalStats.traceSerialTasks);
+    fprintf(fp, "        \"trace_serial_task_dispatch_total\": %lu,\n", evalStats.traceSerialTaskDispatches);
+    fprintf(fp, "        \"trace_active_word_or_volume_total\": %lu,\n", evalStats.traceActiveWordOrVolume);
+    fprintf(fp, "        \"local_eval_cap4_trace_speedup\": %.6f,\n", localEvalSpeedup);
+    fprintf(fp, "        \"serial_fraction\": %.6f,\n", localEvalSerialFraction);
+    fprintf(fp, "        \"makespan_p50\": %d,\n", readyBatchPctInt(evalStats.traceMakespans, 50));
+    fprintf(fp, "        \"makespan_p95\": %d,\n", readyBatchPctInt(evalStats.traceMakespans, 95));
+    fprintf(fp, "        \"dispatch_p50\": %d,\n", readyBatchPctInt(evalStats.traceDispatchCounts, 50));
+    fprintf(fp, "        \"dispatch_p95\": %d,\n", readyBatchPctInt(evalStats.traceDispatchCounts, 95));
+    fprintf(fp, "        \"serial_task_dispatch_p50\": %d,\n", readyBatchPctInt(evalStats.traceSerialTaskDispatchCounts, 50));
+    fprintf(fp, "        \"serial_task_dispatch_p95\": %d,\n", readyBatchPctInt(evalStats.traceSerialTaskDispatchCounts, 95));
+    fprintf(fp, "        \"active_word_or_volume_p50\": %d,\n", readyBatchPctInt(evalStats.traceActiveWordOrVolumes, 50));
+    fprintf(fp, "        \"active_word_or_volume_p95\": %d,\n", readyBatchPctInt(evalStats.traceActiveWordOrVolumes, 95));
+    uint64_t staticReasonTotal = 0;
+    for (const auto& kv : lane.envelopeSerialReasonTaskCount) staticReasonTotal += static_cast<uint64_t>(kv.second);
+    uint64_t traceReasonTotal = 0;
+    for (const auto& kv : lane.envelopeTraceSerialReasonTaskCount) traceReasonTotal += kv.second;
+    uint64_t activeWordHitTotal = 0;
+    std::vector<std::pair<int, uint64_t>> activeWordHits;
+    for (const auto& kv : lane.envelopeTraceActiveWordHits) {
+      activeWordHitTotal += kv.second;
+      activeWordHits.push_back(kv);
+    }
+    std::sort(activeWordHits.begin(), activeWordHits.end(), [](const std::pair<int, uint64_t>& a, const std::pair<int, uint64_t>& b) {
+      if (a.second != b.second) return a.second > b.second;
+      return a.first < b.first;
+    });
+    auto readyBatchTopActiveWordShare = [&](size_t limit) -> double {
+      if (activeWordHitTotal == 0) return 0.0;
+      uint64_t top = 0;
+      size_t n = std::min(limit, activeWordHits.size());
+      for (size_t idx = 0; idx < n; idx ++) top += activeWordHits[idx].second;
+      return static_cast<double>(top) / static_cast<double>(activeWordHitTotal);
+    };
+    int activeWordMax = 0;
+    for (int value : evalStats.traceActiveWordOrVolumes) activeWordMax = std::max(activeWordMax, value);
+    const ReadyBatchLocalEvalStats& selectedOnlyStats = lane.envelopeLocalEvalSelectedOnly;
+    const ReadyBatchLocalEvalStats& serialWorker0Stats = lane.envelopeLocalEvalSerialWorker0;
+    double selectedOnlySpeedup = selectedOnlyStats.traceMakespan == 0 ? 0.0 : static_cast<double>(selectedOnlyStats.traceSerial) / static_cast<double>(selectedOnlyStats.traceMakespan);
+    double selectedOnlySerialFraction = selectedOnlyStats.traceActiveTasks == 0 ? 0.0 : static_cast<double>(selectedOnlyStats.traceSerialTasks) / static_cast<double>(selectedOnlyStats.traceActiveTasks);
+    double serialWorker0Speedup = serialWorker0Stats.traceMakespan == 0 ? 0.0 : static_cast<double>(serialWorker0Stats.traceSerial) / static_cast<double>(serialWorker0Stats.traceMakespan);
+    double serialWorker0SerialFraction = serialWorker0Stats.traceActiveTasks == 0 ? 0.0 : static_cast<double>(serialWorker0Stats.traceSerialTasks) / static_cast<double>(serialWorker0Stats.traceActiveTasks);
+    fprintf(fp, "        \"diagnostics\": {\n");
+    fprintf(fp, "          \"enabled\": %s,\n", envelopeLocalEvalDiagnosticsEnabled ? "true" : "false");
+    fprintf(fp, "          \"serial_reason_task_total\": %lu,\n", staticReasonTotal);
+    fprintf(fp, "          \"trace_serial_reason_task_total\": %lu,\n", traceReasonTotal);
+    fprintf(fp, "          \"serial_reason_task_counts\": [\n");
+    {
+      size_t reasonIdx = 0;
+      for (const auto& kv : lane.envelopeSerialReasonTaskCount) {
+        fprintf(fp, "            {\"reason\": \"%s\", \"count\": %d}%s\n",
+                jsonEscape(kv.first).c_str(), kv.second, reasonIdx + 1 == lane.envelopeSerialReasonTaskCount.size() ? "" : ",");
+        reasonIdx ++;
+      }
+    }
+    fprintf(fp, "          ],\n");
+    fprintf(fp, "          \"trace_serial_reason_task_counts\": [\n");
+    {
+      size_t reasonIdx = 0;
+      for (const auto& kv : lane.envelopeTraceSerialReasonTaskCount) {
+        fprintf(fp, "            {\"reason\": \"%s\", \"count\": %lu}%s\n",
+                jsonEscape(kv.first).c_str(), kv.second, reasonIdx + 1 == lane.envelopeTraceSerialReasonTaskCount.size() ? "" : ",");
+        reasonIdx ++;
+      }
+    }
+    fprintf(fp, "          ],\n");
+    fprintf(fp, "          \"trace_state_update_group_hits\": {\n");
+    fprintf(fp, "            \"blocked\": %lu,\n", lane.envelopeTraceStateUpdateBlockedHits);
+    fprintf(fp, "            \"local_safe_only\": %lu,\n", lane.envelopeTraceStateUpdateLocalSafeOnlyHits);
+    fprintf(fp, "            \"runtime_safe\": %lu,\n", lane.envelopeTraceStateUpdateRuntimeSafeHits);
+    fprintf(fp, "            \"target_writer_conflict_hit_counts\": ");
+    dumpReadyBatchStringUint64CountArray(fp, lane.envelopeTraceStateUpdateTargetWriterConflictHits);
+    fprintf(fp, ",\n");
+    fprintf(fp, "            \"runtime_block_reason_hit_counts\": ");
+    dumpReadyBatchStringUint64CountArray(fp, lane.envelopeTraceStateUpdateRuntimeBlockReasonHits);
+    fprintf(fp, "\n");
+    fprintf(fp, "          },\n");
+    fprintf(fp, "          \"active_word_trace_hit_total\": %lu,\n", activeWordHitTotal);
+    fprintf(fp, "          \"active_word_or_volume_p90\": %d,\n", readyBatchPctInt(evalStats.traceActiveWordOrVolumes, 90));
+    fprintf(fp, "          \"active_word_or_volume_p99\": %d,\n", readyBatchPctInt(evalStats.traceActiveWordOrVolumes, 99));
+    fprintf(fp, "          \"active_word_or_volume_max\": %d,\n", activeWordMax);
+    fprintf(fp, "          \"active_word_top1_share\": %.6f,\n", readyBatchTopActiveWordShare(1));
+    fprintf(fp, "          \"active_word_top5_share\": %.6f,\n", readyBatchTopActiveWordShare(5));
+    fprintf(fp, "          \"active_word_top10_share\": %.6f,\n", readyBatchTopActiveWordShare(10));
+    fprintf(fp, "          \"active_word_top\": [\n");
+    {
+      size_t limit = std::min(static_cast<size_t>(10), activeWordHits.size());
+      for (size_t idx = 0; idx < limit; idx ++) {
+        double share = activeWordHitTotal == 0 ? 0.0 : static_cast<double>(activeWordHits[idx].second) / static_cast<double>(activeWordHitTotal);
+        fprintf(fp, "            {\"active_word\": %d, \"hits\": %lu, \"share\": %.6f}%s\n",
+                activeWordHits[idx].first, activeWordHits[idx].second, share, idx + 1 == limit ? "" : ",");
+      }
+    }
+    fprintf(fp, "          ],\n");
+    fprintf(fp, "          \"selected_only\": {\"trace_cycles\": %d, \"trace_serial_total\": %lu, \"trace_makespan_total\": %lu, \"trace_dispatch_total\": %lu, \"local_eval_cap4_trace_speedup\": %.6f, \"serial_fraction\": %.6f, \"dispatch_p95\": %d, \"serial_task_dispatch_p95\": %d, \"trace_active_task_total\": %lu, \"trace_selected_task_total\": %lu, \"trace_gap_task_total\": %lu},\n",
+            selectedOnlyStats.traceCycles, selectedOnlyStats.traceSerial, selectedOnlyStats.traceMakespan,
+            selectedOnlyStats.traceDispatches, selectedOnlySpeedup, selectedOnlySerialFraction,
+            readyBatchPctInt(selectedOnlyStats.traceDispatchCounts, 95),
+            readyBatchPctInt(selectedOnlyStats.traceSerialTaskDispatchCounts, 95),
+            selectedOnlyStats.traceActiveTasks, selectedOnlyStats.traceSelectedTasks, selectedOnlyStats.traceGapTasks);
+    fprintf(fp, "          \"serial_on_worker0\": {\"trace_cycles\": %d, \"trace_serial_total\": %lu, \"trace_makespan_total\": %lu, \"trace_dispatch_total\": %lu, \"local_eval_cap4_trace_speedup\": %.6f, \"serial_fraction\": %.6f, \"dispatch_p95\": %d, \"serial_task_dispatch_p95\": %d, \"trace_active_task_total\": %lu, \"trace_selected_task_total\": %lu, \"trace_gap_task_total\": %lu}\n",
+            serialWorker0Stats.traceCycles, serialWorker0Stats.traceSerial, serialWorker0Stats.traceMakespan,
+            serialWorker0Stats.traceDispatches, serialWorker0Speedup, serialWorker0SerialFraction,
+            readyBatchPctInt(serialWorker0Stats.traceDispatchCounts, 95),
+            readyBatchPctInt(serialWorker0Stats.traceSerialTaskDispatchCounts, 95),
+            serialWorker0Stats.traceActiveTasks, serialWorker0Stats.traceSelectedTasks, serialWorker0Stats.traceGapTasks);
+    fprintf(fp, "        }\n");
+    fprintf(fp, "      }\n");
     fprintf(fp, "    }%s\n", laneIdx + 1 == lanes.size() ? "" : ",");
   }
   fprintf(fp, "  ]\n");
   fprintf(fp, "}\n");
   fclose(fp);
   printf("[mt-ready-batch] wrote %zu lanes to %s\n", lanes.size(), path.c_str());
+  logMtReportTimer("ready-batch", mtReportTimerStart, getTime());
 }
 
 std::pair<int, int> cppId2flagIdx(int cppId) {
@@ -4717,8 +7214,11 @@ std::string strReplace(std::string s, std::string oldStr, std::string newStr) {
 }
 
 FILE* graph::genHeaderStart() {
-  FILE* header = std::fopen((globalConfig.OutputDir + "/" + name + ".h").c_str(), "w");
-
+  headerFilePath = globalConfig.OutputDir + "/" + name + ".h";
+  headerTmpFilePath = globalConfig.MtStableOutput ? headerFilePath + ".tmp" : "";
+  const std::string openPath = globalConfig.MtStableOutput ? headerTmpFilePath : headerFilePath;
+  FILE* header = std::fopen(openPath.c_str(), "w");
+  assert(header != NULL);
   fprintf(header, "#ifndef %s_H\n#define %s_H\n", name.c_str(), name.c_str());
   fprintf(header, "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n");
   fprintf(header, "#ifdef __linux\n");
@@ -5042,8 +7542,15 @@ void graph::genNodeDef(FILE* fp, Node* node) {
 
 void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
                          std::string activeBufferName, int indent,
-                         const std::string& accumFlagName) {
+                         const std::string& accumFlagName, bool emitActivation) {
   std::string nodeName = node->name;
+  if (!emitActivation) {
+    if (inStep) {
+      if (node->isReset() && node->type == NODE_REG_SRC) emitBodyLock(indent, "%s = %s;\n", RESET_NAME(node).c_str(), newName(node).c_str());
+      emitBodyLock(indent, "%s = %s;\n", node->name.c_str(), newName(node).c_str());
+    }
+    return;
+  }
   auto condName = std::string("cond_") + nodeName;
   bool opt{false};
 
@@ -5096,7 +7603,8 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
 }
 void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
                                std::string activeBufferName, int indent,
-                               const std::string& accumFlagName) {
+                               const std::string& accumFlagName, bool emitActivation) {
+  if (!emitActivation) return;
   std::map<uint64_t, ActiveType> bitMapInfo;
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
   if (ACTIVE_MASK(curMask) != 0) {
@@ -5116,9 +7624,9 @@ void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inSte
   if (inStep) emitBodyLock(indent, "isActivateValid = true;\n");
 #endif
 }
-int graph::genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent) {
+int graph::genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent, bool skipAdmissionGuard) {
   nodeNum ++;
-  if (!isAlwaysActive(node->cppId)) {
+  if (!skipAdmissionGuard && !isAlwaysActive(node->cppId)) {
     emitBodyLock(indent ++, "if(unlikely(%s & 0x%lx)) { // id=%d\n", flagName.c_str(), mask, idx);
   }
   int id;
@@ -5174,14 +7682,14 @@ void graph::nodeDisplay(Node* member, int indent) {
   emitBodyLock(indent, "printf(\"\\n\");\n");
 }
 
-int graph::genNodeStepEnd(SuperNode* node, int indent) {
+int graph::genNodeStepEnd(SuperNode* node, int indent, bool skipAdmissionGuard) {
 #ifdef PERF
   if (node->superType != SUPER_EXTMOD) {
     emitBodyLock(indent, "validActive[%d] += isActivateValid;\n", node->cppId);
   }
 #endif
 
-  if(!isAlwaysActive(node->cppId)) {
+  if(!skipAdmissionGuard && !isAlwaysActive(node->cppId)) {
     emitBodyLock(-- indent, "}\n");
   }
   return indent;
@@ -5193,7 +7701,7 @@ bool Node::isLocal() { // TODO: isArray is OK
 
 static std::map<Node*, std::string> mtRepCutActiveReplacements;
 
-int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName) {
+int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName, bool emitActivation) {
   switch (inst.infoType) {
     case SUPER_INFO_IF:
       emitBodyLock(indent ++, "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
@@ -5213,8 +7721,8 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
       break;
     case SUPER_INFO_ASSIGN_END:
       if (inst.node->isLocal() || !inst.node->needActivate()) break;
-      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent, accumFlagName);
-      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent, accumFlagName);
+      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent, accumFlagName, emitActivation);
+      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent, accumFlagName, emitActivation);
       break;
     default:
       break;
@@ -5227,8 +7735,8 @@ static bool mtActAccEnabled() {
   return e && e[0] == '1';
 }
 
-void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent) { // current indent = 2
-  bool useAccum = mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
+void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation) { // current indent = 2
+  bool useAccum = emitActivation && mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
   std::string accumVar;
   if (useAccum) {
     accumVar = format("__actac_%d", super->cppId);
@@ -5242,17 +7750,24 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       emitBodyLock(indent, "%s %s = %s;\n", widthUType(extOut->width).c_str(), oldName(extOut).c_str(), extOut->name.c_str());
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar);
+      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
     }
     for (size_t i = 1; i < super->member.size(); i ++) {
       if (!super->member[i]->needActivate()) continue;
-      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent, accumVar);
-      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent, accumVar);
+      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent, accumVar, emitActivation);
+      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent, accumVar, emitActivation);
     }
   } else {
     if (super->superType == SUPER_ASYNC_RESET) {
-      if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
-      else emitBodyLock(indent, "subReset%d(%s);\n", super2ResetId[super->resetNode].second, activeBufferName.c_str());
+      int resetId = super2ResetId[super->resetNode].second;
+      if (!emitActivation && activeBufferName.empty()) {
+        int denseResetId = -1;
+        auto denseResetIt = super2DenseResetId.find(super->resetNode);
+        if (denseResetIt != super2DenseResetId.end()) denseResetId = denseResetIt->second.second;
+        Assert(denseResetId >= 0, "missing dense async reset id for %s", super->resetNode->name.c_str());
+        emitBodyLock(indent, "subResetDense%d();\n", denseResetId);
+      } else if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", resetId);
+      else emitBodyLock(indent, "subReset%d(%s);\n", resetId, activeBufferName.c_str());
     }
     /* local nodes definition */
     for (Node* n : super->member) {
@@ -5261,11 +7776,18 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       }
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar);
+      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
     }
     if (super->superType == SUPER_ASYNC_RESET) {
-      if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", super2ResetId[super->resetNode].second);
-      else emitBodyLock(indent, "subReset%d(%s);\n", super2ResetId[super->resetNode].second, activeBufferName.c_str());
+      int resetId = super2ResetId[super->resetNode].second;
+      if (!emitActivation && activeBufferName.empty()) {
+        int denseResetId = -1;
+        auto denseResetIt = super2DenseResetId.find(super->resetNode);
+        if (denseResetIt != super2DenseResetId.end()) denseResetId = denseResetIt->second.second;
+        Assert(denseResetId >= 0, "missing dense async reset id for %s", super->resetNode->name.c_str());
+        emitBodyLock(indent, "subResetDense%d();\n", denseResetId);
+      } else if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", resetId);
+      else emitBodyLock(indent, "subReset%d(%s);\n", resetId, activeBufferName.c_str());
     }
     emitBodyLock(indent, "#ifdef ENABLE_LOG\n");
     emitBodyLock(indent ++, "if (cycles >= LOG_START && cycles <= LOG_END) {\n");
@@ -5309,19 +7831,19 @@ int graph::genActivate(const std::string& subStepSuffix) {
       }
       SuperNode* super = cppId2Super[idx];
       std::string flagName = prevActiveWhole ? "oldFlag" : format("activeFlags[%d]", id);
-      indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      indent = genNodeStepStart(super, mask, idx, flagName, indent, false);
       static bool wallfracAudit = (std::getenv("GSIM_WALLFRAC_AUDIT") && std::string(std::getenv("GSIM_WALLFRAC_AUDIT")) == "1");
       bool wfCommit = (super->superType == SUPER_UPDATE_REG);
       for (Node* wfm : super->member) { if (nodeHasStateUpdate(wfm)) { wfCommit = true; break; } }
       if (wallfracAudit) {
         emitBodyLock(indent, "uint32_t __wf_a0_%d,__wf_d0_%d; __asm__ __volatile__(\"rdtsc\":\"=a\"(__wf_a0_%d),\"=d\"(__wf_d0_%d)); uint64_t __wf_t0_%d=((uint64_t)__wf_d0_%d<<32)|__wf_a0_%d;\n", idx, idx, idx, idx, idx, idx, idx);
       }
-      genSuperEval(super, flagName, "", indent);
+      genSuperEval(super, flagName, "", indent, true);
       if (wallfracAudit) {
         emitBodyLock(indent, "uint32_t __wf_a1_%d,__wf_d1_%d; __asm__ __volatile__(\"rdtsc\":\"=a\"(__wf_a1_%d),\"=d\"(__wf_d1_%d)); uint64_t __wf_t1_%d=((uint64_t)__wf_d1_%d<<32)|__wf_a1_%d;\n", idx, idx, idx, idx, idx, idx, idx);
         emitBodyLock(indent, "%s += __wf_t1_%d-__wf_t0_%d; %s ++;\n", wfCommit?"wallfracCommitCycles":"wallfracCombCycles", idx, idx, wfCommit?"wallfracCommitBrackets":"wallfracCombBrackets");
       }
-      indent = genNodeStepEnd(super, indent);
+      indent = genNodeStepEnd(super, indent, false);
     }
     emitBodyLock(--indent, "}\n");
     if (prevActiveWhole) emitBodyLock(--indent, "}\n");
@@ -5332,10 +7854,10 @@ int graph::genActivate(const std::string& subStepSuffix) {
 void graph::genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType) {
   if (buffered) {
     emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
-    genSuperEval(super, "flag", "nextActive", 1);
+    genSuperEval(super, "flag", "nextActive", 1, true);
   } else {
     emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH);
-    genSuperEval(super, "flag", "", 1);
+    genSuperEval(super, "flag", "", 1, true);
   }
   emitBodyLock(0, "}\n");
 }
@@ -5351,13 +7873,13 @@ void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepC
     emitBodyLock(1, "%s %s = %s;\n", widthUType(clone.sourceNode->width).c_str(), clone.cloneName.c_str(), clone.expr.c_str());
   }
   mtRepCutActiveReplacements = replacements;
-  genSuperEval(super, "flag", "nextActive", 1);
+  genSuperEval(super, "flag", "nextActive", 1, true);
   mtRepCutActiveReplacements.clear();
   emitBodyLock(0, "}\n");
 }
 
 void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   markMtRepCutLiteRuntimeApplied(mtTasks);
   int shardCount = mtPureBatchShardCount();
   bool useCoarse = globalConfig.MtBatchFormationMode == "coarse";
@@ -5508,8 +8030,8 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "const int chunkBegin = mtWorkerPoolChunks[(size_t)worker].begin;\n");
   emitBodyLock(2, "const int chunkEnd = mtWorkerPoolChunks[(size_t)worker].end;\n");
+  emitBodyLock(2, "const int jobKind = mtWorkerPoolJobKind;\n");
   if (useCoarse) {
-    emitBodyLock(2, "const int jobKind = mtWorkerPoolJobKind;\n");
     emitBodyLock(2, "const int coarseRegionIndex = mtWorkerPoolCoarseRegionIndex;\n");
     emitBodyLock(2, "const int coarseLayerIndex = mtWorkerPoolCoarseLayerIndex;\n");
     emitBodyLock(2, "if (jobKind == 1) {\n");
@@ -5530,11 +8052,21 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(3, "/* A35-P empty-barrier microbench: worker performs no work */\n");
     emitBodyLock(2, "} else if (jobKind == 5) {\n");
     emitBodyLock(3, "mtRunCoarseMTaskDynamic(coarseRegionIndex, worker);\n");
+    emitBodyLock(2, "} else if (jobKind == 6) {\n");
+    emitBodyLock(3, "(this->*mtWorkerPoolDenseLayerFn)(worker, chunkBegin, chunkEnd);\n");
+    emitBodyLock(2, "} else if (jobKind == 7) {\n");
+    emitBodyLock(3, "stepDenseThreadWorker(worker);\n");
     emitBodyLock(2, "} else {\n");
     emitBodyLock(3, "mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd);\n");
     emitBodyLock(2, "}\n");
   } else {
-    emitBodyLock(2, "mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd);\n");
+    emitBodyLock(2, "if (jobKind == 6) {\n");
+    emitBodyLock(3, "(this->*mtWorkerPoolDenseLayerFn)(worker, chunkBegin, chunkEnd);\n");
+    emitBodyLock(2, "} else if (jobKind == 7) {\n");
+    emitBodyLock(3, "stepDenseThreadWorker(worker);\n");
+    emitBodyLock(2, "} else {\n");
+    emitBodyLock(3, "mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd);\n");
+    emitBodyLock(2, "}\n");
   }
   emitBodyLock(2, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
   emitBodyLock(1, "}\n");
@@ -5771,9 +8303,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "if (workerCount == 1) {\n");
   emitBodyLock(2, "mtRunPureBatchWorkerRange(0, beginCppId, endCppId);\n");
   emitBodyLock(1, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= workerCount) {\n");
-  if (useCoarse) {
-    emitBodyLock(2, "mtWorkerPoolJobKind = 0;\n");
-  }
+  emitBodyLock(2, "mtWorkerPoolJobKind = 0;\n");
   emitBodyLock(2, "mtWorkerPoolCurrentWorkerCount = workerCount;\n");
   emitBodyLock(2, "for (int worker = 0; worker < workerCount; worker ++) {\n");
   emitBodyLock(3, "mtWorkerPoolChunks[(size_t)worker].begin = beginCppId + (taskCount * worker) / workerCount;\n");
@@ -5828,7 +8358,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
 }
 
 void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan) {
-  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+  std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   markMtRepCutLiteRuntimeApplied(mtTasks);
   bool waitProbeCodegen = mtUseWaitProbeCodegen();
   // 28c-2: shared emitter for `switch (mtaskIndex) { case M: <body>; break; ... }` body.
@@ -6507,6 +9037,26 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     }
   }
   emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionBeginCppId[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.beginCppId);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
+  emitBodyLock(1, "static const int kCoarseRegionEndCppId[%d] = {", a104EligibleCount);
+  {
+    bool first = true;
+    for (const MtCoarseRegion& region : coarsePlan.regions) {
+      if (!region.runtimeEligible) continue;
+      emitBodyLock(0, "%s%d", first ? "" : ", ", region.endCppId);
+      first = false;
+    }
+  }
+  emitBodyLock(0, "};\n");
   // Track 2 Week 4: antichain runtime constant arrays.
   {
     std::vector<int> useAntichainRuntimeValues;
@@ -6547,6 +9097,10 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "const int regionUsefulWork = kCoarseRegionUsefulWork[regionIndex];\n");
   emitBodyLock(1, "const int regionMaxParallelWidth = kCoarseRegionMaxParallelWidth[regionIndex];\n");
   emitBodyLock(1, "const int regionMTaskCount = kCoarseRegionMTaskCount[regionIndex];\n");
+  emitBodyLock(1, "const int regionBeginCppId = kCoarseRegionBeginCppId[regionIndex];\n");
+  emitBodyLock(1, "const int regionEndCppId = kCoarseRegionEndCppId[regionIndex];\n");
+  emitBodyLock(1, "const bool mtVerilatorDualPathSelected = mtUseVerilatorDualPath && ((mtVerilatorDualPathRegionIndex >= 0 && regionIndex == mtVerilatorDualPathRegionIndex) || (regionBeginCppId == mtVerilatorDualPathBeginCppId && regionEndCppId == mtVerilatorDualPathEndCppId));\n");
+  emitBodyLock(1, "if (mtProfileEnabled && mtVerilatorDualPathSelected) mtProfileVerilatorDualPathDispatches ++;\n");
   emitBodyLock(1, "int activeMTaskCount = 0;\n");
   emitBodyLock(1, "int activeMTaskStaticCost = 0;\n");
   emitBodyLock(1, "if (mtProfileEnabled) {\n");
@@ -6574,7 +9128,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(1, "if (workerCount > 1 && regionActiveWordSpan > 0 && regionMemberNodeCount < regionActiveWordSpan * workerCount * 8) workerCount = 1;\n");
   }
   if (globalConfig.MtCoarseProfitabilityMode == "static") {
-    emitBodyLock(1, "if (mtCoarseUseMTaskRuntime) {\n");
+    emitBodyLock(1, "if (mtCoarseUseMTaskRuntime || mtVerilatorDualPathSelected) {\n");
     if (globalConfig.MtCoarseWorkerPolicyMode == "profitable") {
       emitBodyLock(2, "activeMTaskCount = mtCountActiveCoarseMTasks(regionIndex, coarseActiveWords, &activeMTaskStaticCost);\n");
       emitBodyLock(2, "if (regionMaxParallelWidth > 0 && workerCount > regionMaxParallelWidth) workerCount = regionMaxParallelWidth;\n");
@@ -6606,6 +9160,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "coarseRuntimeActiveBits += __builtin_popcount((unsigned int)coarseActiveWords[w]);\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtCoarseMinActiveBits > 0 && coarseRuntimeActiveBits < mtCoarseMinActiveBits) workerCount = 1;\n");
+  emitBodyLock(1, "if (mtVerilatorDualPathSelected && workerCount < 2 && mtConfiguredWorkerCount >= 2 && regionMTaskCount >= 2) workerCount = 2;\n");
   emitBodyLock(1, "if (mtProfileEnabled) {\n");
   emitBodyLock(2, "int batchSizeBucket = regionTaskCount <= 1 ? 0 : (regionTaskCount == 2 ? 1 : (regionTaskCount <= 4 ? 2 : (regionTaskCount <= 8 ? 3 : (regionTaskCount <= 15 ? 4 : 5))));\n");
   emitBodyLock(2, "mtProfileBatchSizeHist[batchSizeBucket] ++;\n");
@@ -6650,7 +9205,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   // Track 2 Week 4: atomic-counter antichain runtime. Single-threaded init,
   // then workers scan/CAS ready mtasks and hand off via shared region flags.
-  emitBodyLock(1, "if (mtCoarseUseAntichainRuntime && kCoarseRegionUseAntichainRuntime[regionIndex]) {\n");
+  emitBodyLock(1, "if (mtCoarseUseAntichainRuntime && !mtVerilatorDualPathSelected && kCoarseRegionUseAntichainRuntime[regionIndex]) {\n");
   emitBodyLock(2, "mtWorkerPoolCoarseActiveWords = coarseActiveWords;\n");
   emitBodyLock(2, "int antichainMTaskCount = kCoarseRegionAntichainMTaskCount[regionIndex];\n");
   emitBodyLock(2, "if (antichainMTaskCount <= 0) return;\n");
@@ -6770,7 +9325,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   // 28c-2: mtask runtime is a runtime branch (env GSIM_MT_COARSE_RUNTIME=mtask|layered);
   // emit the mtask block unconditionally and gate execution by mtCoarseUseMTaskRuntime.
-  emitBodyLock(1, "if (mtCoarseUseMTaskRuntime) {\n");
+  emitBodyLock(1, "if (mtCoarseUseMTaskRuntime || mtVerilatorDualPathSelected) {\n");
   emitBodyLock(1, "if (regionMTaskCount <= 0) return;\n");
   emitBodyLock(1, "int mtaskWorkerCount = workerCount;\n");
   emitBodyLock(1, "if (mtaskWorkerCount > regionMTaskCount) mtaskWorkerCount = regionMTaskCount;\n");
@@ -6817,7 +9372,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   // D-static uses precomputed worker plans for powers of two only. Round before
   // per-worker clear/copy/profile so accepted regions do not pay for workers
   // that the D-static executor will not launch.
-  emitBodyLock(1, "if (mtCoarseUseDStatic) {\n");
+  emitBodyLock(1, "if (mtCoarseUseDStatic && !mtVerilatorDualPathSelected) {\n");
   emitBodyLock(2, "if (mtaskWorkerCount >= 8) mtaskWorkerCount = 8;\n");
   emitBodyLock(2, "else if (mtaskWorkerCount >= 4) mtaskWorkerCount = 4;\n");
   emitBodyLock(2, "else if (mtaskWorkerCount >= 2) mtaskWorkerCount = 2;\n");
@@ -6844,7 +9399,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   // double-switch (regionIndex, mtaskIndex) dispatch with the codegen-time
   // LPT + flat-array path. mtaskWorkerCount was rounded above to match the
   // available precomputed plans.
-  emitBodyLock(1, "if (mtCoarseUseDStatic) {\n");
+  emitBodyLock(1, "if (mtCoarseUseDStatic && !mtVerilatorDualPathSelected) {\n");
   emitBodyLock(2, "const int dstaticRoundedWC = mtaskWorkerCount;\n");
   emitBodyLock(2, "if (dstaticRoundedWC == 1) {\n");
   emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(regionIndex, dstaticRoundedWC, 0, regionBeginActiveWord, regionActiveWordSpan);\n");
@@ -6908,6 +9463,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   }
   emitBodyLock(1, "} else if (mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtaskWorkerCount) {\n");
   emitBodyLock(2, "mtWorkerPoolJobKind = 2;\n");
+  emitBodyLock(2, "if (mtProfileEnabled && mtVerilatorDualPathSelected) mtProfileVerilatorDualPathWorkerPoolDispatches ++;\n");
   emitBodyLock(2, "mtWorkerPoolCoarseRegionIndex = regionIndex;\n");
   emitBodyLock(2, "mtWorkerPoolCoarseLayerIndex = -1;\n");
   emitBodyLock(2, "mtWorkerPoolCurrentWorkerCount = mtaskWorkerCount;\n");
@@ -7097,7 +9653,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
 }
 
 int graph::genActivateSeqHelpers(bool buffered) {
-    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCut();
+    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutForInvocation();
     for (int idx = 0; idx < superId; idx ++) {
       genMtTaskHelper(cppId2Super[idx], buffered, "ActiveBuffer");
     }
@@ -7134,7 +9690,7 @@ int graph::genActivateSeqHelpers(bool buffered) {
       }
       SuperNode* super = cppId2Super[idx];
       std::string flagName = prevActiveWhole ? "oldFlag" : (buffered ? format("activeWord%d", id) : format("activeFlags[%d]", id));
-      indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      indent = genNodeStepStart(super, mask, idx, flagName, indent, false);
       emitBodyLock(indent ++, "{\n");
       if (buffered) {
         emitBodyLock(indent, "ActiveBuffer mtBuffer;\n");
@@ -7153,7 +9709,7 @@ int graph::genActivateSeqHelpers(bool buffered) {
                      idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
       }
       emitBodyLock(-- indent, "}\n");
-      indent = genNodeStepEnd(super, indent);
+      indent = genNodeStepEnd(super, indent, false);
     }
     emitBodyLock(--indent, "}\n");
     if (prevActiveWhole) emitBodyLock(--indent, "}\n");
@@ -7162,10 +9718,10 @@ int graph::genActivateSeqHelpers(bool buffered) {
 }
 
 int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& serialFastSuffix) {
-    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelection();
+    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
     markMtRepCutLiteRuntimeApplied(mtTasks);
     MtRepCutSemanticPlan semanticPlan = planMtRepCutSemantics(mtTasks);
-    MtCoarseRegionPlan coarsePlan = planMtCoarseRegions(mtTasks);
+    MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation(mtTasks);
     MtPureBatchPlan batchPlan = semanticPlan.batchPlan;
     std::map<int, int> batchEndByStart;
     for (auto batch : batchPlan.batches) {
@@ -7302,7 +9858,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
             }
             if (profileOffDirectSerial && !mtUseSubchunkProbe()) {
               if (directInlineFallback) {
-                genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent);
+                genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent, true);
               } else {
                 emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
               }
@@ -7313,7 +9869,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
               emitBodyLock(taskIndent, "recordMtProfileTask(%d, %s, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileTaskBegin).count());\n", cppId, mtTasks[cppId].taskKind == "pure_compute" ? "true" : "false");
               emitBodyLock(--taskIndent, "} else {\n");
               if (directInlineFallback) {
-                genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent);
+                genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent, true);
               } else {
                 emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
               }
@@ -7412,7 +9968,15 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
             emitBodyLock(bodyIndent, "activeFlags[%d] |= mtCoarseWords%d[%d];\n", activeWord, idx, word);
           }
         };
+        const bool emitVerilatorDualPathCallerBypass = region.beginCppId == 4488 && region.endCppId == 5080;
         if (regionCleanSerialFallback) {
+          if (emitVerilatorDualPathCallerBypass) {
+            emitBodyLock(indent, "const bool mtVerilatorDualPathCallerSelected%d = mtUseVerilatorDualPath && ((mtVerilatorDualPathRegionIndex >= 0 && mtVerilatorDualPathRegionIndex == %d) || (mtVerilatorDualPathRegionIndex < 0 && mtVerilatorDualPathBeginCppId == %d && mtVerilatorDualPathEndCppId == %d));\n", idx, coarseIter->second, region.beginCppId, region.endCppId);
+            emitBodyLock(indent ++, "if (unlikely(mtVerilatorDualPathCallerSelected%d)) {\n", idx);
+            emitCoarseDispatchAndMerge(indent);
+            emitBodyLock(--indent, "} else {\n");
+            indent ++;
+          }
           emitBodyLock(indent ++, "if (mtCoarseInlineThreshold > 0) {\n");
           emitBodyLock(indent, "int coarseInlineActiveBits%d = 0;\n", idx);
           if (mtUseStaticCoarseInlineBound() && profileOffDirectSerial && !mtUseSubchunkProbe()) {
@@ -7533,6 +10097,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           indent ++;
           emitCoarseDispatchAndMerge(indent);
           emitBodyLock(--indent, "}\n");
+          if (emitVerilatorDualPathCallerBypass) emitBodyLock(--indent, "}\n");
         } else {
           if (regionHasRepcut) emitBodyLock(indent, "if (mtProfileEnabled && mtCoarseInlineThreshold > 0) mtProfileCoarseSerialFallbackRepcutExcluded ++;\n");
           if (regionHasNonPure) emitBodyLock(indent, "if (mtProfileEnabled && mtCoarseInlineThreshold > 0) mtProfileCoarseSerialFallbackNonPureExcluded ++;\n");
@@ -7602,7 +10167,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
                 emitBodyLock(indent, "mtInlineBatchDelta%d.mergeInto(activeFlags);\n", batchCppId);
                 emitBodyLock(--indent, "}\n");
               } else if (inlineSmallPureBatchBodies) {
-                genSuperEval(cppId2Super[batchCppId], "oldFlag", "", indent);
+                genSuperEval(cppId2Super[batchCppId], "oldFlag", "", indent, true);
               } else {
                 emitBodyLock(indent, "mtTask%d(oldFlag);\n", batchCppId);
               }
@@ -7633,13 +10198,13 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
                                     !directInlineSerialIter->second.repcutRuntimeApplied &&
                                     !directInlineSerialTask &&
                                     hasOnlyA73Worker0SafeReasons(directInlineSerialIter->second.serialReasons);
-      indent = genNodeStepStart(super, mask, idx, flagName, indent);
+      indent = genNodeStepStart(super, mask, idx, flagName, indent, false);
       if (profileOffDirectSerial) {
         // A77 D1-NARROW: emit only the lean profile-off body, matching the
         // SerialFast shape (genActivate). Drops both `if (mtProfileEnabled)`
         // wrappers and the outer scope; profile counters/timers are not emitted.
         if (directInlineSerialTask || directInlineWorker0Task) {
-          genSuperEval(super, flagName, "", indent);
+          genSuperEval(super, flagName, "", indent, true);
         } else if (mtTasks[idx].repcutRuntimeApplied) {
           emitBodyLock(indent ++, "{\n");
           emitBodyLock(indent, "ActivationDelta mtScalarDelta;\n");
@@ -7689,7 +10254,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
                    idx, mtTasks[idx].taskKind == "pure_compute" ? "true" : "false");
       emitBodyLock(indent, "} else {\n");
       if (directInlineSerialTask || directInlineWorker0Task) {
-        genSuperEval(super, flagName, "", indent + 1);
+        genSuperEval(super, flagName, "", indent + 1, true);
       } else if (mtTasks[idx].repcutRuntimeApplied) {
         emitBodyLock(indent + 1, "ActivationDelta mtScalarDelta;\n");
         emitBodyLock(indent + 1, "mtRepCutLiteTask%d(%s, mtScalarDelta);\n", idx, flagName.c_str());
@@ -7700,7 +10265,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
       emitBodyLock(indent, "}\n");
       emitBodyLock(-- indent, "}\n");
       }
-      indent = genNodeStepEnd(super, indent);
+      indent = genNodeStepEnd(super, indent, false);
     }
     emitBodyLock(--indent, "}\n");
     if (prevActiveWhole) emitBodyLock(--indent, "}\n");
@@ -7708,35 +10273,41 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     return nextSubStepIdx - 1;
 }
 
-void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent) {
+void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent, const std::string& nameSuffix, bool emitActivation) {
   std::string activeSinkType = (globalConfig.MtHelperMode == "mt" ||
                                 globalConfig.MtHelperMode == "mt-level-dispatch")
                                  ? "ActivationDelta" : "ActiveBuffer";
-  if (buffered) emitBodyLock(indent ++, "void S%s::subReset%d(%s &nextActive){ // %s reset\n", name.c_str(), resetId, activeSinkType.c_str(), isUIntReset ? "uint" : "async");
-  else emitBodyLock(indent ++, "void S%s::subReset%d(){ // %s reset\n", name.c_str(), resetId, isUIntReset ? "uint" : "async");
+  std::string resetFuncName = format("subReset%s%d", nameSuffix.c_str(), resetId);
+  if (buffered) emitBodyLock(indent ++, "void S%s::%s(%s &nextActive){ // %s reset\n", name.c_str(), resetFuncName.c_str(), activeSinkType.c_str(), isUIntReset ? "uint" : "async");
+  else emitBodyLock(indent ++, "void S%s::%s(){ // %s reset\n", name.c_str(), resetFuncName.c_str(), isUIntReset ? "uint" : "async");
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
-  emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
-  std::set<int> allNext;
-  for (size_t i = 0; i < super->member.size(); i ++) {
-    Node* node = super->member[i];
-    if (node->type == NODE_REG_RESET) node = node->getResetSrc();
-    for (Node* next : node->next) {
-      if (next->super->cppId >= 0) allNext.insert(next->super->cppId);
-    }
+  if (!emitActivation) {
+    emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
   }
+  if (emitActivation) {
+    emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
+    std::set<int> allNext;
+    for (size_t i = 0; i < super->member.size(); i ++) {
+      Node* node = super->member[i];
+      if (node->type == NODE_REG_RESET) node = node->getResetSrc();
+      for (Node* next : node->next) {
+        if (next->super->cppId >= 0) allNext.insert(next->super->cppId);
+      }
+    }
 
-  if (allNext.size() > 100) {
-    if (buffered) emitBodyLock(indent, "nextActive.activateAll();\n");
-    else emitBodyLock(indent, "activateAll();\n");
-  }
-  else {
-    std::map<uint64_t, ActiveType> bitMapInfo;
-    activeSet2bitMap(allNext, bitMapInfo, -1);
-    for (auto iter : bitMapInfo) {
-      emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), buffered ? "nextActive" : "").c_str(), ACTIVE_COMMENT(iter.second).c_str());
+    if (allNext.size() > 100) {
+      if (buffered) emitBodyLock(indent, "nextActive.activateAll();\n");
+      else emitBodyLock(indent, "activateAll();\n");
     }
+    else {
+      std::map<uint64_t, ActiveType> bitMapInfo;
+      activeSet2bitMap(allNext, bitMapInfo, -1);
+      for (auto iter : bitMapInfo) {
+        emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), buffered ? "nextActive" : "").c_str(), ACTIVE_COMMENT(iter.second).c_str());
+      }
+    }
+    emitBodyLock(-- indent, "}\n");
   }
-  emitBodyLock(-- indent, "}\n");
   for (InstInfo inst : super->insts) {
     switch (inst.infoType) {
       case SUPER_INFO_IF:
@@ -7753,11 +10324,20 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
         break;
     }
   }
+  if (!emitActivation) {
+    emitBodyLock(-- indent, "}\n");
+  }
   emitBodyLock(-- indent, "}\n");
 }
 
 void graph::genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId) {
   emitBodyLock(indent, "subReset%d();\n", resetId);
+}
+
+void graph::genResetActivationDense(SuperNode* super, bool isUIntReset, int indent, int resetId) {
+  (void)super;
+  (void)isUIntReset;
+  emitBodyLock(indent, "subResetDense%d();\n", resetId);
 }
 
 void graph::genResetAll() {
@@ -7767,9 +10347,7 @@ void graph::genResetAll() {
       Assert(mpz_sgn(super->resetNode->computeInfo->consVal) == 0, "reset %s is always true", super->resetNode->name.c_str());
       continue;
     }
-    if (super2ResetId.find(super->resetNode) != super2ResetId.end()) {
-      super2ResetId[super->resetNode] = std::make_pair(-1, -1);
-    }
+    super2ResetId.emplace(super->resetNode, std::make_pair(-1, -1));
     int resetId = resetFuncNum ++;
     bool isUIntReset = super->superType == SUPER_UINT_RESET;
     if (isUIntReset) super2ResetId[super->resetNode].first = resetId;
@@ -7791,9 +10369,257 @@ void graph::genResetAll() {
   emitBodyLock(0, "}\n");
 }
 
-void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::string& serialFastSuffix) {
+void graph::genResetAllDense() {
+  std::vector<std::tuple<SuperNode*, bool, int>> resetSuper;
+  super2DenseResetId.clear();
+  int denseResetFuncNum = 0;
+  for (SuperNode* super : allReset) {
+    if (super->resetNode->status == CONSTANT_NODE) continue;
+    bool isUIntReset = super->superType == SUPER_UINT_RESET;
+    int resetId = denseResetFuncNum ++;
+    if (super2DenseResetId.find(super->resetNode) == super2DenseResetId.end()) {
+      super2DenseResetId[super->resetNode] = std::make_pair(-1, -1);
+    }
+    if (isUIntReset) super2DenseResetId[super->resetNode].first = resetId;
+    else super2DenseResetId[super->resetNode].second = resetId;
+    genResetDef(super, isUIntReset, false, resetId, 0, "Dense", false);
+    resetSuper.push_back(std::make_tuple(super, isUIntReset, resetId));
+  }
+
+  emitFuncDecl(0, "void S%s::resetAllDense(){\n", name.c_str());
+  emitBodyLock(1, "memset(activeFlags, 0, sizeof(activeFlags));\n");
+  for (const auto& entry : resetSuper) {
+    SuperNode* super;
+    bool isUIntReset;
+    int resetId;
+    std::tie(super, isUIntReset, resetId) = entry;
+    if (super->superType == SUPER_ASYNC_RESET) continue;
+    genResetActivationDense(super, isUIntReset, 1, resetId);
+  }
+  emitBodyLock(0, "}\n");
+}
+
+void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header) {
+  Assert(denseSchedule.valid, "cannot emit dense executor for invalid schedule: %s", denseSchedule.fallbackReason.c_str());
+  Assert(!denseSchedule.mtasks.empty(), "v202 requires MTask partitioning");
+  int nMTasks = static_cast<int>(denseSchedule.mtasks.size());
+  int threadCount = 8;
+  const char* threadsEnv = std::getenv("GSIM_THREADS");
+  if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
+  if (threadCount < 1) threadCount = 1;
+  bool workSteal = mtUseDenseWorkSteal();
+  // Work-stealing runs MTasks in DYNAMIC order, so the static in-order-per-owner guarantee that
+  // made same-thread-edge elision and per-worker-sequence transitive reduction safe no longer
+  // holds. Under work-stealing we MUST keep ALL dependency edges (same-thread included) and skip
+  // the sequence-based transitive reduction, or a successor could run before a same-owner pred.
+  bool xthreadDepsOnly = workSteal ? false : mtUseDenseXThreadDepsOnly();
+  bool transitiveReduceEdges = workSteal ? false : mtUseDenseTransitiveReduceEdges();
+  std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, xthreadDepsOnly);
+  int transitiveElidedEdges = transitiveReduceEdges ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, denseSchedule.mtaskThreadAssign) : 0;
+  std::vector<uint32_t> denseRuntimeDepCounts((size_t)nMTasks, 0);
+  int totalSuccs = 0;
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+    for (int succ : denseRuntimeSuccs[(size_t)mtaskId]) {
+      if (succ < 0 || succ >= nMTasks) continue;
+      denseRuntimeDepCounts[(size_t)succ] ++;
+      totalSuccs ++;
+    }
+  }
+  if (totalSuccs == 0) totalSuccs = 1;
+  fprintf(header, "static constexpr bool kDenseXThreadDepsOnly = %s;\n", xthreadDepsOnly ? "true" : "false");
+  fprintf(header, "static constexpr bool kDenseTransitiveReduceEdges = %s;\n", transitiveReduceEdges ? "true" : "false");
+  fprintf(header, "static constexpr int kDenseTransitiveElidedEdgeCount = %d;\n", transitiveElidedEdges);
+  fprintf(header, "static constexpr uint32_t kDenseMTaskDepCount[%d] = {", nMTasks);
+  for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%u", denseRuntimeDepCounts[(size_t)i]); }
+  fprintf(header, "};\n");
+  fprintf(header, "static constexpr int kDenseMTaskSuccOffsets[%d] = {", nMTasks + 1);
+  { int off = 0; for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", off); off += static_cast<int>(denseRuntimeSuccs[(size_t)i].size()); } fprintf(header, ",%d};\n", off); }
+  fprintf(header, "static constexpr int kDenseMTaskSuccList[%d] = {", totalSuccs);
+  { bool firstS = true; for (const auto& succs : denseRuntimeSuccs) for (int s : succs) { if (!firstS) fprintf(header, ","); fprintf(header, "%d", s); firstS = false; } if (firstS) fprintf(header, "0"); fprintf(header, "};\n"); }
+  fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
+  fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
+  // workSteal already computed above.
+  if (workSteal) {
+    // Preferred owner thread per MTask (from assignment) and worker0-only pin flag.
+    fprintf(header, "static constexpr int kDenseMTaskOwner[%d] = {", nMTasks);
+    for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); int o = denseSchedule.mtaskThreadAssign[(size_t)i]; if (o < 0 || o >= threadCount) o = 0; fprintf(header, "%d", o); }
+    fprintf(header, "};\n");
+    fprintf(header, "static constexpr bool kDenseMTaskW0[%d] = {", nMTasks);
+    for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%s", denseSchedule.mtasks[(size_t)i].workerZeroOnly ? "true" : "false"); }
+    fprintf(header, "};\n");
+    // Per-thread ready deque (bounded to nMTasks) + spinlock; global remaining counter.
+    fprintf(header, "static constexpr int kDenseWorkStealThreads = %d;\n", threadCount);
+    fprintf(header, "int mtDenseDeque[%d][%d];\n", threadCount, nMTasks);
+    fprintf(header, "std::atomic<int> mtDenseDequeHead[%d];\n", threadCount); // pop point (LIFO top)
+    fprintf(header, "std::atomic<int> mtDenseDequeTail[%d];\n", threadCount); // steal point (bottom)
+    fprintf(header, "std::atomic_flag mtDenseDequeLock[%d];\n", threadCount);
+    fprintf(header, "std::atomic<int> mtDenseRemaining;\n");
+    fprintf(header, "void stepDenseMTaskById(int mtaskId);\n");
+  }
+  fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
+  for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+    const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
+    emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
+    for (int sccId : mtask.sccIds) {
+      Assert(sccId >= 0 && sccId < static_cast<int>(denseSchedule.sccs.size()), "dense schedule scc index out of range");
+      const MtDenseScc& scc = denseSchedule.sccs[(size_t)sccId];
+      for (int cppId : scc.cppIds) {
+        auto superIter = cppId2Super.find(cppId);
+        if (superIter == cppId2Super.end() || !superIter->second) continue;
+        SuperNode* super = superIter->second;
+        emitBodyLock(1, "{\n");
+        emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileDenseTaskBegin;\n");
+        emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
+        genSuperEval(super, "activeFlags[0]", "", 2, false);
+        emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", cppId);
+        emitBodyLock(1, "}\n");
+      }
+    }
+    emitBodyLock(0, "}\n");
+  }
+  if (workSteal) {
+    // Dispatch an MTask body by id (work-stealing runs MTasks in dynamic order).
+    emitFuncDecl(0, "void S%s::stepDenseMTaskById(int mtaskId) {\n", name.c_str());
+    emitBodyLock(1, "switch (mtaskId) {\n");
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+      emitBodyLock(2, "case %d: stepDenseMTask%d(); break;\n", mtaskId, mtaskId);
+    }
+    emitBodyLock(2, "default: break;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+  }
+  emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
+  emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
+  if (workSteal) {
+    // Owner-affine ready-deque work-stealing. A worker pops ready MTasks from its own deque
+    // (LIFO), steals from other deques' tails when idle, runs the body, and on each successor's
+    // LAST dependency (enqueue-on-last-dep, avoids double-run races) pushes it to its owner's
+    // deque. worker0-only MTasks are never stolen by nonzero workers. Exits when no MTask
+    // remains globally. Seeding of dep-0 MTasks is done in stepDense before workers start.
+    emitBodyLock(1, "const bool evenParity = evenCycle;\n");
+    emitBodyLock(1, "auto dqPush = [&](int owner, int mt) {\n");
+    emitBodyLock(2, "while (mtDenseDequeLock[owner].test_and_set(std::memory_order_acquire)) mtWorkerPoolPause();\n");
+    emitBodyLock(2, "int t = mtDenseDequeTail[owner].load(std::memory_order_relaxed);\n");
+    emitBodyLock(2, "mtDenseDeque[owner][t] = mt; mtDenseDequeTail[owner].store(t + 1, std::memory_order_release);\n");
+    emitBodyLock(2, "mtDenseDequeLock[owner].clear(std::memory_order_release);\n");
+    emitBodyLock(1, "};\n");
+    emitBodyLock(1, "auto dqPopLocal = [&](int owner) -> int {\n");
+    emitBodyLock(2, "int mt = -1;\n");
+    emitBodyLock(2, "while (mtDenseDequeLock[owner].test_and_set(std::memory_order_acquire)) mtWorkerPoolPause();\n");
+    emitBodyLock(2, "int h = mtDenseDequeHead[owner].load(std::memory_order_relaxed);\n");
+    emitBodyLock(2, "int t = mtDenseDequeTail[owner].load(std::memory_order_relaxed);\n");
+    emitBodyLock(2, "if (t > h) { t--; mt = mtDenseDeque[owner][t]; mtDenseDequeTail[owner].store(t, std::memory_order_relaxed); }\n");
+    emitBodyLock(2, "mtDenseDequeLock[owner].clear(std::memory_order_release);\n");
+    emitBodyLock(2, "return mt;\n");
+    emitBodyLock(1, "};\n");
+    emitBodyLock(1, "auto dqSteal = [&](int victim, int thief) -> int {\n");
+    emitBodyLock(2, "int mt = -1;\n");
+    emitBodyLock(2, "while (mtDenseDequeLock[victim].test_and_set(std::memory_order_acquire)) mtWorkerPoolPause();\n");
+    emitBodyLock(2, "int h = mtDenseDequeHead[victim].load(std::memory_order_relaxed);\n");
+    emitBodyLock(2, "int t = mtDenseDequeTail[victim].load(std::memory_order_relaxed);\n");
+    emitBodyLock(2, "if (t > h) { int cand = mtDenseDeque[victim][h]; if (!(kDenseMTaskW0[cand] && thief != 0)) { mtDenseDequeHead[victim].store(h + 1, std::memory_order_relaxed); mt = cand; } }\n");
+    emitBodyLock(2, "mtDenseDequeLock[victim].clear(std::memory_order_release);\n");
+    emitBodyLock(2, "return mt;\n");
+    emitBodyLock(1, "};\n");
+    emitBodyLock(1, "auto signalSuccs = [&](int mt) {\n");
+    emitBodyLock(2, "for (int j = kDenseMTaskSuccOffsets[mt]; j < kDenseMTaskSuccOffsets[mt + 1]; j++) {\n");
+    emitBodyLock(3, "int s = kDenseMTaskSuccList[j];\n");
+    emitBodyLock(3, "bool ready;\n");
+    emitBodyLock(3, "if (evenParity) { uint32_t old = mtDenseMTaskVertices[s].depsDone.fetch_add(1, std::memory_order_acq_rel); ready = (old + 1 == kDenseMTaskDepCount[s]); }\n");
+    emitBodyLock(3, "else { uint32_t old = mtDenseMTaskVertices[s].depsDone.fetch_sub(1, std::memory_order_acq_rel); ready = (old == 1); }\n");
+    emitBodyLock(3, "if (ready) { int owner = kDenseMTaskOwner[s]; dqPush(owner, s); }\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "};\n");
+    emitBodyLock(1, "uint64_t idleSpins = 0;\n");
+    emitBodyLock(1, "for (;;) {\n");
+    emitBodyLock(2, "int mt = dqPopLocal(threadId);\n");
+    emitBodyLock(2, "if (mt < 0) {\n");
+    emitBodyLock(3, "for (int v = 0; v < kDenseWorkStealThreads && mt < 0; v++) { if (v != threadId) mt = dqSteal(v, threadId); }\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "if (mt < 0) {\n");
+    emitBodyLock(3, "if (mtDenseRemaining.load(std::memory_order_acquire) <= 0) break;\n");
+    emitBodyLock(3, "if (++idleSpins > 200000000u) { fprintf(stderr, \"[mt-dense-worksteal] DEADLOCK thread %%d remaining=%%d\\n\", threadId, mtDenseRemaining.load(std::memory_order_acquire)); abort(); }\n");
+    emitBodyLock(3, "mtWorkerPoolPause(); continue;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "idleSpins = 0;\n");
+    emitBodyLock(2, "stepDenseMTaskById(mt);\n");
+    emitBodyLock(2, "signalSuccs(mt);\n");
+    emitBodyLock(2, "mtDenseRemaining.fetch_sub(1, std::memory_order_acq_rel);\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "return;\n");
+  }
+  emitBodyLock(1, "switch (threadId) {\n");
+  for (int t = 0; t < threadCount; t++) {
+    emitBodyLock(2, "case %d: {\n", t);
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+      if (denseSchedule.mtaskThreadAssign[mtaskId] != t) continue;
+      // Verilator VlMTaskVertex::waitUntilUpstreamDone pattern: spin 64, then yield
+      emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
+      emitBodyLock(3, "  unsigned ct = 0;\n");
+      emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
+      emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 64) { ct = 0; std::this_thread::yield(); } }\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+      // Verilator signalUpstreamDone: fetch_add (even) or fetch_sub (odd)
+      emitBodyLock(3, "if (evenCycle) {\n");
+      emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+      emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
+      emitBodyLock(3, "} else {\n");
+      emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+      emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
+      emitBodyLock(3, "}\n");
+    }
+    emitBodyLock(3, "break;\n");
+    emitBodyLock(2, "}\n");
+  }
+  emitBodyLock(2, "default: break;\n");
+  emitBodyLock(1, "}\n");
+  emitBodyLock(0, "}\n");
+  emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
+  emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
+  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
+  emitBodyLock(1, "resetAllDense();\n");
+  for (SuperNode* super : sortedSuper) {
+    for (Node* member : super->member) {
+      if (member->isReset() && member->type == NODE_REG_SRC) {
+        emitBodyLock(1, "%s = %s;\n", RESET_NAME(member).c_str(), member->name.c_str());
+      }
+    }
+  }
+  // No counter reset needed — Verilator even/odd alternation handles it
+  if (workSteal) {
+    // Seed the work-stealing deques: reset head/tail, set remaining, and push every
+    // dependency-free MTask (depCount==0) to its owner's deque. depsDone counters keep the
+    // Verilator even/odd parity across cycles, so a dep-0 MTask is ready every cycle.
+    emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+    emitBodyLock(2, "for (int t = 0; t < kDenseWorkStealThreads; t++) { mtDenseDequeHead[t].store(0, std::memory_order_relaxed); mtDenseDequeTail[t].store(0, std::memory_order_relaxed); mtDenseDequeLock[t].clear(std::memory_order_relaxed); }\n");
+    emitBodyLock(2, "mtDenseRemaining.store(%d, std::memory_order_relaxed);\n", nMTasks);
+    emitBodyLock(2, "for (int mt = 0; mt < %d; mt++) { if (kDenseMTaskDepCount[mt] == 0) { int o = kDenseMTaskOwner[mt]; int tl = mtDenseDequeTail[o].load(std::memory_order_relaxed); mtDenseDeque[o][tl] = mt; mtDenseDequeTail[o].store(tl + 1, std::memory_order_relaxed); } }\n", nMTasks);
+    emitBodyLock(2, "std::atomic_thread_fence(std::memory_order_release);\n");
+    emitBodyLock(1, "}\n");
+  }
+  emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+  emitBodyLock(2, "mtWorkerPoolJobKind = 7;\n");
+  emitBodyLock(2, "mtWorkerPoolCurrentWorkerCount = mtConfiguredWorkerCount;\n");
+  emitBodyLock(2, "mtWorkerPoolPost();\n");
+  emitBodyLock(2, "stepDenseThreadWorker(0);\n");
+  emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
+  emitBodyLock(1, "} else {\n");
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+    emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
+  }
+  emitBodyLock(1, "}\n");
+  emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
+  emitBodyLock(1, "cycles ++;\n");
+  emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
+  emitBodyLock(0, "}\n");
+}
+
+void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::string& serialFastSuffix, bool denseExecutorValid) {
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
+  if (denseExecutorValid) emitBodyLock(1, "if (unlikely(mtUseDenseExecutor)) { stepDense(); return; }\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "resetAll();\n");
   for (SuperNode* super : sortedSuper) {
@@ -7848,8 +10674,12 @@ bool graph::__emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const ch
     if (srcFp != NULL) {
       if (!alreadyEndFunc) fprintf(srcFp, "}"); // the end of the current function
       fclose(srcFp);
+      commitStableOutputFile(srcTmpFilePath, srcFilePath);
     }
-    srcFp = std::fopen(format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), srcFileIdx).c_str(), "w");
+    srcFilePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), srcFileIdx);
+    srcTmpFilePath = globalConfig.MtStableOutput ? srcFilePath + ".tmp" : "";
+    const std::string openPath = globalConfig.MtStableOutput ? srcTmpFilePath : srcFilePath;
+    srcFp = std::fopen(openPath.c_str(), "w");
     srcFileIdx ++;
     assert(srcFp != NULL);
     srcFileBytes = fprintf(srcFp, "#include \"%s.h\"\n", name.c_str());
@@ -7929,16 +10759,24 @@ void graph::cppEmitter() {
       }
     }
   }
+  resetMtContextCache();
   if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson();
   if (globalConfig.DumpMtRepCutLiteReport || globalConfig.MtRepCutLiteMode == "on") dumpMtRepCutLiteReport();
   if (globalConfig.DumpMtCoarseRegionReport || globalConfig.MtBatchFormationMode == "coarse") dumpMtCoarseRegionReport();
-  if (mtUseReadyBatchReport()) dumpMtReadyBatchReport();
+  if (mtUseReadyBatchReport() || mtUseEnvelopeLocalEval() || mtUseEnvelopeLocalEvalDiagnostics()) dumpMtReadyBatchReport();
+  if (mtUseDenseExecutorCodegen()) dumpMtDenseScheduleJson();
+  if (globalConfig.MtReportOnly) {
+    printf("[cppEmitter] mt-report-only: skipped generated C++ emission after reports\n");
+    return;
+  }
 
-  // 28c Phase 1A: remove stale SimTop*.cpp files from previous runs so the
-  // linker never sees a cppEmitter file the current run did not regenerate.
-  for (int staleIdx = 0; ; staleIdx ++) {
-    std::string stalePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), staleIdx);
-    if (std::remove(stalePath.c_str()) != 0) break;
+  if (!globalConfig.MtStableOutput) {
+    // 28c Phase 1A: remove stale SimTop*.cpp files from previous runs so the
+    // linker never sees a cppEmitter file the current run did not regenerate.
+    for (int staleIdx = 0; ; staleIdx ++) {
+      std::string stalePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), staleIdx);
+      if (std::remove(stalePath.c_str()) != 0) break;
+    }
   }
 
   srcFp = NULL;
@@ -7961,14 +10799,40 @@ void graph::cppEmitter() {
   mtProfileRepCutRuntimeCppIds.clear();
   std::map<int, MtTaskInfo> mtRepCutHeaderTasks;
   MtCoarseProfileFacts mtCoarseProfileFacts;
+  bool useDenseExecutorCodegen = mtUseDenseExecutorCodegen();
+  MtDenseSchedule mtDenseSchedule;
   if (useMtHelpers) {
-    mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelection();
+    mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
     markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
     MtRepCutSemanticPlan mtRepCutHeaderSemanticPlan = planMtRepCutSemantics(mtRepCutHeaderTasks);
     mtSetProfileRepCutBatchBeginCppIds(mtRepCutHeaderSemanticPlan);
     mtSetProfileRepCutRuntimeCppIds(mtRepCutHeaderTasks);
     if (useCoarseMt) {
-      mtCoarseProfileFacts = mtComputeCoarseProfileFacts(planMtCoarseRegions(mtRepCutHeaderTasks));
+      mtCoarseProfileFacts = mtComputeCoarseProfileFacts(planMtCoarseRegionsForInvocation(mtRepCutHeaderTasks));
+    }
+  }
+  if (useDenseExecutorCodegen) {
+    Assert(useCoarseMt, "GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation in v181");
+    if (mtRepCutHeaderTasks.empty()) {
+      mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+      markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
+    }
+    mtDenseSchedule = buildMtDenseSchedule(mtRepCutHeaderTasks, true);
+  }
+  bool denseExecutorValid = useDenseExecutorCodegen && mtDenseSchedule.valid;
+  if (useDenseExecutorCodegen && !mtDenseSchedule.valid) {
+    printf("[mt-dense-schedule] dense executor codegen disabled: fallback=%s\n", mtDenseSchedule.fallbackReason.c_str());
+  }
+  std::vector<unsigned char> mtProfileStateUpdateTraceKindByCppIdCodegen;
+  if (mtUseDynamicStateTraceCodegen()) {
+    mtProfileStateUpdateTraceKindByCppIdCodegen.assign(superId, 0);
+    std::map<int, MtTaskInfo> mtStateTraceTasks = mtRepCutHeaderTasks;
+    if (mtStateTraceTasks.empty()) mtStateTraceTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+    std::vector<MtStateUpdateTraceInfo> mtStateTraceInfos = buildMtStateUpdateTraceInfoForInvocation(mtStateTraceTasks);
+    for (int cppId = 0; cppId < static_cast<int>(mtStateTraceInfos.size()); cppId ++) {
+      const MtStateUpdateTraceInfo& info = mtStateTraceInfos[cppId];
+      if (!info.hasStateUpdate) continue;
+      mtProfileStateUpdateTraceKindByCppIdCodegen[cppId] = info.runtimeSafeCandidate ? 3 : (info.localSafeCandidate ? 2 : 1);
     }
   }
   if (globalConfig.MtHelperMode == "buffered-seq") emitActiveBufferDef(header, activeFlagNum);
@@ -7978,11 +10842,16 @@ void graph::cppEmitter() {
   fprintf(header, "uint64_t cycles;\n");
   fprintf(header, "uint64_t LOG_START, LOG_END;\n");
   fprintf(header, "uint%d_t activeFlags[%d];\n", ACTIVE_WIDTH, activeFlagNum); // or super.size() if id == idx
+  if (denseExecutorValid) fprintf(header, "bool mtUseDenseExecutor;\n");
   fprintf(header, "bool mtProfileEnabled;\n");
   fprintf(header, "FILE *mtProfileDynamicTraceFile;\n");
   fprintf(header, "uint64_t mtProfileDynamicTraceCycleStart;\n");
   fprintf(header, "uint64_t mtProfileDynamicTraceCycleLimit;\n");
   fprintf(header, "std::vector<int> mtProfileDynamicTraceTaskIds;\n");
+  if (mtUseDynamicStateTraceCodegen()) {
+    fprintf(header, "bool mtProfileDynamicStateTraceEnabled;\n");
+    fprintf(header, "std::vector<uint8_t> mtProfileStateUpdateTraceKindByCppId;\n");
+  }
   fprintf(header, "const char *mtProfileHelperMode;\n");
   fprintf(header, "int mtConfiguredWorkerCount;\n");
   fprintf(header, "int mtMinBatchTasks;\n");
@@ -8128,7 +10997,6 @@ void graph::cppEmitter() {
       if (globalConfig.MtCoarseWorkerPolicyMode == "profitable") {
         fprintf(header, "std::vector<std::vector<int>> mtWorkerPoolMTaskAssignments;\n");
       }
-      fprintf(header, "int mtWorkerPoolJobKind;\n");
       fprintf(header, "int mtWorkerPoolCoarseRegionIndex;\n");
       fprintf(header, "int mtWorkerPoolCoarseLayerIndex;\n");
       fprintf(header, "bool mtCoarseUseMTaskRuntime;\n");
@@ -8147,6 +11015,12 @@ void graph::cppEmitter() {
       fprintf(header, "};\n");
       fprintf(header, "bool mtCoarseUseDStatic;\n");
       fprintf(header, "bool mtCoarseUseAntichainRuntime;\n");
+      fprintf(header, "bool mtUseVerilatorDualPath;\n");
+      fprintf(header, "int mtVerilatorDualPathRegionIndex;\n");
+      fprintf(header, "int mtVerilatorDualPathBeginCppId;\n");
+      fprintf(header, "int mtVerilatorDualPathEndCppId;\n");
+      fprintf(header, "uint64_t mtProfileVerilatorDualPathDispatches;\n");
+      fprintf(header, "uint64_t mtProfileVerilatorDualPathWorkerPoolDispatches;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticRoundedWC;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticBeginActiveWord;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticActiveWordSpan;\n");
@@ -8169,7 +11043,10 @@ void graph::cppEmitter() {
       fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskInFlight;\n");
       fprintf(header, "bool mtCoarseUseAntichainQueue;\n");
     }
+    fprintf(header, "int mtWorkerPoolJobKind;\n");
+    fprintf(header, "void (S%s::*mtWorkerPoolDenseLayerFn)(int, int, int);\n", name.c_str());
     fprintf(header, "bool mtWorkerPoolEnabled;\n");
+    fprintf(header, "bool mtWorkerPoolLazyStart;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
     // 28c-2 atomic-spin worker pool: hot atomics on independent cache lines.
@@ -8197,7 +11074,7 @@ void graph::cppEmitter() {
   emitBodyLock(1, "LOG_START = 1;\n");
   emitBodyLock(1, "LOG_END = 0;\n");
   emitBodyLock(1, "initMtProfile();\n");
-  if (useMtHelpers) emitBodyLock(1, "startMtWorkerPool();\n");
+  if (useMtHelpers) emitBodyLock(1, "if (!mtWorkerPoolLazyStart) startMtWorkerPool();\n");
   emitBodyLock(1, "init();\n");
   emitBodyLock(0, "}\n");
 
@@ -8269,9 +11146,14 @@ void graph::cppEmitter() {
   emitBodyLock(1, "const char *profileEnv = getenv(\"GSIM_MT_PROFILE\");\n");
   emitBodyLock(1, "const char *fireProfileEnv = getenv(\"GSIM_MT_FIRE_PROFILE\");\n");
   emitBodyLock(1, "const char *dynamicTraceEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE\");\n");
+  if (mtUseDynamicStateTraceCodegen()) emitBodyLock(1, "const char *dynamicStateTraceEnv = getenv(\"GSIM_MT_DYNAMIC_STATE_TRACE\");\n");
   emitBodyLock(1, "bool dynamicTraceEnabled = dynamicTraceEnv != nullptr && dynamicTraceEnv[0] != '\\0';\n");
   emitBodyLock(1, "mtProfileEnabled = (profileEnv != nullptr && profileEnv[0] != '\\0' && profileEnv[0] != '0') || (fireProfileEnv != nullptr && fireProfileEnv[0] != '\\0' && fireProfileEnv[0] != '0') || dynamicTraceEnabled;\n");
   emitBodyLock(1, "mtProfileHelperMode = \"%s\";\n", globalConfig.MtHelperMode.c_str());
+  if (denseExecutorValid) {
+    emitBodyLock(1, "const char *mtExecutorEnv = getenv(\"GSIM_MT_EXECUTOR\");\n");
+    emitBodyLock(1, "mtUseDenseExecutor = mtExecutorEnv != nullptr && mtExecutorEnv[0] == 'd' && mtExecutorEnv[1] == 'e' && mtExecutorEnv[2] == 'n' && mtExecutorEnv[3] == 's' && mtExecutorEnv[4] == 'e' && mtExecutorEnv[5] == '\\0';\n");
+  }
   emitBodyLock(1, "const char *threadsEnv = getenv(\"GSIM_THREADS\");\n");
   emitBodyLock(1, "mtConfiguredWorkerCount = threadsEnv == nullptr ? 1 : atoi(threadsEnv);\n");
   emitBodyLock(1, "if (mtConfiguredWorkerCount < 1) mtConfiguredWorkerCount = 1;\n");
@@ -8342,6 +11224,18 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileDynamicTraceCycleStart = 0;\n");
   emitBodyLock(1, "mtProfileDynamicTraceCycleLimit = 0;\n");
   emitBodyLock(1, "mtProfileDynamicTraceTaskIds.clear();\n");
+  if (mtUseDynamicStateTraceCodegen()) {
+    emitBodyLock(1, "mtProfileDynamicStateTraceEnabled = dynamicTraceEnabled && dynamicStateTraceEnv != nullptr && dynamicStateTraceEnv[0] != '\\0' && dynamicStateTraceEnv[0] != '0';\n");
+    emitBodyLock(1, "static const uint8_t mtProfileStateUpdateTraceKindInit[%d] = {", superId);
+    for (int cppId = 0; cppId < static_cast<int>(mtProfileStateUpdateTraceKindByCppIdCodegen.size()); cppId ++) {
+      if (cppId != 0) emitBodyLock(0, ",");
+      if (cppId % 64 == 0) emitBodyLock(0, "\n    ");
+      emitBodyLock(0, "%u", static_cast<unsigned>(mtProfileStateUpdateTraceKindByCppIdCodegen[cppId]));
+    }
+    emitBodyLock(0, "\n");
+    emitBodyLock(1, "};\n");
+    emitBodyLock(1, "mtProfileStateUpdateTraceKindByCppId.assign(mtProfileStateUpdateTraceKindInit, mtProfileStateUpdateTraceKindInit + %d);\n", superId);
+  }
   emitBodyLock(1, "if (dynamicTraceEnabled) {\n");
   emitBodyLock(2, "const char *startEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_START\");\n");
   emitBodyLock(2, "const char *cyclesEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_CYCLES\");\n");
@@ -8438,14 +11332,17 @@ void graph::cppEmitter() {
   if (useMtHelpers) {
     emitBodyLock(1, "const char *workerPoolEnv = getenv(\"GSIM_MT_WORKER_POOL\");\n");
     emitBodyLock(1, "mtWorkerPoolEnabled = workerPoolEnv == nullptr || workerPoolEnv[0] == '\\0' || workerPoolEnv[0] != '0';\n");
+    emitBodyLock(1, "const char *workerPoolLazyEnv = getenv(\"GSIM_MT_LAZY_WORKER_POOL\");\n");
+    emitBodyLock(1, "mtWorkerPoolLazyStart = workerPoolLazyEnv != nullptr && workerPoolLazyEnv[0] != '\\0' && workerPoolLazyEnv[0] != '0';\n");
     emitBodyLock(1, "mtWorkerPoolThreadCount = 0;\n");
     emitBodyLock(1, "mtWorkerPoolGeneration.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolStop.store(false, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolReadyCount.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolCurrentWorkerCount = 0;\n");
+    emitBodyLock(1, "mtWorkerPoolJobKind = 0;\n");
+    emitBodyLock(1, "mtWorkerPoolDenseLayerFn = nullptr;\n");
     if (useCoarseMt) {
-      emitBodyLock(1, "mtWorkerPoolJobKind = 0;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseRegionIndex = -1;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseLayerIndex = -1;\n");
       // 28c-2 default: mtask runtime for mt-level-dispatch; env GSIM_MT_COARSE_RUNTIME=layered overrides.
@@ -8465,6 +11362,28 @@ void graph::cppEmitter() {
       emitBodyLock(1, "mtCoarseUseDStatic = true;\n");
       emitBodyLock(1, "const char *coarseDStaticEnv = getenv(\"GSIM_MT_COARSE_DSTATIC\");\n");
       emitBodyLock(1, "if (coarseDStaticEnv != nullptr && coarseDStaticEnv[0] != '\\0' && coarseDStaticEnv[0] == '0') mtCoarseUseDStatic = false;\n");
+      emitBodyLock(1, "mtUseVerilatorDualPath = false;\n");
+      emitBodyLock(1, "const char *verilatorDualPathEnv = getenv(\"GSIM_MT_VERILATOR_DUAL_PATH\");\n");
+      emitBodyLock(1, "if (verilatorDualPathEnv != nullptr && verilatorDualPathEnv[0] != '\\0' && verilatorDualPathEnv[0] != '0') mtUseVerilatorDualPath = true;\n");
+      emitBodyLock(1, "mtVerilatorDualPathRegionIndex = -1;\n");
+      emitBodyLock(1, "mtVerilatorDualPathBeginCppId = 4488;\n");
+      emitBodyLock(1, "mtVerilatorDualPathEndCppId = 5080;\n");
+      emitBodyLock(1, "const char *verilatorDualRegionEnv = getenv(\"GSIM_MT_VERILATOR_DUAL_REGION\");\n");
+      emitBodyLock(1, "if (verilatorDualRegionEnv != nullptr && verilatorDualRegionEnv[0] != '\\0') {\n");
+      emitBodyLock(2, "const char *sep = strchr(verilatorDualRegionEnv, ':');\n");
+      emitBodyLock(2, "if (sep == nullptr) sep = strchr(verilatorDualRegionEnv, '-');\n");
+      emitBodyLock(2, "if (sep != nullptr) {\n");
+      emitBodyLock(3, "mtVerilatorDualPathBeginCppId = atoi(verilatorDualRegionEnv);\n");
+      emitBodyLock(3, "mtVerilatorDualPathEndCppId = atoi(sep + 1);\n");
+      emitBodyLock(3, "mtVerilatorDualPathRegionIndex = -1;\n");
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(3, "mtVerilatorDualPathRegionIndex = atoi(verilatorDualRegionEnv);\n");
+      emitBodyLock(3, "mtVerilatorDualPathBeginCppId = -1;\n");
+      emitBodyLock(3, "mtVerilatorDualPathEndCppId = -1;\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "mtProfileVerilatorDualPathDispatches = 0;\n");
+      emitBodyLock(1, "mtProfileVerilatorDualPathWorkerPoolDispatches = 0;\n");
       // Track 2 Week 4: env GSIM_MT_ANTICHAIN_RUNTIME=1 enables per-mtask
       // atomic-counter scheduler for antichain-enabled coarse regions.
       emitBodyLock(1, "mtCoarseUseAntichainRuntime = false;\n");
@@ -8528,6 +11447,33 @@ void graph::cppEmitter() {
   emitBodyLock(1, "fprintf(mtProfileDynamicTraceFile, \"[mt-dyn-trace] cycle=%%lu task_count=%%zu tasks=\", cycles, mtProfileDynamicTraceTaskIds.size());\n");
   emitBodyLock(1, "for (size_t i = 0; i < mtProfileDynamicTraceTaskIds.size(); i ++) fprintf(mtProfileDynamicTraceFile, \"%%s%%d\", i == 0 ? \"\" : \",\", mtProfileDynamicTraceTaskIds[i]);\n");
   emitBodyLock(1, "fprintf(mtProfileDynamicTraceFile, \"\\n\");\n");
+  if (mtUseDynamicStateTraceCodegen()) {
+    emitBodyLock(1, "if (mtProfileDynamicStateTraceEnabled) {\n");
+    emitBodyLock(2, "size_t mtStateTraceCount = 0, mtStateTraceBlockedCount = 0, mtStateTraceLocalSafeOnlyCount = 0, mtStateTraceRuntimeSafeCount = 0;\n");
+    emitBodyLock(2, "for (int cppId : mtProfileDynamicTraceTaskIds) {\n");
+    emitBodyLock(3, "if (cppId < 0 || cppId >= (int)mtProfileStateUpdateTraceKindByCppId.size()) continue;\n");
+    emitBodyLock(3, "uint8_t kind = mtProfileStateUpdateTraceKindByCppId[(size_t)cppId];\n");
+    emitBodyLock(3, "if (kind == 0) continue;\n");
+    emitBodyLock(3, "mtStateTraceCount ++;\n");
+    emitBodyLock(3, "if (kind == 3) mtStateTraceRuntimeSafeCount ++; else if (kind == 2) mtStateTraceLocalSafeOnlyCount ++; else mtStateTraceBlockedCount ++;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "if (mtStateTraceCount != 0) {\n");
+    emitBodyLock(3, "fprintf(mtProfileDynamicTraceFile, \"[mt-dyn-state-trace] cycle=%%lu state_task_count=%%zu blocked_count=%%zu local_safe_only_count=%%zu runtime_safe_count=%%zu blocked=\", cycles, mtStateTraceCount, mtStateTraceBlockedCount, mtStateTraceLocalSafeOnlyCount, mtStateTraceRuntimeSafeCount);\n");
+    emitBodyLock(3, "bool mtStateTraceFirst = true;\n");
+    emitBodyLock(3, "for (int cppId : mtProfileDynamicTraceTaskIds) { if (cppId >= 0 && cppId < (int)mtProfileStateUpdateTraceKindByCppId.size() && mtProfileStateUpdateTraceKindByCppId[(size_t)cppId] == 1) { fprintf(mtProfileDynamicTraceFile, \"%%s%%d\", mtStateTraceFirst ? \"\" : \",\", cppId); mtStateTraceFirst = false; } }\n");
+    emitBodyLock(3, "fprintf(mtProfileDynamicTraceFile, \" local_safe_only=\");\n");
+    emitBodyLock(3, "mtStateTraceFirst = true;\n");
+    emitBodyLock(3, "for (int cppId : mtProfileDynamicTraceTaskIds) { if (cppId >= 0 && cppId < (int)mtProfileStateUpdateTraceKindByCppId.size() && mtProfileStateUpdateTraceKindByCppId[(size_t)cppId] == 2) { fprintf(mtProfileDynamicTraceFile, \"%%s%%d\", mtStateTraceFirst ? \"\" : \",\", cppId); mtStateTraceFirst = false; } }\n");
+    emitBodyLock(3, "fprintf(mtProfileDynamicTraceFile, \" runtime_safe=\");\n");
+    emitBodyLock(3, "mtStateTraceFirst = true;\n");
+    emitBodyLock(3, "for (int cppId : mtProfileDynamicTraceTaskIds) { if (cppId >= 0 && cppId < (int)mtProfileStateUpdateTraceKindByCppId.size() && mtProfileStateUpdateTraceKindByCppId[(size_t)cppId] == 3) { fprintf(mtProfileDynamicTraceFile, \"%%s%%d\", mtStateTraceFirst ? \"\" : \",\", cppId); mtStateTraceFirst = false; } }\n");
+    emitBodyLock(3, "fprintf(mtProfileDynamicTraceFile, \" state_tasks=\");\n");
+    emitBodyLock(3, "mtStateTraceFirst = true;\n");
+    emitBodyLock(3, "for (int cppId : mtProfileDynamicTraceTaskIds) { if (cppId >= 0 && cppId < (int)mtProfileStateUpdateTraceKindByCppId.size() && mtProfileStateUpdateTraceKindByCppId[(size_t)cppId] != 0) { fprintf(mtProfileDynamicTraceFile, \"%%s%%d\", mtStateTraceFirst ? \"\" : \",\", cppId); mtStateTraceFirst = false; } }\n");
+    emitBodyLock(3, "fprintf(mtProfileDynamicTraceFile, \"\\n\");\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+  }
   emitBodyLock(1, "mtProfileDynamicTraceTaskIds.clear();\n");
   emitBodyLock(1, "if (cycles + 1 >= mtProfileDynamicTraceCycleLimit) { fclose(mtProfileDynamicTraceFile); mtProfileDynamicTraceFile = nullptr; }\n");
   emitBodyLock(0, "}\n");
@@ -8540,13 +11486,14 @@ void graph::cppEmitter() {
   emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
   emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
   if (useMtHelpers) {
-    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d worker_pool=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtWorkerPoolEnabled ? 1 : 0, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d worker_pool=%%d lazy_worker_pool=%%d worker_pool_threads=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtWorkerPoolEnabled ? 1 : 0, mtWorkerPoolLazyStart ? 1 : 0, mtWorkerPoolThreadCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
   } else {
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
   }
   if (useCoarseMt) {
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_dispatch coarse_runtime=%%s coarse_profitability=%%s coarse_worker_policy=%%s static_runtime_eligible_regions=%%lu static_layer_count=%%lu max_region_layer_count=%%lu static_mtask_count=%%lu region_invocations=%%lu accepted_regions=%%lu rejected_regions=%%lu layer_dispatches=%%lu mtask_dispatches=%%lu worker_jobs=%%lu flag_word_copies=%%lu merge_word_scans=%%lu activation_delta_entries=%%lu estimated_barriers=%%lu estimated_useful_work=%%lu estimated_rejected_useful_work=%%lu estimated_overhead_words=%%lu active_mtasks=%%lu active_mtask_static_cost=%%lu assigned_static_cost=%%lu\\n\", (mtCoarseUseMTaskRuntime ? \"mtask\" : \"layered\"), \"%s\", \"%s\", mtProfileCoarseStaticRuntimeEligibleRegions, mtProfileCoarseStaticLayerCount, mtProfileCoarseStaticMaxRegionLayerCount, mtProfileCoarseStaticMTaskCount, mtProfileCoarseRegionInvocations, mtProfileCoarseAcceptedRegions, mtProfileCoarseRejectedRegions, mtProfileCoarseLayerDispatches, mtProfileCoarseMTaskDispatches, mtProfileCoarseWorkerJobs, mtProfileCoarseFlagWordCopies, mtProfileCoarseMergeWordScans, mtProfileCoarseActivationDeltaEntries, mtProfileCoarseEstimatedBarrierCount, mtProfileCoarseEstimatedUsefulWork, mtProfileCoarseEstimatedRejectedUsefulWork, mtProfileCoarseEstimatedOverheadWords, mtProfileCoarseActiveMTaskCount, mtProfileCoarseActiveMTaskStaticCost, mtProfileCoarseAssignedStaticCost);\n", globalConfig.MtCoarseProfitabilityMode.c_str(), globalConfig.MtCoarseWorkerPolicyMode.c_str());
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_antichain_dispatches=%%lu\\n\", mtProfileCoarseAntichainDispatches);\n");
+    emitBodyLock(1, "fprintf(stderr, \"[mt-profile] verilator_dual_path enabled=%%d selected_dispatches=%%lu pool_dispatches=%%lu region_index=%%d region_cpp=%%d:%%d\\n\", mtUseVerilatorDualPath ? 1 : 0, mtProfileVerilatorDualPathDispatches, mtProfileVerilatorDualPathWorkerPoolDispatches, mtVerilatorDualPathRegionIndex, mtVerilatorDualPathBeginCppId, mtVerilatorDualPathEndCppId);\n");
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_phase body_ns=%%lu wait_ns=%%lu\\n\", mtProfileCoarseBodyNs, mtProfileCoarseWaitNs);\n");
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_assignment worst_worker_static_cost=%%lu best_worker_static_cost=%%lu contiguous_worst_static_cost=%%lu balanced_worst_static_cost=%%lu\\n\", mtProfileCoarseWorstWorkerStaticCost, mtProfileCoarseBestWorkerStaticCost, mtProfileCoarseContiguousWorstStaticCost, mtProfileCoarseBalancedWorstStaticCost);\n");
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_serial_fallback eligible=%%lu taken=%%lu active_bits=%%lu repcut_excluded=%%lu nonpure_excluded=%%lu saved_worker_jobs=%%lu saved_flag_word_copies=%%lu saved_merge_word_scans=%%lu saved_barriers=%%lu\\n\", mtProfileCoarseSerialFallbackEligible, mtProfileCoarseSerialFallbackTaken, mtProfileCoarseSerialFallbackActiveBits, mtProfileCoarseSerialFallbackRepcutExcluded, mtProfileCoarseSerialFallbackNonPureExcluded, mtProfileCoarseSerialFallbackSavedWorkerJobs, mtProfileCoarseSerialFallbackSavedFlagWordCopies, mtProfileCoarseSerialFallbackSavedMergeWordScans, mtProfileCoarseSerialFallbackSavedBarriers);\n");
@@ -8661,8 +11608,13 @@ void graph::cppEmitter() {
   /* reset functions */
   fprintf(header, "void resetAll();\n");
   genResetAll();
+  if (denseExecutorValid) {
+    fprintf(header, "void resetAllDense();\n");
+    genResetAllDense();
+  }
   for (int i = 0; i < resetFuncNum; i ++) {
     fprintf(header, "void subReset%d();\n", i);
+    if (denseExecutorValid) fprintf(header, "void subResetDense%d();\n", i);
     if (globalConfig.MtHelperMode == "buffered-seq") fprintf(header, "void subReset%d(ActiveBuffer &nextActive);\n", i);
     if (useMtHelpers) fprintf(header, "void subReset%d(ActivationDelta &nextActive);\n", i);
   }
@@ -8731,7 +11683,7 @@ void graph::cppEmitter() {
         fprintf(header, "void mtRunCoarseStaticRefList(int regionIndex, int roundedWC, int worker, int regionBeginActiveWord, int regionActiveWordSpan, const SCoarseTaskRef *refs, int refCount);\n");
         fprintf(header, "void mtRunCoarseRegionStaticDispatch(int regionIndex, int roundedWC, int worker, int regionBeginActiveWord, int regionActiveWordSpan);\n");
         {
-          MtCoarseRegionPlan dstaticPlan = planMtCoarseRegions(mtRepCutHeaderTasks);
+          MtCoarseRegionPlan dstaticPlan = planMtCoarseRegionsForInvocation(mtRepCutHeaderTasks);
           int regionIndex = 0;
           for (const MtCoarseRegion& region : dstaticPlan.regions) {
             if (!region.runtimeEligible) continue;
@@ -8743,15 +11695,34 @@ void graph::cppEmitter() {
     }
   }
 
+  if (denseExecutorValid) {
+    fprintf(header, "void stepDense();\n");
+    genDenseExecutor(mtDenseSchedule, header);
+  }
+  else if (useMtHelpers) {
+    fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
+    emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
+    emitBodyLock(1, "(void)threadId;\n");
+    emitBodyLock(0, "}\n");
+  }
+
   /* step wrapper */
   fprintf(header, "void step();\n");
-  genStep(subStepIdxMax, serialFastSubStepMax, serialFastSuffix);
+  genStep(subStepIdxMax, serialFastSubStepMax, serialFastSuffix, denseExecutorValid);
 
   /* end of file */
   fprintf(header, "};\n"
                   "#endif\n");
   fclose(header);
+  commitStableOutputFile(headerTmpFilePath, headerFilePath);
   fclose(srcFp);
+  commitStableOutputFile(srcTmpFilePath, srcFilePath);
+  if (globalConfig.MtStableOutput) {
+    for (int staleIdx = srcFileIdx; ; staleIdx ++) {
+      std::string stalePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), staleIdx);
+      if (std::remove(stalePath.c_str()) != 0) break;
+    }
+  }
 #ifdef DIFFTEST_PER_SIG
   fclose(sigFile);
 #endif

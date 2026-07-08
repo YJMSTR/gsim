@@ -11,6 +11,10 @@ struct Config {
   bool DumpMtRepCutLiteReport;
   bool DumpMtCoarseRegionReport;
   bool DisableReplicationOpt;
+  bool MtReportOnly;
+  bool MtStableOutput;
+  bool MtContextCache;
+  bool MtReportTimers;
   std::string MtHelperMode;
   std::string MtRepCutLiteMode;
   std::string MtBatchFormationMode;

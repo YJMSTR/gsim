@@ -1,6 +1,7 @@
 #include "common.h"
 #include <queue>
 #include <map>
+#include <cstdlib>
 
 int Node::counter = 1;
 
@@ -209,33 +210,77 @@ bool Node::needActivate() {
   return nextNeedActivate.size() != 0;
 }
 
+static bool captureActivationOrigins() {
+  const char* env = std::getenv("GSIM_MT_DENSE_ACTIVATION_ORIGINS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static std::map<const Node*, std::vector<Node::ActivationOriginRecord>> activationOriginRecords;
+
+void Node::recordNextActiveOrigin(int toCppId, Node* targetNode, const char* reason) {
+  if (!captureActivationOrigins()) return;
+  ActivationOriginRecord record;
+  record.fromCppId = super ? super->cppId : -1;
+  record.toCppId = toCppId;
+  record.sourceNodeId = id;
+  record.targetNodeId = targetNode ? targetNode->id : -1;
+  record.sourceNodeType = type;
+  record.targetNodeType = targetNode ? targetNode->type : NODE_INVALID;
+  record.sourceNodeName = name;
+  record.targetNodeName = targetNode ? targetNode->name : "";
+  record.reason = reason ? reason : "unknown";
+  activationOriginRecords[this].push_back(record);
+}
+
+const std::vector<Node::ActivationOriginRecord>& Node::activationOrigins() const {
+  static const std::vector<ActivationOriginRecord> empty;
+  auto iter = activationOriginRecords.find(this);
+  if (iter == activationOriginRecords.end()) return empty;
+  return iter->second;
+}
+
 void Node::updateActivate() {
   for (Node* nextNode : next) {
     if (nextNode->super != super) {
-      if (nextNode->super->cppId != -1)
+      if (nextNode->super->cppId != -1) {
         nextActiveId.insert(nextNode->super->cppId);
+        recordNextActiveOrigin(nextNode->super->cppId, nextNode, "cross_super_successor");
+      }
     } else if (super->findIndex(this) >= super->findIndex(nextNode)) {
-      if (super->cppId != -1)
+      if (super->cppId != -1) {
         nextActiveId.insert(super->cppId);
+        recordNextActiveOrigin(super->cppId, nextNode, "same_super_scan_back");
+      }
     }
   }
   if (type == NODE_REG_DST) {
-    nextActiveId.insert(getSrc()->super->cppId);
+    Node* src = getSrc();
+    int toCppId = src->super->cppId;
+    nextActiveId.insert(toCppId);
+    recordNextActiveOrigin(toCppId, src, "reg_dst_to_reg_src");
   }
   if (type == NODE_WRITER) {
     for (Node* port : parent->member) {
-      if (port->type == NODE_READER && port->status == VALID_NODE  && port->super->cppId != -1)
+      if (port->type == NODE_READER && port->status == VALID_NODE  && port->super->cppId != -1) {
         nextActiveId.insert(port->super->cppId);
+        recordNextActiveOrigin(port->super->cppId, port, "writer_to_reader_memory");
+      }
     }
   }
   if (type == NODE_READWRITER) {
     for (Node* port : parent->member) {
       if (port == this) {
-        if (port->parent->extraInfo != "new") nextActiveId.insert(super->cppId);
+        if (port->parent->extraInfo != "new") {
+          int toCppId = super->cppId;
+          nextActiveId.insert(toCppId);
+          recordNextActiveOrigin(toCppId, port, "readwriter_self_memory");
+        }
       }
       else if ((port->type == NODE_READER || port->type == NODE_READWRITER)
-         && port->status == VALID_NODE && port->super->cppId != -1)
+         && port->status == VALID_NODE && port->super->cppId != -1) {
         nextActiveId.insert(port->super->cppId);
+        recordNextActiveOrigin(port->super->cppId, port, "readwriter_to_peer_memory");
+      }
     }
   }
 }

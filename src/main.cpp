@@ -45,6 +45,10 @@ Config::Config() {
   DumpMtRepCutLiteReport = false;
   DumpMtCoarseRegionReport = false;
   DisableReplicationOpt = false;
+  MtReportOnly = false;
+  MtStableOutput = false;
+  MtContextCache = false;
+  MtReportTimers = false;
   MtHelperMode = "off";
   MtRepCutLiteMode = "off";
   MtBatchFormationMode = "legacy";
@@ -176,6 +180,10 @@ static void printUsage(const char* ProgName) {
             << "      --dump-mt-coarse-region-report\n"
             << "                                      Write a deterministic coarse-region report JSON.\n"
             << "      --disable-replication-opt     Skip the existing gsim replicationOpt pass.\n"
+            << "      --mt-report-only              Stop after MT report JSON generation; skip generated C++ emission.\n"
+            << "      --mt-stable-output            Preserve generated header/source mtimes when contents are unchanged.\n"
+            << "      --mt-context-cache            Memoize MT task classification maps within one generation.\n"
+            << "      --mt-report-timers           Print per-MT-report dump timings.\n"
             ;
 }
 
@@ -217,6 +225,10 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_MT_REPCUT_LITE_REPORT,
     OPT_DUMP_MT_COARSE_REGION_REPORT,
     OPT_DISABLE_REPLICATION_OPT,
+    OPT_MT_REPORT_ONLY,
+    OPT_MT_STABLE_OUTPUT,
+    OPT_MT_CONTEXT_CACHE,
+    OPT_MT_REPORT_TIMERS,
   };
 
   const struct option Table[] = {
@@ -249,6 +261,10 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
       {"dump-mt-coarse-region-report", no_argument, nullptr, 0},
       {"disable-replication-opt", no_argument, nullptr, 0},
+      {"mt-report-only", no_argument, nullptr, 0},
+      {"mt-stable-output", no_argument, nullptr, 0},
+      {"mt-context-cache", no_argument, nullptr, 0},
+      {"mt-report-timers", no_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -417,6 +433,18 @@ static char* parseCommandLine(int argc, char** argv) {
                   break;
                 case OPT_DISABLE_REPLICATION_OPT:
                   globalConfig.DisableReplicationOpt = true;
+                  break;
+                case OPT_MT_REPORT_ONLY:
+                  globalConfig.MtReportOnly = true;
+                  break;
+                case OPT_MT_STABLE_OUTPUT:
+                  globalConfig.MtStableOutput = true;
+                  break;
+                case OPT_MT_CONTEXT_CACHE:
+                  globalConfig.MtContextCache = true;
+                  break;
+                case OPT_MT_REPORT_TIMERS:
+                  globalConfig.MtReportTimers = true;
                   break;
                 default: printUsage(argv[0]); std::cout.flush(); fflush(nullptr); _exit(EXIT_SUCCESS);
               }

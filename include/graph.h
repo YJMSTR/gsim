@@ -8,29 +8,34 @@
 struct MtRepCutClone;
 struct MtRepCutSemanticPlan;
 struct MtCoarseRegionPlan;
+struct MtDenseSchedule;
 
 class graph {
   FILE *srcFp;
   int srcFileIdx;
   int srcFileBytes;
+  std::string srcFilePath;
+  std::string srcTmpFilePath;
+  std::string headerFilePath;
+  std::string headerTmpFilePath;
 
   bool __emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const char *nextFuncDef, const char *fmt, ...);
   void emitPrintf();
   void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
                     std::string activeBufferName, int indent,
-                    const std::string& accumFlagName = "");
+                    const std::string& accumFlagName = "", bool emitActivation = true);
   void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
                           std::string activeBufferName, int indent,
-                          const std::string& accumFlagName = "");
+                          const std::string& accumFlagName = "", bool emitActivation = true);
 
   FILE* genHeaderStart();
+  void genHeaderEnd(FILE* fp);
   void genNodeDef(FILE* fp, Node* node);
   void genInterfaceInput(Node* input);
   void genInterfaceOutput(Node* output);
-  void genStep(int subStepIdxMax, int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
-  void genHeaderEnd(FILE* fp);
-  int genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent);
-  int genNodeStepEnd(SuperNode* node, int indent);
+  void genStep(int subStepIdxMax, int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "", bool denseExecutorValid = false);
+  int genNodeStepStart(SuperNode* node, uint64_t mask, int idx, std::string flagName, int indent, bool skipAdmissionGuard = false);
+  int genNodeStepEnd(SuperNode* node, int indent, bool skipAdmissionGuard = false);
   void genMemInit(Node* node);
   void nodeDisplay(Node* member, int indent);
   void genMemRead(FILE* fp);
@@ -39,17 +44,20 @@ class graph {
   void genMemWrite(FILE* fp);
   void saveDiffRegs();
   void genResetAll();
-  void genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent);
+  void genResetAllDense();
+  void genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent, const std::string& nameSuffix = "", bool emitActivation = true);
   void genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId);
+  void genResetActivationDense(SuperNode* super, bool isUIntReset, int indent, int resetId);
   void genResetDecl(FILE* fp);
-  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName = "");
-  void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent);
+  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName = "", bool emitActivation = true);
+  void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation = true);
   void genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType);
   void genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType);
   void genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan);
   void genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan);
   int genActivateSeqHelpers(bool buffered);
   int genActivateMtHelpers(int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
+  void genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header);
   void removeNodesNoConnect(NodeStatus status);
   void reconnectSuper();
   void reconnectAll();
@@ -101,6 +109,7 @@ class graph {
   void dumpMtRepCutLiteReport();
   void dumpMtCoarseRegionReport();
   void dumpMtReadyBatchReport();
+  void dumpMtDenseScheduleJson();
   void usedBits();
   void traversal();
   void traversalNoTree();
