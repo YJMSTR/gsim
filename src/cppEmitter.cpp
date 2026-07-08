@@ -1487,19 +1487,16 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   for (int i = 0; i < n; i ++) { gRmin[(size_t)i] = gRmax[(size_t)i] = gR[(size_t)i]; gFmin[(size_t)i] = gFmax[(size_t)i] = gF[(size_t)i]; }
   std::function<bool(int,int)> pathExists = [&](int frm, int to) -> bool {
     curGen ++;
-    // Sound target bounds: to's members span reverse-CP up to gRmax and forward-CP down to gFmin.
-    const uint64_t toRmax = gRmax[(size_t)to], toFmin = gFmin[(size_t)to];
     std::vector<int> st; st.push_back(find(frm));
+    long long visits = 0; const long long visitCap = 500000; // overflow -> assume reachable (reject merge, safe)
     while (!st.empty()) {
       int x = find(st.back()); st.pop_back();
       if (x == to) return true;
       if (gen[(size_t)x] == curGen) continue;
       gen[(size_t)x] = curGen;
-      // Sound prune: skip x only if EVERY member of x cannot precede ANY member of to: x's earliest
-      // member starts after to's latest (gRmin[x] > toRmax), or x's latest member ends (forward)
-      // before to's earliest (gFmax[x] < toFmin).
-      if (gRmin[(size_t)x] > toRmax) continue;
-      if (gFmax[(size_t)x] < toFmin) continue;
+      if (++ visits > visitCap) return true;
+      // No CP-bound prune: gR/gF are initial-graph values, not propagated after merges (Verilator's
+      // PropagateCp), so pruning on them would be unsound. Plain gen-tagged DFS is correct.
       for (int s2 : gS[(size_t)x]) { int rs = find(s2); if (rs != x) st.push_back(rs); }
     }
     return false;
