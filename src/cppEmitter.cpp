@@ -1139,6 +1139,17 @@ static bool mtUseDenseTransitiveReduceEdges() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+static bool mtUseDenseStaticEmptyElide() {
+  const char* env = std::getenv("GSIM_MT_DENSE_STATIC_EMPTY_ELIDE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool mtUseDenseHybridEligibilityDiag() {
+  const char* env = std::getenv("GSIM_MT_DENSE_HYBRID_ELIGIBILITY_DIAG");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
 static bool mtUseDenseSplitWorker0MTasks() {
   const char* env = std::getenv("GSIM_MT_DENSE_SPLIT_WORKER0_MTASKS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -5033,13 +5044,25 @@ void graph::dumpMtDenseScheduleJson() {
       else denseMTaskCrossThreadEdgeCount ++;
     }
   }
-  bool denseXThreadDepsOnly = mtUseDenseXThreadDepsOnly();
-  bool denseTransitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
+  bool denseWorkSteal = mtUseDenseWorkSteal();
+  bool denseXThreadDepsOnly = denseWorkSteal ? false : mtUseDenseXThreadDepsOnly();
+  bool denseTransitiveReduceEdges = denseWorkSteal ? false : mtUseDenseTransitiveReduceEdges();
+  bool denseStaticEmptyElide = !denseWorkSteal && mtUseDenseStaticEmptyElide();
   int denseRuntimeSameThreadEdgeElidedCount = 0;
   std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(schedule.mtasks, schedule.mtaskThreadAssign, denseXThreadDepsOnly, &denseRuntimeSameThreadEdgeElidedCount);
   int denseRuntimeDependencyEdgeCountBeforeTransitiveReduce = mtDenseRuntimeEdgeCount(denseRuntimeSuccs);
   int denseRuntimeTransitiveEdgeElidedCount = denseTransitiveReduceEdges ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, schedule.mtaskThreadAssign) : 0;
   int denseRuntimeDependencyEdgeCount = mtDenseRuntimeEdgeCount(denseRuntimeSuccs);
+  int denseRuntimeZeroDepMTaskCount = 0;
+  int denseRuntimeZeroSuccMTaskCount = 0;
+  std::vector<uint32_t> denseRuntimeDepCountsForReport((size_t)denseMTaskCount, 0);
+  for (int mtaskId = 0; mtaskId < denseMTaskCount; mtaskId ++) {
+    if (denseRuntimeSuccs[(size_t)mtaskId].empty()) denseRuntimeZeroSuccMTaskCount ++;
+    for (int succ : denseRuntimeSuccs[(size_t)mtaskId]) {
+      if (succ >= 0 && succ < denseMTaskCount) denseRuntimeDepCountsForReport[(size_t)succ] ++;
+    }
+  }
+  for (uint32_t depCount : denseRuntimeDepCountsForReport) if (depCount == 0) denseRuntimeZeroDepMTaskCount ++;
   auto denseTopBy = [&](auto metric) {
     std::vector<int> top = denseMTaskOrder;
     std::sort(top.begin(), top.end(), [&](int lhs, int rhs) {
@@ -5272,11 +5295,222 @@ void graph::dumpMtDenseScheduleJson() {
   DenseAssignmentStats denseWorker0SplitPackThreadsStats = computeProjectedDenseAssignmentStats(denseWorker0SplitMTasks, denseWorker0SplitPackThreadsProjection.first);
   denseWorker0SplitPackThreadsStats.predictedMakespan = denseWorker0SplitPackThreadsProjection.second;
 
+  struct DenseHybridReasonStat {
+    int mtaskCount = 0;
+    int taskCount = 0;
+    long long staticCost = 0;
+    long long schedCost = 0;
+  };
+  struct DenseHybridMTaskDiag {
+    bool gateable = false;
+    bool mustAlwaysRun = false;
+    bool conservativeIneligible = false;
+    std::set<std::string> reasons;
+    std::set<std::string> mustAlwaysRunReasons;
+    std::set<std::string> unprovenReasons;
+    int cppIdCount = 0;
+    int worker0OnlyTaskCount = 0;
+    int alwaysActiveTaskCount = 0;
+    int stateUpdateTaskCount = 0;
+    int stateSourceCommitTaskCount = 0;
+    int stateNextUpdateTaskCount = 0;
+    int stateResetUpdateTaskCount = 0;
+    int resetTaskCount = 0;
+    int asyncResetTaskCount = 0;
+    int activateAllTaskCount = 0;
+    int rhsNextStateObjectReadTaskCount = 0;
+    int unexpandedRhsDependencyTaskCount = 0;
+    int ambiguousStateTargetTaskCount = 0;
+    int memoryWriteTaskCount = 0;
+    int memoryReadTaskCount = 0;
+    int externalTaskCount = 0;
+    int specialTaskCount = 0;
+    int unknownTaskCount = 0;
+    int arrayOrDynamicIndexTaskCount = 0;
+    int dependencyEdgeInCount = 0;
+    int dependencyEdgeOutCount = 0;
+    int activeEdgeInCount = 0;
+    int activeEdgeOutCount = 0;
+    int needActivateEdgeInCount = 0;
+    int needActivateEdgeOutCount = 0;
+    int runtimeDepCount = 0;
+    int runtimeSuccCount = 0;
+  };
+  bool denseHybridEligibilityDiag = mtUseDenseHybridEligibilityDiag();
+  std::vector<DenseHybridMTaskDiag> denseHybridMTaskDiags((size_t)denseMTaskCount);
+  std::map<std::string, DenseHybridReasonStat> denseHybridReasonStats;
+  std::map<std::string, DenseHybridReasonStat> denseHybridMustAlwaysRunReasonStats;
+  std::map<std::string, DenseHybridReasonStat> denseHybridUnprovenReasonStats;
+  DenseHybridReasonStat denseHybridGateableStats;
+  DenseHybridReasonStat denseHybridMustAlwaysRunStats;
+  DenseHybridReasonStat denseHybridConservativeIneligibleStats;
+  int denseHybridMultiReasonMTaskCount = 0;
+  int denseHybridGateableRuntimeZeroDepMTaskCount = 0;
+  int denseHybridGateableRuntimeZeroSuccMTaskCount = 0;
+  int denseHybridGateableRuntimeDependencyEdgeCount = 0;
+  int denseHybridGateableRuntimeSuccEdgeCount = 0;
+  int denseHybridGateableActiveTouchedMTaskCount = 0;
+  int denseHybridGateableNeedActivateTouchedMTaskCount = 0;
+  int denseHybridMustAlwaysRunRuntimeDependencyEdgeCount = 0;
+  int denseHybridMustAlwaysRunRuntimeSuccEdgeCount = 0;
+  int denseHybridConservativeIneligibleRuntimeDependencyEdgeCount = 0;
+  int denseHybridConservativeIneligibleRuntimeSuccEdgeCount = 0;
+  int denseHybridStaticDependencyInterMTaskEdgeCount = 0;
+  int denseHybridStaticActiveInterMTaskEdgeCount = 0;
+  int denseHybridStaticNeedActivateInterMTaskEdgeCount = 0;
+  std::vector<int> denseHybridTopMustAlwaysRunMTasks;
+  std::vector<int> denseHybridTopConservativeIneligibleMTasks;
+  std::vector<int> denseHybridTopGateableMTasks;
+  std::vector<int> cppIdToDenseMTask((size_t)superId, -1);
+  for (int mtaskId = 0; mtaskId < denseMTaskCount; mtaskId ++) {
+    const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+    for (int sccId : mtask.sccIds) {
+      if (sccId < 0 || sccId >= static_cast<int>(schedule.sccs.size())) continue;
+      const MtDenseScc& scc = schedule.sccs[(size_t)sccId];
+      for (int cppId : scc.cppIds) {
+        if (cppId >= 0 && cppId < superId) cppIdToDenseMTask[(size_t)cppId] = mtaskId;
+      }
+    }
+  }
+  if (denseHybridEligibilityDiag) {
+    auto denseHybridReasonIsMustAlwaysRun = [](const std::string& reason) {
+      return reason == "always_active" || reason == "state_update" ||
+             reason == "state_source_commit" || reason == "state_next_update" ||
+             reason == "state_reset_update" || reason == "reset" ||
+             reason == "async_reset" || reason == "memory_write" ||
+             reason == "memory_read_unsupported" || reason == "external" ||
+             reason == "special" || reason == "super_type_SUPER_EXTMOD";
+    };
+    auto addDenseHybridReason = [&](DenseHybridMTaskDiag& diag, const std::string& reason) {
+      diag.reasons.insert(reason);
+      if (denseHybridReasonIsMustAlwaysRun(reason)) diag.mustAlwaysRunReasons.insert(reason);
+      else diag.unprovenReasons.insert(reason);
+    };
+    for (int mtaskId = 0; mtaskId < denseMTaskCount; mtaskId ++) {
+      DenseHybridMTaskDiag& diag = denseHybridMTaskDiags[(size_t)mtaskId];
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      for (int sccId : mtask.sccIds) {
+        if (sccId < 0 || sccId >= static_cast<int>(schedule.sccs.size())) continue;
+        const MtDenseScc& scc = schedule.sccs[(size_t)sccId];
+        for (int cppId : scc.cppIds) {
+          diag.cppIdCount ++;
+          auto taskIter = mtTasks.find(cppId);
+          if (taskIter == mtTasks.end()) {
+            addDenseHybridReason(diag, "missing_task_info");
+            continue;
+          }
+          const MtTaskInfo& task = taskIter->second;
+          const MtBoundaryInfo& boundary = task.boundary;
+          for (const std::string& reason : task.serialReasons) addDenseHybridReason(diag, reason);
+          if (hasWorker0OnlyReason(task.serialReasons)) {
+            diag.worker0OnlyTaskCount ++;
+            addDenseHybridReason(diag, "worker0_only");
+          }
+          if (isAlwaysActive(cppId)) {
+            diag.alwaysActiveTaskCount ++;
+            addDenseHybridReason(diag, "always_active");
+          }
+          if (boundary.hasStateUpdate) { diag.stateUpdateTaskCount ++; addDenseHybridReason(diag, "state_update"); }
+          if (boundary.stateSourceCommitCount > 0) { diag.stateSourceCommitTaskCount ++; addDenseHybridReason(diag, "state_source_commit"); }
+          if (boundary.stateNextUpdateCount > 0) { diag.stateNextUpdateTaskCount ++; addDenseHybridReason(diag, "state_next_update"); }
+          if (boundary.stateResetUpdateCount > 0) { diag.stateResetUpdateTaskCount ++; addDenseHybridReason(diag, "state_reset_update"); }
+          if (boundary.hasReset) { diag.resetTaskCount ++; addDenseHybridReason(diag, "reset"); }
+          if (boundary.hasAsyncReset) { diag.asyncResetTaskCount ++; addDenseHybridReason(diag, "async_reset"); }
+          if (boundary.hasActivateAllPath) { diag.activateAllTaskCount ++; addDenseHybridReason(diag, "activate_all_path"); }
+          if (boundary.hasRhsNextStateObjectRead) { diag.rhsNextStateObjectReadTaskCount ++; addDenseHybridReason(diag, "rhs_next_state_object_read"); }
+          if (boundary.hasUnexpandedRhsDependency) { diag.unexpandedRhsDependencyTaskCount ++; addDenseHybridReason(diag, "unexpanded_rhs_dependency"); }
+          if (boundary.hasAmbiguousStateTarget) { diag.ambiguousStateTargetTaskCount ++; addDenseHybridReason(diag, "ambiguous_state_target"); }
+          if (boundary.hasMemoryWrite) { diag.memoryWriteTaskCount ++; addDenseHybridReason(diag, "memory_write"); }
+          if (boundary.hasMemoryRead) { diag.memoryReadTaskCount ++; addDenseHybridReason(diag, "memory_read_unsupported"); }
+          if (boundary.hasExternal) { diag.externalTaskCount ++; addDenseHybridReason(diag, "external"); }
+          if (boundary.hasSpecial) { diag.specialTaskCount ++; addDenseHybridReason(diag, "special"); }
+          if (boundary.hasUnknownNode) { diag.unknownTaskCount ++; addDenseHybridReason(diag, "unknown_node"); }
+          if (boundary.hasUnknownOp) { diag.unknownTaskCount ++; addDenseHybridReason(diag, "unknown_op"); }
+          if (boundary.hasArrayOrDynamicIndex) { diag.arrayOrDynamicIndexTaskCount ++; addDenseHybridReason(diag, "array_or_dynamic_index"); }
+        }
+      }
+      if (diag.cppIdCount == 0) addDenseHybridReason(diag, "empty_mtask");
+    }
+    for (const MtDenseEdge& edge : schedule.edges) {
+      int fromMTask = edge.fromCppId >= 0 && edge.fromCppId < superId ? cppIdToDenseMTask[(size_t)edge.fromCppId] : -1;
+      int toMTask = edge.toCppId >= 0 && edge.toCppId < superId ? cppIdToDenseMTask[(size_t)edge.toCppId] : -1;
+      if (fromMTask < 0 || toMTask < 0 || fromMTask == toMTask) continue;
+      DenseHybridMTaskDiag& fromDiag = denseHybridMTaskDiags[(size_t)fromMTask];
+      DenseHybridMTaskDiag& toDiag = denseHybridMTaskDiags[(size_t)toMTask];
+      if (edge.kind == "dependency") {
+        fromDiag.dependencyEdgeOutCount ++;
+        toDiag.dependencyEdgeInCount ++;
+        denseHybridStaticDependencyInterMTaskEdgeCount ++;
+      } else if (edge.kind == "active") {
+        fromDiag.activeEdgeOutCount ++;
+        toDiag.activeEdgeInCount ++;
+        denseHybridStaticActiveInterMTaskEdgeCount ++;
+      } else if (edge.kind == "need_activate") {
+        fromDiag.needActivateEdgeOutCount ++;
+        toDiag.needActivateEdgeInCount ++;
+        denseHybridStaticNeedActivateInterMTaskEdgeCount ++;
+      }
+    }
+    auto addDenseHybridStat = [](DenseHybridReasonStat& stat, const MtDenseMTask& mtask) {
+      stat.mtaskCount ++;
+      stat.taskCount += mtask.taskCount;
+      stat.staticCost += mtask.staticCost;
+      stat.schedCost += mtask.schedCost > 0 ? mtask.schedCost : mtask.staticCost;
+    };
+    for (int mtaskId = 0; mtaskId < denseMTaskCount; mtaskId ++) {
+      DenseHybridMTaskDiag& diag = denseHybridMTaskDiags[(size_t)mtaskId];
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      diag.runtimeDepCount = mtaskId < static_cast<int>(denseRuntimeDepCountsForReport.size()) ? static_cast<int>(denseRuntimeDepCountsForReport[(size_t)mtaskId]) : 0;
+      diag.runtimeSuccCount = mtaskId < static_cast<int>(denseRuntimeSuccs.size()) ? static_cast<int>(denseRuntimeSuccs[(size_t)mtaskId].size()) : 0;
+      diag.mustAlwaysRun = !diag.mustAlwaysRunReasons.empty();
+      diag.conservativeIneligible = !diag.mustAlwaysRun && !diag.unprovenReasons.empty();
+      diag.gateable = !diag.mustAlwaysRun && !diag.conservativeIneligible;
+      if (diag.gateable) {
+        addDenseHybridStat(denseHybridGateableStats, mtask);
+        if (diag.runtimeDepCount == 0) denseHybridGateableRuntimeZeroDepMTaskCount ++;
+        if (diag.runtimeSuccCount == 0) denseHybridGateableRuntimeZeroSuccMTaskCount ++;
+        denseHybridGateableRuntimeDependencyEdgeCount += diag.runtimeDepCount;
+        denseHybridGateableRuntimeSuccEdgeCount += diag.runtimeSuccCount;
+        if (diag.activeEdgeInCount + diag.activeEdgeOutCount > 0) denseHybridGateableActiveTouchedMTaskCount ++;
+        if (diag.needActivateEdgeInCount + diag.needActivateEdgeOutCount > 0) denseHybridGateableNeedActivateTouchedMTaskCount ++;
+        denseHybridTopGateableMTasks.push_back(mtaskId);
+      } else if (diag.mustAlwaysRun) {
+        addDenseHybridStat(denseHybridMustAlwaysRunStats, mtask);
+        denseHybridMustAlwaysRunRuntimeDependencyEdgeCount += diag.runtimeDepCount;
+        denseHybridMustAlwaysRunRuntimeSuccEdgeCount += diag.runtimeSuccCount;
+        denseHybridTopMustAlwaysRunMTasks.push_back(mtaskId);
+      } else {
+        addDenseHybridStat(denseHybridConservativeIneligibleStats, mtask);
+        denseHybridConservativeIneligibleRuntimeDependencyEdgeCount += diag.runtimeDepCount;
+        denseHybridConservativeIneligibleRuntimeSuccEdgeCount += diag.runtimeSuccCount;
+        denseHybridTopConservativeIneligibleMTasks.push_back(mtaskId);
+      }
+      if (diag.reasons.size() > 1) denseHybridMultiReasonMTaskCount ++;
+      for (const std::string& reason : diag.reasons) addDenseHybridStat(denseHybridReasonStats[reason], mtask);
+      for (const std::string& reason : diag.mustAlwaysRunReasons) addDenseHybridStat(denseHybridMustAlwaysRunReasonStats[reason], mtask);
+      for (const std::string& reason : diag.unprovenReasons) addDenseHybridStat(denseHybridUnprovenReasonStats[reason], mtask);
+    }
+    auto denseHybridTopCmp = [&](int lhs, int rhs) {
+      const MtDenseMTask& lm = schedule.mtasks[(size_t)lhs];
+      const MtDenseMTask& rm = schedule.mtasks[(size_t)rhs];
+      if (lm.staticCost != rm.staticCost) return lm.staticCost > rm.staticCost;
+      if (lm.taskCount != rm.taskCount) return lm.taskCount > rm.taskCount;
+      return lhs < rhs;
+    };
+    std::sort(denseHybridTopGateableMTasks.begin(), denseHybridTopGateableMTasks.end(), denseHybridTopCmp);
+    std::sort(denseHybridTopMustAlwaysRunMTasks.begin(), denseHybridTopMustAlwaysRunMTasks.end(), denseHybridTopCmp);
+    std::sort(denseHybridTopConservativeIneligibleMTasks.begin(), denseHybridTopConservativeIneligibleMTasks.end(), denseHybridTopCmp);
+    if (denseHybridTopGateableMTasks.size() > 20) denseHybridTopGateableMTasks.resize(20);
+    if (denseHybridTopMustAlwaysRunMTasks.size() > 20) denseHybridTopMustAlwaysRunMTasks.resize(20);
+    if (denseHybridTopConservativeIneligibleMTasks.size() > 20) denseHybridTopConservativeIneligibleMTasks.resize(20);
+  }
+
   fprintf(fp, "{\n");
   fprintf(fp, "  \"format\": \"gsim.mt-dense-schedule.v1\",\n");
   fprintf(fp, "  \"codegen_enabled\": %s,\n", schedule.codegenEnabled ? "true" : "false");
   fprintf(fp, "  \"valid\": %s,\n", schedule.valid ? "true" : "false");
   fprintf(fp, "  \"fallback_reason\": \"%s\",\n", jsonEscape(schedule.fallbackReason).c_str());
+  fprintf(fp, "  \"dense_worksteal_enabled\": %s,\n", denseWorkSteal ? "true" : "false");
   fprintf(fp, "  \"dense_xthread_deps_only_enabled\": %s,\n", denseXThreadDepsOnly ? "true" : "false");
   fprintf(fp, "  \"dense_transitive_reduce_edges_enabled\": %s,\n", denseTransitiveReduceEdges ? "true" : "false");
   fprintf(fp, "  \"dense_split_worker0_mtasks_enabled\": %s,\n", mtUseDenseSplitWorker0MTasks() ? "true" : "false");
@@ -5284,6 +5518,9 @@ void graph::dumpMtDenseScheduleJson() {
   fprintf(fp, "  \"dense_runtime_dependency_edge_count_before_transitive_reduce\": %d,\n", denseRuntimeDependencyEdgeCountBeforeTransitiveReduce);
   fprintf(fp, "  \"dense_runtime_same_thread_edge_elided_count\": %d,\n", denseRuntimeSameThreadEdgeElidedCount);
   fprintf(fp, "  \"dense_runtime_transitive_edge_elided_count\": %d,\n", denseRuntimeTransitiveEdgeElidedCount);
+  fprintf(fp, "  \"dense_static_empty_elide_enabled\": %s,\n", denseStaticEmptyElide ? "true" : "false");
+  fprintf(fp, "  \"dense_runtime_zero_dep_mtask_count\": %d,\n", denseRuntimeZeroDepMTaskCount);
+  fprintf(fp, "  \"dense_runtime_zero_succ_mtask_count\": %d,\n", denseRuntimeZeroSuccMTaskCount);
   fprintf(fp, "  \"task_count\": %d,\n", schedule.taskCount);
   fprintf(fp, "  \"active_width\": %d,\n", ACTIVE_WIDTH);
   fprintf(fp, "  \"edge_count\": %d,\n", schedule.edgeCount);
@@ -5369,6 +5606,85 @@ void graph::dumpMtDenseScheduleJson() {
   dumpJsonIntArray(fp, schedule.alwaysActiveCppIds);
   fprintf(fp, ",\n");
 
+  auto dumpDenseHybridStatObject = [&](const char* key, const DenseHybridReasonStat& stat, bool trailingComma) {
+    fprintf(fp, "    \"%s\": {\"mtask_count\": %d, \"task_count\": %d, \"static_cost\": %lld, \"sched_cost\": %lld}%s\n",
+            key, stat.mtaskCount, stat.taskCount, stat.staticCost, stat.schedCost, trailingComma ? "," : "");
+  };
+  auto dumpDenseHybridReasonHistogram = [&](const char* key, const std::map<std::string, DenseHybridReasonStat>& stats, bool trailingComma) {
+    fprintf(fp, "    \"%s\": [\n", key);
+    size_t rank = 0;
+    for (const auto& item : stats) {
+      const DenseHybridReasonStat& stat = item.second;
+      fprintf(fp, "      {\"reason\": \"%s\", \"mtask_count\": %d, \"task_count\": %d, \"static_cost\": %lld, \"sched_cost\": %lld}%s\n",
+              jsonEscape(item.first).c_str(), stat.mtaskCount, stat.taskCount, stat.staticCost, stat.schedCost,
+              ++ rank == stats.size() ? "" : ",");
+    }
+    fprintf(fp, "    ]%s\n", trailingComma ? "," : "");
+  };
+  auto dumpDenseHybridMTaskDiagArray = [&](const char* key, const std::vector<int>& indices, bool trailingComma) {
+    fprintf(fp, "    \"%s\": [\n", key);
+    for (size_t rank = 0; rank < indices.size(); rank ++) {
+      int mtaskId = indices[rank];
+      const MtDenseMTask& mtask = schedule.mtasks[(size_t)mtaskId];
+      const DenseHybridMTaskDiag& diag = denseHybridMTaskDiags[(size_t)mtaskId];
+      int worker = mtaskId < static_cast<int>(schedule.mtaskThreadAssign.size()) ? schedule.mtaskThreadAssign[(size_t)mtaskId] : -1;
+      fprintf(fp, "      {\"rank\": %zu, \"mtask_id\": %d, \"thread\": %d, \"gateable\": %s, \"must_always_run\": %s, \"conservative_ineligible\": %s, \"reasons\": ",
+              rank, mtaskId, worker, diag.gateable ? "true" : "false", diag.mustAlwaysRun ? "true" : "false", diag.conservativeIneligible ? "true" : "false");
+      dumpJsonStringArray(fp, diag.reasons);
+      fprintf(fp, ", \"must_always_run_reasons\": ");
+      dumpJsonStringArray(fp, diag.mustAlwaysRunReasons);
+      fprintf(fp, ", \"unproven_reasons\": ");
+      dumpJsonStringArray(fp, diag.unprovenReasons);
+      fprintf(fp, ", \"pred_count\": %zu, \"succ_count\": %zu, \"runtime_dep_count\": %d, \"runtime_succ_count\": %d, \"task_count\": %d, \"static_cost\": %d, \"sched_cost\": %d, \"worker0_only_task_count\": %d, \"always_active_task_count\": %d, \"state_update_task_count\": %d, \"state_source_commit_task_count\": %d, \"state_next_update_task_count\": %d, \"state_reset_update_task_count\": %d, \"reset_task_count\": %d, \"async_reset_task_count\": %d, \"activate_all_task_count\": %d, \"rhs_next_state_object_read_task_count\": %d, \"unexpanded_rhs_dependency_task_count\": %d, \"ambiguous_state_target_task_count\": %d, \"memory_write_task_count\": %d, \"memory_read_task_count\": %d, \"external_task_count\": %d, \"special_task_count\": %d, \"unknown_task_count\": %d, \"array_or_dynamic_index_task_count\": %d, \"dependency_edge_in_count\": %d, \"dependency_edge_out_count\": %d, \"active_edge_in_count\": %d, \"active_edge_out_count\": %d, \"need_activate_edge_in_count\": %d, \"need_activate_edge_out_count\": %d}%s\n",
+              mtask.predMTasks.size(), mtask.succMTasks.size(), diag.runtimeDepCount, diag.runtimeSuccCount,
+              mtask.taskCount, mtask.staticCost, mtask.schedCost > 0 ? mtask.schedCost : mtask.staticCost,
+              diag.worker0OnlyTaskCount, diag.alwaysActiveTaskCount, diag.stateUpdateTaskCount,
+              diag.stateSourceCommitTaskCount, diag.stateNextUpdateTaskCount, diag.stateResetUpdateTaskCount,
+              diag.resetTaskCount, diag.asyncResetTaskCount, diag.activateAllTaskCount,
+              diag.rhsNextStateObjectReadTaskCount, diag.unexpandedRhsDependencyTaskCount,
+              diag.ambiguousStateTargetTaskCount, diag.memoryWriteTaskCount, diag.memoryReadTaskCount,
+              diag.externalTaskCount, diag.specialTaskCount, diag.unknownTaskCount, diag.arrayOrDynamicIndexTaskCount,
+              diag.dependencyEdgeInCount, diag.dependencyEdgeOutCount, diag.activeEdgeInCount, diag.activeEdgeOutCount,
+              diag.needActivateEdgeInCount, diag.needActivateEdgeOutCount,
+              rank + 1 == indices.size() ? "" : ",");
+    }
+    fprintf(fp, "    ]%s\n", trailingComma ? "," : "");
+  };
+  fprintf(fp, "  \"dense_hybrid_eligibility\": {\n");
+  fprintf(fp, "    \"enabled\": %s,\n", denseHybridEligibilityDiag ? "true" : "false");
+  fprintf(fp, "    \"basis\": \"static_mtask_membership_upper_bound\",\n");
+  fprintf(fp, "    \"per_cycle_skip_rate_source\": \"none_static_only_requires_sparse_dynamic_trace\",\n");
+  fprintf(fp, "    \"runtime_dependency_is_eligibility_blocker\": false,\n");
+  fprintf(fp, "    \"dynamic_trace_required_for_skip_rate\": true,\n");
+  fprintf(fp, "    \"must_always_run_policy\": \"Always-run MTasks include always-active work, worker0-only external calls, memory/state-update/commit work, EXTMOD/DPIC side effects, or reset-sensitive work; see docs/draft.md dense/sparse hybrid workflow notes.\",\n");
+  fprintf(fp, "    \"cpp_id_to_dense_mtask\": ");
+  dumpJsonIntArray(fp, cppIdToDenseMTask);
+  fprintf(fp, ",\n");
+  dumpDenseHybridStatObject("gateable_upper_bound", denseHybridGateableStats, true);
+  dumpDenseHybridStatObject("must_always_run", denseHybridMustAlwaysRunStats, true);
+  dumpDenseHybridStatObject("conservative_ineligible", denseHybridConservativeIneligibleStats, true);
+  fprintf(fp, "    \"multi_reason_mtask_count\": %d,\n", denseHybridMultiReasonMTaskCount);
+  fprintf(fp, "    \"static_dependency_inter_mtask_edge_count\": %d,\n", denseHybridStaticDependencyInterMTaskEdgeCount);
+  fprintf(fp, "    \"static_active_inter_mtask_edge_count\": %d,\n", denseHybridStaticActiveInterMTaskEdgeCount);
+  fprintf(fp, "    \"static_need_activate_inter_mtask_edge_count\": %d,\n", denseHybridStaticNeedActivateInterMTaskEdgeCount);
+  fprintf(fp, "    \"gateable_runtime_zero_dep_mtask_count\": %d,\n", denseHybridGateableRuntimeZeroDepMTaskCount);
+  fprintf(fp, "    \"gateable_runtime_zero_succ_mtask_count\": %d,\n", denseHybridGateableRuntimeZeroSuccMTaskCount);
+  fprintf(fp, "    \"gateable_runtime_dependency_edge_count\": %d,\n", denseHybridGateableRuntimeDependencyEdgeCount);
+  fprintf(fp, "    \"gateable_runtime_succ_edge_count\": %d,\n", denseHybridGateableRuntimeSuccEdgeCount);
+  fprintf(fp, "    \"gateable_active_touched_mtask_count\": %d,\n", denseHybridGateableActiveTouchedMTaskCount);
+  fprintf(fp, "    \"gateable_need_activate_touched_mtask_count\": %d,\n", denseHybridGateableNeedActivateTouchedMTaskCount);
+  fprintf(fp, "    \"must_always_run_runtime_dependency_edge_count\": %d,\n", denseHybridMustAlwaysRunRuntimeDependencyEdgeCount);
+  fprintf(fp, "    \"must_always_run_runtime_succ_edge_count\": %d,\n", denseHybridMustAlwaysRunRuntimeSuccEdgeCount);
+  fprintf(fp, "    \"conservative_ineligible_runtime_dependency_edge_count\": %d,\n", denseHybridConservativeIneligibleRuntimeDependencyEdgeCount);
+  fprintf(fp, "    \"conservative_ineligible_runtime_succ_edge_count\": %d,\n", denseHybridConservativeIneligibleRuntimeSuccEdgeCount);
+  dumpDenseHybridReasonHistogram("reason_histogram", denseHybridReasonStats, true);
+  dumpDenseHybridReasonHistogram("must_always_run_reason_histogram", denseHybridMustAlwaysRunReasonStats, true);
+  dumpDenseHybridReasonHistogram("unproven_reason_histogram", denseHybridUnprovenReasonStats, true);
+  dumpDenseHybridMTaskDiagArray("top_static_cost_gateable_mtasks", denseHybridTopGateableMTasks, true);
+  dumpDenseHybridMTaskDiagArray("top_static_cost_must_always_run_mtasks", denseHybridTopMustAlwaysRunMTasks, true);
+  dumpDenseHybridMTaskDiagArray("top_static_cost_conservative_ineligible_mtasks", denseHybridTopConservativeIneligibleMTasks, false);
+  fprintf(fp, "  },\n");
+
   fprintf(fp, "  \"tasks\": [\n");
   for (int cppId = 0; cppId < superId; cppId ++) {
     SuperNode* super = cppId2Super[cppId];
@@ -5376,8 +5692,9 @@ void graph::dumpMtDenseScheduleJson() {
     int activeWord;
     uint64_t activeMask;
     std::tie(activeWord, activeMask) = setIdxMask(cppId);
+    int denseMTaskId = cppId < static_cast<int>(cppIdToDenseMTask.size()) ? cppIdToDenseMTask[(size_t)cppId] : -1;
     fprintf(fp, "    {\"cpp_id\": %d, \"scan_index\": %d, \"super_id\": %d, \"super_type\": \"%s\", ", cppId, cppId, super->id, superTypeName(super->superType));
-    fprintf(fp, "\"task_kind\": \"%s\", \"serial_reasons\": ", mtTask.taskKind.c_str());
+    fprintf(fp, "\"task_kind\": \"%s\", \"dense_mtask_id\": %d, \"serial_reasons\": ", mtTask.taskKind.c_str(), denseMTaskId);
     dumpJsonStringArray(fp, mtTask.serialReasons);
     fprintf(fp, ", \"worker0_only\": %s, \"is_always_active\": %s, ",
             hasWorker0OnlyReason(mtTask.serialReasons) ? "true" : "false",
@@ -10667,6 +10984,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // the sequence-based transitive reduction, or a successor could run before a same-owner pred.
   bool xthreadDepsOnly = workSteal ? false : mtUseDenseXThreadDepsOnly();
   bool transitiveReduceEdges = workSteal ? false : mtUseDenseTransitiveReduceEdges();
+  bool staticEmptyElide = !workSteal && mtUseDenseStaticEmptyElide();
   std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, xthreadDepsOnly);
   int transitiveElidedEdges = transitiveReduceEdges ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, denseSchedule.mtaskThreadAssign) : 0;
   std::vector<uint32_t> denseRuntimeDepCounts((size_t)nMTasks, 0);
@@ -10742,9 +11060,46 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "}\n");
     emitBodyLock(0, "}\n");
   }
-  emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
-  emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
+  auto emitFixedDenseThreadWorker = [&](const char* funcName) {
+    emitFuncDecl(0, "void S%s::%s(int threadId) {\n", name.c_str(), funcName);
+    emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
+    emitBodyLock(1, "switch (threadId) {\n");
+    for (int t = 0; t < threadCount; t++) {
+      emitBodyLock(2, "case %d: {\n", t);
+      for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+        if (denseSchedule.mtaskThreadAssign[mtaskId] != t) continue;
+        const bool skipDenseWait = staticEmptyElide && denseRuntimeDepCounts[(size_t)mtaskId] == 0;
+        if (!skipDenseWait) {
+          // Verilator VlMTaskVertex::waitUntilUpstreamDone pattern: spin 64, then yield.
+          emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
+          emitBodyLock(3, "  unsigned ct = 0;\n");
+          emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
+          emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 64) { ct = 0; std::this_thread::yield(); } }\n");
+          emitBodyLock(3, "}\n");
+        }
+        emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+        const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
+        if (!skipDenseSignal) {
+          // Verilator signalUpstreamDone: fetch_add (even) or fetch_sub (odd).
+          emitBodyLock(3, "if (evenCycle) {\n");
+          emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+          emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
+          emitBodyLock(3, "} else {\n");
+          emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+          emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
+          emitBodyLock(3, "}\n");
+        }
+      }
+      emitBodyLock(3, "break;\n");
+      emitBodyLock(2, "}\n");
+    }
+    emitBodyLock(2, "default: break;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+  };
   if (workSteal) {
+    emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
+    emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
     // Owner-affine ready-deque work-stealing. A worker pops ready MTasks from its own deque
     // (LIFO), steals from other deques' tails when idle, runs the body, and on each successor's
     // LAST dependency (enqueue-on-last-dep, avoids double-run races) pushes it to its owner's
@@ -10801,34 +11156,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "mtDenseRemaining.fetch_sub(1, std::memory_order_acq_rel);\n");
     emitBodyLock(1, "}\n");
     emitBodyLock(1, "return;\n");
+    emitBodyLock(0, "}\n");
+  } else {
+    emitFixedDenseThreadWorker("stepDenseThreadWorker");
   }
-  emitBodyLock(1, "switch (threadId) {\n");
-  for (int t = 0; t < threadCount; t++) {
-    emitBodyLock(2, "case %d: {\n", t);
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-      if (denseSchedule.mtaskThreadAssign[mtaskId] != t) continue;
-      // Verilator VlMTaskVertex::waitUntilUpstreamDone pattern: spin 64, then yield
-      emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
-      emitBodyLock(3, "  unsigned ct = 0;\n");
-      emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-      emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 64) { ct = 0; std::this_thread::yield(); } }\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
-      // Verilator signalUpstreamDone: fetch_add (even) or fetch_sub (odd)
-      emitBodyLock(3, "if (evenCycle) {\n");
-      emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
-      emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
-      emitBodyLock(3, "} else {\n");
-      emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
-      emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
-      emitBodyLock(3, "}\n");
-    }
-    emitBodyLock(3, "break;\n");
-    emitBodyLock(2, "}\n");
-  }
-  emitBodyLock(2, "default: break;\n");
-  emitBodyLock(1, "}\n");
-  emitBodyLock(0, "}\n");
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
