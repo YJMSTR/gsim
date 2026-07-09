@@ -1502,6 +1502,43 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   const uint64_t perMTaskCap = std::max<uint64_t>(1, (totalCost / (uint64_t)maxMTasks) * (uint64_t)capMul);
   bool sibEnabled = true;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_SIBLING"); if (e && e[0] == '0') sibEnabled = false; }
+  // Verilator PropagateCp port (2026-07-09): keep fwd/rev critical paths ACCURATE through merges so
+  // edgeScore reflects live critical paths (gsim previously froze gF/gR at initial values -> stale
+  // edgeScore -> suboptimal merge ORDER vs Verilator's lowest-local-CP order). Rather than
+  // Verilator's incremental pairing-heap propagation, this port EXACTLY recomputes gF/gR over the
+  // live quotient DAG every K merges (see recomputeCP below) and rebuilds the candidate PQ so pops
+  // follow the freshly-recomputed CP order. Between recomputes CP is briefly stale, which only
+  // shifts merge ORDER (a heuristic, safe for any CP value) -- contraction correctness never
+  // depends on it. Default-off knob. NOTE: no CP-ordering cycle prune is added (a prune on stale CP
+  // is unsound), so cycle-safety stays the plain gen-tagged DFS; CP feeds ONLY edgeScore.
+  bool propagateCp = [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP"); return e && e[0] && e[0] != '0'; }();
+  // recomputeEvery K: recompute cost is O(V+E) per call * (merges/K), so K amortizes it against the
+  // merge loop. The exact recompute (vs Verilator's incremental heap) sidesteps the union-find
+  // quotient hazard where CP both rises (cost growth) and falls (a->b edge internalizes) per merge.
+  int recomputeEvery = 256;
+  { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP_EVERY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) recomputeEvery = v; } }
+  auto recomputeCP = [&]() {
+    // Live roots and their find()-normalized, deduped succ/pred sets.
+    std::vector<int> roots; roots.reserve((size_t)n);
+    for (int i = 0; i < n; i ++) if (find(i) == i) roots.push_back(i);
+    std::vector<std::vector<int>> succ((size_t)n), pred((size_t)n);
+    std::vector<int> indeg((size_t)n, 0);
+    for (int r : roots) {
+      std::set<int> ss; for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r) ss.insert(rs); }
+      succ[(size_t)r].assign(ss.begin(), ss.end());
+      for (int rs : succ[(size_t)r]) { pred[(size_t)rs].push_back(r); }
+    }
+    for (int r : roots) indeg[(size_t)r] = (int)pred[(size_t)r].size();
+    // Kahn topo order of live roots.
+    std::vector<int> topo; topo.reserve(roots.size());
+    std::vector<int> q; for (int r : roots) if (indeg[(size_t)r] == 0) q.push_back(r);
+    size_t qh = 0;
+    while (qh < q.size()) { int u = q[qh ++]; topo.push_back(u); for (int v : succ[(size_t)u]) if (-- indeg[(size_t)v] == 0) q.push_back(v); }
+    // gF (cost-to-sink): reverse topo. gR (cost-from-source): forward topo.
+    for (int r : roots) { gF[(size_t)r] = 0; gR[(size_t)r] = 0; }
+    for (size_t k = topo.size(); k-- > 0; ) { int u = topo[k]; uint64_t b = 0; for (int v : succ[(size_t)u]) b = std::max(b, gF[(size_t)v] + mtDenseStepCostV(gcost[(size_t)v])); gF[(size_t)u] = b; }
+    for (int u : topo) { uint64_t b = 0; for (int p : pred[(size_t)u]) b = std::max(b, gR[(size_t)p] + mtDenseStepCostV(gcost[(size_t)p])); gR[(size_t)u] = b; }
+  };
   // CP-bound-pruned, generation-tagged DFS: does a path root(frm)~>root(to) exist (excluding the
   // direct frm->to edge, which the caller removes temporarily)?
   std::vector<uint32_t> gen((size_t)n, 0); uint32_t curGen = 0;
@@ -1521,8 +1558,13 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
       if (gen[(size_t)x] == curGen) continue;
       gen[(size_t)x] = curGen;
       if (++ visits > visitCap) return true;
-      // No CP-bound prune: gR/gF are initial-graph values, not propagated after merges (Verilator's
-      // PropagateCp), so pruning on them would be unsound. Plain gen-tagged DFS is correct.
+      // NOTE: a CP-ordering prune here (skip x if gF[x]+step>gF[to]) is UNSOUND with bounded/
+      // stale-LOW propagated CP: a stale-low gF[to] would make the prune over-fire and wrongly
+      // reject a real ancestor -> a cycle-creating merge. gF is only a LOWER bound (propagation
+      // never overshoots), and comparing two lower bounds cannot soundly prune. So we keep the plain
+      // gen-tagged DFS for cycle-safety; propagated CP is used ONLY in edgeScore (merge ORDER, a
+      // heuristic that is safe for any CP value). This still captures Verilator's exact-merge-order
+      // fidelity win without the unsound prune.
       for (int s2 : gS[(size_t)x]) { int rs = find(s2); if (rs != x) st.push_back(rs); }
     }
     return false;
@@ -1546,6 +1588,14 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
       for (int s2 : gS[(size_t)rp]) { int rs = find(s2);
         if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({edgeScore(r, rs), r, rs, true}); if (++ emitted >= sibCap) return; } } }
   };
+  auto rebuildPQ = [&]() {
+    // Rebuild the candidate heap from scratch over all live roots with LIVE edgeScore. Called after
+    // recomputeCP() so every candidate is scored against the freshly-recomputed critical paths
+    // (a recompute can LOWER a CP, burying a now-cheaper edge under a stale-high key that on-pop
+    // revalidation alone could never surface). O(V+E) per call, amortized by recomputeEvery.
+    std::priority_queue<Cand, std::vector<Cand>, Cmp> empty; pq.swap(empty);
+    for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
+  };
   for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
   int live = n; uint64_t merges = 0, cycRej = 0, sibMerges = 0;
   while (live > maxMTasks && !pq.empty()) {
@@ -1553,6 +1603,14 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     int a = find(c.a), b = find(c.b);
     if (a == b || gw0[(size_t)a] != gw0[(size_t)b]) continue;
     if (gcost[(size_t)a] + gcost[(size_t)b] > perMTaskCap) continue;
+    if (propagateCp) {
+      // Lazy stale-key check: gcost grows within a recompute window, so a candidate's stored score
+      // may no longer equal the live edgeScore. If it drifted, re-push at the live score and skip;
+      // this keeps pops in true-live-CP order (paired with the rebuildPQ after each recomputeCP,
+      // which repairs CP DECREASES that a re-push cannot surface).
+      uint64_t liveScore = edgeScore(a, b);
+      if (liveScore != c.score) { pq.push({liveScore, a, b, c.sibling}); continue; }
+    }
     bool cyc;
     if (c.sibling) {
       // Sibling merge: no direct edge assumed. Cycle-safe iff neither a~>b nor b~>a.
@@ -1575,6 +1633,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) { gP[(size_t)a].insert(rp); gS[(size_t)rp].insert(a); } }
     gS[(size_t)a].erase(a); gP[(size_t)a].erase(a); gS[(size_t)a].erase(b); gP[(size_t)a].erase(b);
     live --; merges ++; if (c.sibling) sibMerges ++;
+    if (propagateCp && (merges % (uint64_t)recomputeEvery) == 0) { recomputeCP(); rebuildPQ(); }
     pushEdges(a); if (sibEnabled) pushSiblings(a);
     for (int p : gP[(size_t)a]) { int rp = find(p); if (rp != a && gw0[(size_t)rp] == gw0[(size_t)a] && gcost[(size_t)rp] + gcost[(size_t)a] <= perMTaskCap) pq.push({edgeScore(rp, a), rp, a, false}); }
   }
