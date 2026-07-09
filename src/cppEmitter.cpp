@@ -85,6 +85,10 @@ static std::vector<int> mtProfileRepCutRuntimeCppIds;
 static std::set<int> alwaysActive;
 static std::vector<std::vector<int>> mtStepActiveWordGuards;
 static std::vector<char> mtStepActiveWordGuardable;
+// Sparse-in-dense MT: when set, updateActiveStr emits per-byte __atomic_fetch_or into activeFlags
+// (ACTIVE_WIDTH==8 => each activeFlags[] is uint8_t, so byte atomics are aligned/UB-free) so
+// cross-thread same-word activations don't lose updates. Set only around the gated dense body.
+static bool mtDenseSparseGateAtomicEmit = false;
 
 static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
 static std::map<Node*, std::pair<int, int>> super2DenseResetId;  // dense uint & async reset
@@ -1141,6 +1145,17 @@ static bool mtUseDenseTransitiveReduceEdges() {
 
 static bool mtUseDenseStaticEmptyElide() {
   const char* env = std::getenv("GSIM_MT_DENSE_STATIC_EMPTY_ELIDE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Sparse-in-dense hybrid (2026-07-09): run each dense MTask member under gsim's per-super
+// activeFlags gate + activation production, instead of unconditionally. Dense execution order
+// (MTask-id major, cppId ascending minor) is a valid topological order of the dependency+
+// activation DAG (offline-proven: 0 backward edges in that order), so per-bit test-and-clear
+// gating in that order reproduces sparse-ST semantics. Default-off. First correctness build is
+// single-thread; MT adds atomic clear/OR after C5000 bit-exact. See docs/sparse-in-dense-design.md.
+static bool mtUseDenseSparseGate() {
+  const char* env = std::getenv("GSIM_MT_DENSE_SPARSE_GATE");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
@@ -7736,6 +7751,17 @@ ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveTy
 
 std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBufferName = "") {
   if (!activeBufferName.empty()) return format("%s.orWord(%d, 0x%lx);", activeBufferName.c_str(), idx, mask);
+  if (mtDenseSparseGateAtomicEmit) {
+    // Mirror `*(uintN*)&activeFlags[idx] |= mask` byte-for-byte with aligned uint8_t atomics
+    // (ACTIVE_WIDTH==8). Byte i of mask targets activeFlags[idx+i].
+    std::string s;
+    for (int i = 0; i * ACTIVE_WIDTH < 64; i ++) {
+      uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
+      if (byteMask == 0) continue;
+      s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)0x%lx, __ATOMIC_RELAXED); ", idx + i, ACTIVE_WIDTH, byteMask);
+    }
+    return s;
+  }
   if (mask <= MAX_U8) return format("activeFlags[%d] |= 0x%lx;", idx, mask);
   if (mask <= MAX_U16) return format("*(uint16_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
   if (mask <= MAX_U32) return format("*(uint32_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
@@ -7752,6 +7778,21 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
     else if (mask <= MAX_U16) castWidth = 16;
     else if (mask <= MAX_U32) castWidth = 32;
     return format("%s.orWord(%d, -(uint%d_t)%s & 0x%lx);", activeBufferName.c_str(), idx, castWidth, cond.c_str(), mask);
+  }
+  if (mtDenseSparseGateAtomicEmit) {
+    if (uniqueId >= 0) {
+      // single-byte target word idx, bit set from cond shifted to uniqueId
+      return format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(%s%s), __ATOMIC_RELAXED);",
+                    idx, ACTIVE_WIDTH, cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str());
+    }
+    std::string s;
+    for (int i = 0; i * ACTIVE_WIDTH < 64; i ++) {
+      uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
+      if (byteMask == 0) continue;
+      s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); ",
+                  idx + i, ACTIVE_WIDTH, ACTIVE_WIDTH, cond.c_str(), byteMask);
+    }
+    return s;
   }
   auto activeFlags = std::string("activeFlags[") + std::to_string(idx) + std::string("]");
 
@@ -8151,7 +8192,14 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
       std::string flagForOr = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
-      if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      // In the sparse-gate dense body flagName is "activeFlags[w]" (a single uint8_t word);
+      // same-word activations must be atomic to avoid cross-thread lost updates on split words.
+      bool atomicWord = mtDenseSparseGateAtomicEmit && flagForOr.rfind("activeFlags[", 0) == 0;
+      if (atomicWord) {
+        std::string addr = "&" + flagForOr;
+        if (opt) emitBodyLock(indent, "__atomic_fetch_or(%s, (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); // %s\n", addr.c_str(), ACTIVE_WIDTH, ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+        else emitBodyLock(indent, "__atomic_fetch_or(%s, (uint%d_t)0x%lx, __ATOMIC_RELAXED); // %s\n", addr.c_str(), ACTIVE_WIDTH, ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      } else if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
       else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
     }
     for (auto iter : bitMapInfo) {
@@ -11029,16 +11077,76 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
   for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
+  bool sparseGate = mtUseDenseSparseGate();
+  // Atomic activeFlags ops for MT safety; default ON when sparse-gate is on (correct for T1 too,
+  // just uint8_t atomics). GSIM_MT_DENSE_SPARSE_GATE_ATOMIC=0 forces the plain non-atomic form
+  // (only bit-exact at THREADS=1; used for the ST-only A/B).
+  bool sparseGateAtomic = sparseGate && [](){ const char* e = std::getenv("GSIM_MT_DENSE_SPARSE_GATE_ATOMIC"); return !(e && e[0] == '0'); }();
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
     emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
+    // Sparse-in-dense: emit members ASCENDING by cppId (proven valid topo order of intra-MTask
+    // forward activation edges: 0 backward in cppId order). Gather then sort.
+    std::vector<int> memberCppIds;
     for (int sccId : mtask.sccIds) {
       Assert(sccId >= 0 && sccId < static_cast<int>(denseSchedule.sccs.size()), "dense schedule scc index out of range");
       const MtDenseScc& scc = denseSchedule.sccs[(size_t)sccId];
-      for (int cppId : scc.cppIds) {
-        auto superIter = cppId2Super.find(cppId);
-        if (superIter == cppId2Super.end() || !superIter->second) continue;
-        SuperNode* super = superIter->second;
+      for (int cppId : scc.cppIds) memberCppIds.push_back(cppId);
+    }
+    if (sparseGate) std::sort(memberCppIds.begin(), memberCppIds.end());
+    // R3 prefilter: if EVERY member is gated (none isAlwaysActive), skip the whole MTask body when
+    // none of its footprint words are set. Converts the 0.18%-active reality into skipped bodies
+    // instead of 45313 idle per-super gate loads/cycle. Guard uses the same relaxed atomic load as
+    // the per-super gate (ordered by the dep-counter HB, so no missed activation).
+    bool prefilterSafe = sparseGate;
+    std::set<int> footprintWords;
+    for (int cppId : memberCppIds) {
+      if (isAlwaysActive(cppId)) { prefilterSafe = false; break; }
+      footprintWords.insert(cppId / ACTIVE_WIDTH);
+    }
+    bool prefilterEmitted = false;
+    if (prefilterSafe && !footprintWords.empty()) {
+      std::string guard;
+      for (int w : footprintWords) {
+        if (!guard.empty()) guard += " | ";
+        if (sparseGateAtomic) guard += format("__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED)", w);
+        else guard += format("activeFlags[%d]", w);
+      }
+      emitBodyLock(1, "if (!(%s)) return;\n", guard.c_str());
+      prefilterEmitted = true;
+    }
+    (void)prefilterEmitted;
+    for (int cppId : memberCppIds) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || !superIter->second) continue;
+      SuperNode* super = superIter->second;
+      if (sparseGate) {
+        // Per-super live-activeFlags gate + activation production, matching sparse-ST. Under MT the
+        // shared activeFlags byte is touched by multiple threads (83.8% of words split across
+        // MTasks), so gate clear + activations use uint8_t atomics (ACTIVE_WIDTH==8 => aligned,
+        // UB-free). Cross-thread same-cycle visibility holds via the dep-counter release/acquire HB
+        // (activation edges are runtime dep-counter edges). isAlwaysActive supers run ungated.
+        int wordId; uint64_t mask;
+        std::tie(wordId, mask) = setIdxMask(cppId);
+        uint64_t clrBit = mask & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
+        int localIndent = 1;
+        bool gated = !isAlwaysActive(cppId);
+        bool atomicGate = sparseGateAtomic;
+        if (gated) {
+          if (atomicGate) {
+            emitBodyLock(localIndent ++, "if (__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED) & 0x%lx) {\n", wordId, mask);
+            emitBodyLock(localIndent, "__atomic_fetch_and(&activeFlags[%d], (uint%d_t)~0x%lx, __ATOMIC_RELAXED);\n", wordId, ACTIVE_WIDTH, clrBit);
+          } else {
+            emitBodyLock(localIndent ++, "if (activeFlags[%d] & 0x%lx) {\n", wordId, mask);
+            emitBodyLock(localIndent, "activeFlags[%d] &= (uint%d_t)~0x%lx;\n", wordId, ACTIVE_WIDTH, clrBit);
+          }
+        }
+        bool savedAtomic = mtDenseSparseGateAtomicEmit;
+        mtDenseSparseGateAtomicEmit = atomicGate;
+        genSuperEval(super, format("activeFlags[%d]", wordId), "", localIndent, true);
+        mtDenseSparseGateAtomicEmit = savedAtomic;
+        if (gated) emitBodyLock(-- localIndent, "}\n");
+      } else {
         emitBodyLock(1, "{\n");
         emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileDenseTaskBegin;\n");
         emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
@@ -11163,7 +11271,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
-  emitBodyLock(1, "resetAllDense();\n");
+  // Sparse-in-dense: use the sparse resetAll() seeder (no memset, activation-producing resets) so
+  // cross-cycle activation carry is preserved (the gated bodies clear bits as they consume them).
+  // Default dense path keeps resetAllDense() (memset + reset activation, fine when bodies are
+  // unconditional).
+  if (sparseGate) emitBodyLock(1, "resetAll();\n");
+  else emitBodyLock(1, "resetAllDense();\n");
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
       if (member->isReset() && member->type == NODE_REG_SRC) {
