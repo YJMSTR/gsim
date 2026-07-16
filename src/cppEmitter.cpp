@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cinttypes>
 #include <cctype>
+#include <cmath>
 #include <algorithm>
 #include <cstdlib>
 #include <deque>
@@ -89,6 +90,15 @@ static std::vector<char> mtStepActiveWordGuardable;
 // (ACTIVE_WIDTH==8 => each activeFlags[] is uint8_t, so byte atomics are aligned/UB-free) so
 // cross-thread same-word activations don't lose updates. Set only around the gated dense body.
 static bool mtDenseSparseGateAtomicEmit = false;
+// V340: emit push-driven active-MTask registration only while generating the
+// single-thread sparse-dense executor body. Activation writes then mark the
+// static reverse-index candidates directly; no repeated active-word scans.
+static bool mtDenseActiveWorklistEmit = false;
+// Suppress sparse activation-event calls while emitting the optional dense executor body.
+static bool mtActivationEventTraceSuppressed = false;
+// Codegen-time semantic source: admitted sparse mtTask cppId, or -1 for reset/external paths.
+static int mtActivationEventTraceSourceCppId = -1;
+
 
 static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
 static std::map<Node*, std::pair<int, int>> super2DenseResetId;  // dense uint & async reset
@@ -1126,6 +1136,15 @@ static bool mtUseDynamicStateTraceCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Default-off exact sparse activation-event trace support. The generated model
+// still requires GSIM_MT_ACTIVATION_EVENT_TRACE=/path and a non-empty dynamic
+// trace cycle range at runtime.
+static bool mtUseActivationEventTraceCodegen() {
+  const char* env = std::getenv("GSIM_MT_ACTIVATION_EVENT_TRACE_CODEGEN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
 // Default-off v181 codegen: emit a whole-design dense schedule report and,
 // when the graph is acyclic, dense runtime wrappers selected by GSIM_MT_EXECUTOR=dense.
 static bool mtUseDenseExecutorCodegen() {
@@ -1160,6 +1179,67 @@ static bool mtUseDenseOwnerBankCountersDiag() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// v285: optionally emit compile-exclusive producer-owner ready flags beside the
+// v280 fixed-order owner-banked and identity dependency-counter layouts.
+static bool mtUseDenseOwnerReadyFlags() {
+  const char* env = std::getenv("GSIM_MT_DENSE_OWNER_READY_FLAGS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// V335: default-off compile-exclusive per-worker completion join.
+static bool mtUseWorkerPoolFlagJoinCodegen() {
+  const char* env = std::getenv("GSIM_MT_WORKER_POOL_FLAG_JOIN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
+
+
+
+// V357: default-off compile-exclusive per-CCD wake-generation sharding. The
+// single shared mtWorkerPoolGeneration line is read-hammered by all N-1 workers
+// every post; at T32 those workers span 4 CCDs (4 L3 domains) so each post
+// broadcast-invalidates the line across CCDs. Sharding the wake signal into
+// cache-line-isolated per-shard copies keeps each worker's spin line shared by
+// only its CCD-group (~8 readers), cutting cross-CCD coherence traffic. The
+// global generation counter remains the authoritative epoch (release before the
+// shard stores, so a worker acquiring its shard sees the counter); this only
+// changes which line the inner spin polls. Generation is opt-in; the compile
+// macro GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE selects it in one A/B tree.
+static bool mtUseWorkerPoolWakeShardCodegen() {
+  const char* env = std::getenv("GSIM_MT_WORKER_POOL_WAKE_SHARD");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Default-off dense ready-token scheduler breakdown profiler. Generation is
+// deliberately opt-in so its unset path emits no additional model text.
+static bool mtUseDenseBreakdownProfileCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_BREAKDOWN_PROFILE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Bounded per-cycle dense-breakdown window trace. This is a codegen sub-gate:
+// absent window knobs leave Slice A's emitted model text byte-identical.
+static bool mtUseDenseBreakdownWindowCodegen() {
+  const char* start = std::getenv("GSIM_MT_DENSE_BREAKDOWN_WINDOW_START");
+  const char* cycles = std::getenv("GSIM_MT_DENSE_BREAKDOWN_WINDOW_CYCLES");
+  const bool hasStart = start != nullptr && start[0] != '\0';
+  const bool hasCycles = cycles != nullptr && cycles[0] != '\0';
+  if (!hasStart && !hasCycles) return false;
+  Assert(hasStart && hasCycles,
+         "GSIM_MT_DENSE_BREAKDOWN_WINDOW_START and GSIM_MT_DENSE_BREAKDOWN_WINDOW_CYCLES must be set together");
+  return true;
+}
+
+
+// v290b: reorder only dense MTask function emission by fixed owner so each worker's hot text is
+// contiguous. Logical IDs, bodies, owner call order, dependency protocol, and schedule are unchanged.
+static bool mtUseDenseWorkerMajorText() {
+  const char* env = std::getenv("GSIM_MT_DENSE_WORKER_MAJOR_TEXT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
 // Sparse-in-dense hybrid (2026-07-09): run each dense MTask member under gsim's per-super
 // activeFlags gate + activation production, instead of unconditionally. Dense execution order
 // (MTask-id major, cppId ascending minor) is a valid topological order of the dependency+
@@ -1170,6 +1250,14 @@ static bool mtUseDenseSparseGate() {
   const char* env = std::getenv("GSIM_MT_DENSE_SPARSE_GATE");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+// V340: push-driven T1 de-risk for sparse-dense. This is intentionally
+// default-off and requires atomic sparse-gate writes so every activation can
+// register its target active word with the generated worklist.
+static bool mtUseDenseActiveWorklistPush() {
+  const char* env = std::getenv("GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 static bool mtUseDenseHybridEligibilityDiag() {
   const char* env = std::getenv("GSIM_MT_DENSE_HYBRID_ELIGIBILITY_DIAG");
@@ -1189,12 +1277,23 @@ static bool mtUseDenseCpContraction() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Phase 82: retain the established VCONTRACT heuristic and expose a separate
+// default-off policy path for the coupled V3OrderParallel score/limit rules.
+// It intentionally keeps GSim's worker0-only safety boundary.
+static bool mtUseDenseV3ContractPolicy() {
+  const char* env = std::getenv("GSIM_MT_DENSE_VCONTRACT_V3_POLICY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
+
 // v236: wire the Verilator-like PackThreads DAG-aware assignment (already used only
 // for the report) into the codegen mtaskThreadAssign, replacing i % threadCount.
 static bool mtUseDensePackThreadsAssignment() {
   const char* env = std::getenv("GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+
 
 // v239: dense runtime work-stealing. Default-off. Replaces the fixed ascending-id per-thread
 // MTask execution (which spin-stalls on cross-thread deps) with owner-affine ready deques +
@@ -1489,31 +1588,72 @@ static uint64_t mtDenseStepCostV(uint64_t c) {
   if (c <= 1) return c;
   uint64_t s = 1; while (s < c) s = s + s / 20 + 1; return s;
 }
+
+static uint64_t mtDenseStepCostV3(uint64_t cost) {
+  if (cost == 0) return 0;
+  double logCost = std::log(static_cast<double>(cost));
+  logCost = std::ceil(logCost * 20.0) / 20.0;
+  return static_cast<uint64_t>(std::exp(logCost));
+}
 static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDenseSchedule& schedule,
                                                                      int threadCount) {
-  const int n = static_cast<int>(schedule.sccs.size());
+  const int realN = static_cast<int>(schedule.sccs.size());
   std::vector<MtDenseMTask> mtasks;
-  if (n == 0) return mtasks;
+  if (realN == 0) return mtasks;
   if (threadCount < 1) threadCount = 1;
+  const bool v3Policy = mtUseDenseV3ContractPolicy();
+  // V3OrderParallel connects all real roots through artificial zero-cost entry/exit vertices,
+  // then removes those vertices after contraction. They make disconnected components eligible
+  // for sibling pairing without permitting the artificial edges themselves to be contracted.
+  const int firstRealMTask = v3Policy ? 1 : 0;
+  const int entryMTask = v3Policy ? 0 : -1;
+  const int exitMTask = v3Policy ? realN + 1 : -1;
+  const int n = realN + (v3Policy ? 2 : 0);
+  const auto denseNode = [firstRealMTask](int scc) { return scc + firstRealMTask; };
   auto sc = [&](int s) -> uint64_t { return (uint64_t)std::max(1, schedule.sccs[(size_t)s].memberNodeCost); };
+  const uint64_t totalCost = [&]{ uint64_t c = 0; for (int scc = 0; scc < realN; ++scc) c += sc(scc); return c; }();
+  std::vector<uint64_t> v3StepCostCache(v3Policy ? (size_t)totalCost + 1 : 0, 0);
+  const auto stepCost = [v3Policy, totalCost, &v3StepCostCache](uint64_t cost) -> uint64_t {
+    if (!v3Policy) return mtDenseStepCostV(cost);
+    if (cost == 0) return 0;
+    if (cost <= totalCost) {
+      uint64_t &cached = v3StepCostCache[(size_t)cost];
+      if (cached == 0) cached = mtDenseStepCostV3(cost);
+      return cached;
+    }
+    return mtDenseStepCostV3(cost);
+  };
   std::vector<int> uf((size_t)n); for (int i = 0; i < n; i ++) uf[(size_t)i] = i;
   std::function<int(int)> find = [&](int x){ while (uf[(size_t)x]!=x){ uf[(size_t)x]=uf[(size_t)uf[(size_t)x]]; x=uf[(size_t)x]; } return x; };
   std::vector<uint64_t> gcost((size_t)n), gF((size_t)n, 0), gR((size_t)n, 0);
   std::vector<bool> gw0((size_t)n);
   std::vector<std::set<int>> gS((size_t)n), gP((size_t)n);
-  for (int i = 0; i < n; i ++) { gcost[(size_t)i] = sc(i); gw0[(size_t)i] = schedule.sccs[(size_t)i].workerZeroOnly; }
-  for (int u = 0; u < n; u ++) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < n) { gS[(size_t)u].insert(v); gP[(size_t)v].insert(u); }
+  for (int scc = 0; scc < realN; ++scc) { int node = denseNode(scc); gcost[(size_t)node] = sc(scc); gw0[(size_t)node] = schedule.sccs[(size_t)scc].workerZeroOnly; }
+  for (int u = 0; u < realN; ++u) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < realN) { int from = denseNode(u), to = denseNode(v); gS[(size_t)from].insert(to); gP[(size_t)to].insert(from); }
+  if (v3Policy) {
+    for (int scc = 0; scc < realN; ++scc) {
+      int node = denseNode(scc);
+      if (gP[(size_t)node].empty()) { gS[(size_t)entryMTask].insert(node); gP[(size_t)node].insert(entryMTask); }
+      if (gS[(size_t)node].empty()) { gS[(size_t)node].insert(exitMTask); gP[(size_t)exitMTask].insert(node); }
+    }
+  }
   // Forward (to-end) and reverse (from-start) stepped critical paths over the SCC DAG (topo by id).
-  for (int u = n - 1; u >= 0; u --) { uint64_t b = 0; for (int v : gS[(size_t)u]) b = std::max(b, gF[(size_t)v] + mtDenseStepCostV(gcost[(size_t)v])); gF[(size_t)u] = b; }
-  for (int u = 0; u < n; u ++) { uint64_t b = 0; for (int p : gP[(size_t)u]) b = std::max(b, gR[(size_t)p] + mtDenseStepCostV(gcost[(size_t)p])); gR[(size_t)u] = b; }
-  const uint64_t totalCost = [&]{ uint64_t c = 0; for (int i = 0; i < n; i ++) c += sc(i); return c; }();
+  for (int u = n - 1; u >= 0; u --) { uint64_t b = 0; for (int v : gS[(size_t)u]) b = std::max(b, gF[(size_t)v] + stepCost(gcost[(size_t)v])); gF[(size_t)u] = b; }
+  for (int u = 0; u < n; u ++) { uint64_t b = 0; for (int p : gP[(size_t)u]) b = std::max(b, gR[(size_t)p] + stepCost(gcost[(size_t)p])); gR[(size_t)u] = b; }
   int maxMTasks = std::max(threadCount, 50 * threadCount);
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT"); if (e && e[0]) { int v = std::atoi(e); if (v > threadCount) maxMTasks = v; } }
   int capMul = 3;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_CAP"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) capMul = v; } }
-  const uint64_t perMTaskCap = std::max<uint64_t>(1, (totalCost / (uint64_t)maxMTasks) * (uint64_t)capMul);
+  const uint64_t legacyMTaskCap = std::max<uint64_t>(1, (totalCost / (uint64_t)maxMTasks) * (uint64_t)capMul);
+  const uint64_t perMTaskCap = v3Policy ? std::numeric_limits<uint64_t>::max() : legacyMTaskCap;
+  uint64_t scoreLimit = v3Policy
+      ? std::max<uint64_t>(1, (totalCost * 3) / ((uint64_t)threadCount * 5))
+      : std::numeric_limits<uint64_t>::max();
   bool sibEnabled = true;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_SIBLING"); if (e && e[0] == '0') sibEnabled = false; }
+  // V331: use V3's critPathCostWithout edge score in the legacy contraction
+  // without coupling to V3's cost domain or its soft stop policy.
+  const bool edgeCpWithout = [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_EDGE_CPWO"); return e && e[0] && e[0] != '0'; }();
   // Verilator PropagateCp port (2026-07-09): keep fwd/rev critical paths ACCURATE through merges so
   // edgeScore reflects live critical paths (gsim previously froze gF/gR at initial values -> stale
   // edgeScore -> suboptimal merge ORDER vs Verilator's lowest-local-CP order). Rather than
@@ -1523,7 +1663,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // shifts merge ORDER (a heuristic, safe for any CP value) -- contraction correctness never
   // depends on it. Default-off knob. NOTE: no CP-ordering cycle prune is added (a prune on stale CP
   // is unsound), so cycle-safety stays the plain gen-tagged DFS; CP feeds ONLY edgeScore.
-  bool propagateCp = [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP"); return e && e[0] && e[0] != '0'; }();
+  bool propagateCp = v3Policy || edgeCpWithout || [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP"); return e && e[0] && e[0] != '0'; }();
   // recomputeEvery K: recompute cost is O(V+E) per call * (merges/K), so K amortizes it against the
   // merge loop. The exact recompute (vs Verilator's incremental heap) sidesteps the union-find
   // quotient hazard where CP both rises (cost growth) and falls (a->b edge internalizes) per merge.
@@ -1548,8 +1688,8 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     while (qh < q.size()) { int u = q[qh ++]; topo.push_back(u); for (int v : succ[(size_t)u]) if (-- indeg[(size_t)v] == 0) q.push_back(v); }
     // gF (cost-to-sink): reverse topo. gR (cost-from-source): forward topo.
     for (int r : roots) { gF[(size_t)r] = 0; gR[(size_t)r] = 0; }
-    for (size_t k = topo.size(); k-- > 0; ) { int u = topo[k]; uint64_t b = 0; for (int v : succ[(size_t)u]) b = std::max(b, gF[(size_t)v] + mtDenseStepCostV(gcost[(size_t)v])); gF[(size_t)u] = b; }
-    for (int u : topo) { uint64_t b = 0; for (int p : pred[(size_t)u]) b = std::max(b, gR[(size_t)p] + mtDenseStepCostV(gcost[(size_t)p])); gR[(size_t)u] = b; }
+    for (size_t k = topo.size(); k-- > 0; ) { int u = topo[k]; uint64_t b = 0; for (int v : succ[(size_t)u]) b = std::max(b, gF[(size_t)v] + stepCost(gcost[(size_t)v])); gF[(size_t)u] = b; }
+    for (int u : topo) { uint64_t b = 0; for (int p : pred[(size_t)u]) b = std::max(b, gR[(size_t)p] + stepCost(gcost[(size_t)p])); gR[(size_t)u] = b; }
   };
   // CP-bound-pruned, generation-tagged DFS: does a path root(frm)~>root(to) exist (excluding the
   // direct frm->to edge, which the caller removes temporarily)?
@@ -1581,47 +1721,145 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     }
     return false;
   };
+  uint32_t scoreCacheGeneration = 1;
+  std::vector<uint32_t> incomingScoreCacheGeneration((size_t)n, 0), outgoingScoreCacheGeneration((size_t)n, 0);
+  std::vector<int> incomingBestRoot((size_t)n, -1), incomingSecondRoot((size_t)n, -1), outgoingBestRoot((size_t)n, -1), outgoingSecondRoot((size_t)n, -1);
+  std::vector<uint64_t> incomingBestValue((size_t)n, 0), incomingSecondValue((size_t)n, 0), outgoingBestValue((size_t)n, 0), outgoingSecondValue((size_t)n, 0);
+  auto refreshBestTwo = [&](int node, const std::set<int>& relations, const std::vector<uint64_t>& cp,
+                            std::vector<uint32_t>& cacheGeneration, std::vector<int>& bestRoot,
+                            std::vector<int>& secondRoot, std::vector<uint64_t>& bestValue,
+                            std::vector<uint64_t>& secondValue) {
+    if (cacheGeneration[(size_t)node] == scoreCacheGeneration) return;
+    cacheGeneration[(size_t)node] = scoreCacheGeneration;
+    bestRoot[(size_t)node] = -1; secondRoot[(size_t)node] = -1;
+    bestValue[(size_t)node] = 0; secondValue[(size_t)node] = 0;
+    for (int relation : relations) {
+      int root = find(relation);
+      if (root == node || root == bestRoot[(size_t)node] || root == secondRoot[(size_t)node]) continue;
+      uint64_t value = cp[(size_t)root] + stepCost(gcost[(size_t)root]);
+      if (bestRoot[(size_t)node] < 0 || value > bestValue[(size_t)node] || (value == bestValue[(size_t)node] && root < bestRoot[(size_t)node])) {
+        secondRoot[(size_t)node] = bestRoot[(size_t)node]; secondValue[(size_t)node] = bestValue[(size_t)node];
+        bestRoot[(size_t)node] = root; bestValue[(size_t)node] = value;
+      } else if (secondRoot[(size_t)node] < 0 || value > secondValue[(size_t)node] || (value == secondValue[(size_t)node] && root < secondRoot[(size_t)node])) {
+        secondRoot[(size_t)node] = root; secondValue[(size_t)node] = value;
+      }
+    }
+  };
+  auto incomingWithout = [&](int node, int excluded) -> uint64_t {
+    refreshBestTwo(node, gP[(size_t)node], gR, incomingScoreCacheGeneration, incomingBestRoot, incomingSecondRoot, incomingBestValue, incomingSecondValue);
+    return incomingBestRoot[(size_t)node] == excluded ? incomingSecondValue[(size_t)node] : incomingBestValue[(size_t)node];
+  };
+  auto outgoingWithout = [&](int node, int excluded) -> uint64_t {
+    refreshBestTwo(node, gS[(size_t)node], gF, outgoingScoreCacheGeneration, outgoingBestRoot, outgoingSecondRoot, outgoingBestValue, outgoingSecondValue);
+    return outgoingBestRoot[(size_t)node] == excluded ? outgoingSecondValue[(size_t)node] : outgoingBestValue[(size_t)node];
+  };
+  auto siblingScore = [&](int a, int b) -> uint64_t {
+    return std::max(gF[(size_t)a], gF[(size_t)b]) + std::max(gR[(size_t)a], gR[(size_t)b])
+        + stepCost(gcost[(size_t)a] + gcost[(size_t)b]);
+  };
   auto edgeScore = [&](int a, int b) -> uint64_t {
-    return std::max(gF[(size_t)a], gF[(size_t)b]) + std::max(gR[(size_t)a], gR[(size_t)b]) + mtDenseStepCostV(gcost[(size_t)a] + gcost[(size_t)b]);
+    if (!v3Policy && !edgeCpWithout) {
+      return std::max(gF[(size_t)a], gF[(size_t)b]) + std::max(gR[(size_t)a], gR[(size_t)b])
+          + stepCost(gcost[(size_t)a] + gcost[(size_t)b]);
+    }
+    const uint64_t mergedFromStart = std::max(gR[(size_t)a], incomingWithout(b, a));
+    const uint64_t mergedToEnd = std::max(outgoingWithout(a, b), gF[(size_t)b]);
+    return mergedFromStart + mergedToEnd + stepCost(gcost[(size_t)a] + gcost[(size_t)b]);
+  };
+  auto candidateScore = [&](int a, int b, bool sibling) -> uint64_t {
+    uint64_t score = sibling ? siblingScore(a, b) : edgeScore(a, b);
+    if (v3Policy && !sibling && score < std::numeric_limits<uint64_t>::max()) ++score;
+    return score;
   };
   struct Cand { uint64_t score; int a; int b; bool sibling; };
-  struct Cmp { bool operator()(const Cand&x,const Cand&y) const { return x.score > y.score; } };
-  std::priority_queue<Cand, std::vector<Cand>, Cmp> pq;
-  auto pushEdges = [&](int r) {
-    for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) pq.push({edgeScore(r, rs), r, rs, false}); }
+  struct Cmp {
+    bool v3Policy = false;
+    bool operator()(const Cand& x, const Cand& y) const {
+      if (x.score != y.score) return x.score > y.score;
+      if (!v3Policy) return false;
+      if (x.sibling != y.sibling) return !x.sibling && y.sibling;
+      if (x.a != y.a) return x.a > y.a;
+      return x.b > y.b;
+    }
   };
-  // Sibling candidates: two groups sharing a common predecessor (independent -> cycle-free to merge).
-  // Verilator's SiblingMC. These bypass the diamond-mesh edge-cycle wall (v237/v248 saw ~1M edge
-  // cycle rejections). Seed from each group's successors' shared-parent sets, bounded per node.
-  auto pushSiblings = [&](int r) {
-    // siblings = other successors of r's predecessors (share a common predecessor -> independent).
-    int emitted = 0; const int sibCap = 8;
-    for (int p : gP[(size_t)r]) { int rp = find(p);
-      for (int s2 : gS[(size_t)rp]) { int rs = find(s2);
-        if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({edgeScore(r, rs), r, rs, true}); if (++ emitted >= sibCap) return; } } }
+  std::priority_queue<Cand, std::vector<Cand>, Cmp> pq(Cmp{v3Policy});
+  auto pushEdges = [&](int r) {
+    for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) pq.push({candidateScore(r, rs, false), r, rs, false}); }
+  };
+  // The legacy heuristic pairs a node with successors of each predecessor.  The V3 policy
+  // uses V3OrderParallel's bounded sorted sibling pairing in both adjacency directions.
+  auto pushSiblings = [&](int r, bool exhaustive) {
+    if (!v3Policy) {
+      int emitted = 0; const int sibCap = 8;
+      for (int p : gP[(size_t)r]) { int rp = find(p);
+        for (int s2 : gS[(size_t)rp]) { int rs = find(s2);
+          if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({candidateScore(r, rs, true), r, rs, true}); if (++ emitted >= sibCap) return; } } }
+      return;
+    }
+    const auto addPairs = [&](const std::set<int>& relatives, bool useForwardCp) {
+      constexpr size_t siblingEdgeLimit = 72;
+      constexpr size_t nonExhaustivePairs = 3;
+      std::vector<int> neighbors;
+      neighbors.reserve(std::min(siblingEdgeLimit, relatives.size()));
+      for (int relative : relatives) {
+        int root = find(relative);
+        if (root == r || std::find(neighbors.begin(), neighbors.end(), root) != neighbors.end()) continue;
+        neighbors.push_back(root);
+        if (neighbors.size() == siblingEdgeLimit) break;
+      }
+      std::sort(neighbors.begin(), neighbors.end(), [&](int lhs, int rhs) {
+        const uint64_t lhsCp = (useForwardCp ? gF[(size_t)lhs] : gR[(size_t)lhs]) + gcost[(size_t)lhs];
+        const uint64_t rhsCp = (useForwardCp ? gF[(size_t)rhs] : gR[(size_t)rhs]) + gcost[(size_t)rhs];
+        return lhsCp != rhsCp ? lhsCp < rhsCp : lhs < rhs;
+      });
+      const size_t pairEnd = exhaustive || neighbors.size() <= 2 * nonExhaustivePairs
+          ? neighbors.size() & ~size_t{1}
+          : 2 * nonExhaustivePairs;
+      for (size_t i = 0; i < pairEnd; i += 2) {
+        int a = neighbors[i];
+        int b = neighbors[i + 1];
+        if (gw0[(size_t)a] != gw0[(size_t)b] || gcost[(size_t)a] + gcost[(size_t)b] > perMTaskCap) continue;
+        pq.push({candidateScore(a, b, true), a, b, true});
+      }
+    };
+    addPairs(gP[(size_t)r], false);
+    addPairs(gS[(size_t)r], true);
   };
   auto rebuildPQ = [&]() {
     // Rebuild the candidate heap from scratch over all live roots with LIVE edgeScore. Called after
     // recomputeCP() so every candidate is scored against the freshly-recomputed critical paths
     // (a recompute can LOWER a CP, burying a now-cheaper edge under a stale-high key that on-pop
     // revalidation alone could never surface). O(V+E) per call, amortized by recomputeEvery.
-    std::priority_queue<Cand, std::vector<Cand>, Cmp> empty; pq.swap(empty);
-    for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
+    std::priority_queue<Cand, std::vector<Cand>, Cmp> empty(Cmp{v3Policy}); pq.swap(empty);
+    for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u, true); }
   };
-  for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
-  int live = n; uint64_t merges = 0, cycRej = 0, sibMerges = 0;
-  while (live > maxMTasks && !pq.empty()) {
+  for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u, true); }
+  int live = n; uint64_t merges = 0, cycRej = 0, sibMerges = 0, entryExitSkips = 0, scoreLimitEscalations = 0;
+  while (!pq.empty()) {
+    if (!v3Policy && live <= maxMTasks) break;
     Cand c = pq.top(); pq.pop();
     int a = find(c.a), b = find(c.b);
     if (a == b || gw0[(size_t)a] != gw0[(size_t)b]) continue;
     if (gcost[(size_t)a] + gcost[(size_t)b] > perMTaskCap) continue;
+    if (v3Policy && c.score > scoreLimit) {
+      if (live <= maxMTasks) break;
+      const uint64_t limitMax = std::numeric_limits<uint64_t>::max();
+      scoreLimit = scoreLimit > limitMax / 120 * 100
+          ? limitMax
+          : std::max(scoreLimit + 1, (scoreLimit * 120) / 100);
+      ++ scoreLimitEscalations;
+      pq.push(c);
+      continue;
+    }
     if (propagateCp) {
       // Lazy stale-key check: gcost grows within a recompute window, so a candidate's stored score
-      // may no longer equal the live edgeScore. If it drifted, re-push at the live score and skip;
-      // this keeps pops in true-live-CP order (paired with the rebuildPQ after each recomputeCP,
-      // which repairs CP DECREASES that a re-push cannot surface).
-      uint64_t liveScore = edgeScore(a, b);
+      // may no longer equal the live score.  The periodic full rebuild also repairs score decreases.
+      uint64_t liveScore = candidateScore(a, b, c.sibling);
       if (liveScore != c.score) { pq.push({liveScore, a, b, c.sibling}); continue; }
+    }
+    if (v3Policy && !c.sibling && (a == find(entryMTask) || b == find(exitMTask))) {
+      ++entryExitSkips;
+      continue;
     }
     bool cyc;
     if (c.sibling) {
@@ -1644,18 +1882,23 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     for (int s2 : gS[(size_t)b]) { int rs = find(s2); if (rs != a) { gS[(size_t)a].insert(rs); gP[(size_t)rs].insert(a); } }
     for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) { gP[(size_t)a].insert(rp); gS[(size_t)rp].insert(a); } }
     gS[(size_t)a].erase(a); gP[(size_t)a].erase(a); gS[(size_t)a].erase(b); gP[(size_t)a].erase(b);
-    live --; merges ++; if (c.sibling) sibMerges ++;
-    if (propagateCp && (merges % (uint64_t)recomputeEvery) == 0) { recomputeCP(); rebuildPQ(); }
-    pushEdges(a); if (sibEnabled) pushSiblings(a);
-    for (int p : gP[(size_t)a]) { int rp = find(p); if (rp != a && gw0[(size_t)rp] == gw0[(size_t)a] && gcost[(size_t)rp] + gcost[(size_t)a] <= perMTaskCap) pq.push({edgeScore(rp, a), rp, a, false}); }
+    live --; merges ++; ++scoreCacheGeneration; if (c.sibling) sibMerges ++;
+    if (propagateCp && (merges % (uint64_t)recomputeEvery) == 0) { recomputeCP(); ++scoreCacheGeneration; rebuildPQ(); }
+    pushEdges(a); if (sibEnabled) pushSiblings(a, true);
+    int siblingRefreshes = 0;
+    for (int p : gP[(size_t)a]) {
+      int rp = find(p);
+      if (rp != a && gw0[(size_t)rp] == gw0[(size_t)a] && gcost[(size_t)rp] + gcost[(size_t)a] <= perMTaskCap) pq.push({candidateScore(rp, a, false), rp, a, false});
+      if (v3Policy && sibEnabled && rp != a && siblingRefreshes ++ < 72) pushSiblings(rp, false);
+    }
   }
   // Materialize groups in Kahn topo order for monotone ids.
-  std::map<int,int> rootIdx; for (int i = 0; i < n; i ++) { int r = find(i); if (!rootIdx.count(r)) rootIdx[r] = (int)rootIdx.size(); }
+  std::map<int,int> rootIdx; for (int scc = 0; scc < realN; ++scc) { int r = find(denseNode(scc)); if (!rootIdx.count(r)) rootIdx[r] = (int)rootIdx.size(); }
   int R = (int)rootIdx.size();
   std::vector<std::set<int>> rS((size_t)R), rP((size_t)R);
-  for (int u = 0; u < n; u ++) { int ru = rootIdx[find(u)]; for (int v : schedule.sccs[(size_t)u].succSccs) { if (v < 0 || v >= n) continue; int rv = rootIdx[find(v)]; if (rv != ru) { rS[(size_t)ru].insert(rv); rP[(size_t)rv].insert(ru); } } }
+  for (int fromScc = 0; fromScc < realN; ++fromScc) { int ru = rootIdx[find(denseNode(fromScc))]; for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) { if (toScc < 0 || toScc >= realN) continue; int rv = rootIdx[find(denseNode(toScc))]; if (rv != ru) { rS[(size_t)ru].insert(rv); rP[(size_t)rv].insert(ru); } } }
   std::vector<int> minScc((size_t)R, INT32_MAX);
-  for (int s : schedule.topoSccOrder) { auto it = rootIdx.find(find(s)); if (it != rootIdx.end()) minScc[(size_t)it->second] = std::min(minScc[(size_t)it->second], s); }
+  for (int s : schedule.topoSccOrder) { auto it = rootIdx.find(find(denseNode(s))); if (it != rootIdx.end()) minScc[(size_t)it->second] = std::min(minScc[(size_t)it->second], s); }
   std::vector<int> indeg((size_t)R, 0); for (int i = 0; i < R; i ++) indeg[(size_t)i] = (int)rP[(size_t)i].size();
   auto cmp = [&](int a, int b){ if (minScc[(size_t)a] != minScc[(size_t)b]) return minScc[(size_t)a] > minScc[(size_t)b]; return a > b; };
   std::priority_queue<int, std::vector<int>, decltype(cmp)> rq(cmp);
@@ -1664,12 +1907,12 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   while (!rq.empty()) { int u = rq.top(); rq.pop(); rootOrder[(size_t)u] = nextId ++; for (int v : rS[(size_t)u]) if (-- indeg[(size_t)v] == 0) rq.push(v); }
   Assert(nextId == R, "verilator contraction cyclic MTask graph (%d/%d)", nextId, R);
   mtasks.assign((size_t)R, MtDenseMTask());
-  std::vector<int> sccToMTask((size_t)n, -1);
-  for (int s : schedule.topoSccOrder) { auto it = rootIdx.find(find(s)); if (it == rootIdx.end()) continue; int mi = rootOrder[(size_t)it->second]; MtDenseMTask& mt = mtasks[(size_t)mi]; mt.sccIds.push_back(s); mt.staticCost += schedule.sccs[(size_t)s].staticCost; mt.schedCost += (int)sc(s); mt.taskCount += (int)schedule.sccs[(size_t)s].cppIds.size(); mt.workerZeroOnly = mt.workerZeroOnly || schedule.sccs[(size_t)s].workerZeroOnly; sccToMTask[(size_t)s] = mi; }
+  std::vector<int> sccToMTask((size_t)realN, -1);
+  for (int s : schedule.topoSccOrder) { auto it = rootIdx.find(find(denseNode(s))); if (it == rootIdx.end()) continue; int mi = rootOrder[(size_t)it->second]; MtDenseMTask& mt = mtasks[(size_t)mi]; mt.sccIds.push_back(s); mt.staticCost += schedule.sccs[(size_t)s].staticCost; mt.schedCost += (int)sc(s); mt.taskCount += (int)schedule.sccs[(size_t)s].cppIds.size(); mt.workerZeroOnly = mt.workerZeroOnly || schedule.sccs[(size_t)s].workerZeroOnly; sccToMTask[(size_t)s] = mi; }
   std::vector<std::set<int>> predSets((size_t)R), succSets((size_t)R);
-  for (int fromScc = 0; fromScc < n; fromScc ++) { int fm = sccToMTask[(size_t)fromScc]; if (fm < 0) continue; for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) { int tm = (toScc >= 0 && toScc < n) ? sccToMTask[(size_t)toScc] : -1; if (tm < 0 || tm == fm) continue; succSets[(size_t)fm].insert(tm); predSets[(size_t)tm].insert(fm); } }
+  for (int fromScc = 0; fromScc < realN; ++fromScc) { int fm = sccToMTask[(size_t)fromScc]; if (fm < 0) continue; for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) { int tm = (toScc >= 0 && toScc < realN) ? sccToMTask[(size_t)toScc] : -1; if (tm < 0 || tm == fm) continue; succSets[(size_t)fm].insert(tm); predSets[(size_t)tm].insert(fm); } }
   for (int mi = 0; mi < R; mi ++) { mtasks[(size_t)mi].predMTasks.assign(predSets[(size_t)mi].begin(), predSets[(size_t)mi].end()); mtasks[(size_t)mi].succMTasks.assign(succSets[(size_t)mi].begin(), succSets[(size_t)mi].end()); }
-  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu maxMTasks=%d\n", n, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, maxMTasks);
+  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu entryExitSkips=%llu maxMTasks=%d v3Policy=%d scoreLimit=%llu escalations=%llu\n", realN, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, (unsigned long long)entryExitSkips, maxMTasks, v3Policy ? 1 : 0, (unsigned long long)scoreLimit, (unsigned long long)scoreLimitEscalations);
   return mtasks;
 }
 
@@ -1973,6 +2216,324 @@ static std::vector<int> mtBuildDenseOwnerBankVertexSlots(const std::vector<int>&
   return slotByMTask;
 }
 
+struct MtDenseOwnerReadyTokenProvenance {
+  int readySlot = -1;
+  int producerMTask = -1;
+  int producerOwner = -1;
+  int consumerMTask = -1;
+  int consumerOwner = -1;
+};
+
+struct MtDenseOwnerReadyLayout {
+  int edgeCount = 0;
+  int tokenCount = 0;
+  int physicalSlotCount = 0;
+  int pairBankCount = 0;
+  std::vector<MtDenseOwnerReadyTokenProvenance> tokenProvenanceByLogicalToken;
+  std::vector<int> logicalTokenByPhysicalSlot;
+  std::vector<std::vector<int>> waitSlotsByMTask;
+  std::vector<std::vector<int>> storeSlotsByMTask;
+};
+
+static MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
+    const std::vector<std::vector<int>>& runtimeSuccs,
+    const std::vector<int>& assignment,
+    int threadCount) {
+  const int nMTasks = static_cast<int>(runtimeSuccs.size());
+  Assert(threadCount > 0, "dense owner-ready layout requires at least one thread");
+  Assert(static_cast<int>(assignment.size()) == nMTasks,
+         "dense owner-ready layout assignment size %zu does not match MTask count %d",
+         assignment.size(), nMTasks);
+
+  // Fixed workers execute their assigned MTasks in ascending id order. Record that
+  // order explicitly so the selected writer is tied to the actual emitted order.
+  std::vector<int> ownerOrdinal((size_t)nMTasks, -1);
+  for (int owner = 0; owner < threadCount; owner ++) {
+    int ordinal = 0;
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+      Assert(assignment[(size_t)mtaskId] >= 0 && assignment[(size_t)mtaskId] < threadCount,
+             "dense owner-ready MTask %d has invalid owner %d for %d threads",
+             mtaskId, assignment[(size_t)mtaskId], threadCount);
+      if (assignment[(size_t)mtaskId] == owner) ownerOrdinal[(size_t)mtaskId] = ordinal ++;
+    }
+  }
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+    Assert(ownerOrdinal[(size_t)mtaskId] >= 0,
+           "dense owner-ready MTask %d is absent from fixed owner order", mtaskId);
+  }
+
+  // One token represents all reduced edges from one producer owner to one
+  // destination. The last such producer in fixed-owner order publishes it.
+  std::map<std::pair<int, int>, std::vector<int>> sourcesByDestinationOwner;
+  int edgeCount = 0;
+  for (int source = 0; source < nMTasks; source ++) {
+    int previousDestination = -1;
+    for (int destination : runtimeSuccs[(size_t)source]) {
+      Assert(destination >= 0 && destination < nMTasks,
+             "dense owner-ready edge %d -> %d has invalid destination", source, destination);
+      Assert(destination > source,
+             "dense owner-ready edge %d -> %d is not forward in fixed MTask order",
+             source, destination);
+      Assert(destination > previousDestination,
+             "dense owner-ready successors for MTask %d are not unique ascending ids", source);
+      previousDestination = destination;
+      const int producerOwner = assignment[(size_t)source];
+      const int consumerOwner = assignment[(size_t)destination];
+      Assert(producerOwner != consumerOwner,
+             "dense owner-ready edge %d -> %d is not cross-thread (%d)",
+             source, destination, producerOwner);
+      sourcesByDestinationOwner[std::make_pair(destination, producerOwner)].push_back(source);
+      edgeCount ++;
+    }
+  }
+
+  struct Group {
+    int destination = -1;
+    int producerOwner = -1;
+    int consumerOwner = -1;
+    int lastSource = -1;
+    int slot = -1;
+    int logicalToken = -1;
+    std::vector<int> sources;
+  };
+  std::vector<Group> groups;
+  int groupedEdgeCount = 0;
+  for (const auto& entry : sourcesByDestinationOwner) {
+    Group group;
+    group.destination = entry.first.first;
+    group.producerOwner = entry.first.second;
+    group.consumerOwner = assignment[(size_t)group.destination];
+    group.sources = entry.second;
+    Assert(!group.sources.empty(),
+           "dense owner-ready group destination %d producer %d is empty",
+           group.destination, group.producerOwner);
+    int previousOrdinal = -1;
+    for (int source : group.sources) {
+      Assert(assignment[(size_t)source] == group.producerOwner,
+             "dense owner-ready group source %d owner %d does not match producer %d",
+             source, assignment[(size_t)source], group.producerOwner);
+      Assert(ownerOrdinal[(size_t)source] > previousOrdinal,
+             "dense owner-ready group destination %d producer %d is not in fixed-owner order",
+             group.destination, group.producerOwner);
+      previousOrdinal = ownerOrdinal[(size_t)source];
+      groupedEdgeCount ++;
+    }
+    group.lastSource = group.sources.back();
+    Assert(assignment[(size_t)group.lastSource] == group.producerOwner,
+           "dense owner-ready last source %d has wrong owner", group.lastSource);
+    for (int source : group.sources) {
+      Assert(ownerOrdinal[(size_t)source] <= ownerOrdinal[(size_t)group.lastSource],
+             "dense owner-ready source %d follows selected last source %d",
+             source, group.lastSource);
+    }
+    group.logicalToken = static_cast<int>(groups.size());
+    groups.push_back(group);
+  }
+  Assert(groupedEdgeCount == edgeCount,
+         "dense owner-ready groups cover %d of %d reduced edges", groupedEdgeCount, edgeCount);
+
+  std::map<std::pair<int, int>, std::vector<int>> groupsByOwnerPair;
+  for (int groupId = 0; groupId < static_cast<int>(groups.size()); groupId ++) {
+    const Group& group = groups[(size_t)groupId];
+    groupsByOwnerPair[std::make_pair(group.producerOwner, group.consumerOwner)].push_back(groupId);
+  }
+
+  MtDenseOwnerReadyLayout layout;
+  layout.edgeCount = edgeCount;
+  layout.tokenCount = static_cast<int>(groups.size());
+  layout.pairBankCount = static_cast<int>(groupsByOwnerPair.size());
+  layout.waitSlotsByMTask.assign((size_t)nMTasks, std::vector<int>());
+  layout.storeSlotsByMTask.assign((size_t)nMTasks, std::vector<int>());
+  auto alignCacheLine = [](int slot) { return (slot + 63) & ~63; };
+  int nextSlot = 0;
+  std::vector<std::tuple<int, int, int, int>> bankRanges;
+  for (const auto& bank : groupsByOwnerPair) {
+    const int producerOwner = bank.first.first;
+    const int consumerOwner = bank.first.second;
+    Assert(producerOwner != consumerOwner,
+           "dense owner-ready pair bank unexpectedly aliases owner %d", producerOwner);
+    nextSlot = alignCacheLine(nextSlot);
+    const int bankBegin = nextSlot;
+    Assert((bankBegin & 63) == 0,
+           "dense owner-ready pair bank %d -> %d does not start on 64-byte boundary",
+           producerOwner, consumerOwner);
+    for (int groupId : bank.second) {
+      Group& group = groups[(size_t)groupId];
+      Assert(group.slot < 0, "dense owner-ready group %d received duplicate slots", groupId);
+      Assert(group.producerOwner == producerOwner && group.consumerOwner == consumerOwner,
+             "dense owner-ready group %d escaped pair bank %d -> %d",
+             groupId, producerOwner, consumerOwner);
+      group.slot = nextSlot ++;
+    }
+    const int bankEnd = alignCacheLine(nextSlot);
+    Assert((bankEnd & 63) == 0 && bankEnd > bankBegin,
+           "dense owner-ready pair bank %d -> %d has invalid aligned extent [%d,%d)",
+           producerOwner, consumerOwner, bankBegin, bankEnd);
+    for (int groupId : bank.second) {
+      const Group& group = groups[(size_t)groupId];
+      Assert(group.slot >= bankBegin && group.slot + 1 <= bankEnd,
+             "dense owner-ready one-byte slot %d escapes pair bank [%d,%d)",
+             group.slot, bankBegin, bankEnd);
+    }
+    bankRanges.emplace_back(producerOwner, consumerOwner, bankBegin, bankEnd);
+    nextSlot = bankEnd;
+  }
+  for (size_t lhs = 0; lhs < bankRanges.size(); lhs ++) {
+    int lhsBegin = std::get<2>(bankRanges[lhs]);
+    int lhsEnd = std::get<3>(bankRanges[lhs]);
+    for (size_t rhs = lhs + 1; rhs < bankRanges.size(); rhs ++) {
+      int rhsBegin = std::get<2>(bankRanges[rhs]);
+      int rhsEnd = std::get<3>(bankRanges[rhs]);
+      Assert(lhsEnd <= rhsBegin || rhsEnd <= lhsBegin,
+             "dense owner-ready pair banks overlap: [%d,%d) and [%d,%d)",
+             lhsBegin, lhsEnd, rhsBegin, rhsEnd);
+    }
+  }
+
+  layout.tokenProvenanceByLogicalToken.assign(
+      (size_t)layout.tokenCount, MtDenseOwnerReadyTokenProvenance());
+  layout.logicalTokenByPhysicalSlot.assign((size_t)nextSlot, -1);
+  std::set<int> uniqueSlots;
+  for (const Group& group : groups) {
+    Assert(group.slot >= 0, "dense owner-ready group has no physical slot");
+    Assert(uniqueSlots.insert(group.slot).second,
+           "dense owner-ready physical slot %d is shared by multiple groups", group.slot);
+    Assert(group.logicalToken >= 0 && group.logicalToken < layout.tokenCount,
+           "dense owner-ready group has invalid logical token %d", group.logicalToken);
+    Assert(layout.logicalTokenByPhysicalSlot[(size_t)group.slot] < 0,
+           "dense owner-ready physical slot %d aliases logical tokens %d and %d",
+           group.slot, layout.logicalTokenByPhysicalSlot[(size_t)group.slot], group.logicalToken);
+    MtDenseOwnerReadyTokenProvenance& provenance =
+        layout.tokenProvenanceByLogicalToken[(size_t)group.logicalToken];
+    Assert(provenance.readySlot < 0,
+           "dense owner-ready logical token %d has duplicate provenance", group.logicalToken);
+    provenance.readySlot = group.slot;
+    provenance.producerMTask = group.lastSource;
+    provenance.producerOwner = group.producerOwner;
+    provenance.consumerMTask = group.destination;
+    provenance.consumerOwner = group.consumerOwner;
+    layout.logicalTokenByPhysicalSlot[(size_t)group.slot] = group.logicalToken;
+    layout.waitSlotsByMTask[(size_t)group.destination].push_back(group.slot);
+    layout.storeSlotsByMTask[(size_t)group.lastSource].push_back(group.slot);
+  }
+  for (int logicalToken = 0; logicalToken < layout.tokenCount; logicalToken ++) {
+    const MtDenseOwnerReadyTokenProvenance& provenance =
+        layout.tokenProvenanceByLogicalToken[(size_t)logicalToken];
+    Assert(provenance.readySlot >= 0 && provenance.readySlot < nextSlot,
+           "dense owner-ready logical token %d has invalid physical slot %d",
+           logicalToken, provenance.readySlot);
+    Assert(layout.logicalTokenByPhysicalSlot[(size_t)provenance.readySlot] == logicalToken,
+           "dense owner-ready logical token %d does not round-trip through slot %d",
+           logicalToken, provenance.readySlot);
+    Assert(provenance.producerMTask >= 0 && provenance.producerMTask < nMTasks
+           && provenance.consumerMTask >= 0 && provenance.consumerMTask < nMTasks
+           && provenance.producerOwner >= 0 && provenance.producerOwner < threadCount
+           && provenance.consumerOwner >= 0 && provenance.consumerOwner < threadCount,
+           "dense owner-ready logical token %d has incomplete provenance", logicalToken);
+    Assert(assignment[(size_t)provenance.producerMTask] == provenance.producerOwner
+           && assignment[(size_t)provenance.consumerMTask] == provenance.consumerOwner,
+           "dense owner-ready logical token %d owner provenance mismatch", logicalToken);
+  }
+  Assert(static_cast<int>(uniqueSlots.size()) == layout.tokenCount,
+         "dense owner-ready unique slot count %zu does not match token count %d",
+         uniqueSlots.size(), layout.tokenCount);
+  int waitTokenCount = 0;
+  int storeTokenCount = 0;
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+    std::vector<int>& waits = layout.waitSlotsByMTask[(size_t)mtaskId];
+    std::vector<int>& stores = layout.storeSlotsByMTask[(size_t)mtaskId];
+    std::sort(waits.begin(), waits.end());
+    std::sort(stores.begin(), stores.end());
+    waitTokenCount += static_cast<int>(waits.size());
+    storeTokenCount += static_cast<int>(stores.size());
+  }
+  Assert(waitTokenCount == layout.tokenCount && storeTokenCount == layout.tokenCount,
+         "dense owner-ready token coverage mismatch: waits=%d stores=%d tokens=%d",
+         waitTokenCount, storeTokenCount, layout.tokenCount);
+  if (nextSlot == 0) nextSlot = 64;
+  layout.logicalTokenByPhysicalSlot.resize((size_t)nextSlot, -1);
+  Assert((nextSlot & 63) == 0,
+         "dense owner-ready physical layout does not end on 64-byte boundary: %d", nextSlot);
+  layout.physicalSlotCount = nextSlot;
+  return layout;
+}
+
+
+struct MtDenseBreakdownWindowWaitLayout {
+  int totalWaitRecords = 0;
+  std::vector<int> laneOffsets;
+};
+
+static MtDenseBreakdownWindowWaitLayout mtBuildDenseBreakdownWindowWaitLayout(
+    const MtDenseOwnerReadyLayout& readyLayout,
+    const std::vector<int>& assignment,
+    int threadCount) {
+  Assert(threadCount > 0, "dense breakdown window requires at least one wait lane");
+  MtDenseBreakdownWindowWaitLayout layout;
+  layout.laneOffsets.assign((size_t)threadCount + 1, 0);
+  for (int mtaskId = 0; mtaskId < static_cast<int>(assignment.size()); mtaskId ++) {
+    const int worker = assignment[(size_t)mtaskId];
+    Assert(worker >= 0 && worker < threadCount,
+           "dense breakdown window MTask %d has invalid owner %d", mtaskId, worker);
+    layout.laneOffsets[(size_t)worker + 1] +=
+        static_cast<int>(readyLayout.waitSlotsByMTask[(size_t)mtaskId].size());
+  }
+  for (int worker = 0; worker < threadCount; worker ++) {
+    layout.laneOffsets[(size_t)worker + 1] += layout.laneOffsets[(size_t)worker];
+  }
+  layout.totalWaitRecords = layout.laneOffsets.back();
+  return layout;
+}
+
+// The all-owner record is 40 bytes.  Round each owner lane to eight records
+// (320 bytes), preserving a 64-byte-aligned base and lane boundary without
+// spending an entire cache line on every record.
+struct MtDenseBreakdownWindowAllOwnerLayout {
+  int recordCount = 0;
+  std::vector<int> laneOffsets;
+  std::vector<int> recordIndexByMTask;
+};
+
+static MtDenseBreakdownWindowAllOwnerLayout mtBuildDenseBreakdownWindowAllOwnerLayout(
+    const std::vector<int>& assignment, int threadCount) {
+  Assert(threadCount > 0, "dense breakdown all-owner layout requires workers");
+  constexpr int kRecordsPerAlignedOwnerLane = 8;
+  MtDenseBreakdownWindowAllOwnerLayout layout;
+  layout.laneOffsets.assign((size_t)threadCount + 1, 0);
+  layout.recordIndexByMTask.assign(assignment.size(), -1);
+  std::vector<int> laneCounts((size_t)threadCount, 0);
+  for (int mtaskId = 0; mtaskId < static_cast<int>(assignment.size()); mtaskId ++) {
+    const int owner = assignment[(size_t)mtaskId];
+    Assert(owner >= 0 && owner < threadCount,
+           "dense breakdown all-owner MTask %d has invalid owner %d", mtaskId, owner);
+    laneCounts[(size_t)owner] += 1;
+  }
+  for (int owner = 0; owner < threadCount; owner ++) {
+    const int unpaddedEnd = layout.laneOffsets[(size_t)owner] + laneCounts[(size_t)owner];
+    layout.laneOffsets[(size_t)owner + 1] =
+        ((unpaddedEnd + kRecordsPerAlignedOwnerLane - 1) / kRecordsPerAlignedOwnerLane)
+        * kRecordsPerAlignedOwnerLane;
+    Assert((layout.laneOffsets[(size_t)owner] % kRecordsPerAlignedOwnerLane) == 0
+           && (layout.laneOffsets[(size_t)owner + 1] % kRecordsPerAlignedOwnerLane) == 0,
+           "dense breakdown all-owner lane %d is not cache-line aligned", owner);
+  }
+  std::vector<int> next(layout.laneOffsets.begin(), layout.laneOffsets.end() - 1);
+  for (int mtaskId = 0; mtaskId < static_cast<int>(assignment.size()); mtaskId ++) {
+    const int owner = assignment[(size_t)mtaskId];
+    const int recordIndex = next[(size_t)owner] ++;
+    Assert(recordIndex >= layout.laneOffsets[(size_t)owner]
+           && recordIndex < layout.laneOffsets[(size_t)owner + 1],
+           "dense breakdown all-owner MTask %d escapes owner %d lane", mtaskId, owner);
+    layout.recordIndexByMTask[(size_t)mtaskId] = recordIndex;
+  }
+  for (int owner = 0; owner < threadCount; owner ++) {
+    Assert(next[(size_t)owner] == layout.laneOffsets[(size_t)owner] + laneCounts[(size_t)owner],
+           "dense breakdown all-owner lane %d fill mismatch", owner);
+  }
+  layout.recordCount = layout.laneOffsets.back();
+  return layout;
+}
+
 static int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& runtimeSuccs,
                                                const std::vector<int>& assignment) {
   const int nMTasks = static_cast<int>(runtimeSuccs.size());
@@ -2032,6 +2593,60 @@ static int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& ru
       else kept.push_back(succ);
     }
     runtimeSuccs[(size_t)from].swap(kept);
+  }
+  return removed;
+}
+
+// V3OrderParallel removes transitive edges on the complete MTask DAG before
+// PackThreads runs.  The existing runtime reduction additionally models worker
+// chains, so it cannot be reused here without changing the static schedule.
+static int mtReduceDenseMTaskEdgesTransitive(std::vector<MtDenseMTask>& mtasks) {
+  const int nMTasks = static_cast<int>(mtasks.size());
+  if (nMTasks <= 1) return 0;
+  const int wordCount = (nMTasks + 63) / 64;
+  std::vector<std::vector<uint64_t>> reachable(
+      (size_t)nMTasks, std::vector<uint64_t>((size_t)wordCount, 0));
+  auto setReachable = [&](int from, int to) {
+    reachable[(size_t)from][(size_t)to >> 6] |= uint64_t{1} << (to & 63);
+  };
+  auto isReachable = [&](int from, int to) {
+    return (reachable[(size_t)from][(size_t)to >> 6] & (uint64_t{1} << (to & 63))) != 0;
+  };
+  for (int from = nMTasks - 1; from >= 0; --from) {
+    for (int succ : mtasks[(size_t)from].succMTasks) {
+      Assert(succ > from && succ < nMTasks,
+             "dense MTask transitive reduction requires topo edge %d->%d", from, succ);
+      setReachable(from, succ);
+      for (int word = 0; word < wordCount; ++word) {
+        reachable[(size_t)from][(size_t)word] |= reachable[(size_t)succ][(size_t)word];
+      }
+    }
+  }
+  int removed = 0;
+  for (int from = 0; from < nMTasks; ++from) {
+    std::vector<int> kept;
+    kept.reserve(mtasks[(size_t)from].succMTasks.size());
+    for (int succ : mtasks[(size_t)from].succMTasks) {
+      bool redundant = false;
+      for (int alternative : mtasks[(size_t)from].succMTasks) {
+        if (alternative != succ && isReachable(alternative, succ)) {
+          redundant = true;
+          break;
+        }
+      }
+      if (redundant) {
+        ++removed;
+      } else {
+        kept.push_back(succ);
+      }
+    }
+    mtasks[(size_t)from].succMTasks.swap(kept);
+  }
+  for (MtDenseMTask& mtask : mtasks) mtask.predMTasks.clear();
+  for (int from = 0; from < nMTasks; ++from) {
+    for (int succ : mtasks[(size_t)from].succMTasks) {
+      mtasks[(size_t)succ].predMTasks.push_back(from);
+    }
   }
   return removed;
 }
@@ -2110,6 +2725,7 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
   return std::make_pair(assignment, makespan);
 }
 
+
 // v243: list-scheduler that returns BOTH the worker assignment AND the schedule order (the
 // sequence in which MTasks are scheduled). Renumbering MTask ids by this order makes the
 // fixed-order runtime (which runs each worker's MTasks in ascending global id) execute them in
@@ -2120,11 +2736,14 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
                                       std::vector<int>& outAssign, std::vector<int>& outOrder) {
   if (threadCount < 1) threadCount = 1;
   const int n = static_cast<int>(mtasks.size());
+  const bool v3Policy = mtUseDenseV3ContractPolicy();
   auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
   outAssign.assign((size_t)n, -1);
   outOrder.clear(); outOrder.reserve((size_t)n);
   std::vector<long long> completion((size_t)n, 0);
   std::vector<long long> busyUntil((size_t)threadCount, 0);
+  std::vector<int> nextOnWorker((size_t)n, -1);
+  std::vector<int> lastOnWorker((size_t)threadCount, -1);
   std::vector<int> remainingPreds((size_t)n, 0);
   std::vector<long long> priority((size_t)n, 0);
   for (int i = 0; i < n; i ++) remainingPreds[(size_t)i] = static_cast<int>(mtasks[(size_t)i].predMTasks.size());
@@ -2152,7 +2771,16 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           if (pred < 0 || pred >= n) continue;
           long long predEnd = completion[(size_t)pred];
           int predWorker = outAssign[(size_t)pred];
-          if (predWorker >= 0 && predWorker != worker) predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
+          if (predWorker >= 0 && predWorker != worker) {
+            predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
+            // V3 PackThreads bounds a cross-thread estimate by the end of the next task
+            // already packed on the predecessor's worker, avoiding a priority inversion.
+            int next = v3Policy ? nextOnWorker[(size_t)pred] : -1;
+            if (next >= 0) {
+              const long long successorEnd = completion[(size_t)next];
+              if (predEnd >= successorEnd && successorEnd > 1) predEnd = successorEnd - 1;
+            }
+          }
           if (predEnd > timeBegin) timeBegin = predEnd;
         }
         if (timeBegin < bestTime ||
@@ -2165,6 +2793,9 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     if (bestMTask < 0) break;
     outAssign[(size_t)bestMTask] = bestWorker;
     completion[(size_t)bestMTask] = bestTime + std::max(1, costOf(mtasks[(size_t)bestMTask]));
+    int previousOnWorker = lastOnWorker[(size_t)bestWorker];
+    if (previousOnWorker >= 0) nextOnWorker[(size_t)previousOnWorker] = bestMTask;
+    lastOnWorker[(size_t)bestWorker] = bestMTask;
     busyUntil[(size_t)bestWorker] = completion[(size_t)bestMTask];
     outOrder.push_back(bestMTask);
     ready[(size_t)bestReadyIndex] = ready.back(); ready.pop_back();
@@ -2173,6 +2804,18 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
       if (-- remainingPreds[(size_t)succ] == 0) ready.push_back(succ);
     }
   }
+  if (v3Policy) {
+    long long makespan = 0;
+    std::vector<long long> workerLoads((size_t)threadCount, 0);
+    for (int mtaskId = 0; mtaskId < n; ++mtaskId) {
+      makespan = std::max(makespan, completion[(size_t)mtaskId]);
+      int worker = outAssign[(size_t)mtaskId];
+      if (worker >= 0 && worker < threadCount) workerLoads[(size_t)worker] += costOf(mtasks[(size_t)mtaskId]);
+    }
+    fprintf(stderr, "[mt-dense-v3-schedule] predicted_makespan=%lld worker_loads=", makespan);
+    for (int worker = 0; worker < threadCount; ++worker) fprintf(stderr, "%s%lld", worker ? "," : "", workerLoads[(size_t)worker]);
+    fprintf(stderr, "\n");
+  }
   // Any unscheduled (shouldn't happen for a DAG) appended in id order.
   if (static_cast<int>(outOrder.size()) != n) {
     std::vector<char> seen((size_t)n, 0);
@@ -2180,7 +2823,6 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     for (int i = 0; i < n; i ++) if (!seen[(size_t)i]) { outOrder.push_back(i); if (outAssign[(size_t)i] < 0) outAssign[(size_t)i] = mtasks[(size_t)i].workerZeroOnly ? 0 : 0; }
   }
 }
-
 static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {
   MtDenseSchedule schedule;
   schedule.codegenEnabled = codegenEnabled;
@@ -2505,17 +3147,22 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
     if (threadCount < 1) threadCount = 1;
 
-    if (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1') {
+    const bool v3Policy = mtUseDenseV3ContractPolicy();
+    if (v3Policy || (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1')) {
       schedule.mtasks = mtBuildDenseMTasksVerilatorContract(schedule, threadCount);
     } else if (mtUseDenseCpContraction()) {
       schedule.mtasks = mtBuildDenseMTasksCpContraction(schedule, threadCount);
     } else {
       schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
     }
-    // executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
+    if (v3Policy) {
+      const int removed = mtReduceDenseMTaskEdgesTransitive(schedule.mtasks);
+      fprintf(stderr, "[mt-dense-v3-policy] removed_full_dag_transitive_edges=%d\n", removed);
+    }
+    // Executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
     // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.
-    bool schedOrder = false;
-    { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_ORDER"); schedOrder = e && e[0] && e[0] != '0'; }
+    bool schedOrder = v3Policy;
+    { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_ORDER"); if (e) schedOrder = e[0] && e[0] != '0'; }
     std::vector<int> schedOrderAssign;
     if (schedOrder && static_cast<int>(schedule.mtasks.size()) > 1) {
       std::vector<int> assignTmp, orderTmp;
@@ -4975,6 +5622,24 @@ void graph::dumpMtScheduleJson() {
       for (int nextCppId : member->nextNeedActivate) {
         if (nextCppId >= 0) activeFanout.insert(nextCppId);
       }
+      if (mtUseActivationEventTraceCodegen()) {
+        for (int nextCppId : member->nextActiveId) {
+          if (nextCppId >= 0) activeFanout.insert(nextCppId);
+        }
+      }
+    }
+    if (mtUseActivationEventTraceCodegen() && super->superType == SUPER_ASYNC_RESET) {
+      SuperNode* resetSourceSuper = nullptr;
+      for (SuperNode* candidate : allReset) {
+        if (candidate->superType == SUPER_ASYNC_RESET && candidate->resetNode == super->resetNode) resetSourceSuper = candidate;
+      }
+      Assert(resetSourceSuper != nullptr, "missing async reset trace fanout source for cppId %d", cppId);
+      for (Node* member : resetSourceSuper->member) {
+        Node* source = member->type == NODE_REG_RESET ? member->getResetSrc() : member;
+        for (Node* next : source->next) {
+          if (next->super->cppId >= 0) activeFanout.insert(next->super->cppId);
+        }
+      }
     }
 
     fprintf(fp, "    {\n");
@@ -5006,6 +5671,9 @@ void graph::dumpMtScheduleJson() {
     fprintf(fp, "      \"active_fanout\": ");
     dumpJsonIntArray(fp, activeFanout);
     fprintf(fp, ",\n");
+    if (mtUseActivationEventTraceCodegen()) {
+      fprintf(fp, "      \"always_active\": %s,\n", isAlwaysActive(cppId) ? "true" : "false");
+    }
 
     fprintf(fp, "      \"boundary\": {\n");
     fprintf(fp, "        \"has_state_update\": %s,\n", boundary.hasStateUpdate ? "true" : "false");
@@ -7858,6 +8526,7 @@ std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBuf
       uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
       if (byteMask == 0) continue;
       s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)0x%lx, __ATOMIC_RELAXED); ", idx + i, ACTIVE_WIDTH, byteMask);
+      if (mtDenseActiveWorklistEmit) s += format("markDenseActiveWorklistWord(%d); ", idx + i);
     }
     return s;
   }
@@ -7881,8 +8550,9 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
   if (mtDenseSparseGateAtomicEmit) {
     if (uniqueId >= 0) {
       // single-byte target word idx, bit set from cond shifted to uniqueId
-      return format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(%s%s), __ATOMIC_RELAXED);",
-                    idx, ACTIVE_WIDTH, cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str());
+      return format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(%s%s), __ATOMIC_RELAXED); %s",
+                    idx, ACTIVE_WIDTH, cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str(),
+                    mtDenseActiveWorklistEmit ? format("markDenseActiveWorklistWord(%d);", idx).c_str() : "");
     }
     std::string s;
     for (int i = 0; i * ACTIVE_WIDTH < 64; i ++) {
@@ -7890,6 +8560,7 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
       if (byteMask == 0) continue;
       s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); ",
                   idx + i, ACTIVE_WIDTH, ACTIVE_WIDTH, cond.c_str(), byteMask);
+      if (mtDenseActiveWorklistEmit) s += format("markDenseActiveWorklistWord(%d); ", idx + i);
     }
     return s;
   }
@@ -7954,6 +8625,7 @@ FILE* graph::genHeaderStart() {
   includeLib(header, "cstdlib", true);
   includeLib(header, "algorithm", true);
   includeLib(header, "atomic", true);
+  if (mtUseActivationEventTraceCodegen()) includeLib(header, "cstddef", true);
   newLine(header);
 
   fprintf(header, "\n// User configuration\n");
@@ -8015,6 +8687,9 @@ void graph::genInterfaceInput(Node* input) {
   activeSet2bitMap(allNext, bitMapInfo, -1);
   for (auto iter : bitMapInfo) {
     emitBodyLock(2, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second)).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+    if (mtUseActivationEventTraceCodegen()) {
+      emitBodyLock(2, "recordMtActivationEvent(-1, (uint32_t)%lu, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_CONDITIONAL);\n", iter.first, ACTIVE_MASK(iter.second));
+    }
   }
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
@@ -8121,6 +8796,46 @@ static void emitActivationDeltaDef(FILE* header, int activeWords) {
           "};\n\n",
           packedActiveWords, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH, ACTIVE_WIDTH,
           ACTIVE_WIDTH, activeWords, ACTIVE_WIDTH, ACTIVE_WIDTH);
+}
+
+static void emitActivationEventTraceDef(FILE* header) {
+  fprintf(header,
+          "enum MtActivationEventKind : uint8_t {\n"
+          "  MT_ACTIVATION_EVENT_CONDITIONAL = 1,\n"
+          "  MT_ACTIVATION_EVENT_UNCONDITIONAL = 2,\n"
+          "  MT_ACTIVATION_EVENT_ACTIVATE_ALL = 3,\n"
+          "  MT_ACTIVATION_EVENT_FRONTIER = 4,\n"
+          "  MT_ACTIVATION_EVENT_CYCLE_END = 5\n"
+          "};\n"
+          "struct MtActivationEventTraceHeader {\n"
+          "  uint8_t magic[8];\n"
+          "  uint16_t version;\n"
+          "  uint16_t headerSize;\n"
+          "  uint16_t activeWidth;\n"
+          "  uint16_t reserved0;\n"
+          "  uint32_t taskCount;\n"
+          "  uint32_t recordSize;\n"
+          "  uint64_t traceStart;\n"
+          "  uint64_t traceCount;\n"
+          "  uint64_t reserved1;\n"
+          "};\n"
+          "struct MtActivationEventTraceRecord {\n"
+          "  uint64_t cycle;\n"
+          "  int32_t sourceCppId;\n"
+          "  uint32_t activeWordBase;\n"
+          "  uint64_t mask;\n"
+          "  MtActivationEventKind kind;\n"
+          "  uint8_t reserved[7];\n"
+          "};\n"
+          "static_assert(sizeof(MtActivationEventTraceHeader) == 48, \"activation-event trace header size\");\n"
+          "static_assert(offsetof(MtActivationEventTraceHeader, version) == 8, \"activation-event trace header layout\");\n"
+          "static_assert(offsetof(MtActivationEventTraceHeader, traceStart) == 24, \"activation-event trace header layout\");\n"
+          "static_assert(offsetof(MtActivationEventTraceHeader, traceCount) == 32, \"activation-event trace header layout\");\n"
+          "static_assert(offsetof(MtActivationEventTraceHeader, reserved1) == 40, \"activation-event trace header layout\");\n"
+          "static_assert(sizeof(MtActivationEventTraceRecord) == 32, \"activation-event trace record size\");\n"
+          "static_assert(offsetof(MtActivationEventTraceRecord, sourceCppId) == 8, \"activation-event trace record layout\");\n"
+          "static_assert(offsetof(MtActivationEventTraceRecord, mask) == 16, \"activation-event trace record layout\");\n"
+          "static_assert(offsetof(MtActivationEventTraceRecord, kind) == 24, \"activation-event trace record layout\");\n\n");
 }
 
 #if defined(DIFFTEST_PER_SIG) && defined(GSIM_DIFF)
@@ -8285,9 +9000,17 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   }
   if (node->isAsyncReset()) {
     Assert(!opt, "invalid opt");
-    if (activeBufferName.empty()) emitBodyLock(indent, "activateAll();\n");
-    else emitBodyLock(indent, "%s.activateAll();\n", activeBufferName.c_str());
+    if (activeBufferName.empty()) {
+      if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) emitBodyLock(indent, "activateAll(%d);\n", mtActivationEventTraceSourceCppId);
+      else emitBodyLock(indent, "activateAll();\n");
+    } else {
+      emitBodyLock(indent, "%s.activateAll();\n", activeBufferName.c_str());
+      if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
+        emitBodyLock(indent, "recordMtActivationEvent(%d, 0, UINT64_MAX, MT_ACTIVATION_EVENT_ACTIVATE_ALL);\n", mtActivationEventTraceSourceCppId);
+      }
+    }
     emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
+    if (mtDenseActiveWorklistEmit && activeBufferName.empty()) emitBodyLock(indent, "markDenseActiveWorklistAll();\n");
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
       std::string flagForOr = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
@@ -8300,11 +9023,35 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
         else emitBodyLock(indent, "__atomic_fetch_or(%s, (uint%d_t)0x%lx, __ATOMIC_RELAXED); // %s\n", addr.c_str(), ACTIVE_WIDTH, ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
       } else if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
       else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      if (mtDenseActiveWorklistEmit && activeBufferName.empty() && accumFlagName.empty()) {
+        emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", node->super->cppId / ACTIVE_WIDTH);
+      }
+      if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
+        if (opt) {
+          emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%d, (-(uint64_t)%s & (uint64_t)0x%lx), MT_ACTIVATION_EVENT_CONDITIONAL);\n",
+                       mtActivationEventTraceSourceCppId, node->super->cppId / ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask));
+        } else {
+          emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%d, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_CONDITIONAL);\n",
+                       mtActivationEventTraceSourceCppId, node->super->cppId / ACTIVE_WIDTH, ACTIVE_MASK(curMask));
+        }
+      }
     }
     for (auto iter : bitMapInfo) {
       auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second), activeBufferName)
                      : updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName);
       emitBodyLock(indent, "%s // %s\n", str.c_str(), ACTIVE_COMMENT(iter.second).c_str());
+      if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
+        if (!opt) {
+          emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%lu, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_CONDITIONAL);\n",
+                       mtActivationEventTraceSourceCppId, iter.first, ACTIVE_MASK(iter.second));
+        } else if (ACTIVE_UNIQUE(iter.second) >= 0) {
+          emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%lu, ((uint64_t)%s << %d), MT_ACTIVATION_EVENT_CONDITIONAL);\n",
+                       mtActivationEventTraceSourceCppId, iter.first, condName.c_str(), ACTIVE_UNIQUE(iter.second));
+        } else {
+          emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%lu, (-(uint64_t)%s & (uint64_t)0x%lx), MT_ACTIVATION_EVENT_CONDITIONAL);\n",
+                       mtActivationEventTraceSourceCppId, iter.first, condName.c_str(), ACTIVE_MASK(iter.second));
+        }
+      }
     }
   #ifdef PERF
     #if ENABLE_ACTIVATOR
@@ -8327,9 +9074,17 @@ void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inSte
   if (ACTIVE_MASK(curMask) != 0) {
     std::string orFlag = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
     emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+    if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
+      emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%d, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_UNCONDITIONAL);\n",
+                   mtActivationEventTraceSourceCppId, node->super->cppId / ACTIVE_WIDTH, ACTIVE_MASK(curMask));
+    }
   }
   for (auto iter : bitMapInfo) {
     emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName).c_str(), ACTIVE_COMMENT(iter.second).c_str());
+    if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
+      emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%lu, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_UNCONDITIONAL);\n",
+                   mtActivationEventTraceSourceCppId, iter.first, ACTIVE_MASK(iter.second));
+    }
   }
 #ifdef PERF
   #if ENABLE_ACTIVATOR
@@ -8453,6 +9208,8 @@ static bool mtActAccEnabled() {
 }
 
 void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation) { // current indent = 2
+  int savedTraceSourceCppId = mtActivationEventTraceSourceCppId;
+  if (emitActivation && !mtActivationEventTraceSuppressed) mtActivationEventTraceSourceCppId = super->cppId;
   bool useAccum = emitActivation && mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
   std::string accumVar;
   if (useAccum) {
@@ -8483,8 +9240,13 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
         if (denseResetIt != super2DenseResetId.end()) denseResetId = denseResetIt->second.second;
         Assert(denseResetId >= 0, "missing dense async reset id for %s", super->resetNode->name.c_str());
         emitBodyLock(indent, "subResetDense%d();\n", denseResetId);
-      } else if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", resetId);
-      else emitBodyLock(indent, "subReset%d(%s);\n", resetId, activeBufferName.c_str());
+      } else if (activeBufferName.empty()) {
+        if (mtUseActivationEventTraceCodegen()) emitBodyLock(indent, "subReset%d(%d);\n", resetId, mtActivationEventTraceSourceCppId);
+        else emitBodyLock(indent, "subReset%d();\n", resetId);
+      } else {
+        if (mtUseActivationEventTraceCodegen()) emitBodyLock(indent, "subReset%d(%s, %d);\n", resetId, activeBufferName.c_str(), mtActivationEventTraceSourceCppId);
+        else emitBodyLock(indent, "subReset%d(%s);\n", resetId, activeBufferName.c_str());
+      }
     }
     /* local nodes definition */
     for (Node* n : super->member) {
@@ -8503,8 +9265,13 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
         if (denseResetIt != super2DenseResetId.end()) denseResetId = denseResetIt->second.second;
         Assert(denseResetId >= 0, "missing dense async reset id for %s", super->resetNode->name.c_str());
         emitBodyLock(indent, "subResetDense%d();\n", denseResetId);
-      } else if (activeBufferName.empty()) emitBodyLock(indent, "subReset%d();\n", resetId);
-      else emitBodyLock(indent, "subReset%d(%s);\n", resetId, activeBufferName.c_str());
+      } else if (activeBufferName.empty()) {
+        if (mtUseActivationEventTraceCodegen()) emitBodyLock(indent, "subReset%d(%d);\n", resetId, mtActivationEventTraceSourceCppId);
+        else emitBodyLock(indent, "subReset%d();\n", resetId);
+      } else {
+        if (mtUseActivationEventTraceCodegen()) emitBodyLock(indent, "subReset%d(%s, %d);\n", resetId, activeBufferName.c_str(), mtActivationEventTraceSourceCppId);
+        else emitBodyLock(indent, "subReset%d(%s);\n", resetId, activeBufferName.c_str());
+      }
     }
     emitBodyLock(indent, "#ifdef ENABLE_LOG\n");
     emitBodyLock(indent ++, "if (cycles >= LOG_START && cycles <= LOG_END) {\n");
@@ -8514,7 +9281,9 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
   }
   if (useAccum) {
     emitBodyLock(indent, "%s |= %s;\n", flagName.c_str(), accumVar.c_str());
+    if (mtDenseActiveWorklistEmit) emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", super->cppId / ACTIVE_WIDTH);
   }
+  mtActivationEventTraceSourceCppId = savedTraceSourceCppId;
 }
 
 
@@ -8569,6 +9338,8 @@ int graph::genActivate(const std::string& subStepSuffix) {
 }
 
 void graph::genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType) {
+  int savedTraceSourceCppId = mtActivationEventTraceSourceCppId;
+  mtActivationEventTraceSourceCppId = super->cppId;
   if (buffered) {
     emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
     genSuperEval(super, "flag", "nextActive", 1, true);
@@ -8577,9 +9348,12 @@ void graph::genMtTaskHelper(SuperNode* super, bool buffered, const std::string& 
     genSuperEval(super, "flag", "", 1, true);
   }
   emitBodyLock(0, "}\n");
+  mtActivationEventTraceSourceCppId = savedTraceSourceCppId;
 }
 
 void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType) {
+  int savedTraceSourceCppId = mtActivationEventTraceSourceCppId;
+  mtActivationEventTraceSourceCppId = super->cppId;
   emitFuncDecl(0, "void S%s::mtRepCutLiteTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileRepCutLiteTaskCallsByCppId[%d].fetch_add(1, std::memory_order_relaxed);\n", super->cppId);
   std::map<Node*, std::string> replacements = mtRepCutReplacementMap(clones);
@@ -8593,11 +9367,13 @@ void graph::genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepC
   genSuperEval(super, "flag", "nextActive", 1, true);
   mtRepCutActiveReplacements.clear();
   emitBodyLock(0, "}\n");
+  mtActivationEventTraceSourceCppId = savedTraceSourceCppId;
 }
 
 void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   markMtRepCutLiteRuntimeApplied(mtTasks);
+  const bool denseBreakdownWindowCodegen = mtUseDenseBreakdownProfileCodegen() && mtUseDenseBreakdownWindowCodegen();
   int shardCount = mtPureBatchShardCount();
   bool useCoarse = globalConfig.MtBatchFormationMode == "coarse";
   bool waitProbeCodegen = mtUseWaitProbeCodegen();
@@ -8714,15 +9490,53 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   // new generation. Every spawned background worker acknowledges each generation,
   // including inactive high IDs, before the main thread reuses payload fields.
   emitFuncDecl(0, "void S%s::mtWorkerPoolPost() {\n", name.c_str());
-  emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(1, "#if !defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) || !GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "#endif\n");
+  } else {
+    emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
+  }
+  if (denseBreakdownWindowCodegen) {
+    emitBodyLock(1, "if (unlikely(mtDenseBreakdownWindowEnabled && mtWorkerPoolJobKind == 7 && cycles >= mtDenseBreakdownWindowStart && cycles - mtDenseBreakdownWindowStart < mtDenseBreakdownWindowCycles)) {\n");
+    emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowRecordedCycles >= mtDenseBreakdownWindowCycles || mtDenseBreakdownWindowRecordedCycles >= kDenseBreakdownWindowMaxCycles)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window cycle record overflow\\n\"); abort(); }\n");
+    emitBodyLock(2, "mtDenseBreakdownWindowCurrentSlot = (int)mtDenseBreakdownWindowRecordedCycles;\n");
+    emitBodyLock(2, "mtDenseBreakdownWindowCycleNumbers[mtDenseBreakdownWindowCurrentSlot] = cycles;\n");
+    emitBodyLock(2, "mtDenseBreakdownWindowEpoch = std::chrono::steady_clock::now();\n");
+    emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowCausalChainMode)) { for (int token = 0; token < kDenseBreakdownWindowCausalTokenCount; token ++) { mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowCurrentSlot][token].releaseBeforeOffsetNs = UINT64_MAX; mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowCurrentSlot][token].releaseAfterOffsetNs = UINT64_MAX; } }\n");
+    emitBodyLock(2, "mtDenseBreakdownWindowRecordedCycles += 1;\n");
+    emitBodyLock(1, "} else {\n");
+    emitBodyLock(2, "mtDenseBreakdownWindowCurrentSlot = -1;\n");
+    emitBodyLock(1, "}\n");
+  }
   emitBodyLock(1, "mtWorkerPoolGeneration.fetch_add(1, std::memory_order_release);\n");
+  if (mtUseWorkerPoolWakeShardCodegen()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
+    emitBodyLock(1, "{ const uint64_t g = mtWorkerPoolGeneration.load(std::memory_order_relaxed);\n");
+    emitBodyLock(1, "  for (int s = 0; s < kMtWorkerPoolWakeShardCount; s ++) mtWorkerPoolGenShard[s].gen.store(g, std::memory_order_release); }\n");
+    emitBodyLock(1, "#endif\n");
+  }
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolWaitForDone(int expectedDoneCount) {\n", name.c_str());
   emitBodyLock(1, "expectedDoneCount = mtWorkerPoolThreadCount;\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(1, "const uint8_t expectedParity = static_cast<uint8_t>(mtWorkerPoolGeneration.load(std::memory_order_acquire) & 1);\n");
+    emitBodyLock(1, "while (true) {\n");
+    emitBodyLock(2, "bool allDone = true;\n");
+    emitBodyLock(2, "for (int worker = 0; worker < expectedDoneCount; worker ++) {\n");
+    emitBodyLock(3, "if (mtWorkerPoolDoneFlags[(size_t)worker].parity.load(std::memory_order_acquire) != expectedParity) { allDone = false; break; }\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "if (allDone) break;\n");
+    emitBodyLock(2, "mtWorkerPoolPause();\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "#else\n");
+  }
   emitBodyLock(1, "while (mtWorkerPoolDoneCount.load(std::memory_order_acquire) < expectedDoneCount) {\n");
   emitBodyLock(2, "mtWorkerPoolPause();\n");
   emitBodyLock(1, "}\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) emitBodyLock(1, "#endif\n");
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolLoop(int worker) {\n", name.c_str());
@@ -8730,11 +9544,24 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   // post cannot race a late-start worker that has not captured the baseline generation.
   emitBodyLock(1, "uint64_t seenGeneration = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
   emitBodyLock(1, "mtWorkerPoolReadyCount.fetch_add(1, std::memory_order_release);\n");
+  if (mtUseWorkerPoolWakeShardCodegen()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
+    emitBodyLock(1, "int mtWakeShard = worker / kMtWorkerPoolWakeShardStride; if (mtWakeShard >= kMtWorkerPoolWakeShardCount) mtWakeShard = kMtWorkerPoolWakeShardCount - 1;\n");
+    emitBodyLock(1, "#endif\n");
+  }
   emitBodyLock(1, "while (true) {\n");
   emitBodyLock(2, "uint64_t generation = seenGeneration;\n");
   emitBodyLock(2, "while (true) {\n");
   emitBodyLock(3, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
-  emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
+  if (mtUseWorkerPoolWakeShardCodegen()) {
+    emitBodyLock(3, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
+    emitBodyLock(3, "generation = mtWorkerPoolGenShard[mtWakeShard].gen.load(std::memory_order_acquire);\n");
+    emitBodyLock(3, "#else\n");
+    emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
+    emitBodyLock(3, "#endif\n");
+  } else {
+    emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
+  }
   emitBodyLock(3, "if (generation != seenGeneration) break;\n");
   emitBodyLock(3, "mtWorkerPoolPause();\n");
   emitBodyLock(2, "}\n");
@@ -8742,7 +9569,15 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
   emitBodyLock(2, "const int workerCount = mtWorkerPoolCurrentWorkerCount;\n");
   emitBodyLock(2, "if (worker >= workerCount) {\n");
-  emitBodyLock(3, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(3, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(3, "mtWorkerPoolDoneFlags[(size_t)(worker - 1)].parity.store(static_cast<uint8_t>(seenGeneration & 1), std::memory_order_release);\n");
+    emitBodyLock(3, "#else\n");
+    emitBodyLock(3, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
+    emitBodyLock(3, "#endif\n");
+  } else {
+    emitBodyLock(3, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
+  }
   emitBodyLock(3, "continue;\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "const int chunkBegin = mtWorkerPoolChunks[(size_t)worker].begin;\n");
@@ -8785,7 +9620,15 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(3, "mtRunPureBatchWorkerRange(worker, chunkBegin, chunkEnd);\n");
     emitBodyLock(2, "}\n");
   }
-  emitBodyLock(2, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(2, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(2, "mtWorkerPoolDoneFlags[(size_t)(worker - 1)].parity.store(static_cast<uint8_t>(seenGeneration & 1), std::memory_order_release);\n");
+    emitBodyLock(2, "#else\n");
+    emitBodyLock(2, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
+    emitBodyLock(2, "#endif\n");
+  } else {
+    emitBodyLock(2, "mtWorkerPoolDoneCount.fetch_add(1, std::memory_order_release);\n");
+  }
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
 
@@ -8795,6 +9638,13 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "mtWorkerPoolThreadCount = mtConfiguredWorkerCount - 1;\n");
   emitBodyLock(1, "mtWorkerPoolReadyCount.store(0, std::memory_order_relaxed);\n");
   emitBodyLock(1, "mtWorkerPoolChunks.assign((size_t)mtConfiguredWorkerCount, MtWorkerPoolChunk{0, 0});\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(1, "delete[] mtWorkerPoolDoneFlags;\n");
+    emitBodyLock(1, "mtWorkerPoolDoneFlags = new MtWorkerPoolDoneFlag[(size_t)mtWorkerPoolThreadCount];\n");
+    emitBodyLock(1, "for (int worker = 0; worker < mtWorkerPoolThreadCount; worker ++) mtWorkerPoolDoneFlags[(size_t)worker].parity.store(0, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "#endif\n");
+  }
   emitBodyLock(1, "mtWorkerDeltas.resize((size_t)mtConfiguredWorkerCount);\n");
   emitBodyLock(1, "mtWorkerFlags.resize((size_t)mtConfiguredWorkerCount);\n");
   if (useCoarse) {
@@ -8831,10 +9681,10 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "std::thread& t = mtWorkerPoolThreads.back();\n");
   emitBodyLock(2, "#ifdef __linux\n");
   emitBodyLock(2, "if (!mtAllowedCpus.empty()) {\n");
-  emitBodyLock(3, "int mtCpuIdx = (mtCpuAffinityBase + worker - 1) % (int)mtAllowedCpus.size();\n");
+  emitBodyLock(3, "int mtCpu = mtAllowedCpus[(mtCpuAffinityBase + worker - 1) %% (int)mtAllowedCpus.size()];\n");
   emitBodyLock(3, "cpu_set_t mtCpuset;\n");
   emitBodyLock(3, "CPU_ZERO(&mtCpuset);\n");
-  emitBodyLock(3, "CPU_SET(mtAllowedCpus[mtCpuIdx], &mtCpuset);\n");
+  emitBodyLock(3, "CPU_SET(mtCpu, &mtCpuset);\n");
   emitBodyLock(3, "pthread_setaffinity_np(t.native_handle(), sizeof(mtCpuset), &mtCpuset);\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "#endif\n");
@@ -10579,6 +11429,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
               } else {
                 emitBodyLock(taskIndent, "mtTask%d(coarseInlineFlag%d_%d);\n", cppId, idx, word);
               }
+              if (mtUseActivationEventTraceCodegen()) emitBodyLock(taskIndent, "recordMtProfileDynamicTraceTask(%d);\n", cppId);
             } else {
               emitBodyLock(taskIndent ++, "if (mtProfileEnabled) {\n");
               emitBodyLock(taskIndent, "std::chrono::steady_clock::time_point mtProfileTaskBegin = std::chrono::steady_clock::now();\n");
@@ -10931,6 +11782,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
         } else {
           emitBodyLock(indent, "mtTask%d(%s);\n", idx, flagName.c_str());
         }
+        if (mtUseActivationEventTraceCodegen()) emitBodyLock(indent, "recordMtProfileDynamicTraceTask(%d);\n", idx);
       } else {
       emitBodyLock(indent ++, "{\n");
       emitBodyLock(indent, "if (mtProfileEnabled) {\n");
@@ -10995,8 +11847,14 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
                                 globalConfig.MtHelperMode == "mt-level-dispatch")
                                  ? "ActivationDelta" : "ActiveBuffer";
   std::string resetFuncName = format("subReset%s%d", nameSuffix.c_str(), resetId);
-  if (buffered) emitBodyLock(indent ++, "void S%s::%s(%s &nextActive){ // %s reset\n", name.c_str(), resetFuncName.c_str(), activeSinkType.c_str(), isUIntReset ? "uint" : "async");
-  else emitBodyLock(indent ++, "void S%s::%s(){ // %s reset\n", name.c_str(), resetFuncName.c_str(), isUIntReset ? "uint" : "async");
+  bool traceSourceParam = mtUseActivationEventTraceCodegen() && emitActivation;
+  if (buffered) {
+    if (traceSourceParam) emitBodyLock(indent ++, "void S%s::%s(%s &nextActive, int32_t traceSourceCppId){ // %s reset\n", name.c_str(), resetFuncName.c_str(), activeSinkType.c_str(), isUIntReset ? "uint" : "async");
+    else emitBodyLock(indent ++, "void S%s::%s(%s &nextActive){ // %s reset\n", name.c_str(), resetFuncName.c_str(), activeSinkType.c_str(), isUIntReset ? "uint" : "async");
+  } else {
+    if (traceSourceParam) emitBodyLock(indent ++, "void S%s::%s(int32_t traceSourceCppId){ // %s reset\n", name.c_str(), resetFuncName.c_str(), isUIntReset ? "uint" : "async");
+    else emitBodyLock(indent ++, "void S%s::%s(){ // %s reset\n", name.c_str(), resetFuncName.c_str(), isUIntReset ? "uint" : "async");
+  }
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
   if (!emitActivation) {
     emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
@@ -11013,14 +11871,26 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
     }
 
     if (allNext.size() > 100) {
-      if (buffered) emitBodyLock(indent, "nextActive.activateAll();\n");
-      else emitBodyLock(indent, "activateAll();\n");
+      if (buffered) {
+        emitBodyLock(indent, "nextActive.activateAll();\n");
+        if (mtUseActivationEventTraceCodegen()) {
+          emitBodyLock(indent, "recordMtActivationEvent(traceSourceCppId, 0, UINT64_MAX, MT_ACTIVATION_EVENT_ACTIVATE_ALL);\n");
+        }
+      } else if (mtUseActivationEventTraceCodegen()) {
+        emitBodyLock(indent, "activateAll(traceSourceCppId);\n");
+      } else {
+        emitBodyLock(indent, "activateAll();\n");
+      }
     }
     else {
       std::map<uint64_t, ActiveType> bitMapInfo;
       activeSet2bitMap(allNext, bitMapInfo, -1);
       for (auto iter : bitMapInfo) {
         emitBodyLock(indent, "%s // %s\n", updateActiveStr(iter.first, ACTIVE_MASK(iter.second), buffered ? "nextActive" : "").c_str(), ACTIVE_COMMENT(iter.second).c_str());
+        if (mtUseActivationEventTraceCodegen()) {
+          emitBodyLock(indent, "recordMtActivationEvent(traceSourceCppId, (uint32_t)%lu, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_CONDITIONAL);\n",
+                       iter.first, ACTIVE_MASK(iter.second));
+        }
       }
     }
     emitBodyLock(-- indent, "}\n");
@@ -11048,7 +11918,8 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
 }
 
 void graph::genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId) {
-  emitBodyLock(indent, "subReset%d();\n", resetId);
+  if (mtUseActivationEventTraceCodegen()) emitBodyLock(indent, "subReset%d(-1);\n", resetId);
+  else emitBodyLock(indent, "subReset%d();\n", resetId);
 }
 
 void graph::genResetActivationDense(SuperNode* super, bool isUIntReset, int indent, int resetId) {
@@ -11119,23 +11990,78 @@ void graph::genResetAllDense() {
 void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header) {
   Assert(denseSchedule.valid, "cannot emit dense executor for invalid schedule: %s", denseSchedule.fallbackReason.c_str());
   Assert(!denseSchedule.mtasks.empty(), "v202 requires MTask partitioning");
+  bool savedActivationEventTraceSuppressed = mtActivationEventTraceSuppressed;
+  mtActivationEventTraceSuppressed = true;
   int nMTasks = static_cast<int>(denseSchedule.mtasks.size());
   int threadCount = 8;
   const char* threadsEnv = std::getenv("GSIM_THREADS");
   if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
   if (threadCount < 1) threadCount = 1;
   bool workSteal = mtUseDenseWorkSteal();
-  // Work-stealing runs MTasks in DYNAMIC order, so the static in-order-per-owner guarantee that
-  // made same-thread-edge elision and per-worker-sequence transitive reduction safe no longer
-  // holds. Under work-stealing we MUST keep ALL dependency edges (same-thread included) and skip
-  // the sequence-based transitive reduction, or a successor could run before a same-owner pred.
   bool xthreadDepsOnly = workSteal ? false : mtUseDenseXThreadDepsOnly();
   bool transitiveReduceEdges = workSteal ? false : mtUseDenseTransitiveReduceEdges();
   bool staticEmptyElide = !workSteal && mtUseDenseStaticEmptyElide();
   bool ownerBankCounters = !workSteal && mtUseDenseOwnerBankCounters();
   bool ownerBankCountersDiag = ownerBankCounters && mtUseDenseOwnerBankCountersDiag();
-  std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, xthreadDepsOnly);
-  int transitiveElidedEdges = transitiveReduceEdges ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, denseSchedule.mtaskThreadAssign) : 0;
+  bool ownerReadyFlags = mtUseDenseOwnerReadyFlags();
+  bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
+  bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
+  int denseBreakdownWindowWorker0MTaskCount = 0;
+  if (denseBreakdownWindowCodegen) {
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+      if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] == 0) denseBreakdownWindowWorker0MTaskCount ++;
+    }
+    Assert(denseBreakdownWindowWorker0MTaskCount <= 2267,
+           "GSIM_MT_DENSE_BREAKDOWN window supports at most 2267 worker0 MTasks (got %d)",
+           denseBreakdownWindowWorker0MTaskCount);
+    Assert(threadCount >= 2,
+           "GSIM_MT_DENSE_BREAKDOWN window requires at least 2 workers (got %d)", threadCount);
+  }
+  if (denseBreakdownProfileCodegen) {
+    Assert(!workSteal,
+           "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires fixed-owner execution without GSIM_MT_DENSE_WORKSTEAL");
+    Assert(ownerReadyFlags,
+           "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+    Assert(threadCount <= 16,
+           "GSIM_MT_DENSE_BREAKDOWN_PROFILE supports at most 16 workers (got %d)", threadCount);
+  }
+
+  if (ownerReadyFlags) {
+    Assert(!workSteal,
+           "GSIM_MT_DENSE_OWNER_READY_FLAGS requires fixed-order execution without GSIM_MT_DENSE_WORKSTEAL");
+    Assert(ownerBankCounters,
+           "GSIM_MT_DENSE_OWNER_READY_FLAGS requires GSIM_MT_DENSE_OWNER_BANK_COUNTERS=1");
+    Assert(xthreadDepsOnly,
+           "GSIM_MT_DENSE_OWNER_READY_FLAGS requires GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1");
+    Assert(transitiveReduceEdges,
+           "GSIM_MT_DENSE_OWNER_READY_FLAGS experiment requires GSIM_MT_DENSE_TRANSITIVE_REDUCE_EDGES=1");
+  }
+  std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(
+      denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, xthreadDepsOnly);
+  int transitiveElidedEdges = transitiveReduceEdges
+      ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, denseSchedule.mtaskThreadAssign) : 0;
+  MtDenseOwnerReadyLayout ownerReadyLayout;
+  if (ownerReadyFlags) {
+    ownerReadyLayout = mtBuildDenseOwnerReadyLayout(
+        denseRuntimeSuccs, denseSchedule.mtaskThreadAssign, threadCount);
+  }
+  MtDenseBreakdownWindowWaitLayout denseBreakdownWindowWaitLayout;
+  if (denseBreakdownWindowCodegen) {
+    denseBreakdownWindowWaitLayout = mtBuildDenseBreakdownWindowWaitLayout(
+        ownerReadyLayout, denseSchedule.mtaskThreadAssign, threadCount);
+    Assert(denseBreakdownWindowWaitLayout.totalWaitRecords <= 65536,
+           "GSIM_MT_DENSE_BREAKDOWN window supports at most 65536 ready waits per cycle (got %d)",
+           denseBreakdownWindowWaitLayout.totalWaitRecords);
+  }
+  MtDenseBreakdownWindowAllOwnerLayout denseBreakdownWindowAllOwnerLayout;
+  if (denseBreakdownWindowCodegen) {
+    denseBreakdownWindowAllOwnerLayout = mtBuildDenseBreakdownWindowAllOwnerLayout(
+        denseSchedule.mtaskThreadAssign, threadCount);
+    Assert(denseBreakdownWindowAllOwnerLayout.recordCount >= nMTasks
+           && denseBreakdownWindowAllOwnerLayout.recordCount <= nMTasks + 7 * threadCount,
+           "dense breakdown all-owner physical record count %d is invalid for %d MTasks",
+           denseBreakdownWindowAllOwnerLayout.recordCount, nMTasks);
+  }
   std::vector<uint32_t> denseRuntimeDepCounts((size_t)nMTasks, 0);
   int totalSuccs = 0;
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
@@ -11156,13 +12082,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             nMTasks, denseMTaskPhysicalSlotCount, denseMTaskPhysicalSlotCount - nMTasks,
             threadCount, ownerBankCountersDiag ? 1 : 0);
   }
-  fprintf(header, "static constexpr bool kDenseXThreadDepsOnly = %s;\n", xthreadDepsOnly ? "true" : "false");
-  fprintf(header, "static constexpr bool kDenseTransitiveReduceEdges = %s;\n", transitiveReduceEdges ? "true" : "false");
-  fprintf(header, "static constexpr int kDenseTransitiveElidedEdgeCount = %d;\n", transitiveElidedEdges);
-  fprintf(header, "static constexpr uint32_t kDenseMTaskDepCount[%d] = {", nMTasks);
-  for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%u", denseRuntimeDepCounts[(size_t)i]); }
-  fprintf(header, "};\n");
-  if (ownerBankCountersDiag) {
+  if (ownerReadyFlags) {
+    fprintf(stderr,
+            "[mt-dense-owner-ready] mtasks=%d edges=%d tokens=%d slots=%d padding=%d banks=%d threads=%d\n",
+            nMTasks, ownerReadyLayout.edgeCount, ownerReadyLayout.tokenCount,
+            ownerReadyLayout.physicalSlotCount,
+            ownerReadyLayout.physicalSlotCount - ownerReadyLayout.tokenCount,
+            ownerReadyLayout.pairBankCount, threadCount);
+  }
+
+  auto emitDenseDepCounts = [&]() {
+    fprintf(header, "static constexpr uint32_t kDenseMTaskDepCount[%d] = {", nMTasks);
+    for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%u", denseRuntimeDepCounts[(size_t)i]); }
+    fprintf(header, "};\n");
+  };
+  auto emitDenseOwnerBankDiagnostics = [&]() {
+    if (!ownerBankCountersDiag) return;
     fprintf(header, "static constexpr int kDenseMTaskPhysicalSlotCount = %d;\n", denseMTaskPhysicalSlotCount);
     fprintf(header, "static constexpr int kDenseMTaskVertexSlot[%d] = {", nMTasks);
     for (int i = 0; i < nMTasks; i ++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", denseMTaskVertexSlots[(size_t)i]); }
@@ -11170,33 +12105,122 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "static constexpr int kDenseMTaskVertexOwner[%d] = {", nMTasks);
     for (int i = 0; i < nMTasks; i ++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", denseSchedule.mtaskThreadAssign[(size_t)i]); }
     fprintf(header, "};\n");
-  }
-  fprintf(header, "static constexpr int kDenseMTaskSuccOffsets[%d] = {", nMTasks + 1);
-  { int off = 0; for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", off); off += static_cast<int>(denseRuntimeSuccs[(size_t)i].size()); } fprintf(header, ",%d};\n", off); }
-  if (ownerBankCounters) {
-    fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+  };
+  auto emitDenseSuccOffsets = [&]() {
+    fprintf(header, "static constexpr int kDenseMTaskSuccOffsets[%d] = {", nMTasks + 1);
+    int off = 0;
+    for (int i = 0; i < nMTasks; i++) {
+      if (i > 0) fprintf(header, ",");
+      fprintf(header, "%d", off);
+      off += static_cast<int>(denseRuntimeSuccs[(size_t)i].size());
+    }
+    fprintf(header, ",%d};\n", off);
+  };
+  auto emitDenseSuccList = [&](bool ownerBanked) {
     fprintf(header, "static constexpr int kDenseMTaskSuccList[%d] = {", totalSuccs);
-    { bool firstS = true; for (const auto& succs : denseRuntimeSuccs) for (int s : succs) { if (!firstS) fprintf(header, ","); fprintf(header, "%d", denseMTaskVertexSlots[(size_t)s]); firstS = false; } if (firstS) fprintf(header, "0"); fprintf(header, "};\n"); }
-    fprintf(header, "#else\n");
-  }
-  fprintf(header, "static constexpr int kDenseMTaskSuccList[%d] = {", totalSuccs);
-  { bool firstS = true; for (const auto& succs : denseRuntimeSuccs) for (int s : succs) { if (!firstS) fprintf(header, ","); fprintf(header, "%d", s); firstS = false; } if (firstS) fprintf(header, "0"); fprintf(header, "};\n"); }
-  if (ownerBankCounters) fprintf(header, "#endif\n");
-  fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
-  if (ownerBankCounters) {
-    fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+    bool firstSucc = true;
+    for (const std::vector<int>& succs : denseRuntimeSuccs) {
+      for (int succ : succs) {
+        if (!firstSucc) fprintf(header, ",");
+        fprintf(header, "%d", ownerBanked ? denseMTaskVertexSlots[(size_t)succ] : succ);
+        firstSucc = false;
+      }
+    }
+    if (firstSucc) fprintf(header, "0");
+    fprintf(header, "};\n");
+  };
+
+  fprintf(header, "static constexpr bool kDenseXThreadDepsOnly = %s;\n", xthreadDepsOnly ? "true" : "false");
+  fprintf(header, "static constexpr bool kDenseTransitiveReduceEdges = %s;\n", transitiveReduceEdges ? "true" : "false");
+  fprintf(header, "static constexpr int kDenseTransitiveElidedEdgeCount = %d;\n", transitiveElidedEdges);
+  if (!ownerReadyFlags) {
+    emitDenseDepCounts();
+    emitDenseOwnerBankDiagnostics();
+    emitDenseSuccOffsets();
+    if (ownerBankCounters) {
+      fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+      emitDenseSuccList(true);
+      fprintf(header, "#else\n");
+    }
+    emitDenseSuccList(false);
+    if (ownerBankCounters) fprintf(header, "#endif\n");
+    fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
+    if (ownerBankCounters) {
+      fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+      fprintf(header, "static_assert(sizeof(MtDenseMTaskVertex) == 4, \"owner-bank layout requires four-byte dense vertices\");\n");
+      fprintf(header, "alignas(64) MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", denseMTaskPhysicalSlotCount);
+      fprintf(header, "#else\n");
+    }
+    fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
+    if (ownerBankCounters) fprintf(header, "#endif\n");
+  } else {
+    fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+    fprintf(header, "#error \"GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE and GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE are compile-exclusive\"\n");
+    fprintf(header, "#endif\n");
+    if (denseBreakdownProfileCodegen) {
+      fprintf(header, "#if !defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) || !GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      fprintf(header, "#error \"GSIM_MT_DENSE_BREAKDOWN_PROFILE requires GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\"\n");
+      fprintf(header, "#endif\n");
+    }
+
+    fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    fprintf(header, "static constexpr int kDenseOwnerReadyTokenCount = %d;\n", ownerReadyLayout.tokenCount);
+    fprintf(header, "static constexpr int kDenseOwnerReadyWorkerCount = %d;\n", threadCount);
+    fprintf(header, "static constexpr int kDenseOwnerReadyPhysicalSlotCount = %d;\n", ownerReadyLayout.physicalSlotCount);
+    fprintf(header, "static constexpr int kDenseOwnerReadyStoreOffsets[%d] = {", nMTasks + 1);
+    {
+      int off = 0;
+      for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+        if (mtaskId > 0) fprintf(header, ",");
+        fprintf(header, "%d", off);
+        off += static_cast<int>(ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].size());
+      }
+      fprintf(header, ",%d};\n", off);
+      Assert(off == ownerReadyLayout.tokenCount,
+             "dense owner-ready signal table has %d entries for %d tokens",
+             off, ownerReadyLayout.tokenCount);
+    }
+    fprintf(header, "static constexpr int kDenseOwnerReadyStoreList[%d] = {",
+            std::max(1, ownerReadyLayout.tokenCount));
+    {
+      bool firstSlot = true;
+      for (const std::vector<int>& slots : ownerReadyLayout.storeSlotsByMTask) {
+        for (int slot : slots) {
+          if (!firstSlot) fprintf(header, ",");
+          fprintf(header, "%d", slot);
+          firstSlot = false;
+        }
+      }
+      if (firstSlot) fprintf(header, "0");
+      fprintf(header, "};\n");
+    }
+    fprintf(header, "struct MtDenseOwnerReadyToken { std::atomic<uint8_t> ready{0}; };\n");
+    fprintf(header, "static_assert(sizeof(std::atomic<uint8_t>) == 1, \"owner-ready atomic must occupy one byte\");\n");
+    fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"owner-ready atomic must be lock-free\");\n");
+    fprintf(header, "static_assert(sizeof(MtDenseOwnerReadyToken) == 1, \"owner-ready slots must have one-byte extent\");\n");
+    fprintf(header, "static_assert((kDenseOwnerReadyPhysicalSlotCount %% 64) == 0, \"owner-ready storage must end on a 64-byte boundary\");\n");
+    fprintf(header, "alignas(64) MtDenseOwnerReadyToken mtDenseOwnerReadyTokens[%d];\n",
+            ownerReadyLayout.physicalSlotCount);
+    fprintf(header, "bool mtDenseOwnerReadyTokensPrimed = false;\n");
+    fprintf(header, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+    emitDenseDepCounts();
+    emitDenseOwnerBankDiagnostics();
+    emitDenseSuccOffsets();
+    emitDenseSuccList(true);
+    fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
     fprintf(header, "static_assert(sizeof(MtDenseMTaskVertex) == 4, \"owner-bank layout requires four-byte dense vertices\");\n");
     fprintf(header, "alignas(64) MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", denseMTaskPhysicalSlotCount);
     fprintf(header, "#else\n");
+    emitDenseDepCounts();
+    emitDenseOwnerBankDiagnostics();
+    emitDenseSuccOffsets();
+    emitDenseSuccList(false);
+    fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
+    fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
+    fprintf(header, "#endif\n");
   }
-  fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
-  if (ownerBankCounters) fprintf(header, "#endif\n");
   // workSteal already computed above.
   if (workSteal) {
-    // Preferred owner thread per MTask (from assignment) and worker0-only pin flag.
-    fprintf(header, "static constexpr int kDenseMTaskOwner[%d] = {", nMTasks);
-    for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); int o = denseSchedule.mtaskThreadAssign[(size_t)i]; if (o < 0 || o >= threadCount) o = 0; fprintf(header, "%d", o); }
-    fprintf(header, "};\n");
     fprintf(header, "static constexpr bool kDenseMTaskW0[%d] = {", nMTasks);
     for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%s", denseSchedule.mtasks[(size_t)i].workerZeroOnly ? "true" : "false"); }
     fprintf(header, "};\n");
@@ -11216,7 +12240,92 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // just uint8_t atomics). GSIM_MT_DENSE_SPARSE_GATE_ATOMIC=0 forces the plain non-atomic form
   // (only bit-exact at THREADS=1; used for the ST-only A/B).
   bool sparseGateAtomic = sparseGate && [](){ const char* e = std::getenv("GSIM_MT_DENSE_SPARSE_GATE_ATOMIC"); return !(e && e[0] == '0'); }();
-  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+  const bool activeWorklistPush = mtUseDenseActiveWorklistPush();
+  Assert(!activeWorklistPush || sparseGate,
+         "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH requires GSIM_MT_DENSE_SPARSE_GATE");
+  Assert(!activeWorklistPush || threadCount == 1,
+         "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH is a T1 de-risk path");
+  Assert(!activeWorklistPush || sparseGateAtomic,
+         "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH requires atomic sparse-gate updates");
+  std::vector<std::vector<int>> activeWorklistWordMTasks;
+  std::vector<char> activeWorklistAlwaysMTasks;
+  if (activeWorklistPush) {
+    activeWorklistWordMTasks.resize((size_t)activeFlagNum);
+    activeWorklistAlwaysMTasks.assign((size_t)nMTasks, false);
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+      std::set<int> words;
+      for (int sccId : denseSchedule.mtasks[(size_t)mtaskId].sccIds) {
+        for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+          if (isAlwaysActive(cppId)) activeWorklistAlwaysMTasks[(size_t)mtaskId] = true;
+          words.insert(cppId / ACTIVE_WIDTH);
+        }
+      }
+      for (int wordId : words) {
+        Assert(wordId >= 0 && wordId < activeFlagNum, "active-worklist word out of range");
+        activeWorklistWordMTasks[(size_t)wordId].push_back(mtaskId);
+      }
+    }
+    std::vector<int> wordOffsets((size_t)activeFlagNum + 1, 0);
+    int entries = 0;
+    for (int wordId = 0; wordId < activeFlagNum; wordId++) {
+      wordOffsets[(size_t)wordId] = entries;
+      entries += (int)activeWorklistWordMTasks[(size_t)wordId].size();
+    }
+    wordOffsets[(size_t)activeFlagNum] = entries;
+    fprintf(header, "static constexpr int kDenseActiveWorklistWordCount = %d;\n", activeFlagNum);
+    fprintf(header, "static constexpr int kDenseActiveWorklistWordOffsets[%d] = {", activeFlagNum + 1);
+    for (int wordId = 0; wordId <= activeFlagNum; wordId++) fprintf(header, "%s%d", wordId ? "," : "", wordOffsets[(size_t)wordId]);
+    fprintf(header, "};\n");
+    fprintf(header, "static constexpr int kDenseActiveWorklistWordMTasks[%d] = {", std::max(1, entries));
+    int emitted = 0;
+    for (const auto& mtasks : activeWorklistWordMTasks) for (int mtaskId : mtasks) fprintf(header, "%s%d", emitted++ ? "," : "", mtaskId);
+    if (entries == 0) fprintf(header, "0");
+    fprintf(header, "};\n");
+    fprintf(header, "static constexpr bool kDenseActiveWorklistAlwaysMTasks[%d] = {", std::max(1, nMTasks));
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) fprintf(header, "%s%s", mtaskId ? "," : "", activeWorklistAlwaysMTasks[(size_t)mtaskId] ? "true" : "false");
+    if (nMTasks == 0) fprintf(header, "false");
+    fprintf(header, "};\n");
+    fprintf(header, "uint32_t mtDenseActiveWorklistEpoch = 0;\n");
+    fprintf(header, "uint32_t mtDenseActiveWorklistMTaskEpoch[%d] = {};\n", std::max(1, nMTasks));
+    fprintf(header, "int mtDenseActiveWorklistNextMTask = 0;\n");
+    fprintf(header, "void markDenseActiveWorklistWord(int wordId);\n");
+    fprintf(header, "void markDenseActiveWorklistAll();\n");
+    fprintf(header, "void stepDenseActiveWorklistSingleThread();\n");
+    fprintf(stderr, "[mt-dense-active-worklist-push] mtasks=%d words=%d reverse_entries=%d\n", nMTasks, activeFlagNum, entries);
+  }
+  bool workerMajorText = mtUseDenseWorkerMajorText();
+  Assert(!workerMajorText || !workSteal,
+         "GSIM_MT_DENSE_WORKER_MAJOR_TEXT requires fixed-owner dense execution");
+  std::vector<int> denseMTaskEmissionOrder;
+  denseMTaskEmissionOrder.reserve((size_t)nMTasks);
+  if (workerMajorText) {
+    for (int owner = 0; owner < threadCount; owner++) {
+      for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+        if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] == owner)
+          denseMTaskEmissionOrder.push_back(mtaskId);
+      }
+    }
+    Assert((int)denseMTaskEmissionOrder.size() == nMTasks,
+           "worker-major text emission did not cover all dense MTasks");
+    int originalRuns = nMTasks > 0 ? 1 : 0;
+    for (int mtaskId = 1; mtaskId < nMTasks; mtaskId++) {
+      if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] !=
+          denseSchedule.mtaskThreadAssign[(size_t)mtaskId - 1]) originalRuns++;
+    }
+    int emittedRuns = nMTasks > 0 ? 1 : 0;
+    for (int i = 1; i < nMTasks; i++) {
+      if (denseSchedule.mtaskThreadAssign[(size_t)denseMTaskEmissionOrder[(size_t)i]] !=
+          denseSchedule.mtaskThreadAssign[(size_t)denseMTaskEmissionOrder[(size_t)i - 1]]) emittedRuns++;
+    }
+    fprintf(stderr,
+            "[mt-dense-worker-major-text] mtasks=%d original_owner_runs=%d emitted_owner_runs=%d threads=%d\n",
+            nMTasks, originalRuns, emittedRuns, threadCount);
+  } else {
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++)
+      denseMTaskEmissionOrder.push_back(mtaskId);
+  }
+  for (int mtaskId : denseMTaskEmissionOrder) {
+
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
     emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
     // Sparse-in-dense: emit members ASCENDING by cppId (proven valid topo order of intra-MTask
@@ -11276,8 +12385,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           }
         }
         bool savedAtomic = mtDenseSparseGateAtomicEmit;
+        bool savedActiveWorklistEmit = mtDenseActiveWorklistEmit;
         mtDenseSparseGateAtomicEmit = atomicGate;
+        mtDenseActiveWorklistEmit = activeWorklistPush;
         genSuperEval(super, format("activeFlags[%d]", wordId), "", localIndent, true);
+        mtDenseActiveWorklistEmit = savedActiveWorklistEmit;
         mtDenseSparseGateAtomicEmit = savedAtomic;
         if (gated) emitBodyLock(-- localIndent, "}\n");
       } else {
@@ -11288,6 +12400,28 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", cppId);
         emitBodyLock(1, "}\n");
       }
+    }
+    emitBodyLock(0, "}\n");
+  }
+  if (activeWorklistPush) {
+    emitFuncDecl(0, "void S%s::markDenseActiveWorklistWord(int wordId) {\n", name.c_str());
+    emitBodyLock(1, "if (wordId < 0 || wordId >= kDenseActiveWorklistWordCount) return;\n");
+    emitBodyLock(1, "for (int i = kDenseActiveWorklistWordOffsets[wordId]; i < kDenseActiveWorklistWordOffsets[wordId + 1]; i++) {\n");
+    emitBodyLock(2, "const int mtaskId = kDenseActiveWorklistWordMTasks[i];\n");
+    emitBodyLock(2, "if (mtaskId >= mtDenseActiveWorklistNextMTask) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+    emitFuncDecl(0, "void S%s::markDenseActiveWorklistAll() {\n", name.c_str());
+    emitBodyLock(1, "for (int mtaskId = mtDenseActiveWorklistNextMTask; mtaskId < %d; mtaskId++) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n", nMTasks);
+    emitBodyLock(0, "}\n");
+    emitFuncDecl(0, "void S%s::stepDenseActiveWorklistSingleThread() {\n", name.c_str());
+    emitBodyLock(1, "if (unlikely(++mtDenseActiveWorklistEpoch == 0)) { std::memset(mtDenseActiveWorklistMTaskEpoch, 0, sizeof(mtDenseActiveWorklistMTaskEpoch)); mtDenseActiveWorklistEpoch = 1; }\n");
+    emitBodyLock(1, "mtDenseActiveWorklistNextMTask = 0;\n");
+    emitBodyLock(1, "for (int wordId = 0; wordId < kDenseActiveWorklistWordCount; wordId++) if (__atomic_load_n(&activeFlags[wordId], __ATOMIC_RELAXED)) markDenseActiveWorklistWord(wordId);\n");
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+      emitBodyLock(1, "mtDenseActiveWorklistNextMTask = %d;\n", mtaskId);
+      emitBodyLock(1, "if (kDenseActiveWorklistAlwaysMTasks[%d] || mtDenseActiveWorklistMTaskEpoch[%d] == mtDenseActiveWorklistEpoch) stepDenseMTask%d();\n", mtaskId, mtaskId, mtaskId);
+      emitBodyLock(1, "mtDenseActiveWorklistNextMTask = %d;\n", mtaskId + 1);
     }
     emitBodyLock(0, "}\n");
   }
@@ -11304,6 +12438,33 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   auto emitFixedDenseThreadWorker = [&](const char* funcName) {
     emitFuncDecl(0, "void S%s::%s(int threadId) {\n", name.c_str(), funcName);
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "const int mtDenseBreakdownWindowSlot = mtDenseBreakdownWindowCurrentSlot;\n");
+      emitBodyLock(1, "const bool mtDenseBreakdownWindow = mtDenseBreakdownWindowSlot >= 0;\n");
+      emitBodyLock(1, "MtDenseBreakdownWindowWorker *mtDenseBreakdownWindowWorker = nullptr;\n");
+      emitBodyLock(1, "int mtDenseBreakdownWindowWorker0MTaskNext = 0;\n");
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownWindow)) {\n");
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowSlot >= kDenseBreakdownWindowMaxCycles || threadId < 0 || threadId >= kDenseBreakdownWindowThreadCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] invalid window worker lane\\n\"); abort(); }\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker = &mtDenseBreakdownWindowWorkers[mtDenseBreakdownWindowSlot][threadId];\n");
+      emitBodyLock(2, "const uint64_t mtDenseBreakdownWindowStartOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownWindowEpoch).count();\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->startOffsetNs = mtDenseBreakdownWindowStartOffsetNs;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->finishOffsetNs = 0;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->blockedWaitNs = 0;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->bodyNs = 0;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->controlNs = 0;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWaitCounts[mtDenseBreakdownWindowSlot][threadId] = 0;\n");
+      emitBodyLock(1, "}\n");
+    }
+    if (denseBreakdownProfileCodegen) {
+      if (denseBreakdownWindowCodegen) {
+        emitBodyLock(1, "const bool mtDenseBreakdownProfile = mtDenseBreakdownProfileEnabled && mtDenseBreakdownWindow;\n");
+      } else {
+        emitBodyLock(1, "const bool mtDenseBreakdownProfile = mtDenseBreakdownProfileEnabled;\n");
+      }
+      emitBodyLock(1, "std::chrono::steady_clock::time_point mtDenseBreakdownDispatchBegin;\n");
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfile)) mtDenseBreakdownDispatchBegin = std::chrono::steady_clock::now();\n");
+    }
+
     emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
     emitBodyLock(1, "switch (threadId) {\n");
     for (int t = 0; t < threadCount; t++) {
@@ -11311,30 +12472,202 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
         if (denseSchedule.mtaskThreadAssign[mtaskId] != t) continue;
         const bool skipDenseWait = staticEmptyElide && denseRuntimeDepCounts[(size_t)mtaskId] == 0;
-        if (!skipDenseWait) {
-          // Verilator VlMTaskVertex::waitUntilUpstreamDone pattern: spin 64, then yield.
-          emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
-          emitBodyLock(3, "  unsigned ct = 0;\n");
-          if (ownerBankCounters) {
-            emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-            emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
-            emitBodyLock(3, "#else\n");
+        if (!ownerReadyFlags) {
+          if (!skipDenseWait) {
+            // Fixed dependency-counter fallback keeps the historical 256-spin yield budget.
+            emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
+            emitBodyLock(3, "  unsigned ct = 0;\n");
+            if (ownerBankCounters) {
+              emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+              emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
+              emitBodyLock(3, "#else\n");
+            }
+            emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
+            if (ownerBankCounters) emitBodyLock(3, "#endif\n");
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            emitBodyLock(3, "}\n");
           }
-          emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-          if (ownerBankCounters) emitBodyLock(3, "#endif\n");
-          emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 64) { ct = 0; std::this_thread::yield(); } }\n");
-          emitBodyLock(3, "}\n");
+        } else {
+          emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+          for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
+            if (denseBreakdownProfileCodegen) {
+              emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
+              if (denseBreakdownWindowCodegen) {
+                emitBodyLock(3, "  if (unlikely(mtDenseBreakdownProfile && !(mtDenseBreakdownWindow && mtDenseBreakdownWindowFinishOnlyMode))) {\n");
+              } else {
+                emitBodyLock(3, "  if (unlikely(mtDenseBreakdownProfile)) {\n");
+              }
+              emitBodyLock(4, "bool mtDenseBreakdownBlocked = false;\n");
+              emitBodyLock(4, "std::chrono::steady_clock::time_point mtDenseBreakdownBlockedBegin;\n");
+              emitBodyLock(4, "unsigned ct = 0;\n");
+              emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+              emitBodyLock(5, "if (!mtDenseBreakdownBlocked) { mtDenseBreakdownBlocked = true; mtDenseBreakdownBlockedBegin = std::chrono::steady_clock::now(); }\n");
+              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
+              emitBodyLock(4, "}\n");
+              emitBodyLock(4, "if (mtDenseBreakdownBlocked) {\n");
+              emitBodyLock(5, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
+              if (denseBreakdownWindowCodegen) {
+                emitBodyLock(5, "const std::chrono::steady_clock::time_point mtDenseBreakdownBlockedEnd = std::chrono::steady_clock::now();\n");
+                emitBodyLock(5, "uint64_t mtDenseBreakdownBlockedNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownBlockedEnd - mtDenseBreakdownBlockedBegin).count();\n");
+              } else {
+                emitBodyLock(5, "uint64_t mtDenseBreakdownBlockedNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownBlockedBegin).count();\n");
+              }
+              emitBodyLock(5, "if (unlikely(UINT64_MAX - mtDenseBreakdownWorker.blockedWaitNs < mtDenseBreakdownBlockedNs || mtDenseBreakdownWorker.blockedWaitCount == UINT64_MAX)) { fprintf(stderr, \"[mt-dense-breakdown] blocked-wait counter overflow\\n\"); abort(); }\n");
+              emitBodyLock(5, "mtDenseBreakdownWorker.blockedWaitNs += mtDenseBreakdownBlockedNs;\n");
+              emitBodyLock(5, "mtDenseBreakdownWorker.blockedWaitCount += 1;\n");
+              if (denseBreakdownWindowCodegen) {
+                emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow)) { if (unlikely(UINT64_MAX - mtDenseBreakdownWindowWorker->blockedWaitNs < mtDenseBreakdownBlockedNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window blocked-wait overflow\\n\"); abort(); } mtDenseBreakdownWindowWorker->blockedWaitNs += mtDenseBreakdownBlockedNs; }\n");
+              }
+              if (denseBreakdownWindowCodegen) {
+                emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow)) { uint32_t &mtDenseBreakdownWindowWaitCount = mtDenseBreakdownWindowWaitCounts[mtDenseBreakdownWindowSlot][threadId]; const uint32_t mtDenseBreakdownWindowWaitCapacity = (uint32_t)(kDenseBreakdownWindowWaitLaneOffsets[threadId + 1] - kDenseBreakdownWindowWaitLaneOffsets[threadId]); if (unlikely(mtDenseBreakdownWindowWaitCount >= mtDenseBreakdownWindowWaitCapacity)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window ready-wait record overflow\\n\"); abort(); } MtDenseBreakdownWindowWait &mtDenseBreakdownWindowWait = mtDenseBreakdownWindowWaits[mtDenseBreakdownWindowSlot][kDenseBreakdownWindowWaitLaneOffsets[threadId] + mtDenseBreakdownWindowWaitCount ++]; mtDenseBreakdownWindowWait.cycleSlot = (uint16_t)mtDenseBreakdownWindowSlot; mtDenseBreakdownWindowWait.threadId = (uint16_t)threadId; mtDenseBreakdownWindowWait.consumerMtaskId = %d; mtDenseBreakdownWindowWait.readySlot = %d; mtDenseBreakdownWindowWait.blockedNs = mtDenseBreakdownBlockedNs; }\n", mtaskId, slot);
+                emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow)) { uint64_t mtDenseBreakdownWindowWaitEndOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownBlockedEnd - mtDenseBreakdownWindowEpoch).count(); if (unlikely(mtDenseBreakdownWindowWaitEndOffsetNs < mtDenseBreakdownBlockedNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window ready-wait timeline underflow\\n\"); abort(); } const uint32_t mtDenseBreakdownWindowWaitIndex = mtDenseBreakdownWindowWaitCounts[mtDenseBreakdownWindowSlot][threadId] - 1; mtDenseBreakdownWindowWaits[mtDenseBreakdownWindowSlot][kDenseBreakdownWindowWaitLaneOffsets[threadId] + mtDenseBreakdownWindowWaitIndex].endOffsetNs = mtDenseBreakdownWindowWaitEndOffsetNs; }\n");
+              }
+              if (denseBreakdownWindowCodegen) {
+                emitBodyLock(4, "} else if (unlikely(mtDenseBreakdownWindow && mtDenseBreakdownWindowCausalChainMode)) {\n");
+                emitBodyLock(5, "uint32_t &mtDenseBreakdownWindowWaitCount = mtDenseBreakdownWindowWaitCounts[mtDenseBreakdownWindowSlot][threadId];\n");
+                emitBodyLock(5, "const uint32_t mtDenseBreakdownWindowWaitCapacity = (uint32_t)(kDenseBreakdownWindowWaitLaneOffsets[threadId + 1] - kDenseBreakdownWindowWaitLaneOffsets[threadId]);\n");
+                emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowWaitCount >= mtDenseBreakdownWindowWaitCapacity)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window causal wait record overflow\\n\"); abort(); }\n");
+                emitBodyLock(5, "const std::chrono::steady_clock::time_point mtDenseBreakdownWindowWaitEnd = std::chrono::steady_clock::now();\n");
+                emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowWaitEnd < mtDenseBreakdownWindowEpoch)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window causal wait clock regression\\n\"); abort(); }\n");
+                emitBodyLock(5, "MtDenseBreakdownWindowWait &mtDenseBreakdownWindowWait = mtDenseBreakdownWindowWaits[mtDenseBreakdownWindowSlot][kDenseBreakdownWindowWaitLaneOffsets[threadId] + mtDenseBreakdownWindowWaitCount ++];\n");
+                emitBodyLock(5, "mtDenseBreakdownWindowWait.cycleSlot = (uint16_t)mtDenseBreakdownWindowSlot; mtDenseBreakdownWindowWait.threadId = (uint16_t)threadId; mtDenseBreakdownWindowWait.consumerMtaskId = %d; mtDenseBreakdownWindowWait.readySlot = %d; mtDenseBreakdownWindowWait.blockedNs = 0; mtDenseBreakdownWindowWait.endOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowWaitEnd - mtDenseBreakdownWindowEpoch).count();\n", mtaskId, slot);
+                emitBodyLock(4, "}\n");
+              } else {
+                emitBodyLock(4, "}\n");
+              }
+              emitBodyLock(3, "  } else {\n");
+              emitBodyLock(4, "unsigned ct = 0;\n");
+              emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
+              emitBodyLock(4, "}\n");
+              emitBodyLock(3, "  }\n");
+              emitBodyLock(3, "}\n");
+            } else {
+              emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
+              emitBodyLock(3, "  unsigned ct = 0;\n");
+              emitBodyLock(3, "  while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+              emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+              emitBodyLock(3, "}\n");
+            }
+
+          }
+          emitBodyLock(3, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+          if (!skipDenseWait) {
+            emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
+            emitBodyLock(3, "  unsigned ct = 0;\n");
+            emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            emitBodyLock(3, "}\n");
+          }
+          emitBodyLock(3, "#else\n");
+          if (!skipDenseWait) {
+            emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
+            emitBodyLock(3, "  unsigned ct = 0;\n");
+            emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            emitBodyLock(3, "}\n");
+          }
+          emitBodyLock(3, "#endif\n");
         }
-        emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
-        const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
-        if (!skipDenseSignal) {
-          // Verilator signalUpstreamDone: fetch_add (even) or fetch_sub (odd).
-          emitBodyLock(3, "if (evenCycle) {\n");
-          emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
-          emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
+        if (denseBreakdownWindowCodegen) {
+          emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindow && (mtDenseBreakdownWindowAllOwnerBodyMode || mtDenseBreakdownWindowCausalChainMode))) {\n");
+          emitBodyLock(4, "MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowAllOwnerMTask = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[%d]];\n", mtaskId);
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.mtaskId = %d;\n", mtaskId);
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.ownerThreadId = (uint16_t)threadId;\n");
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.readyTokenStoreCount = %d;\n", (int)ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].size());
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.releaseEndOffsetNs = UINT64_MAX;\n");
+          emitBodyLock(4, "std::chrono::steady_clock::time_point mtDenseBreakdownWindowBodyBegin = std::chrono::steady_clock::now();\n");
+          emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalChainMode && mtDenseBreakdownWindowBodyBegin < mtDenseBreakdownWindowEpoch)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal body start clock regression\\n\"); abort(); }\n");
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.bodyStartOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowBodyBegin - mtDenseBreakdownWindowEpoch).count();\n");
+          emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
+          emitBodyLock(4, "std::chrono::steady_clock::time_point mtDenseBreakdownWindowBodyEnd = std::chrono::steady_clock::now();\n");
+          emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalChainMode && mtDenseBreakdownWindowBodyEnd < mtDenseBreakdownWindowEpoch)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal body end clock regression\\n\"); abort(); }\n");
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.bodyEndOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowBodyEnd - mtDenseBreakdownWindowEpoch).count();\n");
+          emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowAllOwnerMTask.bodyEndOffsetNs < mtDenseBreakdownWindowAllOwnerMTask.bodyStartOffsetNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] all-owner body timeline underflow\\n\"); abort(); }\n");
+          emitBodyLock(4, "uint64_t mtDenseBreakdownWindowBodyNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowBodyEnd - mtDenseBreakdownWindowBodyBegin).count();\n");
+          emitBodyLock(4, "if (unlikely(UINT64_MAX - mtDenseBreakdownWindowWorker->bodyNs < mtDenseBreakdownWindowBodyNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window all-owner body counter overflow\\n\"); abort(); }\n");
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTask.bodyNs = mtDenseBreakdownWindowBodyNs;\n");
+          emitBodyLock(4, "mtDenseBreakdownWindowWorker->bodyNs += mtDenseBreakdownWindowBodyNs;\n");
+          if (t == 0) {
+            emitBodyLock(3, "} else if (unlikely(mtDenseBreakdownWindow && mtDenseBreakdownWindowWorker0BodyMode)) {\n");
+            emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowWorker0MTaskNext >= kDenseBreakdownWindowWorker0MTaskCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window worker0 MTask record overflow\\n\"); abort(); }\n");
+            emitBodyLock(4, "MtDenseBreakdownWindowMTask &mtDenseBreakdownWindowMTask = mtDenseBreakdownWindowWorker0MTasks[mtDenseBreakdownWindowSlot][mtDenseBreakdownWindowWorker0MTaskNext ++];\n");
+            emitBodyLock(4, "mtDenseBreakdownWindowMTask.mtaskId = %d;\n", mtaskId);
+            emitBodyLock(4, "std::chrono::steady_clock::time_point mtDenseBreakdownWindowBodyBegin = std::chrono::steady_clock::now();\n");
+            emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
+            emitBodyLock(4, "uint64_t mtDenseBreakdownWindowBodyNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownWindowBodyBegin).count();\n");
+            emitBodyLock(4, "if (unlikely(UINT64_MAX - mtDenseBreakdownWindowWorker->bodyNs < mtDenseBreakdownWindowBodyNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window body counter overflow\\n\"); abort(); }\n");
+            emitBodyLock(4, "mtDenseBreakdownWindowMTask.bodyNs = mtDenseBreakdownWindowBodyNs;\n");
+            emitBodyLock(4, "mtDenseBreakdownWindowWorker->bodyNs += mtDenseBreakdownWindowBodyNs;\n");
+          }
           emitBodyLock(3, "} else {\n");
-          emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
-          emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
+          emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
+          emitBodyLock(3, "}\n");
+        } else {
+          emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+        }
+        const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
+        if (!ownerReadyFlags) {
+          if (!skipDenseSignal) {
+            // Verilator signalUpstreamDone: fetch_add (even) or fetch_sub (odd).
+            emitBodyLock(3, "if (evenCycle) {\n");
+            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
+            emitBodyLock(3, "} else {\n");
+            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
+            emitBodyLock(3, "}\n");
+          }
+        } else {
+          emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+          if (!ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].empty()) {
+            emitBodyLock(3, "if (evenCycle) {\n");
+            emitBodyLock(4, "for (int j = kDenseOwnerReadyStoreOffsets[%d]; j < kDenseOwnerReadyStoreOffsets[%d]; j++) {\n", mtaskId, mtaskId + 1);
+            if (denseBreakdownProfileCodegen) {
+              emitBodyLock(5, "const int mtDenseBreakdownWindowReadySlot = kDenseOwnerReadyStoreList[j];\n");
+              emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow && mtDenseBreakdownWindowCausalChainMode)) { const int mtDenseBreakdownWindowLogicalToken = kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowReadySlot]; if (unlikely(mtDenseBreakdownWindowLogicalToken < 0 || mtDenseBreakdownWindowLogicalToken >= kDenseBreakdownWindowCausalTokenCount || kDenseBreakdownWindowCausalTokenReadySlot[mtDenseBreakdownWindowLogicalToken] != mtDenseBreakdownWindowReadySlot || kDenseBreakdownWindowCausalTokenProducerMTask[mtDenseBreakdownWindowLogicalToken] != %d || kDenseBreakdownWindowCausalTokenProducerOwner[mtDenseBreakdownWindowLogicalToken] != threadId)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token provenance mismatch\\n\"); abort(); } MtDenseBreakdownWindowReadyToken &mtDenseBreakdownWindowTokenRelease = mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowSlot][mtDenseBreakdownWindowLogicalToken]; const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseBefore = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseBefore < mtDenseBreakdownWindowEpoch || mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs != UINT64_MAX)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-before invalid\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseBefore - mtDenseBreakdownWindowEpoch).count(); mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{1}, std::memory_order_release); const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseAfter = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseAfter < mtDenseBreakdownWindowReleaseBefore)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-after clock regression\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseAfter - mtDenseBreakdownWindowEpoch).count(); } else { mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{1}, std::memory_order_release); }\n", mtaskId);
+            } else {
+              emitBodyLock(5, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(uint8_t{1}, std::memory_order_release);\n");
+            }
+            emitBodyLock(4, "}\n");
+            emitBodyLock(3, "} else {\n");
+            emitBodyLock(4, "for (int j = kDenseOwnerReadyStoreOffsets[%d]; j < kDenseOwnerReadyStoreOffsets[%d]; j++) {\n", mtaskId, mtaskId + 1);
+            if (denseBreakdownProfileCodegen) {
+              emitBodyLock(5, "const int mtDenseBreakdownWindowReadySlot = kDenseOwnerReadyStoreList[j];\n");
+              emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow && mtDenseBreakdownWindowCausalChainMode)) { const int mtDenseBreakdownWindowLogicalToken = kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowReadySlot]; if (unlikely(mtDenseBreakdownWindowLogicalToken < 0 || mtDenseBreakdownWindowLogicalToken >= kDenseBreakdownWindowCausalTokenCount || kDenseBreakdownWindowCausalTokenReadySlot[mtDenseBreakdownWindowLogicalToken] != mtDenseBreakdownWindowReadySlot || kDenseBreakdownWindowCausalTokenProducerMTask[mtDenseBreakdownWindowLogicalToken] != %d || kDenseBreakdownWindowCausalTokenProducerOwner[mtDenseBreakdownWindowLogicalToken] != threadId)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token provenance mismatch\\n\"); abort(); } MtDenseBreakdownWindowReadyToken &mtDenseBreakdownWindowTokenRelease = mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowSlot][mtDenseBreakdownWindowLogicalToken]; const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseBefore = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseBefore < mtDenseBreakdownWindowEpoch || mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs != UINT64_MAX)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-before invalid\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseBefore - mtDenseBreakdownWindowEpoch).count(); mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{0}, std::memory_order_release); const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseAfter = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseAfter < mtDenseBreakdownWindowReleaseBefore)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-after clock regression\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseAfter - mtDenseBreakdownWindowEpoch).count(); } else { mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{0}, std::memory_order_release); }\n", mtaskId);
+            } else {
+              emitBodyLock(5, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(uint8_t{0}, std::memory_order_release);\n");
+            }
+            emitBodyLock(4, "}\n");
+            emitBodyLock(3, "}\n");
+          }
+          emitBodyLock(3, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
+          if (!skipDenseSignal) {
+            emitBodyLock(3, "if (evenCycle) {\n");
+            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
+            emitBodyLock(3, "} else {\n");
+            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
+            emitBodyLock(3, "}\n");
+          }
+          emitBodyLock(3, "#else\n");
+          if (!skipDenseSignal) {
+            emitBodyLock(3, "if (evenCycle) {\n");
+            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
+            emitBodyLock(3, "} else {\n");
+            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
+            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
+            emitBodyLock(3, "}\n");
+          }
+          emitBodyLock(3, "#endif\n");
+        }
+        if (denseBreakdownWindowCodegen) {
+          emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindow && (mtDenseBreakdownWindowAllOwnerBodyMode || mtDenseBreakdownWindowCausalChainMode))) {\n");
+          emitBodyLock(4, "const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseEnd = std::chrono::steady_clock::now();\n");
+          emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalChainMode && mtDenseBreakdownWindowReleaseEnd < mtDenseBreakdownWindowEpoch)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal MTask release clock regression\\n\"); abort(); }\n");
+          emitBodyLock(4, "mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[%d]].releaseEndOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseEnd - mtDenseBreakdownWindowEpoch).count();\n", mtaskId);
           emitBodyLock(3, "}\n");
         }
       }
@@ -11343,6 +12676,26 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(2, "default: break;\n");
     emitBodyLock(1, "}\n");
+    if (denseBreakdownProfileCodegen) {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfile)) {\n");
+      emitBodyLock(2, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
+      emitBodyLock(2, "uint64_t mtDenseBreakdownDispatchNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownDispatchBegin).count();\n");
+      emitBodyLock(2, "if (unlikely(UINT64_MAX - mtDenseBreakdownWorker.dispatchSpanNs < mtDenseBreakdownDispatchNs)) { fprintf(stderr, \"[mt-dense-breakdown] dispatch counter overflow\\n\"); abort(); }\n");
+      emitBodyLock(2, "mtDenseBreakdownWorker.dispatchSpanNs += mtDenseBreakdownDispatchNs;\n");
+      emitBodyLock(1, "}\n");
+    }
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownWindow)) {\n");
+      emitBodyLock(2, "uint64_t mtDenseBreakdownWindowFinishOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownWindowEpoch).count();\n");
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowFinishOffsetNs < mtDenseBreakdownWindowWorker->startOffsetNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window negative dispatch span\\n\"); abort(); }\n");
+      emitBodyLock(2, "uint64_t mtDenseBreakdownWindowDispatchNs = mtDenseBreakdownWindowFinishOffsetNs - mtDenseBreakdownWindowWorker->startOffsetNs;\n");
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowWorker->blockedWaitNs > mtDenseBreakdownWindowDispatchNs || mtDenseBreakdownWindowWorker->bodyNs > mtDenseBreakdownWindowDispatchNs - mtDenseBreakdownWindowWorker->blockedWaitNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window attribution exceeds dispatch span\\n\"); abort(); }\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->finishOffsetNs = mtDenseBreakdownWindowFinishOffsetNs;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker->controlNs = mtDenseBreakdownWindowDispatchNs - mtDenseBreakdownWindowWorker->blockedWaitNs - mtDenseBreakdownWindowWorker->bodyNs;\n");
+      emitBodyLock(2, "if (threadId == 0) { if (mtDenseBreakdownWindowWorker0BodyMode) { if (unlikely(mtDenseBreakdownWindowWorker0MTaskNext != kDenseBreakdownWindowWorker0MTaskCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] window worker0 MTask record count mismatch\\n\"); abort(); } } mtDenseBreakdownWindowWorker0MTaskCounts[mtDenseBreakdownWindowSlot] = (uint32_t)mtDenseBreakdownWindowWorker0MTaskNext; }\n");
+      emitBodyLock(1, "}\n");
+    }
+
     emitBodyLock(0, "}\n");
   };
   if (workSteal) {
@@ -11409,6 +12762,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitFixedDenseThreadWorker("stepDenseThreadWorker");
   }
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
+  if (denseBreakdownWindowCodegen) {
+    emitBodyLock(1, "const bool mtDenseBreakdownWindowInCycle = mtDenseBreakdownWindowEnabled && cycles >= mtDenseBreakdownWindowStart && cycles - mtDenseBreakdownWindowStart < mtDenseBreakdownWindowCycles;\n");
+    emitBodyLock(1, "const bool mtDenseBreakdownProfileInCycle = mtDenseBreakdownProfileEnabled && mtDenseBreakdownWindowInCycle;\n");
+  }
+  if (denseBreakdownProfileCodegen) {
+    emitBodyLock(1, "std::chrono::steady_clock::time_point mtDenseBreakdownStepBegin;\n");
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfileInCycle)) mtDenseBreakdownStepBegin = std::chrono::steady_clock::now();\n");
+    } else {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfileEnabled)) mtDenseBreakdownStepBegin = std::chrono::steady_clock::now();\n");
+    }
+  }
+
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   // Sparse-in-dense: use the sparse resetAll() seeder (no memset, activation-producing resets) so
@@ -11436,27 +12802,230 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "std::atomic_thread_fence(std::memory_order_release);\n");
     emitBodyLock(1, "}\n");
   }
-  emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+  if (ownerReadyFlags) {
+    emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(1, "if (mtConfiguredWorkerCount == kDenseOwnerReadyWorkerCount && mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+    emitBodyLock(1, "#else\n");
+    emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+    emitBodyLock(1, "#endif\n");
+  } else {
+    emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+  }
   emitBodyLock(2, "mtWorkerPoolJobKind = 7;\n");
   emitBodyLock(2, "mtWorkerPoolCurrentWorkerCount = mtConfiguredWorkerCount;\n");
+  if (ownerReadyFlags) {
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(2, "if (!mtDenseOwnerReadyTokensPrimed) {\n");
+    emitBodyLock(3, "const uint8_t mtDenseOwnerReadyRephaseValue = (cycles & 1) == 0 ? uint8_t{0} : uint8_t{1};\n");
+    emitBodyLock(3, "for (int i = 0; i < kDenseOwnerReadyTokenCount; i++)\n");
+    emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[i]].ready.store(mtDenseOwnerReadyRephaseValue, std::memory_order_relaxed);\n");
+    emitBodyLock(3, "mtDenseOwnerReadyTokensPrimed = true;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "#endif\n");
+  }
+  if (denseBreakdownProfileCodegen) {
+    emitBodyLock(2, "std::chrono::steady_clock::time_point mtDenseBreakdownPoolIdleBegin;\n");
+    emitBodyLock(2, "std::chrono::steady_clock::time_point mtDenseBreakdownPoolDoneBegin;\n");
+  }
+
   emitBodyLock(2, "mtWorkerPoolPost();\n");
+  if (denseBreakdownProfileCodegen) {
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle)) mtDenseBreakdownPoolIdleBegin = std::chrono::steady_clock::now();\n");
+    } else {
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileEnabled)) mtDenseBreakdownPoolIdleBegin = std::chrono::steady_clock::now();\n");
+    }
+  }
   emitBodyLock(2, "stepDenseThreadWorker(0);\n");
+  if (denseBreakdownProfileCodegen) {
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle)) {\n");
+    } else {
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileEnabled)) {\n");
+    }
+    emitBodyLock(3, "mtDenseBreakdownPoolDoneBegin = std::chrono::steady_clock::now();\n");
+    emitBodyLock(3, "uint64_t mtDenseBreakdownPoolIdleNsThisStep = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownPoolDoneBegin - mtDenseBreakdownPoolIdleBegin).count();\n");
+    emitBodyLock(3, "if (unlikely(UINT64_MAX - mtDenseBreakdownPoolIdleNs < mtDenseBreakdownPoolIdleNsThisStep)) { fprintf(stderr, \"[mt-dense-breakdown] pool-idle counter overflow\\n\"); abort(); }\n");
+    emitBodyLock(3, "mtDenseBreakdownPoolIdleNs += mtDenseBreakdownPoolIdleNsThisStep;\n");
+    emitBodyLock(2, "}\n");
+  }
+
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
+  if (denseBreakdownWindowCodegen) {
+    emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle && mtDenseBreakdownWindowCausalChainMode)) {\n");
+    emitBodyLock(3, "const int mtDenseBreakdownWindowCausalSlot = mtDenseBreakdownWindowCurrentSlot;\n");
+    emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindowCausalSlot < 0 || mtDenseBreakdownWindowCausalSlot >= kDenseBreakdownWindowMaxCycles)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal invalid post-join slot\\n\"); abort(); }\n");
+    emitBodyLock(3, "MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[mtDenseBreakdownWindowCausalSlot];\n");
+    emitBodyLock(3, "mtDenseBreakdownWindowCausalSummary.causalBoundNs = 0; mtDenseBreakdownWindowCausalSummary.maxLagNs = 0; mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs = 0; mtDenseBreakdownWindowCausalSummary.latestOwnerFinishNs = 0; mtDenseBreakdownWindowCausalSummary.makespanNs = 0; mtDenseBreakdownWindowCausalSummary.chainBodyNs = 0; mtDenseBreakdownWindowCausalSummary.chainReleaseNs = 0; mtDenseBreakdownWindowCausalSummary.chainGapNs = 0; mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount = 0; mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount = 0; mtDenseBreakdownWindowCausalSummary.waitObservationCount = 0; mtDenseBreakdownWindowCausalSummary.chainNodeCount = 0; mtDenseBreakdownWindowCausalSummary.chainEdgeCount = 0; mtDenseBreakdownWindowCausalSummary.latestOwner = -1; mtDenseBreakdownWindowCausalSummary.complete = false; mtDenseBreakdownWindowCausalSummary.incompleteMapping = false; mtDenseBreakdownWindowCausalSummary.clockRegression = false; mtDenseBreakdownWindowCausalSummary.overflow = false;\n");
+    emitBodyLock(3, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) { mtDenseBreakdownWindowCausalRemotePredecessorEnds[mtaskId] = UINT64_MAX; mtDenseBreakdownWindowCausalRemotePredecessorTokens[mtaskId] = -1; mtDenseBreakdownWindowCausalSelectedPredecessors[mtaskId] = -1; mtDenseBreakdownWindowCausalSelectedPredecessorEnds[mtaskId] = 0; }\n");
+    emitBodyLock(3, "for (int token = 0; token < kDenseBreakdownWindowCausalTokenCount; token ++) {\n");
+    emitBodyLock(4, "const int mtDenseBreakdownWindowReadySlot = kDenseBreakdownWindowCausalTokenReadySlot[token]; const int mtDenseBreakdownWindowProducerMTask = kDenseBreakdownWindowCausalTokenProducerMTask[token]; const int mtDenseBreakdownWindowConsumerMTask = kDenseBreakdownWindowCausalTokenConsumerMTask[token]; const int mtDenseBreakdownWindowProducerOwner = kDenseBreakdownWindowCausalTokenProducerOwner[token]; const int mtDenseBreakdownWindowConsumerOwner = kDenseBreakdownWindowCausalTokenConsumerOwner[token];\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowReadySlot < 0 || mtDenseBreakdownWindowReadySlot >= kDenseOwnerReadyPhysicalSlotCount || kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowReadySlot] != token || mtDenseBreakdownWindowProducerMTask < 0 || mtDenseBreakdownWindowProducerMTask >= kDenseBreakdownWindowAllOwnerMTaskCount || mtDenseBreakdownWindowConsumerMTask < 0 || mtDenseBreakdownWindowConsumerMTask >= kDenseBreakdownWindowAllOwnerMTaskCount || mtDenseBreakdownWindowProducerOwner < 0 || mtDenseBreakdownWindowProducerOwner >= mtConfiguredWorkerCount || mtDenseBreakdownWindowConsumerOwner < 0 || mtDenseBreakdownWindowConsumerOwner >= mtConfiguredWorkerCount || mtDenseBreakdownWindowProducerOwner == mtDenseBreakdownWindowConsumerOwner)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal static provenance incomplete\\n\"); abort(); }\n");
+    emitBodyLock(4, "const MtDenseBreakdownWindowReadyToken &mtDenseBreakdownWindowTokenRelease = mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowCausalSlot][token];\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs == UINT64_MAX || mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs == UINT64_MAX)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release missing\\n\"); abort(); }\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs < mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs)) { mtDenseBreakdownWindowCausalSummary.clockRegression = true; mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release clock regression\\n\"); abort(); }\n");
+    emitBodyLock(4, "const uint64_t mtDenseBreakdownWindowTokenUncertainty = mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs - mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs; if (mtDenseBreakdownWindowTokenUncertainty > mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs) mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs = mtDenseBreakdownWindowTokenUncertainty;\n");
+    emitBodyLock(4, "MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowProducer = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtDenseBreakdownWindowProducerMTask]];\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowProducer.mtaskId != (uint32_t)mtDenseBreakdownWindowProducerMTask || mtDenseBreakdownWindowProducer.ownerThreadId != (uint16_t)mtDenseBreakdownWindowProducerOwner || mtDenseBreakdownWindowProducer.bodyEndOffsetNs < mtDenseBreakdownWindowProducer.bodyStartOffsetNs || mtDenseBreakdownWindowProducer.releaseEndOffsetNs == UINT64_MAX || mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs < mtDenseBreakdownWindowProducer.bodyEndOffsetNs || mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs > mtDenseBreakdownWindowProducer.releaseEndOffsetNs)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal producer record mismatch\\n\"); abort(); }\n");
+    emitBodyLock(4, "uint64_t &mtDenseBreakdownWindowRemoteEnd = mtDenseBreakdownWindowCausalRemotePredecessorEnds[mtDenseBreakdownWindowConsumerMTask]; int &mtDenseBreakdownWindowRemoteToken = mtDenseBreakdownWindowCausalRemotePredecessorTokens[mtDenseBreakdownWindowConsumerMTask];\n");
+    emitBodyLock(4, "if (mtDenseBreakdownWindowRemoteEnd == UINT64_MAX || mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs > mtDenseBreakdownWindowRemoteEnd || (mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs == mtDenseBreakdownWindowRemoteEnd && (mtDenseBreakdownWindowRemoteToken < 0 || token < mtDenseBreakdownWindowRemoteToken))) { mtDenseBreakdownWindowRemoteEnd = mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs; mtDenseBreakdownWindowRemoteToken = token; }\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount == UINT32_MAX)) { mtDenseBreakdownWindowCausalSummary.overflow = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal remote predecessor count overflow\\n\"); abort(); } mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount ++;\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "for (int worker = 0; worker < mtConfiguredWorkerCount; worker ++) {\n");
+    emitBodyLock(4, "const uint32_t mtDenseBreakdownWindowWaitCount = mtDenseBreakdownWindowWaitCounts[mtDenseBreakdownWindowCausalSlot][worker];\n");
+    emitBodyLock(4, "const uint32_t mtDenseBreakdownWindowWaitCapacity = (uint32_t)(kDenseBreakdownWindowWaitLaneOffsets[worker + 1] - kDenseBreakdownWindowWaitLaneOffsets[worker]);\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowWaitCount != mtDenseBreakdownWindowWaitCapacity)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal wait observation count mismatch\\n\"); abort(); }\n");
+    emitBodyLock(4, "for (uint32_t w = 0; w < mtDenseBreakdownWindowWaitCount; w ++) {\n");
+    emitBodyLock(5, "const MtDenseBreakdownWindowWait &mtDenseBreakdownWindowWait = mtDenseBreakdownWindowWaits[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowWaitLaneOffsets[worker] + w];\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowWait.cycleSlot != (uint16_t)mtDenseBreakdownWindowCausalSlot || mtDenseBreakdownWindowWait.threadId != (uint16_t)worker || mtDenseBreakdownWindowWait.readySlot >= (uint32_t)kDenseOwnerReadyPhysicalSlotCount)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal wait record malformed\\n\"); abort(); }\n");
+    emitBodyLock(5, "const int mtDenseBreakdownWindowLogicalToken = kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowWait.readySlot];\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowLogicalToken < 0 || mtDenseBreakdownWindowLogicalToken >= kDenseBreakdownWindowCausalTokenCount || kDenseBreakdownWindowCausalTokenConsumerMTask[mtDenseBreakdownWindowLogicalToken] != (int)mtDenseBreakdownWindowWait.consumerMtaskId || kDenseBreakdownWindowCausalTokenConsumerOwner[mtDenseBreakdownWindowLogicalToken] != worker)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal wait provenance mismatch\\n\"); abort(); }\n");
+    emitBodyLock(5, "const MtDenseBreakdownWindowReadyToken &mtDenseBreakdownWindowTokenRelease = mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowCausalSlot][mtDenseBreakdownWindowLogicalToken];\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowWait.endOffsetNs < mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs || mtDenseBreakdownWindowCausalSummary.waitObservationCount == UINT32_MAX)) { mtDenseBreakdownWindowCausalSummary.clockRegression = true; mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal wait timestamp regression\\n\"); abort(); }\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalSummary.waitObservationCount ++;\n");
+    emitBodyLock(4, "}\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "int mtDenseBreakdownWindowLastMTaskByOwner[kDenseBreakdownWindowThreadCount];\n");
+    emitBodyLock(3, "for (int worker = 0; worker < kDenseBreakdownWindowThreadCount; worker ++) mtDenseBreakdownWindowLastMTaskByOwner[worker] = -1;\n");
+    emitBodyLock(3, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {\n");
+    emitBodyLock(4, "const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowMTask = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtaskId]];\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowMTask.mtaskId != (uint32_t)mtaskId || mtDenseBreakdownWindowMTask.ownerThreadId >= (uint16_t)mtConfiguredWorkerCount || mtDenseBreakdownWindowMTask.bodyEndOffsetNs < mtDenseBreakdownWindowMTask.bodyStartOffsetNs || mtDenseBreakdownWindowMTask.releaseEndOffsetNs == UINT64_MAX || mtDenseBreakdownWindowMTask.releaseEndOffsetNs < mtDenseBreakdownWindowMTask.bodyEndOffsetNs)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal MTask record incomplete\\n\"); abort(); }\n");
+    emitBodyLock(4, "const int mtDenseBreakdownWindowOwner = (int)mtDenseBreakdownWindowMTask.ownerThreadId; int mtDenseBreakdownWindowSelectedPredecessor = -1; uint64_t mtDenseBreakdownWindowSelectedEnd = 0;\n");
+    emitBodyLock(4, "const int mtDenseBreakdownWindowPreviousMTask = mtDenseBreakdownWindowLastMTaskByOwner[mtDenseBreakdownWindowOwner];\n");
+    emitBodyLock(4, "if (mtDenseBreakdownWindowPreviousMTask >= 0) { const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowPrevious = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtDenseBreakdownWindowPreviousMTask]]; if (unlikely(mtDenseBreakdownWindowPrevious.releaseEndOffsetNs == UINT64_MAX || mtDenseBreakdownWindowPrevious.ownerThreadId != (uint16_t)mtDenseBreakdownWindowOwner || mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount == UINT32_MAX)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal same-owner predecessor missing\\n\"); abort(); } mtDenseBreakdownWindowSelectedPredecessor = mtDenseBreakdownWindowPreviousMTask; mtDenseBreakdownWindowSelectedEnd = mtDenseBreakdownWindowPrevious.releaseEndOffsetNs; mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount ++; }\n");
+    emitBodyLock(4, "const int mtDenseBreakdownWindowRemoteToken = mtDenseBreakdownWindowCausalRemotePredecessorTokens[mtaskId];\n");
+    emitBodyLock(4, "if (mtDenseBreakdownWindowRemoteToken >= 0) { const int mtDenseBreakdownWindowRemoteProducer = kDenseBreakdownWindowCausalTokenProducerMTask[mtDenseBreakdownWindowRemoteToken]; const uint64_t mtDenseBreakdownWindowRemoteEnd = mtDenseBreakdownWindowCausalRemotePredecessorEnds[mtaskId]; if (unlikely(mtDenseBreakdownWindowRemoteEnd == UINT64_MAX || mtDenseBreakdownWindowRemoteProducer < 0 || mtDenseBreakdownWindowRemoteProducer >= mtaskId)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal remote predecessor invalid\\n\"); abort(); } if (mtDenseBreakdownWindowSelectedPredecessor < 0 || mtDenseBreakdownWindowRemoteEnd > mtDenseBreakdownWindowSelectedEnd || (mtDenseBreakdownWindowRemoteEnd == mtDenseBreakdownWindowSelectedEnd && mtDenseBreakdownWindowRemoteProducer < mtDenseBreakdownWindowSelectedPredecessor)) { mtDenseBreakdownWindowSelectedPredecessor = mtDenseBreakdownWindowRemoteProducer; mtDenseBreakdownWindowSelectedEnd = mtDenseBreakdownWindowRemoteEnd; } }\n");
+    emitBodyLock(4, "if (mtDenseBreakdownWindowSelectedPredecessor >= 0) { if (unlikely(mtDenseBreakdownWindowMTask.bodyStartOffsetNs < mtDenseBreakdownWindowSelectedEnd)) { mtDenseBreakdownWindowCausalSummary.clockRegression = true; mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal predecessor timestamp regression\\n\"); abort(); } const uint64_t mtDenseBreakdownWindowLag = mtDenseBreakdownWindowMTask.bodyStartOffsetNs - mtDenseBreakdownWindowSelectedEnd; if (mtDenseBreakdownWindowLag > mtDenseBreakdownWindowCausalSummary.maxLagNs) mtDenseBreakdownWindowCausalSummary.maxLagNs = mtDenseBreakdownWindowLag; if (mtDenseBreakdownWindowSelectedEnd > mtDenseBreakdownWindowCausalSummary.causalBoundNs) mtDenseBreakdownWindowCausalSummary.causalBoundNs = mtDenseBreakdownWindowSelectedEnd; mtDenseBreakdownWindowCausalSelectedPredecessors[mtaskId] = mtDenseBreakdownWindowSelectedPredecessor; mtDenseBreakdownWindowCausalSelectedPredecessorEnds[mtaskId] = mtDenseBreakdownWindowSelectedEnd; }\n");
+    emitBodyLock(4, "mtDenseBreakdownWindowLastMTaskByOwner[mtDenseBreakdownWindowOwner] = mtaskId;\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "int mtDenseBreakdownWindowLatestOwner = -1; uint64_t mtDenseBreakdownWindowLatestFinish = 0;\n");
+    emitBodyLock(3, "for (int worker = 0; worker < mtConfiguredWorkerCount; worker ++) { if (mtDenseBreakdownWindowLastMTaskByOwner[worker] < 0) continue; const MtDenseBreakdownWindowWorker &mtDenseBreakdownWindowWorker = mtDenseBreakdownWindowWorkers[mtDenseBreakdownWindowCausalSlot][worker]; if (unlikely(mtDenseBreakdownWindowWorker.finishOffsetNs < mtDenseBreakdownWindowWorker.startOffsetNs)) { mtDenseBreakdownWindowCausalSummary.clockRegression = true; mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal worker finish regression\\n\"); abort(); } if (mtDenseBreakdownWindowLatestOwner < 0 || mtDenseBreakdownWindowWorker.finishOffsetNs > mtDenseBreakdownWindowLatestFinish || (mtDenseBreakdownWindowWorker.finishOffsetNs == mtDenseBreakdownWindowLatestFinish && worker < mtDenseBreakdownWindowLatestOwner)) { mtDenseBreakdownWindowLatestOwner = worker; mtDenseBreakdownWindowLatestFinish = mtDenseBreakdownWindowWorker.finishOffsetNs; } }\n");
+    emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindowLatestOwner < 0)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal latest owner missing\\n\"); abort(); }\n");
+    emitBodyLock(3, "mtDenseBreakdownWindowCausalSummary.latestOwner = mtDenseBreakdownWindowLatestOwner; mtDenseBreakdownWindowCausalSummary.latestOwnerFinishNs = mtDenseBreakdownWindowLatestFinish; mtDenseBreakdownWindowCausalSummary.makespanNs = mtDenseBreakdownWindowLatestFinish;\n");
+    emitBodyLock(3, "const uint32_t mtDenseBreakdownWindowVisitMark = (uint32_t)mtDenseBreakdownWindowCausalSlot + 1; int mtDenseBreakdownWindowChainMTask = mtDenseBreakdownWindowLastMTaskByOwner[mtDenseBreakdownWindowLatestOwner]; uint64_t mtDenseBreakdownWindowChainCausalReleaseEnd = UINT64_MAX;\n");
+    emitBodyLock(3, "while (mtDenseBreakdownWindowChainMTask >= 0) { if (unlikely(mtDenseBreakdownWindowChainMTask >= kDenseBreakdownWindowAllOwnerMTaskCount || mtDenseBreakdownWindowCausalSummary.chainNodeCount >= (uint32_t)kDenseBreakdownWindowAllOwnerMTaskCount || mtDenseBreakdownWindowCausalVisitMarks[mtDenseBreakdownWindowChainMTask] == mtDenseBreakdownWindowVisitMark)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal backtrack cycle or bound failure\\n\"); abort(); } mtDenseBreakdownWindowCausalVisitMarks[mtDenseBreakdownWindowChainMTask] = mtDenseBreakdownWindowVisitMark; const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowChainNode = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtDenseBreakdownWindowChainMTask]]; const uint64_t mtDenseBreakdownWindowChainReleaseEnd = mtDenseBreakdownWindowChainCausalReleaseEnd == UINT64_MAX ? mtDenseBreakdownWindowChainNode.releaseEndOffsetNs : mtDenseBreakdownWindowChainCausalReleaseEnd; if (unlikely(mtDenseBreakdownWindowChainReleaseEnd < mtDenseBreakdownWindowChainNode.bodyEndOffsetNs)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal chain release boundary invalid\\n\"); abort(); } const uint64_t mtDenseBreakdownWindowChainBodyNs = mtDenseBreakdownWindowChainNode.bodyEndOffsetNs - mtDenseBreakdownWindowChainNode.bodyStartOffsetNs; const uint64_t mtDenseBreakdownWindowReleaseNs = mtDenseBreakdownWindowChainReleaseEnd - mtDenseBreakdownWindowChainNode.bodyEndOffsetNs; if (unlikely(UINT64_MAX - mtDenseBreakdownWindowCausalSummary.chainBodyNs < mtDenseBreakdownWindowChainBodyNs || UINT64_MAX - mtDenseBreakdownWindowCausalSummary.chainReleaseNs < mtDenseBreakdownWindowReleaseNs)) { mtDenseBreakdownWindowCausalSummary.overflow = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal chain sum overflow\\n\"); abort(); } mtDenseBreakdownWindowCausalSummary.chainBodyNs += mtDenseBreakdownWindowChainBodyNs; mtDenseBreakdownWindowCausalSummary.chainReleaseNs += mtDenseBreakdownWindowReleaseNs; mtDenseBreakdownWindowCausalSummary.chainNodeCount ++; const int mtDenseBreakdownWindowChainPredecessor = mtDenseBreakdownWindowCausalSelectedPredecessors[mtDenseBreakdownWindowChainMTask]; if (mtDenseBreakdownWindowChainPredecessor < 0) break; const uint64_t mtDenseBreakdownWindowChainPredecessorEnd = mtDenseBreakdownWindowCausalSelectedPredecessorEnds[mtDenseBreakdownWindowChainMTask]; if (unlikely(mtDenseBreakdownWindowChainNode.bodyStartOffsetNs < mtDenseBreakdownWindowChainPredecessorEnd || mtDenseBreakdownWindowCausalSummary.chainEdgeCount == UINT32_MAX || UINT64_MAX - mtDenseBreakdownWindowCausalSummary.chainGapNs < mtDenseBreakdownWindowChainNode.bodyStartOffsetNs - mtDenseBreakdownWindowChainPredecessorEnd)) { mtDenseBreakdownWindowCausalSummary.clockRegression = true; mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal chain gap invalid\\n\"); abort(); } mtDenseBreakdownWindowCausalSummary.chainGapNs += mtDenseBreakdownWindowChainNode.bodyStartOffsetNs - mtDenseBreakdownWindowChainPredecessorEnd; mtDenseBreakdownWindowCausalSummary.chainEdgeCount ++; mtDenseBreakdownWindowChainCausalReleaseEnd = mtDenseBreakdownWindowChainPredecessorEnd; mtDenseBreakdownWindowChainMTask = mtDenseBreakdownWindowChainPredecessor; }\n");
+    emitBodyLock(3, "if (mtDenseBreakdownWindowCausalHotspotsMode) {\n");
+    emitBodyLock(4, "MtDenseBreakdownWindowCausalHotspotTotals mtDenseBreakdownWindowCausalHotspotCycleTotals = {};\n");
+    emitBodyLock(4, "auto mtDenseBreakdownWindowCausalHotspotsAdd = [&](uint64_t &target, uint64_t value) { if (unlikely(UINT64_MAX - target < value)) { mtDenseBreakdownWindowCausalSummary.overflow = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots aggregate overflow\\n\"); abort(); } target += value; };\n");
+    emitBodyLock(4, "int mtDenseBreakdownWindowCausalHotspotMTaskId = mtDenseBreakdownWindowLastMTaskByOwner[mtDenseBreakdownWindowLatestOwner];\n");
+    emitBodyLock(4, "uint64_t mtDenseBreakdownWindowCausalHotspotReleaseEnd = UINT64_MAX;\n");
+    emitBodyLock(4, "uint32_t mtDenseBreakdownWindowCausalHotspotNodes = 0;\n");
+    emitBodyLock(4, "while (mtDenseBreakdownWindowCausalHotspotMTaskId >= 0) {\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowCausalHotspotMTaskId >= kDenseBreakdownWindowAllOwnerMTaskCount || mtDenseBreakdownWindowCausalHotspotNodes >= (uint32_t)kDenseBreakdownWindowAllOwnerMTaskCount)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots logical MTask mapping invalid\\n\"); abort(); }\n");
+    emitBodyLock(5, "const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowCausalHotspotNode = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtDenseBreakdownWindowCausalHotspotMTaskId]];\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowCausalHotspotNode.mtaskId != (uint32_t)mtDenseBreakdownWindowCausalHotspotMTaskId || mtDenseBreakdownWindowCausalHotspotNode.bodyEndOffsetNs < mtDenseBreakdownWindowCausalHotspotNode.bodyStartOffsetNs || mtDenseBreakdownWindowCausalHotspotNode.releaseEndOffsetNs == UINT64_MAX)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots MTask record invalid\\n\"); abort(); }\n");
+    emitBodyLock(5, "const uint64_t mtDenseBreakdownWindowCausalHotspotNodeReleaseEnd = mtDenseBreakdownWindowCausalHotspotReleaseEnd == UINT64_MAX ? mtDenseBreakdownWindowCausalHotspotNode.releaseEndOffsetNs : mtDenseBreakdownWindowCausalHotspotReleaseEnd;\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowCausalHotspotNodeReleaseEnd < mtDenseBreakdownWindowCausalHotspotNode.bodyEndOffsetNs)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots release boundary invalid\\n\"); abort(); }\n");
+    emitBodyLock(5, "const uint64_t mtDenseBreakdownWindowCausalHotspotBodyNs = mtDenseBreakdownWindowCausalHotspotNode.bodyEndOffsetNs - mtDenseBreakdownWindowCausalHotspotNode.bodyStartOffsetNs;\n");
+    emitBodyLock(5, "const uint64_t mtDenseBreakdownWindowCausalHotspotReleaseNs = mtDenseBreakdownWindowCausalHotspotNodeReleaseEnd - mtDenseBreakdownWindowCausalHotspotNode.bodyEndOffsetNs;\n");
+    emitBodyLock(5, "MtDenseBreakdownWindowCausalHotspotMTask &mtDenseBreakdownWindowCausalHotspotMTask = mtDenseBreakdownWindowCausalHotspotMTasks[mtDenseBreakdownWindowCausalHotspotMTaskId];\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.count, 1);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.bodyNs, mtDenseBreakdownWindowCausalHotspotBodyNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.releaseNs, mtDenseBreakdownWindowCausalHotspotReleaseNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.count, 1);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.bodyNs, mtDenseBreakdownWindowCausalHotspotBodyNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.releaseNs, mtDenseBreakdownWindowCausalHotspotReleaseNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.count, 1);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.bodyNs, mtDenseBreakdownWindowCausalHotspotBodyNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.releaseNs, mtDenseBreakdownWindowCausalHotspotReleaseNs);\n");
+    emitBodyLock(5, "if (mtDenseBreakdownWindowCausalHotspotNodes == 0) { mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.latestTailCount, 1); mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.latestTailCount, 1); mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.latestTailCount, 1); }\n");
+    emitBodyLock(5, "const int mtDenseBreakdownWindowCausalHotspotPredecessor = mtDenseBreakdownWindowCausalSelectedPredecessors[mtDenseBreakdownWindowCausalHotspotMTaskId];\n");
+    emitBodyLock(5, "if (mtDenseBreakdownWindowCausalHotspotPredecessor < 0) break;\n");
+    emitBodyLock(5, "const uint64_t mtDenseBreakdownWindowCausalHotspotPredecessorEnd = mtDenseBreakdownWindowCausalSelectedPredecessorEnds[mtDenseBreakdownWindowCausalHotspotMTaskId];\n");
+    emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowCausalHotspotPredecessor >= mtDenseBreakdownWindowCausalHotspotMTaskId || mtDenseBreakdownWindowCausalHotspotNode.bodyStartOffsetNs < mtDenseBreakdownWindowCausalHotspotPredecessorEnd)) { mtDenseBreakdownWindowCausalSummary.clockRegression = true; mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots predecessor mapping invalid\\n\"); abort(); }\n");
+    emitBodyLock(5, "const uint64_t mtDenseBreakdownWindowCausalHotspotGapNs = mtDenseBreakdownWindowCausalHotspotNode.bodyStartOffsetNs - mtDenseBreakdownWindowCausalHotspotPredecessorEnd;\n");
+    emitBodyLock(5, "const int mtDenseBreakdownWindowCausalHotspotRemoteToken = mtDenseBreakdownWindowCausalRemotePredecessorTokens[mtDenseBreakdownWindowCausalHotspotMTaskId];\n");
+    emitBodyLock(5, "bool mtDenseBreakdownWindowCausalHotspotSelectedRemoteToken = false;\n");
+    emitBodyLock(5, "if (mtDenseBreakdownWindowCausalHotspotRemoteToken >= 0) { if (unlikely(mtDenseBreakdownWindowCausalHotspotRemoteToken >= kDenseBreakdownWindowCausalTokenCount)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots remote token index invalid\\n\"); abort(); } mtDenseBreakdownWindowCausalHotspotSelectedRemoteToken = kDenseBreakdownWindowCausalTokenProducerMTask[mtDenseBreakdownWindowCausalHotspotRemoteToken] == mtDenseBreakdownWindowCausalHotspotPredecessor && mtDenseBreakdownWindowCausalRemotePredecessorEnds[mtDenseBreakdownWindowCausalHotspotMTaskId] == mtDenseBreakdownWindowCausalHotspotPredecessorEnd; }\n");
+    emitBodyLock(5, "if (mtDenseBreakdownWindowCausalHotspotSelectedRemoteToken && kDenseBreakdownWindowCausalSameOwnerProducerMTask[mtDenseBreakdownWindowCausalHotspotMTaskId] == mtDenseBreakdownWindowCausalHotspotPredecessor) mtDenseBreakdownWindowCausalHotspotSelectedRemoteToken = false;\n");
+    emitBodyLock(5, "if (mtDenseBreakdownWindowCausalHotspotSelectedRemoteToken) {\n");
+    emitBodyLock(6, "const int mtDenseBreakdownWindowCausalHotspotReadySlot = kDenseBreakdownWindowCausalTokenReadySlot[mtDenseBreakdownWindowCausalHotspotRemoteToken];\n");
+    emitBodyLock(6, "if (unlikely(mtDenseBreakdownWindowCausalHotspotReadySlot < 0 || mtDenseBreakdownWindowCausalHotspotReadySlot >= kDenseOwnerReadyPhysicalSlotCount || kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowCausalHotspotReadySlot] != mtDenseBreakdownWindowCausalHotspotRemoteToken || kDenseBreakdownWindowCausalTokenConsumerMTask[mtDenseBreakdownWindowCausalHotspotRemoteToken] != mtDenseBreakdownWindowCausalHotspotMTaskId)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots remote token provenance invalid\\n\"); abort(); }\n");
+    emitBodyLock(6, "if (unlikely(mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowCausalSlot][mtDenseBreakdownWindowCausalHotspotRemoteToken].releaseBeforeOffsetNs != mtDenseBreakdownWindowCausalHotspotPredecessorEnd)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots remote release-before endpoint mismatch\\n\"); abort(); }\n");
+    emitBodyLock(6, "MtDenseBreakdownWindowCausalHotspotEdge &mtDenseBreakdownWindowCausalHotspotEdge = mtDenseBreakdownWindowCausalHotspotRemoteTokenEdges[mtDenseBreakdownWindowCausalHotspotRemoteToken];\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.remoteTokenPredCount, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.remoteTokenPredCount, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotEdge.count, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotEdge.gapNs, mtDenseBreakdownWindowCausalHotspotGapNs);\n");
+    emitBodyLock(5, "} else {\n");
+    emitBodyLock(6, "const int mtDenseBreakdownWindowCausalHotspotSameOwnerProducer = kDenseBreakdownWindowCausalSameOwnerProducerMTask[mtDenseBreakdownWindowCausalHotspotMTaskId];\n");
+    emitBodyLock(6, "const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowCausalHotspotProducer = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowCausalSlot][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtDenseBreakdownWindowCausalHotspotPredecessor]];\n");
+    emitBodyLock(6, "if (unlikely(mtDenseBreakdownWindowCausalHotspotSameOwnerProducer != mtDenseBreakdownWindowCausalHotspotPredecessor || mtDenseBreakdownWindowCausalHotspotProducer.mtaskId != (uint32_t)mtDenseBreakdownWindowCausalHotspotPredecessor || mtDenseBreakdownWindowCausalHotspotProducer.ownerThreadId != mtDenseBreakdownWindowCausalHotspotNode.ownerThreadId)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots same-owner mapping invalid\\n\"); abort(); }\n");
+    emitBodyLock(6, "MtDenseBreakdownWindowCausalHotspotEdge &mtDenseBreakdownWindowCausalHotspotEdge = mtDenseBreakdownWindowCausalHotspotSameOwnerEdges[mtDenseBreakdownWindowCausalHotspotMTaskId];\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.sameOwnerPredCount, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotEdge.count, 1);\n");
+    emitBodyLock(6, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotEdge.gapNs, mtDenseBreakdownWindowCausalHotspotGapNs);\n");
+    emitBodyLock(5, "}\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotMTask.gapNs, mtDenseBreakdownWindowCausalHotspotGapNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.gapNs, mtDenseBreakdownWindowCausalHotspotGapNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotTotals.edgeCount, 1);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.gapNs, mtDenseBreakdownWindowCausalHotspotGapNs);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotsAdd(mtDenseBreakdownWindowCausalHotspotCycleTotals.edgeCount, 1);\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotReleaseEnd = mtDenseBreakdownWindowCausalHotspotPredecessorEnd;\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotMTaskId = mtDenseBreakdownWindowCausalHotspotPredecessor;\n");
+    emitBodyLock(5, "mtDenseBreakdownWindowCausalHotspotNodes ++;\n");
+    emitBodyLock(4, "}\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalHotspotCycleTotals.count != mtDenseBreakdownWindowCausalSummary.chainNodeCount || mtDenseBreakdownWindowCausalHotspotCycleTotals.bodyNs != mtDenseBreakdownWindowCausalSummary.chainBodyNs || mtDenseBreakdownWindowCausalHotspotCycleTotals.releaseNs != mtDenseBreakdownWindowCausalSummary.chainReleaseNs || mtDenseBreakdownWindowCausalHotspotCycleTotals.gapNs != mtDenseBreakdownWindowCausalSummary.chainGapNs || mtDenseBreakdownWindowCausalHotspotCycleTotals.edgeCount != mtDenseBreakdownWindowCausalSummary.chainEdgeCount || mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount > mtDenseBreakdownWindowCausalHotspotCycleTotals.edgeCount || mtDenseBreakdownWindowCausalHotspotCycleTotals.remoteTokenPredCount > mtDenseBreakdownWindowCausalHotspotCycleTotals.edgeCount - mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount || mtDenseBreakdownWindowCausalHotspotCycleTotals.latestTailCount != 1)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots cycle reconciliation failed\\n\"); abort(); }\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount > mtDenseBreakdownWindowCausalHotspotCycleTotals.edgeCount || mtDenseBreakdownWindowCausalHotspotCycleTotals.remoteTokenPredCount != mtDenseBreakdownWindowCausalHotspotCycleTotals.edgeCount - mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount)) { mtDenseBreakdownWindowCausalSummary.incompleteMapping = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots selected edge-kind reconciliation failed\\n\"); abort(); }\n");
+    emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount > UINT32_MAX || mtDenseBreakdownWindowCausalHotspotCycleTotals.remoteTokenPredCount > UINT32_MAX)) { mtDenseBreakdownWindowCausalSummary.overflow = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots selected predecessor count overflow\\n\"); abort(); }\n");
+    emitBodyLock(4, "mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount = (uint32_t)mtDenseBreakdownWindowCausalHotspotCycleTotals.sameOwnerPredCount; mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount = (uint32_t)mtDenseBreakdownWindowCausalHotspotCycleTotals.remoteTokenPredCount;\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "if (mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs > mtDenseBreakdownWindowCausalTimestampBoundUncertaintyNs) mtDenseBreakdownWindowCausalTimestampBoundUncertaintyNs = mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs; mtDenseBreakdownWindowCausalSummary.complete = true;\n");
+    emitBodyLock(2, "}\n");
+  }
+  if (denseBreakdownProfileCodegen) {
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle)) {\n");
+    } else {
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileEnabled)) {\n");
+    }
+    emitBodyLock(3, "uint64_t mtDenseBreakdownPoolDoneNsThisStep = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownPoolDoneBegin).count();\n");
+    emitBodyLock(3, "if (unlikely(UINT64_MAX - mtDenseBreakdownPoolDoneNs < mtDenseBreakdownPoolDoneNsThisStep)) { fprintf(stderr, \"[mt-dense-breakdown] pool-done counter overflow\\n\"); abort(); }\n");
+    emitBodyLock(3, "mtDenseBreakdownPoolDoneNs += mtDenseBreakdownPoolDoneNsThisStep;\n");
+    emitBodyLock(2, "}\n");
+  }
+
   emitBodyLock(1, "} else {\n");
-  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-    emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
+  if (ownerReadyFlags) {
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(2, "mtDenseOwnerReadyTokensPrimed = false;\n");
+    emitBodyLock(2, "#endif\n");
+  }
+  if (activeWorklistPush) {
+    emitBodyLock(2, "if (unlikely(mtConfiguredWorkerCount != 1)) { fprintf(stderr, \"[mt-dense-active-worklist-push] requires one worker\\n\"); abort(); }\n");
+    emitBodyLock(2, "stepDenseActiveWorklistSingleThread();\n");
+  } else {
+    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+      emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
+    }
   }
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
   emitBodyLock(1, "cycles ++;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
+  if (denseBreakdownProfileCodegen) {
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfileInCycle)) {\n");
+    } else {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfileEnabled)) {\n");
+    }
+    emitBodyLock(2, "uint64_t mtDenseBreakdownStepNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDenseBreakdownStepBegin).count();\n");
+    emitBodyLock(2, "if (unlikely(UINT64_MAX - mtDenseBreakdownTotalStepNs < mtDenseBreakdownStepNs)) { fprintf(stderr, \"[mt-dense-breakdown] total-step counter overflow\\n\"); abort(); }\n");
+    emitBodyLock(2, "mtDenseBreakdownTotalStepNs += mtDenseBreakdownStepNs;\n");
+    emitBodyLock(1, "}\n");
+  }
   emitBodyLock(0, "}\n");
+  mtActivationEventTraceSuppressed = savedActivationEventTraceSuppressed;
 }
 
 void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::string& serialFastSuffix, bool denseExecutorValid) {
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   if (denseExecutorValid) emitBodyLock(1, "if (unlikely(mtUseDenseExecutor)) { stepDense(); return; }\n");
+  if (mtUseActivationEventTraceCodegen()) emitBodyLock(1, "beginMtActivationEventTraceCycle();\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "resetAll();\n");
   for (SuperNode* super : sortedSuper) {
@@ -11471,6 +13040,7 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
     for (int i = 0; i <= serialFastSubStepMax; i ++) {
       emitBodyLock(2, "subStep%d%s();\n", i, serialFastSuffix.c_str());
     }
+    if (mtUseActivationEventTraceCodegen()) emitBodyLock(2, "flushMtActivationEventTraceCycle();\n");
     emitBodyLock(2, "cycles ++;\n");
     emitBodyLock(2, "return;\n");
     emitBodyLock(1, "}\n");
@@ -11496,6 +13066,7 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
 
   // Dump before cycles++ so the trace line names the cycle whose substeps just ran.
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
+  if (mtUseActivationEventTraceCodegen()) emitBodyLock(1, "flushMtActivationEventTraceCycle();\n");
   emitBodyLock(1, "cycles ++;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
   emitBodyLock(0, "}\n");
@@ -11637,6 +13208,7 @@ void graph::cppEmitter() {
   std::map<int, MtTaskInfo> mtRepCutHeaderTasks;
   MtCoarseProfileFacts mtCoarseProfileFacts;
   bool useDenseExecutorCodegen = mtUseDenseExecutorCodegen();
+  bool activationEventTraceCodegen = mtUseActivationEventTraceCodegen();
   MtDenseSchedule mtDenseSchedule;
   if (useMtHelpers) {
     mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
@@ -11657,6 +13229,121 @@ void graph::cppEmitter() {
     mtDenseSchedule = buildMtDenseSchedule(mtRepCutHeaderTasks, true);
   }
   bool denseExecutorValid = useDenseExecutorCodegen && mtDenseSchedule.valid;
+  bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
+  bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
+  int denseBreakdownWindowWorker0MTaskCount = 0;
+  int denseBreakdownWindowAllOwnerMTaskCount = 0;
+  int denseBreakdownWindowThreadCount = 8;
+  if (denseBreakdownWindowCodegen) {
+    const char* denseBreakdownWindowThreadsEnv = std::getenv("GSIM_THREADS");
+    if (denseBreakdownWindowThreadsEnv != nullptr && denseBreakdownWindowThreadsEnv[0] != '\0') denseBreakdownWindowThreadCount = std::atoi(denseBreakdownWindowThreadsEnv);
+    if (denseBreakdownWindowThreadCount < 1) denseBreakdownWindowThreadCount = 1;
+    Assert(denseBreakdownWindowThreadCount >= 2 && denseBreakdownWindowThreadCount <= 16,
+           "GSIM_MT_DENSE_BREAKDOWN window requires 2..16 workers (got %d)",
+           denseBreakdownWindowThreadCount);
+  }
+  if (denseBreakdownProfileCodegen) {
+    Assert(denseExecutorValid,
+           "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires a valid dense executor");
+  }
+  if (denseBreakdownWindowCodegen) {
+    for (int mtaskId = 0; mtaskId < static_cast<int>(mtDenseSchedule.mtaskThreadAssign.size()); mtaskId ++) {
+      if (mtDenseSchedule.mtaskThreadAssign[(size_t)mtaskId] == 0) denseBreakdownWindowWorker0MTaskCount ++;
+    }
+    Assert(denseBreakdownWindowWorker0MTaskCount <= 2267,
+           "GSIM_MT_DENSE_BREAKDOWN window supports at most 2267 worker0 MTasks (got %d)",
+           denseBreakdownWindowWorker0MTaskCount);
+  }
+  if (denseBreakdownWindowCodegen) {
+    denseBreakdownWindowAllOwnerMTaskCount = static_cast<int>(mtDenseSchedule.mtaskThreadAssign.size());
+    Assert(denseBreakdownWindowAllOwnerMTaskCount <= 32768,
+           "GSIM_MT_DENSE_BREAKDOWN allownerbody supports at most 32768 MTasks (got %d)",
+           denseBreakdownWindowAllOwnerMTaskCount);
+  }
+  MtDenseBreakdownWindowAllOwnerLayout denseBreakdownWindowAllOwnerLayout;
+  if (denseBreakdownWindowCodegen) {
+    denseBreakdownWindowAllOwnerLayout = mtBuildDenseBreakdownWindowAllOwnerLayout(
+        mtDenseSchedule.mtaskThreadAssign, denseBreakdownWindowThreadCount);
+    Assert(denseBreakdownWindowAllOwnerLayout.recordCount >= denseBreakdownWindowAllOwnerMTaskCount
+           && denseBreakdownWindowAllOwnerLayout.recordCount
+                  <= denseBreakdownWindowAllOwnerMTaskCount + 7 * denseBreakdownWindowThreadCount,
+           "dense breakdown header all-owner physical layout count mismatch");
+  }
+  std::vector<int> denseBreakdownWindowCausalSameOwnerProducerByMTask;
+  if (denseBreakdownWindowCodegen) {
+    denseBreakdownWindowCausalSameOwnerProducerByMTask.assign(
+        (size_t)denseBreakdownWindowAllOwnerMTaskCount, -1);
+    std::vector<int> denseBreakdownWindowLastMTaskByOwner(
+        (size_t)denseBreakdownWindowThreadCount, -1);
+    for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {
+      const int owner = mtDenseSchedule.mtaskThreadAssign[(size_t)mtaskId];
+      Assert(owner >= 0 && owner < denseBreakdownWindowThreadCount,
+             "dense breakdown causal same-owner MTask %d has invalid owner %d", mtaskId, owner);
+      denseBreakdownWindowCausalSameOwnerProducerByMTask[(size_t)mtaskId] =
+          denseBreakdownWindowLastMTaskByOwner[(size_t)owner];
+      denseBreakdownWindowLastMTaskByOwner[(size_t)owner] = mtaskId;
+    }
+  }
+  MtDenseOwnerReadyLayout denseBreakdownWindowReadyLayout;
+  MtDenseBreakdownWindowWaitLayout denseBreakdownWindowWaitLayout;
+  if (denseBreakdownWindowCodegen) {
+    const bool denseBreakdownWindowWorkSteal = mtUseDenseWorkSteal();
+    const bool denseBreakdownWindowXThreadDepsOnly = denseBreakdownWindowWorkSteal ? false : mtUseDenseXThreadDepsOnly();
+    const bool denseBreakdownWindowTransitiveReduce = denseBreakdownWindowWorkSteal ? false : mtUseDenseTransitiveReduceEdges();
+    std::vector<std::vector<int>> denseBreakdownWindowRuntimeSuccs = mtBuildDenseRuntimeSuccs(
+        mtDenseSchedule.mtasks, mtDenseSchedule.mtaskThreadAssign, denseBreakdownWindowXThreadDepsOnly);
+    if (denseBreakdownWindowTransitiveReduce) {
+      mtReduceDenseRuntimeSuccsTransitive(denseBreakdownWindowRuntimeSuccs, mtDenseSchedule.mtaskThreadAssign);
+    }
+    denseBreakdownWindowReadyLayout = mtBuildDenseOwnerReadyLayout(
+        denseBreakdownWindowRuntimeSuccs, mtDenseSchedule.mtaskThreadAssign, denseBreakdownWindowThreadCount);
+    denseBreakdownWindowWaitLayout = mtBuildDenseBreakdownWindowWaitLayout(
+        denseBreakdownWindowReadyLayout, mtDenseSchedule.mtaskThreadAssign, denseBreakdownWindowThreadCount);
+    Assert(denseBreakdownWindowWaitLayout.totalWaitRecords <= 65536,
+           "GSIM_MT_DENSE_BREAKDOWN window supports at most 65536 ready waits per cycle (got %d)",
+           denseBreakdownWindowWaitLayout.totalWaitRecords);
+    Assert(denseBreakdownWindowWaitLayout.totalWaitRecords == denseBreakdownWindowReadyLayout.tokenCount,
+           "dense breakdown window wait/token count mismatch: waits=%d tokens=%d",
+           denseBreakdownWindowWaitLayout.totalWaitRecords, denseBreakdownWindowReadyLayout.tokenCount);
+    Assert(static_cast<int>(denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken.size())
+               == denseBreakdownWindowReadyLayout.tokenCount
+           && static_cast<int>(denseBreakdownWindowReadyLayout.logicalTokenByPhysicalSlot.size())
+                  == denseBreakdownWindowReadyLayout.physicalSlotCount,
+           "dense breakdown window causal token provenance is incomplete");
+  }
+  std::vector<int> denseBreakdownWindowCausalHotspotRemoteTokenOutputOrder;
+  std::vector<int> denseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder;
+  if (denseBreakdownWindowCodegen) {
+    for (int token = 0; token < denseBreakdownWindowReadyLayout.tokenCount; token ++) {
+      denseBreakdownWindowCausalHotspotRemoteTokenOutputOrder.push_back(token);
+    }
+    std::sort(denseBreakdownWindowCausalHotspotRemoteTokenOutputOrder.begin(),
+              denseBreakdownWindowCausalHotspotRemoteTokenOutputOrder.end(),
+              [&](int left, int right) {
+                const MtDenseOwnerReadyTokenProvenance& leftToken =
+                    denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)left];
+                const MtDenseOwnerReadyTokenProvenance& rightToken =
+                    denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)right];
+                if (leftToken.producerMTask != rightToken.producerMTask)
+                  return leftToken.producerMTask < rightToken.producerMTask;
+                if (leftToken.consumerMTask != rightToken.consumerMTask)
+                  return leftToken.consumerMTask < rightToken.consumerMTask;
+                return left < right;
+              });
+    for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {
+      denseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder.push_back(mtaskId);
+    }
+    std::sort(denseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder.begin(),
+              denseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder.end(),
+              [&](int left, int right) {
+                const int leftProducer =
+                    denseBreakdownWindowCausalSameOwnerProducerByMTask[(size_t)left];
+                const int rightProducer =
+                    denseBreakdownWindowCausalSameOwnerProducerByMTask[(size_t)right];
+                if (leftProducer != rightProducer) return leftProducer < rightProducer;
+                return left < right;
+              });
+  }
   if (useDenseExecutorCodegen && !mtDenseSchedule.valid) {
     printf("[mt-dense-schedule] dense executor codegen disabled: fallback=%s\n", mtDenseSchedule.fallbackReason.c_str());
   }
@@ -11674,6 +13361,7 @@ void graph::cppEmitter() {
   }
   if (globalConfig.MtHelperMode == "buffered-seq") emitActiveBufferDef(header, activeFlagNum);
   if (useMtHelpers) emitActivationDeltaDef(header, activeFlagNum);
+  if (activationEventTraceCodegen) emitActivationEventTraceDef(header);
 
   fprintf(header, "class S%s {\npublic:\n", name.c_str());
   fprintf(header, "uint64_t cycles;\n");
@@ -11681,10 +13369,181 @@ void graph::cppEmitter() {
   fprintf(header, "uint%d_t activeFlags[%d];\n", ACTIVE_WIDTH, activeFlagNum); // or super.size() if id == idx
   if (denseExecutorValid) fprintf(header, "bool mtUseDenseExecutor;\n");
   fprintf(header, "bool mtProfileEnabled;\n");
+  if (denseBreakdownProfileCodegen) {
+    fprintf(header, "static constexpr int kDenseBreakdownProfileWorkerCount = 16;\n");
+    fprintf(header, "struct alignas(64) MtDenseBreakdownWorker {\n");
+    fprintf(header, "  uint64_t dispatchSpanNs;\n");
+    fprintf(header, "  uint64_t blockedWaitNs;\n");
+    fprintf(header, "  uint64_t blockedWaitCount;\n");
+    fprintf(header, "  uint8_t padding[64 - 3 * sizeof(uint64_t)];\n");
+    fprintf(header, "};\n");
+    fprintf(header, "static_assert(sizeof(MtDenseBreakdownWorker) == 64, \"dense breakdown worker lanes must be cache-line sized\");\n");
+    fprintf(header, "bool mtDenseBreakdownProfileEnabled;\n");
+    fprintf(header, "char mtDenseBreakdownProfileOutPath[4096];\n");
+    fprintf(header, "MtDenseBreakdownWorker mtDenseBreakdownWorkers[kDenseBreakdownProfileWorkerCount];\n");
+    fprintf(header, "uint64_t mtDenseBreakdownPoolIdleNs;\n");
+    fprintf(header, "uint64_t mtDenseBreakdownPoolDoneNs;\n");
+    fprintf(header, "uint64_t mtDenseBreakdownTotalStepNs;\n");
+    if (denseBreakdownWindowCodegen) {
+      const int denseBreakdownWindowWorker0MTaskStorageCount = std::max(1, denseBreakdownWindowWorker0MTaskCount);
+      const int denseBreakdownWindowAllOwnerMTaskStorageCount = std::max(8, denseBreakdownWindowAllOwnerLayout.recordCount);
+      const int denseBreakdownWindowWaitRecordStorageCount = std::max(1, denseBreakdownWindowWaitLayout.totalWaitRecords);
+      const int denseBreakdownWindowCausalTokenStorageCount =
+          std::max(1, denseBreakdownWindowReadyLayout.tokenCount);
+      const int denseBreakdownWindowCausalReadySlotStorageCount =
+          std::max(1, denseBreakdownWindowReadyLayout.physicalSlotCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowMaxCycles = 256;\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowMaxWorker0MTasks = 2267;\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowThreadCount = %d;\n", denseBreakdownWindowThreadCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowWorker0MTaskCount = %d;\n", denseBreakdownWindowWorker0MTaskCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowWorker0MTaskStorageCount = %d;\n", denseBreakdownWindowWorker0MTaskStorageCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenCount = %d;\n", denseBreakdownWindowReadyLayout.tokenCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenStorageCount = %d;\n", denseBreakdownWindowCausalTokenStorageCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenReadySlot[%d] = {", denseBreakdownWindowCausalTokenStorageCount);
+      for (int token = 0; token < denseBreakdownWindowReadyLayout.tokenCount; token ++) {
+        if (token != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].readySlot);
+      }
+      if (denseBreakdownWindowReadyLayout.tokenCount == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenProducerMTask[%d] = {", denseBreakdownWindowCausalTokenStorageCount);
+      for (int token = 0; token < denseBreakdownWindowReadyLayout.tokenCount; token ++) { if (token != 0) fprintf(header, ","); fprintf(header, "%d", denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].producerMTask); }
+      if (denseBreakdownWindowReadyLayout.tokenCount == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenProducerOwner[%d] = {", denseBreakdownWindowCausalTokenStorageCount);
+      for (int token = 0; token < denseBreakdownWindowReadyLayout.tokenCount; token ++) { if (token != 0) fprintf(header, ","); fprintf(header, "%d", denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].producerOwner); }
+      if (denseBreakdownWindowReadyLayout.tokenCount == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenConsumerMTask[%d] = {", denseBreakdownWindowCausalTokenStorageCount);
+      for (int token = 0; token < denseBreakdownWindowReadyLayout.tokenCount; token ++) { if (token != 0) fprintf(header, ","); fprintf(header, "%d", denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerMTask); }
+      if (denseBreakdownWindowReadyLayout.tokenCount == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalTokenConsumerOwner[%d] = {", denseBreakdownWindowCausalTokenStorageCount);
+      for (int token = 0; token < denseBreakdownWindowReadyLayout.tokenCount; token ++) { if (token != 0) fprintf(header, ","); fprintf(header, "%d", denseBreakdownWindowReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerOwner); }
+      if (denseBreakdownWindowReadyLayout.tokenCount == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalLogicalTokenByReadySlot[%d] = {", denseBreakdownWindowCausalReadySlotStorageCount);
+      for (int readySlot = 0; readySlot < denseBreakdownWindowReadyLayout.physicalSlotCount; readySlot ++) { if (readySlot != 0) fprintf(header, ","); fprintf(header, "%d", denseBreakdownWindowReadyLayout.logicalTokenByPhysicalSlot[(size_t)readySlot]); }
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowMaxAllOwnerMTasks = 32768;\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowMaxAllOwnerMTaskStorageCount = 32880;\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowAllOwnerMTaskCount = %d;\n", denseBreakdownWindowAllOwnerMTaskCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowAllOwnerMTaskStorageCount = %d;\n", denseBreakdownWindowAllOwnerMTaskStorageCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowAllOwnerLaneOffsets[kDenseBreakdownWindowThreadCount + 1] = {");
+      for (int worker = 0; worker <= denseBreakdownWindowThreadCount; worker ++) {
+        if (worker != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowAllOwnerLayout.laneOffsets[(size_t)worker]);
+      }
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowAllOwnerMTaskRecordIndex[kDenseBreakdownWindowAllOwnerMTaskStorageCount] = {");
+      for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {
+        if (mtaskId != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowAllOwnerLayout.recordIndexByMTask[(size_t)mtaskId]);
+      }
+      fprintf(header, "};\n");
+      // Fixed workers traverse their assigned logical MTask ids in ascending order after
+      // SCHED_ORDER has renumbered the schedule. This map is deliberately logical-sized:
+      // all-owner storage padding is not a causal same-owner vertex.
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalSameOwnerProducerMTask[kDenseBreakdownWindowAllOwnerMTaskCount] = {");
+      for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {
+        if (mtaskId != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowCausalSameOwnerProducerByMTask[(size_t)mtaskId]);
+      }
+      fprintf(header, "};\n");
+      // These permutations contain only logical ids. Do not use storage capacities here:
+      // those include sentinel padding that is not a causal edge or MTask.
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalHotspotRemoteTokenOutputOrder[kDenseBreakdownWindowCausalTokenCount] = {");
+      for (int index = 0; index < denseBreakdownWindowReadyLayout.tokenCount; index ++) {
+        if (index != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowCausalHotspotRemoteTokenOutputOrder[(size_t)index]);
+      }
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder[kDenseBreakdownWindowAllOwnerMTaskCount] = {");
+      for (int index = 0; index < denseBreakdownWindowAllOwnerMTaskCount; index ++) {
+        if (index != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder[(size_t)index]);
+      }
+      fprintf(header, "};\n");
+      fprintf(header, "static_assert(kDenseBreakdownWindowAllOwnerMTaskCount <= kDenseBreakdownWindowMaxAllOwnerMTasks, \"dense breakdown all-owner MTask cap\");\n");
+      fprintf(header, "static_assert(kDenseBreakdownWindowAllOwnerMTaskStorageCount <= kDenseBreakdownWindowMaxAllOwnerMTaskStorageCount, \"dense breakdown all-owner physical storage cap\");\n");
+      fprintf(header, "static_assert((kDenseBreakdownWindowAllOwnerMTaskStorageCount %% 8) == 0, \"dense breakdown all-owner row alignment\");\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowMaxWaitRecordsPerCycle = 65536;\n");
+      fprintf(header, "static constexpr int kDenseBreakdownWindowWaitRecordCount = %d;\n", denseBreakdownWindowWaitLayout.totalWaitRecords);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowWaitRecordStorageCount = %d;\n", denseBreakdownWindowWaitRecordStorageCount);
+      fprintf(header, "static constexpr int kDenseBreakdownWindowWaitLaneOffsets[kDenseBreakdownWindowThreadCount + 1] = {");
+      for (int worker = 0; worker <= denseBreakdownWindowThreadCount; worker ++) {
+        if (worker != 0) fprintf(header, ",");
+        fprintf(header, "%d", denseBreakdownWindowWaitLayout.laneOffsets[(size_t)worker]);
+      }
+      fprintf(header, "};\n");
+      fprintf(header, "static_assert(kDenseBreakdownWindowWaitRecordCount <= kDenseBreakdownWindowMaxWaitRecordsPerCycle, \"dense breakdown window wait cap\");\n");
+      fprintf(header, "static_assert(kDenseBreakdownWindowWorker0MTaskCount <= kDenseBreakdownWindowMaxWorker0MTasks, \"dense breakdown window worker0 MTask cap\");\n");
+      fprintf(header, "struct alignas(64) MtDenseBreakdownWindowWorker {\n");
+      fprintf(header, "  uint64_t startOffsetNs;\n");
+      fprintf(header, "  uint64_t finishOffsetNs;\n");
+      fprintf(header, "  uint64_t blockedWaitNs;\n");
+      fprintf(header, "  uint64_t bodyNs;\n");
+      fprintf(header, "  uint64_t controlNs;\n");
+      fprintf(header, "  uint8_t padding[64 - 5 * sizeof(uint64_t)];\n");
+      fprintf(header, "};\n");
+      fprintf(header, "static_assert(sizeof(MtDenseBreakdownWindowWorker) == 64, \"dense breakdown window worker lanes must be cache-line sized\");\n");
+      fprintf(header, "struct MtDenseBreakdownWindowMTask { uint32_t mtaskId; uint32_t padding; uint64_t bodyNs; };\n");
+      fprintf(header, "struct MtDenseBreakdownWindowWait { uint16_t cycleSlot; uint16_t threadId; uint32_t consumerMtaskId; uint32_t readySlot; uint32_t padding; uint64_t blockedNs; uint64_t endOffsetNs; };\n");
+      fprintf(header, "struct MtDenseBreakdownWindowAllOwnerMTask { uint32_t mtaskId; uint16_t ownerThreadId; uint16_t readyTokenStoreCount; uint64_t bodyStartOffsetNs; uint64_t bodyEndOffsetNs; uint64_t bodyNs; uint64_t releaseEndOffsetNs; };\n");
+      fprintf(header, "static_assert(sizeof(MtDenseBreakdownWindowAllOwnerMTask) == 40, \"dense breakdown all-owner record size\");\n");
+      fprintf(header, "struct MtDenseBreakdownWindowReadyToken { uint64_t releaseBeforeOffsetNs; uint64_t releaseAfterOffsetNs; };\n");
+      fprintf(header, "struct MtDenseBreakdownWindowCausalSummary { uint64_t causalBoundNs; uint64_t maxLagNs; uint64_t timestampBoundUncertaintyNs; uint64_t latestOwnerFinishNs; uint64_t makespanNs; uint64_t chainBodyNs; uint64_t chainReleaseNs; uint64_t chainGapNs; uint32_t sameOwnerPredecessorCount; uint32_t remoteTokenPredecessorCount; uint32_t waitObservationCount; uint32_t chainNodeCount; uint32_t chainEdgeCount; int32_t latestOwner; bool complete; bool incompleteMapping; bool clockRegression; bool overflow; };\n");
+      fprintf(header, "struct MtDenseBreakdownWindowCausalHotspotMTask { uint64_t count; uint64_t bodyNs; uint64_t releaseNs; uint64_t gapNs; uint64_t sameOwnerPredCount; uint64_t remoteTokenPredCount; uint64_t latestTailCount; };\n");
+      fprintf(header, "struct MtDenseBreakdownWindowCausalHotspotEdge { uint64_t count; uint64_t gapNs; };\n");
+      fprintf(header, "struct MtDenseBreakdownWindowCausalHotspotTotals { uint64_t count; uint64_t bodyNs; uint64_t releaseNs; uint64_t gapNs; uint64_t sameOwnerPredCount; uint64_t remoteTokenPredCount; uint64_t latestTailCount; uint64_t edgeCount; };\n");
+      fprintf(header, "bool mtDenseBreakdownWindowEnabled;\n");
+      fprintf(header, "bool mtDenseBreakdownWindowWorker0BodyMode;\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowCausalRemotePredecessorEnds[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "int mtDenseBreakdownWindowCausalRemotePredecessorTokens[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "int mtDenseBreakdownWindowCausalSelectedPredecessors[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowCausalSelectedPredecessorEnds[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "uint32_t mtDenseBreakdownWindowCausalVisitMarks[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "MtDenseBreakdownWindowCausalHotspotMTask mtDenseBreakdownWindowCausalHotspotMTasks[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "MtDenseBreakdownWindowCausalHotspotEdge mtDenseBreakdownWindowCausalHotspotRemoteTokenEdges[%d];\n", denseBreakdownWindowCausalTokenStorageCount);
+      fprintf(header, "MtDenseBreakdownWindowCausalHotspotEdge mtDenseBreakdownWindowCausalHotspotSameOwnerEdges[kDenseBreakdownWindowMaxAllOwnerMTasks];\n");
+      fprintf(header, "MtDenseBreakdownWindowCausalHotspotTotals mtDenseBreakdownWindowCausalHotspotTotals;\n");
+      fprintf(header, "bool mtDenseBreakdownWindowAllOwnerBodyMode;\n");
+      fprintf(header, "bool mtDenseBreakdownWindowFinishOnlyMode;\n");
+      fprintf(header, "bool mtDenseBreakdownWindowCausalChainMode;\n");
+      fprintf(header, "bool mtDenseBreakdownWindowCausalHotspotsMode;\n");
+      fprintf(header, "bool mtDenseBreakdownWindowCausalClockRegression;\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowCausalTimestampBoundUncertaintyNs;\n");
+      fprintf(header, "std::atomic<bool> mtDenseBreakdownWindowOverflow;\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowStart;\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowCycles;\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowRecordedCycles;\n");
+      fprintf(header, "int mtDenseBreakdownWindowCurrentSlot;\n");
+      fprintf(header, "std::chrono::steady_clock::time_point mtDenseBreakdownWindowEpoch;\n");
+      fprintf(header, "char mtDenseBreakdownWindowOutPath[4096];\n");
+      fprintf(header, "uint64_t mtDenseBreakdownWindowCycleNumbers[kDenseBreakdownWindowMaxCycles];\n");
+      fprintf(header, "uint32_t mtDenseBreakdownWindowWorker0MTaskCounts[kDenseBreakdownWindowMaxCycles];\n");
+      fprintf(header, "MtDenseBreakdownWindowWorker mtDenseBreakdownWindowWorkers[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowThreadCount];\n");
+      fprintf(header, "MtDenseBreakdownWindowMTask mtDenseBreakdownWindowWorker0MTasks[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowWorker0MTaskStorageCount];\n");
+      fprintf(header, "uint32_t mtDenseBreakdownWindowWaitCounts[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowThreadCount];\n");
+      fprintf(header, "MtDenseBreakdownWindowWait mtDenseBreakdownWindowWaits[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowWaitRecordStorageCount];\n");
+      fprintf(header, "alignas(64) MtDenseBreakdownWindowAllOwnerMTask mtDenseBreakdownWindowAllOwnerMTasks[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowAllOwnerMTaskStorageCount];\n");
+      fprintf(header, "MtDenseBreakdownWindowReadyToken mtDenseBreakdownWindowReadyTokens[kDenseBreakdownWindowMaxCycles][%d];\n", denseBreakdownWindowCausalTokenStorageCount);
+      fprintf(header, "MtDenseBreakdownWindowCausalSummary mtDenseBreakdownWindowCausalSummaries[kDenseBreakdownWindowMaxCycles];\n");
+      fprintf(header, "static_assert(kDenseBreakdownWindowCausalTokenCount <= kDenseBreakdownWindowCausalTokenStorageCount, \"dense breakdown causal token storage cap\");\n");
+    }
+  }
   fprintf(header, "FILE *mtProfileDynamicTraceFile;\n");
   fprintf(header, "uint64_t mtProfileDynamicTraceCycleStart;\n");
   fprintf(header, "uint64_t mtProfileDynamicTraceCycleLimit;\n");
   fprintf(header, "std::vector<int> mtProfileDynamicTraceTaskIds;\n");
+  if (activationEventTraceCodegen) {
+    fprintf(header, "FILE *mtActivationEventTraceFile;\n");
+    fprintf(header, "uint64_t mtActivationEventTraceCycleStart;\n");
+    fprintf(header, "uint64_t mtActivationEventTraceCycleLimit;\n");
+    fprintf(header, "bool mtActivationEventTraceCycleOpen;\n");
+    fprintf(header, "std::vector<MtActivationEventTraceRecord> mtActivationEventTraceRecords;\n");
+    fprintf(header, "std::vector<MtActivationEventTraceRecord> mtActivationEventTracePendingRecords;\n");
+  }
   if (mtUseDynamicStateTraceCodegen()) {
     fprintf(header, "bool mtProfileDynamicStateTraceEnabled;\n");
     fprintf(header, "std::vector<uint8_t> mtProfileStateUpdateTraceKindByCppId;\n");
@@ -11888,7 +13747,27 @@ void graph::cppEmitter() {
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
     // 28c-2 atomic-spin worker pool: hot atomics on independent cache lines.
     fprintf(header, "alignas(64) std::atomic<uint64_t> mtWorkerPoolGeneration;\n");
+  if (mtUseWorkerPoolWakeShardCodegen()) {
+    fprintf(header, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
+    fprintf(header, "struct alignas(64) MtWorkerPoolGenShard { std::atomic<uint64_t> gen{0}; };\n");
+    fprintf(header, "static_assert(alignof(MtWorkerPoolGenShard) == 64 && sizeof(MtWorkerPoolGenShard) == 64, \"wake-shard needs one cache line each\");\n");
+    fprintf(header, "static constexpr int kMtWorkerPoolWakeShardStride = 8;\n");
+    fprintf(header, "static constexpr int kMtWorkerPoolWakeShardCount = 16;\n");
+    fprintf(header, "MtWorkerPoolGenShard mtWorkerPoolGenShard[kMtWorkerPoolWakeShardCount];\n");
+    fprintf(header, "#endif\n");
+  }
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    fprintf(header, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    fprintf(header, "struct alignas(64) MtWorkerPoolDoneFlag { std::atomic<uint8_t> parity{0}; };\n");
+    fprintf(header, "static_assert(alignof(MtWorkerPoolDoneFlag) == 64 && sizeof(MtWorkerPoolDoneFlag) == 64, \"worker-pool done flags require one cache line per worker\");\n");
+    fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"worker-pool done flag must be lock-free\");\n");
+    fprintf(header, "MtWorkerPoolDoneFlag* mtWorkerPoolDoneFlags;\n");
+    fprintf(header, "#else\n");
     fprintf(header, "alignas(64) std::atomic<int> mtWorkerPoolDoneCount;\n");
+    fprintf(header, "#endif\n");
+  } else {
+    fprintf(header, "alignas(64) std::atomic<int> mtWorkerPoolDoneCount;\n");
+  }
     fprintf(header, "alignas(64) std::atomic<int> mtWorkerPoolReadyCount;\n");
     fprintf(header, "alignas(64) std::atomic<bool> mtWorkerPoolStop;\n");
     fprintf(header, "alignas(64) int mtWorkerPoolCurrentWorkerCount;\n");
@@ -11911,6 +13790,9 @@ void graph::cppEmitter() {
   emitBodyLock(1, "LOG_START = 1;\n");
   emitBodyLock(1, "LOG_END = 0;\n");
   emitBodyLock(1, "initMtProfile();\n");
+  if (denseBreakdownProfileCodegen) emitBodyLock(1, "initMtDenseBreakdownProfile();\n");
+
+  if (activationEventTraceCodegen) emitBodyLock(1, "initMtActivationEventTrace();\n");
   if (useMtHelpers) emitBodyLock(1, "if (!mtWorkerPoolLazyStart) startMtWorkerPool();\n");
   emitBodyLock(1, "init();\n");
   emitBodyLock(0, "}\n");
@@ -11967,11 +13849,21 @@ void graph::cppEmitter() {
   fprintf(header, "~S%s();\n", name.c_str());
   fprintf(header, "void init();\n");
   fprintf(header, "void initMtProfile();\n");
+  if (denseBreakdownProfileCodegen) fprintf(header, "void initMtDenseBreakdownProfile();\n");
+  if (denseBreakdownProfileCodegen) fprintf(header, "void dumpMtDenseBreakdownProfile();\n");
+
   fprintf(header, "void dumpMtProfile();\n");
   fprintf(header, "void recordMtProfileTask(int cppId, bool pureTask, uint64_t elapsedNs);\n");
   fprintf(header, "void dumpMtProfileDynamicTraceCycle();\n");
   fprintf(header, "void recordMtProfileDynamicTraceTask(int cppId);\n");
   fprintf(header, "void recordMtProfileWorkerTask(int worker);\n");
+  if (activationEventTraceCodegen) {
+    fprintf(header, "void initMtActivationEventTrace();\n");
+    fprintf(header, "void recordMtActivationEvent(int32_t sourceCppId, uint32_t activeWordBase, uint64_t mask, MtActivationEventKind kind);\n");
+    fprintf(header, "void beginMtActivationEventTraceCycle();\n");
+    fprintf(header, "void flushMtActivationEventTraceCycle();\n");
+    fprintf(header, "void closeMtActivationEventTrace();\n");
+  }
   if (useCoarseMt && mtUseWaitProbeCodegen()) {
     fprintf(header, "void runMtWaitProbeEmptyBarrier();\n");
     fprintf(header, "void dumpMtWaitProbe();\n");
@@ -12174,7 +14066,15 @@ void graph::cppEmitter() {
     emitBodyLock(1, "mtWorkerPoolThreadCount = 0;\n");
     emitBodyLock(1, "mtWorkerPoolGeneration.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolStop.store(false, std::memory_order_relaxed);\n");
+  if (mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(1, "mtWorkerPoolDoneFlags = nullptr;\n");
+    emitBodyLock(1, "#else\n");
     emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "#endif\n");
+  } else {
+    emitBodyLock(1, "mtWorkerPoolDoneCount.store(0, std::memory_order_relaxed);\n");
+  }
     emitBodyLock(1, "mtWorkerPoolReadyCount.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "mtWorkerPoolCurrentWorkerCount = 0;\n");
     emitBodyLock(1, "mtWorkerPoolJobKind = 0;\n");
@@ -12248,10 +14148,362 @@ void graph::cppEmitter() {
     }
   }
   emitBodyLock(0, "}\n");
+  if (denseBreakdownProfileCodegen) {
+    emitFuncDecl(0, "void S%s::initMtDenseBreakdownProfile() {\n", name.c_str());
+    emitBodyLock(1, "mtDenseBreakdownProfileEnabled = false;\n");
+    emitBodyLock(1, "mtDenseBreakdownProfileOutPath[0] = '\\0';\n");
+    emitBodyLock(1, "mtDenseBreakdownPoolIdleNs = 0;\n");
+    emitBodyLock(1, "mtDenseBreakdownPoolDoneNs = 0;\n");
+    emitBodyLock(1, "mtDenseBreakdownTotalStepNs = 0;\n");
+    emitBodyLock(1, "for (int i = 0; i < kDenseBreakdownProfileWorkerCount; i++) { mtDenseBreakdownWorkers[i].dispatchSpanNs = 0; mtDenseBreakdownWorkers[i].blockedWaitNs = 0; mtDenseBreakdownWorkers[i].blockedWaitCount = 0; }\n");
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "mtDenseBreakdownWindowEnabled = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowCausalChainMode = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowCausalHotspotsMode = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowCausalClockRegression = false;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowCausalTimestampBoundUncertaintyNs = 0;\n");
+      emitBodyLock(1, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowMaxAllOwnerMTasks; mtaskId ++) mtDenseBreakdownWindowCausalVisitMarks[mtaskId] = 0;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowOverflow.store(false, std::memory_order_relaxed);\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowStart = 0;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowCycles = 0;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowRecordedCycles = 0;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowCurrentSlot = -1;\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowOutPath[0] = '\\0';\n");
+    }
+    emitBodyLock(1, "const char *mtDenseBreakdownProfileEnv = getenv(\"GSIM_MT_DENSE_BREAKDOWN_PROFILE\");\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileEnv == nullptr || mtDenseBreakdownProfileEnv[0] == '\\0' || mtDenseBreakdownProfileEnv[0] == '0') return;\n");
+    emitBodyLock(1, "const char *mtDenseBreakdownProfileOutEnv = getenv(\"GSIM_MT_DENSE_BREAKDOWN_OUT\");\n");
+    emitBodyLock(1, "gAssert(mtDenseBreakdownProfileOutEnv != nullptr && mtDenseBreakdownProfileOutEnv[0] != '\\0', \"GSIM_MT_DENSE_BREAKDOWN_OUT is required when GSIM_MT_DENSE_BREAKDOWN_PROFILE is enabled\");\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileOutEnv == nullptr || mtDenseBreakdownProfileOutEnv[0] == '\\0') abort();\n");
+    emitBodyLock(1, "gAssert(mtConfiguredWorkerCount <= kDenseBreakdownProfileWorkerCount, \"GSIM_MT_DENSE_BREAKDOWN_PROFILE supports at most %%d workers (got %%d)\", kDenseBreakdownProfileWorkerCount, mtConfiguredWorkerCount);\n");
+    emitBodyLock(1, "if (mtConfiguredWorkerCount > kDenseBreakdownProfileWorkerCount) abort();\n");
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "gAssert(mtConfiguredWorkerCount == kDenseBreakdownWindowThreadCount, \"GSIM_MT_DENSE_BREAKDOWN window requires the codegen worker count %%d (got %%d)\", kDenseBreakdownWindowThreadCount, mtConfiguredWorkerCount);\n");
+      emitBodyLock(1, "if (mtConfiguredWorkerCount != kDenseBreakdownWindowThreadCount) abort();\n");
+    }
+    emitBodyLock(1, "size_t mtDenseBreakdownProfileOutPathLen = strlen(mtDenseBreakdownProfileOutEnv);\n");
+    emitBodyLock(1, "gAssert(mtDenseBreakdownProfileOutPathLen < sizeof(mtDenseBreakdownProfileOutPath), \"GSIM_MT_DENSE_BREAKDOWN_OUT path is too long\");\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileOutPathLen >= sizeof(mtDenseBreakdownProfileOutPath)) abort();\n");
+    emitBodyLock(1, "FILE *mtDenseBreakdownProfileProbe = fopen(mtDenseBreakdownProfileOutEnv, \"wb\");\n");
+    emitBodyLock(1, "gAssert(mtDenseBreakdownProfileProbe != nullptr, \"failed to open GSIM_MT_DENSE_BREAKDOWN_OUT=%%s\", mtDenseBreakdownProfileOutEnv);\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileProbe == nullptr) abort();\n");
+    emitBodyLock(1, "if (fclose(mtDenseBreakdownProfileProbe) != 0) { fprintf(stderr, \"[mt-dense-breakdown] failed to close output probe path=%%s\\n\", mtDenseBreakdownProfileOutEnv); abort(); }\n");
+    emitBodyLock(1, "memcpy(mtDenseBreakdownProfileOutPath, mtDenseBreakdownProfileOutEnv, mtDenseBreakdownProfileOutPathLen + 1);\n");
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "const char *mtDenseBreakdownWindowStartEnv = getenv(\"GSIM_MT_DENSE_BREAKDOWN_WINDOW_START\");\n");
+      emitBodyLock(1, "const char *mtDenseBreakdownWindowCyclesEnv = getenv(\"GSIM_MT_DENSE_BREAKDOWN_WINDOW_CYCLES\");\n");
+      emitBodyLock(1, "const bool mtDenseBreakdownWindowHasStart = mtDenseBreakdownWindowStartEnv != nullptr && mtDenseBreakdownWindowStartEnv[0] != '\\0';\n");
+      emitBodyLock(1, "const bool mtDenseBreakdownWindowHasCycles = mtDenseBreakdownWindowCyclesEnv != nullptr && mtDenseBreakdownWindowCyclesEnv[0] != '\\0';\n");
+      emitBodyLock(1, "gAssert(mtDenseBreakdownWindowHasStart && mtDenseBreakdownWindowHasCycles, \"GSIM_MT_DENSE_BREAKDOWN_WINDOW_START and GSIM_MT_DENSE_BREAKDOWN_WINDOW_CYCLES are required together\");\n");
+      emitBodyLock(1, "if (!mtDenseBreakdownWindowHasStart || !mtDenseBreakdownWindowHasCycles) abort();\n");
+      emitBodyLock(1, "auto mtDenseBreakdownParseWindowUint = [](const char *text, uint64_t *value) -> bool {\n");
+      emitBodyLock(2, "if (text == nullptr || text[0] == '\\0') return false;\n");
+      emitBodyLock(2, "uint64_t parsed = 0;\n");
+      emitBodyLock(2, "for (const unsigned char *p = (const unsigned char *)text; *p != 0; ++p) {\n");
+      emitBodyLock(3, "if (*p < '0' || *p > '9') return false;\n");
+      emitBodyLock(3, "uint64_t digit = (uint64_t)(*p - '0');\n");
+      emitBodyLock(3, "if (parsed > (UINT64_MAX - digit) / 10) return false;\n");
+      emitBodyLock(3, "parsed = parsed * 10 + digit;\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(2, "*value = parsed;\n");
+      emitBodyLock(2, "return true;\n");
+      emitBodyLock(1, "};\n");
+      emitBodyLock(1, "const bool mtDenseBreakdownWindowStartValid = mtDenseBreakdownParseWindowUint(mtDenseBreakdownWindowStartEnv, &mtDenseBreakdownWindowStart);\n");
+      emitBodyLock(1, "const bool mtDenseBreakdownWindowCyclesValid = mtDenseBreakdownParseWindowUint(mtDenseBreakdownWindowCyclesEnv, &mtDenseBreakdownWindowCycles);\n");
+      emitBodyLock(1, "gAssert(mtDenseBreakdownWindowStartValid && mtDenseBreakdownWindowCyclesValid && mtDenseBreakdownWindowCycles >= 1 && mtDenseBreakdownWindowCycles <= kDenseBreakdownWindowMaxCycles, \"GSIM_MT_DENSE_BREAKDOWN window requires an unsigned start and 1..%%d cycles\", kDenseBreakdownWindowMaxCycles);\n");
+      emitBodyLock(1, "if (!mtDenseBreakdownWindowStartValid || !mtDenseBreakdownWindowCyclesValid || mtDenseBreakdownWindowCycles < 1 || mtDenseBreakdownWindowCycles > kDenseBreakdownWindowMaxCycles) abort();\n");
+      emitBodyLock(1, "const char *mtDenseBreakdownWindowModeEnv = getenv(\"GSIM_MT_DENSE_BREAKDOWN_WINDOW_MODE\");\n");
+      emitBodyLock(1, "if (mtDenseBreakdownWindowModeEnv == nullptr || mtDenseBreakdownWindowModeEnv[0] == '\\0' || strcmp(mtDenseBreakdownWindowModeEnv, \"criticality\") == 0) {\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      emitBodyLock(1, "} else if (strcmp(mtDenseBreakdownWindowModeEnv, \"worker0body\") == 0) {\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = true;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      emitBodyLock(1, "} else if (strcmp(mtDenseBreakdownWindowModeEnv, \"allownerbody\") == 0) {\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = true;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      emitBodyLock(1, "} else if (strcmp(mtDenseBreakdownWindowModeEnv, \"finishonly\") == 0) {\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowFinishOnlyMode = true;\n");
+      emitBodyLock(1, "} else if (strcmp(mtDenseBreakdownWindowModeEnv, \"causalhotspots\") == 0) {\n");
+      emitBodyLock(2, "#if !defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) || !GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(2, "gAssert(false, \"causalhotspots requires GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\");\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(2, "#endif\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowCausalChainMode = true;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowCausalHotspotsMode = true;\n");
+      emitBodyLock(2, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) { mtDenseBreakdownWindowCausalHotspotMTasks[mtaskId] = {}; mtDenseBreakdownWindowCausalHotspotSameOwnerEdges[mtaskId] = {}; }\n");
+      emitBodyLock(2, "for (int token = 0; token < kDenseBreakdownWindowCausalTokenCount; token ++) mtDenseBreakdownWindowCausalHotspotRemoteTokenEdges[token] = {};\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowCausalHotspotTotals = {};\n");
+      emitBodyLock(1, "} else if (strcmp(mtDenseBreakdownWindowModeEnv, \"causalchain\") == 0) {\n");
+      emitBodyLock(2, "#if !defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) || !GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(2, "gAssert(false, \"causalchain requires GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\");\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(2, "#endif\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowCausalChainMode = true;\n");
+      emitBodyLock(1, "} else {\n");
+      emitBodyLock(2, "gAssert(false, \"GSIM_MT_DENSE_BREAKDOWN_WINDOW_MODE must be finishonly, criticality, worker0body, allownerbody, causalchain, or causalhotspots\");\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "static const char mtDenseBreakdownWindowSuffix[] = \".window.json\";\n");
+      emitBodyLock(1, "gAssert(mtDenseBreakdownProfileOutPathLen + sizeof(mtDenseBreakdownWindowSuffix) <= sizeof(mtDenseBreakdownWindowOutPath), \"GSIM_MT_DENSE_BREAKDOWN_OUT path is too long for window sibling\");\n");
+      emitBodyLock(1, "if (mtDenseBreakdownProfileOutPathLen + sizeof(mtDenseBreakdownWindowSuffix) > sizeof(mtDenseBreakdownWindowOutPath)) abort();\n");
+      emitBodyLock(1, "memcpy(mtDenseBreakdownWindowOutPath, mtDenseBreakdownProfileOutPath, mtDenseBreakdownProfileOutPathLen);\n");
+      emitBodyLock(1, "memcpy(mtDenseBreakdownWindowOutPath + mtDenseBreakdownProfileOutPathLen, mtDenseBreakdownWindowSuffix, sizeof(mtDenseBreakdownWindowSuffix));\n");
+      emitBodyLock(1, "mtDenseBreakdownWindowEnabled = true;\n");
+    }
+    emitBodyLock(1, "mtDenseBreakdownProfileEnabled = true;\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::dumpMtDenseBreakdownProfile() {\n", name.c_str());
+    emitBodyLock(1, "if (!mtDenseBreakdownProfileEnabled) return;\n");
+    emitBodyLock(1, "FILE *mtDenseBreakdownProfileFile = fopen(mtDenseBreakdownProfileOutPath, \"wb\");\n");
+    emitBodyLock(1, "gAssert(mtDenseBreakdownProfileFile != nullptr, \"failed to open GSIM_MT_DENSE_BREAKDOWN_OUT=%%s\", mtDenseBreakdownProfileOutPath);\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileFile == nullptr) abort();\n");
+    emitBodyLock(1, "int mtDenseBreakdownProfileWriteError = 0;\n");
+    emitBodyLock(1, "int mtDenseBreakdownProfileWorkerCount = mtConfiguredWorkerCount;\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileWorkerCount < 1) mtDenseBreakdownProfileWorkerCount = 1;\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileWorkerCount > kDenseBreakdownProfileWorkerCount) { fclose(mtDenseBreakdownProfileFile); abort(); }\n");
+    emitBodyLock(1, "if (fprintf(mtDenseBreakdownProfileFile, \"{\\\"magic\\\":\\\"GSIM_MT_DENSE_BREAKDOWN\\\",\\\"version\\\":1,\\\"threadCount\\\":%%d,\\\"cycles\\\":%%llu,\\\"totalStepNs\\\":%%llu,\\\"poolIdleNs\\\":%%llu,\\\"poolDoneNs\\\":%%llu,\\\"workers\\\":[\", mtDenseBreakdownProfileWorkerCount, (unsigned long long)cycles, (unsigned long long)mtDenseBreakdownTotalStepNs, (unsigned long long)mtDenseBreakdownPoolIdleNs, (unsigned long long)mtDenseBreakdownPoolDoneNs) < 0) mtDenseBreakdownProfileWriteError = 1;\n");
+    emitBodyLock(1, "for (int i = 0; i < mtDenseBreakdownProfileWorkerCount; i++) {\n");
+    emitBodyLock(2, "if (i != 0 && fputc(',', mtDenseBreakdownProfileFile) == EOF) mtDenseBreakdownProfileWriteError = 1;\n");
+    emitBodyLock(2, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[i];\n");
+    emitBodyLock(2, "if (fprintf(mtDenseBreakdownProfileFile, \"{\\\"dispatchSpanNs\\\":%%llu,\\\"blockedWaitNs\\\":%%llu,\\\"blockedWaitCount\\\":%%llu}\", (unsigned long long)mtDenseBreakdownWorker.dispatchSpanNs, (unsigned long long)mtDenseBreakdownWorker.blockedWaitNs, (unsigned long long)mtDenseBreakdownWorker.blockedWaitCount) < 0) mtDenseBreakdownProfileWriteError = 1;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "if (fprintf(mtDenseBreakdownProfileFile, \"]}\\n\") < 0) mtDenseBreakdownProfileWriteError = 1;\n");
+    emitBodyLock(1, "if (fflush(mtDenseBreakdownProfileFile) != 0) mtDenseBreakdownProfileWriteError = 1;\n");
+    emitBodyLock(1, "if (fclose(mtDenseBreakdownProfileFile) != 0) mtDenseBreakdownProfileWriteError = 1;\n");
+    emitBodyLock(1, "if (mtDenseBreakdownProfileWriteError) { fprintf(stderr, \"[mt-dense-breakdown] failed to write output path=%%s\\n\", mtDenseBreakdownProfileOutPath); abort(); }\n");
+    if (denseBreakdownWindowCodegen) {
+      emitBodyLock(1, "if (mtDenseBreakdownWindowEnabled) {\n");
+      emitBodyLock(2, "FILE *mtDenseBreakdownWindowFile = fopen(mtDenseBreakdownWindowOutPath, \"wb\");\n");
+      emitBodyLock(2, "gAssert(mtDenseBreakdownWindowFile != nullptr, \"failed to open dense breakdown window output=%%s\", mtDenseBreakdownWindowOutPath);\n");
+      emitBodyLock(2, "if (mtDenseBreakdownWindowFile == nullptr) abort();\n");
+      emitBodyLock(2, "int mtDenseBreakdownWindowWriteError = 0;\n");
+      emitBodyLock(2, "const bool mtDenseBreakdownWindowOverflowed = mtDenseBreakdownWindowOverflow.load(std::memory_order_relaxed);\n");
+      emitBodyLock(2, "const bool mtDenseBreakdownWindowComplete = !mtDenseBreakdownWindowOverflowed && mtDenseBreakdownWindowRecordedCycles == mtDenseBreakdownWindowCycles;\n");
+      emitBodyLock(2, "const char *mtDenseBreakdownWindowMode = mtDenseBreakdownWindowCausalHotspotsMode ? \"causalhotspots\" : (mtDenseBreakdownWindowCausalChainMode ? \"causalchain\" : (mtDenseBreakdownWindowFinishOnlyMode ? \"finishonly\" : (mtDenseBreakdownWindowAllOwnerBodyMode ? \"allownerbody\" : (mtDenseBreakdownWindowWorker0BodyMode ? \"worker0body\" : \"criticality\"))));\n");
+      emitBodyLock(2, "if (mtDenseBreakdownWindowCausalHotspotsMode) {\n");
+      emitBodyLock(3, "bool mtDenseBreakdownWindowCausalMappingComplete = !mtDenseBreakdownWindowOverflowed && !mtDenseBreakdownWindowCausalClockRegression && mtDenseBreakdownWindowRecordedCycles == mtDenseBreakdownWindowCycles;\n");
+      emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; if (!mtDenseBreakdownWindowCausalSummary.complete || mtDenseBreakdownWindowCausalSummary.incompleteMapping || mtDenseBreakdownWindowCausalSummary.clockRegression || mtDenseBreakdownWindowCausalSummary.overflow) mtDenseBreakdownWindowCausalMappingComplete = false; }\n");
+      emitBodyLock(3, "const bool mtDenseBreakdownWindowCausalHotspotComplete = mtDenseBreakdownWindowCausalMappingComplete;\n");
+      emitBodyLock(3, "MtDenseBreakdownWindowCausalHotspotTotals mtDenseBreakdownWindowCausalHotspotMTaskTotals = {};\n");
+      emitBodyLock(3, "MtDenseBreakdownWindowCausalHotspotTotals mtDenseBreakdownWindowCausalHotspotEdgeTotals = {};\n");
+      emitBodyLock(3, "MtDenseBreakdownWindowCausalHotspotTotals mtDenseBreakdownWindowCausalHotspotSummaryTotals = {};\n");
+      emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount > mtDenseBreakdownWindowCausalHotspotTotals.edgeCount || mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount != mtDenseBreakdownWindowCausalHotspotTotals.edgeCount - mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots dump edge-kind reconciliation failed\\n\"); abort(); }\n");
+      emitBodyLock(3, "auto mtDenseBreakdownWindowCausalHotspotsDumpAdd = [&](uint64_t &target, uint64_t value) { if (unlikely(UINT64_MAX - target < value)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots dump aggregate overflow\\n\"); abort(); } target += value; };\n");
+      emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.sameOwnerPredCount, mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.remoteTokenPredCount, mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount); if (unlikely((uint64_t)mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount > mtDenseBreakdownWindowCausalSummary.chainEdgeCount || (uint64_t)mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount != (uint64_t)mtDenseBreakdownWindowCausalSummary.chainEdgeCount - mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount || mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount > mtDenseBreakdownWindowCausalSummary.waitObservationCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots cycle edge-kind counters corrupt\\n\"); abort(); } }\n");
+      emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindowCausalHotspotSummaryTotals.sameOwnerPredCount != mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount || mtDenseBreakdownWindowCausalHotspotSummaryTotals.remoteTokenPredCount != mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots summary edge-kind reconciliation failed\\n\"); abort(); }\n");
+      emitBodyLock(3, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) { const MtDenseBreakdownWindowCausalHotspotMTask &mtDenseBreakdownWindowCausalHotspotMTask = mtDenseBreakdownWindowCausalHotspotMTasks[mtaskId]; if (unlikely(mtDenseBreakdownWindowCausalHotspotMTask.sameOwnerPredCount > mtDenseBreakdownWindowCausalHotspotMTask.count || mtDenseBreakdownWindowCausalHotspotMTask.remoteTokenPredCount > mtDenseBreakdownWindowCausalHotspotMTask.count - mtDenseBreakdownWindowCausalHotspotMTask.sameOwnerPredCount || (mtDenseBreakdownWindowCausalHotspotMTask.count == 0 && (mtDenseBreakdownWindowCausalHotspotMTask.bodyNs != 0 || mtDenseBreakdownWindowCausalHotspotMTask.releaseNs != 0 || mtDenseBreakdownWindowCausalHotspotMTask.gapNs != 0 || mtDenseBreakdownWindowCausalHotspotMTask.latestTailCount != 0)))) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots MTask aggregate corrupt\\n\"); abort(); } mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.count, mtDenseBreakdownWindowCausalHotspotMTask.count); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.bodyNs, mtDenseBreakdownWindowCausalHotspotMTask.bodyNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.releaseNs, mtDenseBreakdownWindowCausalHotspotMTask.releaseNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.gapNs, mtDenseBreakdownWindowCausalHotspotMTask.gapNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.sameOwnerPredCount, mtDenseBreakdownWindowCausalHotspotMTask.sameOwnerPredCount); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.remoteTokenPredCount, mtDenseBreakdownWindowCausalHotspotMTask.remoteTokenPredCount); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotMTaskTotals.latestTailCount, mtDenseBreakdownWindowCausalHotspotMTask.latestTailCount); }\n");
+      emitBodyLock(3, "for (int index = 0; index < kDenseBreakdownWindowCausalTokenCount; index ++) { const int token = kDenseBreakdownWindowCausalHotspotRemoteTokenOutputOrder[index]; if (unlikely(token < 0 || token >= kDenseBreakdownWindowCausalTokenCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots remote output map invalid\\n\"); abort(); } const MtDenseBreakdownWindowCausalHotspotEdge &mtDenseBreakdownWindowCausalHotspotEdge = mtDenseBreakdownWindowCausalHotspotRemoteTokenEdges[token]; if (unlikely(mtDenseBreakdownWindowCausalHotspotEdge.count == 0 && mtDenseBreakdownWindowCausalHotspotEdge.gapNs != 0)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots remote aggregate corrupt\\n\"); abort(); } mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotEdgeTotals.edgeCount, mtDenseBreakdownWindowCausalHotspotEdge.count); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotEdgeTotals.gapNs, mtDenseBreakdownWindowCausalHotspotEdge.gapNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotEdgeTotals.remoteTokenPredCount, mtDenseBreakdownWindowCausalHotspotEdge.count); }\n");
+      emitBodyLock(3, "for (int index = 0; index < kDenseBreakdownWindowAllOwnerMTaskCount; index ++) { const int consumerMTask = kDenseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder[index]; if (unlikely(consumerMTask < 0 || consumerMTask >= kDenseBreakdownWindowAllOwnerMTaskCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots same-owner output map invalid\\n\"); abort(); } const int producerMTask = kDenseBreakdownWindowCausalSameOwnerProducerMTask[consumerMTask]; const MtDenseBreakdownWindowCausalHotspotEdge &mtDenseBreakdownWindowCausalHotspotEdge = mtDenseBreakdownWindowCausalHotspotSameOwnerEdges[consumerMTask]; if (unlikely((mtDenseBreakdownWindowCausalHotspotEdge.count == 0 && mtDenseBreakdownWindowCausalHotspotEdge.gapNs != 0) || (mtDenseBreakdownWindowCausalHotspotEdge.count != 0 && (producerMTask < 0 || producerMTask >= consumerMTask)))) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots same-owner aggregate corrupt\\n\"); abort(); } mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotEdgeTotals.edgeCount, mtDenseBreakdownWindowCausalHotspotEdge.count); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotEdgeTotals.gapNs, mtDenseBreakdownWindowCausalHotspotEdge.gapNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotEdgeTotals.sameOwnerPredCount, mtDenseBreakdownWindowCausalHotspotEdge.count); }\n");
+      emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.count, mtDenseBreakdownWindowCausalSummary.chainNodeCount); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.bodyNs, mtDenseBreakdownWindowCausalSummary.chainBodyNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.releaseNs, mtDenseBreakdownWindowCausalSummary.chainReleaseNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.gapNs, mtDenseBreakdownWindowCausalSummary.chainGapNs); mtDenseBreakdownWindowCausalHotspotsDumpAdd(mtDenseBreakdownWindowCausalHotspotSummaryTotals.edgeCount, mtDenseBreakdownWindowCausalSummary.chainEdgeCount); }\n");
+      emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindowCausalHotspotMTaskTotals.count != mtDenseBreakdownWindowCausalHotspotTotals.count || mtDenseBreakdownWindowCausalHotspotMTaskTotals.bodyNs != mtDenseBreakdownWindowCausalHotspotTotals.bodyNs || mtDenseBreakdownWindowCausalHotspotMTaskTotals.releaseNs != mtDenseBreakdownWindowCausalHotspotTotals.releaseNs || mtDenseBreakdownWindowCausalHotspotMTaskTotals.gapNs != mtDenseBreakdownWindowCausalHotspotTotals.gapNs || mtDenseBreakdownWindowCausalHotspotMTaskTotals.sameOwnerPredCount != mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount || mtDenseBreakdownWindowCausalHotspotMTaskTotals.remoteTokenPredCount != mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount || mtDenseBreakdownWindowCausalHotspotMTaskTotals.latestTailCount != mtDenseBreakdownWindowCausalHotspotTotals.latestTailCount || mtDenseBreakdownWindowCausalHotspotEdgeTotals.edgeCount != mtDenseBreakdownWindowCausalHotspotTotals.edgeCount || mtDenseBreakdownWindowCausalHotspotEdgeTotals.gapNs != mtDenseBreakdownWindowCausalHotspotTotals.gapNs || mtDenseBreakdownWindowCausalHotspotEdgeTotals.sameOwnerPredCount != mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount || mtDenseBreakdownWindowCausalHotspotEdgeTotals.remoteTokenPredCount != mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount || mtDenseBreakdownWindowCausalHotspotSummaryTotals.count != mtDenseBreakdownWindowCausalHotspotTotals.count || mtDenseBreakdownWindowCausalHotspotSummaryTotals.bodyNs != mtDenseBreakdownWindowCausalHotspotTotals.bodyNs || mtDenseBreakdownWindowCausalHotspotSummaryTotals.releaseNs != mtDenseBreakdownWindowCausalHotspotTotals.releaseNs || mtDenseBreakdownWindowCausalHotspotSummaryTotals.gapNs != mtDenseBreakdownWindowCausalHotspotTotals.gapNs || mtDenseBreakdownWindowCausalHotspotSummaryTotals.edgeCount != mtDenseBreakdownWindowCausalHotspotTotals.edgeCount || mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount > mtDenseBreakdownWindowCausalHotspotTotals.edgeCount || mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount > mtDenseBreakdownWindowCausalHotspotTotals.edgeCount - mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount || mtDenseBreakdownWindowCausalHotspotTotals.latestTailCount != mtDenseBreakdownWindowRecordedCycles)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] causalhotspots aggregate reconciliation failed\\n\"); abort(); }\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"magic\\\":\\\"GSIM_MT_DENSE_BREAKDOWN_WINDOW\\\",\\\"version\\\":2,\\\"window_start\\\":%%llu,\\\"window_cycles\\\":%%llu,\\\"accepted_cycles\\\":%%llu,\\\"threadCount\\\":%%d,\\\"mode\\\":\\\"causalhotspots\\\",\\\"criticality_offsets_valid\\\":false,\\\"worker0_mtask_count\\\":0,\\\"allowner_mtask_count\\\":%%d,\\\"overflow\\\":%%s,\\\"complete\\\":%%s,\\\"causalchain_mapping_complete\\\":%%s,\\\"causalchain_timestamp_bound_uncertainty\\\":true,\\\"causalchain_timestamp_bound_uncertainty_ns\\\":%%llu,\\\"clock_regression\\\":%%s,\\\"cycles\\\":[\", (unsigned long long)mtDenseBreakdownWindowStart, (unsigned long long)mtDenseBreakdownWindowCycles, (unsigned long long)mtDenseBreakdownWindowRecordedCycles, mtDenseBreakdownProfileWorkerCount, kDenseBreakdownWindowAllOwnerMTaskCount, mtDenseBreakdownWindowOverflowed ? \"true\" : \"false\", mtDenseBreakdownWindowCausalHotspotComplete ? \"true\" : \"false\", mtDenseBreakdownWindowCausalMappingComplete ? \"true\" : \"false\", (unsigned long long)mtDenseBreakdownWindowCausalTimestampBoundUncertaintyNs, mtDenseBreakdownWindowCausalClockRegression ? \"true\" : \"false\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { if (c != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1; const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"cycle\\\":%%llu,\\\"causalSummary\\\":{\\\"complete\\\":%%s,\\\"causal_edges\\\":%%u,\\\"max_predecessor_end_ns\\\":%%llu,\\\"max_lag_ns\\\":%%llu,\\\"sameOwnerPredecessorCount\\\":%%u,\\\"remoteTokenPredecessorCount\\\":%%u,\\\"waitObservationCount\\\":%%u,\\\"causalBoundNs\\\":%%llu,\\\"chain_node_count\\\":%%u,\\\"chain_edge_count\\\":%%u,\\\"latest_owner\\\":%%d,\\\"latest_owner_finish_ns\\\":%%llu,\\\"makespan_ns\\\":%%llu,\\\"chain_body_ns\\\":%%llu,\\\"chain_release_ns\\\":%%llu,\\\"chain_gap_ns\\\":%%llu,\\\"timestampBoundUncertainty\\\":true,\\\"timestampBoundUncertaintyNs\\\":%%llu,\\\"incompleteMapping\\\":%%s,\\\"clockRegression\\\":%%s,\\\"overflow\\\":%%s}}\", (unsigned long long)mtDenseBreakdownWindowCycleNumbers[c], mtDenseBreakdownWindowCausalSummary.complete ? \"true\" : \"false\", mtDenseBreakdownWindowCausalSummary.chainEdgeCount, (unsigned long long)mtDenseBreakdownWindowCausalSummary.causalBoundNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.maxLagNs, mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount, mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount, mtDenseBreakdownWindowCausalSummary.waitObservationCount, (unsigned long long)mtDenseBreakdownWindowCausalSummary.causalBoundNs, mtDenseBreakdownWindowCausalSummary.chainNodeCount, mtDenseBreakdownWindowCausalSummary.chainEdgeCount, (int)mtDenseBreakdownWindowCausalSummary.latestOwner, (unsigned long long)mtDenseBreakdownWindowCausalSummary.latestOwnerFinishNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.makespanNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.chainBodyNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.chainReleaseNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.chainGapNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs, mtDenseBreakdownWindowCausalSummary.incompleteMapping ? \"true\" : \"false\", mtDenseBreakdownWindowCausalSummary.clockRegression ? \"true\" : \"false\", mtDenseBreakdownWindowCausalSummary.overflow ? \"true\" : \"false\") < 0) mtDenseBreakdownWindowWriteError = 1; }\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"],\\\"causalHotspots\\\":{\\\"version\\\":1,\\\"complete\\\":%%s,\\\"mapping_complete\\\":%%s,\\\"overflow\\\":%%s,\\\"clock_regression\\\":%%s,\\\"logical_mtask_count\\\":%%d,\\\"logical_token_count\\\":%%d,\\\"mtasks\\\":[\", mtDenseBreakdownWindowCausalHotspotComplete ? \"true\" : \"false\", mtDenseBreakdownWindowCausalMappingComplete ? \"true\" : \"false\", mtDenseBreakdownWindowOverflowed ? \"true\" : \"false\", mtDenseBreakdownWindowCausalClockRegression ? \"true\" : \"false\", kDenseBreakdownWindowAllOwnerMTaskCount, kDenseBreakdownWindowCausalTokenCount) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "bool mtDenseBreakdownWindowCausalHotspotFirstMTask = true; for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) { const MtDenseBreakdownWindowCausalHotspotMTask &mtDenseBreakdownWindowCausalHotspotMTask = mtDenseBreakdownWindowCausalHotspotMTasks[mtaskId]; if (mtDenseBreakdownWindowCausalHotspotMTask.count == 0) continue; if (!mtDenseBreakdownWindowCausalHotspotFirstMTask && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1; mtDenseBreakdownWindowCausalHotspotFirstMTask = false; if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"mtask_id\\\":%%d,\\\"count\\\":%%llu,\\\"body_ns\\\":%%llu,\\\"release_ns\\\":%%llu,\\\"gap_ns\\\":%%llu,\\\"same_owner_pred_count\\\":%%llu,\\\"remote_token_pred_count\\\":%%llu,\\\"latest_tail_count\\\":%%llu}\", mtaskId, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.count, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.bodyNs, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.releaseNs, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.gapNs, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.sameOwnerPredCount, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.remoteTokenPredCount, (unsigned long long)mtDenseBreakdownWindowCausalHotspotMTask.latestTailCount) < 0) mtDenseBreakdownWindowWriteError = 1; }\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"],\\\"edges\\\":[\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "bool mtDenseBreakdownWindowCausalHotspotFirstEdge = true; for (int index = 0; index < kDenseBreakdownWindowCausalTokenCount; index ++) { const int token = kDenseBreakdownWindowCausalHotspotRemoteTokenOutputOrder[index]; const MtDenseBreakdownWindowCausalHotspotEdge &mtDenseBreakdownWindowCausalHotspotEdge = mtDenseBreakdownWindowCausalHotspotRemoteTokenEdges[token]; if (mtDenseBreakdownWindowCausalHotspotEdge.count == 0) continue; if (!mtDenseBreakdownWindowCausalHotspotFirstEdge && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1; mtDenseBreakdownWindowCausalHotspotFirstEdge = false; if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"kind\\\":\\\"remote_token\\\",\\\"producer_mtask_id\\\":%%d,\\\"consumer_mtask_id\\\":%%d,\\\"logical_token_id\\\":%%d,\\\"count\\\":%%llu,\\\"gap_ns\\\":%%llu}\", kDenseBreakdownWindowCausalTokenProducerMTask[token], kDenseBreakdownWindowCausalTokenConsumerMTask[token], token, (unsigned long long)mtDenseBreakdownWindowCausalHotspotEdge.count, (unsigned long long)mtDenseBreakdownWindowCausalHotspotEdge.gapNs) < 0) mtDenseBreakdownWindowWriteError = 1; }\n");
+      emitBodyLock(3, "for (int index = 0; index < kDenseBreakdownWindowAllOwnerMTaskCount; index ++) { const int consumerMTask = kDenseBreakdownWindowCausalHotspotSameOwnerConsumerOutputOrder[index]; const int producerMTask = kDenseBreakdownWindowCausalSameOwnerProducerMTask[consumerMTask]; const MtDenseBreakdownWindowCausalHotspotEdge &mtDenseBreakdownWindowCausalHotspotEdge = mtDenseBreakdownWindowCausalHotspotSameOwnerEdges[consumerMTask]; if (mtDenseBreakdownWindowCausalHotspotEdge.count == 0) continue; if (!mtDenseBreakdownWindowCausalHotspotFirstEdge && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1; mtDenseBreakdownWindowCausalHotspotFirstEdge = false; if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"kind\\\":\\\"same_owner\\\",\\\"producer_mtask_id\\\":%%d,\\\"consumer_mtask_id\\\":%%d,\\\"logical_token_id\\\":-1,\\\"count\\\":%%llu,\\\"gap_ns\\\":%%llu}\", producerMTask, consumerMTask, (unsigned long long)mtDenseBreakdownWindowCausalHotspotEdge.count, (unsigned long long)mtDenseBreakdownWindowCausalHotspotEdge.gapNs) < 0) mtDenseBreakdownWindowWriteError = 1; }\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"],\\\"totals\\\":{\\\"count\\\":%%llu,\\\"body_ns\\\":%%llu,\\\"release_ns\\\":%%llu,\\\"gap_ns\\\":%%llu,\\\"same_owner_pred_count\\\":%%llu,\\\"remote_token_pred_count\\\":%%llu,\\\"latest_tail_count\\\":%%llu,\\\"edge_count\\\":%%llu}}}\\n\", (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.count, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.bodyNs, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.releaseNs, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.gapNs, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.sameOwnerPredCount, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.remoteTokenPredCount, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.latestTailCount, (unsigned long long)mtDenseBreakdownWindowCausalHotspotTotals.edgeCount) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "} else if (mtDenseBreakdownWindowCausalChainMode) {\n");
+      emitBodyLock(3, "bool mtDenseBreakdownWindowCausalMappingComplete = !mtDenseBreakdownWindowOverflowed && !mtDenseBreakdownWindowCausalClockRegression && mtDenseBreakdownWindowRecordedCycles == mtDenseBreakdownWindowCycles;\n");
+      emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; if (!mtDenseBreakdownWindowCausalSummary.complete || mtDenseBreakdownWindowCausalSummary.incompleteMapping || mtDenseBreakdownWindowCausalSummary.clockRegression || mtDenseBreakdownWindowCausalSummary.overflow) mtDenseBreakdownWindowCausalMappingComplete = false; }\n");
+      emitBodyLock(3, "const bool mtDenseBreakdownWindowCausalComplete = mtDenseBreakdownWindowCausalMappingComplete;\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"magic\\\":\\\"GSIM_MT_DENSE_BREAKDOWN_WINDOW\\\",\\\"version\\\":1,\\\"window_start\\\":%%llu,\\\"window_cycles\\\":%%llu,\\\"accepted_cycles\\\":%%llu,\\\"threadCount\\\":%%d,\\\"mode\\\":\\\"causalchain\\\",\\\"criticality_offsets_valid\\\":false,\\\"worker0_mtask_count\\\":0,\\\"allowner_mtask_count\\\":%%d,\\\"overflow\\\":%%s,\\\"complete\\\":%%s,\\\"causalchain_mapping_complete\\\":%%s,\\\"causalchain_timestamp_bound_uncertainty\\\":true,\\\"causalchain_timestamp_bound_uncertainty_ns\\\":%%llu,\\\"clock_regression\\\":%%s,\\\"cycles\\\":[\", (unsigned long long)mtDenseBreakdownWindowStart, (unsigned long long)mtDenseBreakdownWindowCycles, (unsigned long long)mtDenseBreakdownWindowRecordedCycles, mtDenseBreakdownProfileWorkerCount, kDenseBreakdownWindowAllOwnerMTaskCount, mtDenseBreakdownWindowOverflowed ? \"true\" : \"false\", mtDenseBreakdownWindowCausalComplete ? \"true\" : \"false\", mtDenseBreakdownWindowCausalMappingComplete ? \"true\" : \"false\", (unsigned long long)mtDenseBreakdownWindowCausalTimestampBoundUncertaintyNs, mtDenseBreakdownWindowCausalClockRegression ? \"true\" : \"false\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { if (c != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1; const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"cycle\\\":%%llu,\\\"causalSummary\\\":{\\\"complete\\\":%%s,\\\"causal_edges\\\":%%u,\\\"max_predecessor_end_ns\\\":%%llu,\\\"max_lag_ns\\\":%%llu,\\\"sameOwnerPredecessorCount\\\":%%u,\\\"remoteTokenPredecessorCount\\\":%%u,\\\"waitObservationCount\\\":%%u,\\\"causalBoundNs\\\":%%llu,\\\"chain_node_count\\\":%%u,\\\"chain_edge_count\\\":%%u,\\\"latest_owner\\\":%%d,\\\"latest_owner_finish_ns\\\":%%llu,\\\"makespan_ns\\\":%%llu,\\\"chain_body_ns\\\":%%llu,\\\"chain_release_ns\\\":%%llu,\\\"chain_gap_ns\\\":%%llu,\\\"timestampBoundUncertainty\\\":true,\\\"timestampBoundUncertaintyNs\\\":%%llu,\\\"incompleteMapping\\\":%%s,\\\"clockRegression\\\":%%s,\\\"overflow\\\":%%s}}\", (unsigned long long)mtDenseBreakdownWindowCycleNumbers[c], mtDenseBreakdownWindowCausalSummary.complete ? \"true\" : \"false\", mtDenseBreakdownWindowCausalSummary.chainEdgeCount, (unsigned long long)mtDenseBreakdownWindowCausalSummary.causalBoundNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.maxLagNs, mtDenseBreakdownWindowCausalSummary.sameOwnerPredecessorCount, mtDenseBreakdownWindowCausalSummary.remoteTokenPredecessorCount, mtDenseBreakdownWindowCausalSummary.waitObservationCount, (unsigned long long)mtDenseBreakdownWindowCausalSummary.causalBoundNs, mtDenseBreakdownWindowCausalSummary.chainNodeCount, mtDenseBreakdownWindowCausalSummary.chainEdgeCount, (int)mtDenseBreakdownWindowCausalSummary.latestOwner, (unsigned long long)mtDenseBreakdownWindowCausalSummary.latestOwnerFinishNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.makespanNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.chainBodyNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.chainReleaseNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.chainGapNs, (unsigned long long)mtDenseBreakdownWindowCausalSummary.timestampBoundUncertaintyNs, mtDenseBreakdownWindowCausalSummary.incompleteMapping ? \"true\" : \"false\", mtDenseBreakdownWindowCausalSummary.clockRegression ? \"true\" : \"false\", mtDenseBreakdownWindowCausalSummary.overflow ? \"true\" : \"false\") < 0) mtDenseBreakdownWindowWriteError = 1; }\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"]}\\n\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(2, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"magic\\\":\\\"GSIM_MT_DENSE_BREAKDOWN_WINDOW\\\",\\\"version\\\":1,\\\"window_start\\\":%%llu,\\\"window_cycles\\\":%%llu,\\\"accepted_cycles\\\":%%llu,\\\"threadCount\\\":%%d,\\\"mode\\\":\\\"%%s\\\",\\\"criticality_offsets_valid\\\":%%s,\\\"worker0_mtask_count\\\":%%d,\\\"allowner_mtask_count\\\":%%d,\\\"overflow\\\":%%s,\\\"complete\\\":%%s,\\\"cycles\\\":[\", (unsigned long long)mtDenseBreakdownWindowStart, (unsigned long long)mtDenseBreakdownWindowCycles, (unsigned long long)mtDenseBreakdownWindowRecordedCycles, mtDenseBreakdownProfileWorkerCount, mtDenseBreakdownWindowMode, mtDenseBreakdownWindowFinishOnlyMode ? \"true\" : \"false\", mtDenseBreakdownWindowWorker0BodyMode ? kDenseBreakdownWindowWorker0MTaskCount : 0, mtDenseBreakdownWindowAllOwnerBodyMode ? kDenseBreakdownWindowAllOwnerMTaskCount : 0, mtDenseBreakdownWindowOverflowed ? \"true\" : \"false\", mtDenseBreakdownWindowComplete ? \"true\" : \"false\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) {\n");
+      emitBodyLock(3, "if (c != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"cycle\\\":%%llu,\\\"workers\\\":[\", (unsigned long long)mtDenseBreakdownWindowCycleNumbers[c]) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "for (int worker = 0; worker < mtDenseBreakdownProfileWorkerCount; worker ++) {\n");
+      emitBodyLock(4, "if (worker != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(4, "const MtDenseBreakdownWindowWorker &mtDenseBreakdownWindowWorker = mtDenseBreakdownWindowWorkers[c][worker];\n");
+      emitBodyLock(4, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"startOffsetNs\\\":%%llu,\\\"finishOffsetNs\\\":%%llu,\\\"blockedWaitNs\\\":%%llu,\\\"bodyNs\\\":%%llu,\\\"controlNs\\\":%%llu}\", (unsigned long long)mtDenseBreakdownWindowWorker.startOffsetNs, (unsigned long long)mtDenseBreakdownWindowWorker.finishOffsetNs, (unsigned long long)mtDenseBreakdownWindowWorker.blockedWaitNs, (unsigned long long)mtDenseBreakdownWindowWorker.bodyNs, (unsigned long long)mtDenseBreakdownWindowWorker.controlNs) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "uint32_t mtDenseBreakdownWindowMTaskCount = mtDenseBreakdownWindowWorker0MTaskCounts[c];\n");
+      emitBodyLock(3, "if (unlikely(mtDenseBreakdownWindowMTaskCount > kDenseBreakdownWindowWorker0MTaskCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] corrupt window worker0 MTask count\\n\"); abort(); }\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"],\\\"worker0MTasks\\\":[\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "for (uint32_t m = 0; m < mtDenseBreakdownWindowMTaskCount; m ++) {\n");
+      emitBodyLock(4, "if (m != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(4, "const MtDenseBreakdownWindowMTask &mtDenseBreakdownWindowMTask = mtDenseBreakdownWindowWorker0MTasks[c][m];\n");
+      emitBodyLock(4, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"mtaskId\\\":%%u,\\\"bodyNs\\\":%%llu}\", mtDenseBreakdownWindowMTask.mtaskId, (unsigned long long)mtDenseBreakdownWindowMTask.bodyNs) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"],\\\"allOwnerMTasks\\\":[\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "if (mtDenseBreakdownWindowAllOwnerBodyMode) {\n");
+      emitBodyLock(4, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {\n");
+      emitBodyLock(5, "const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowAllOwnerMTask = mtDenseBreakdownWindowAllOwnerMTasks[c][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtaskId]];\n");
+      emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowAllOwnerMTask.mtaskId != (uint32_t)mtaskId || mtDenseBreakdownWindowAllOwnerMTask.ownerThreadId >= (uint16_t)mtDenseBreakdownProfileWorkerCount || mtDenseBreakdownWindowAllOwnerMTask.bodyEndOffsetNs < mtDenseBreakdownWindowAllOwnerMTask.bodyStartOffsetNs || mtDenseBreakdownWindowAllOwnerMTask.releaseEndOffsetNs < mtDenseBreakdownWindowAllOwnerMTask.bodyEndOffsetNs || mtDenseBreakdownWindowAllOwnerMTask.releaseEndOffsetNs == UINT64_MAX)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] corrupt all-owner MTask record\\n\"); abort(); }\n");
+      emitBodyLock(5, "if (mtaskId != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(5, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"mtaskId\\\":%%u,\\\"ownerThreadId\\\":%%u,\\\"readyTokenStoreCount\\\":%%u,\\\"bodyStartOffsetNs\\\":%%llu,\\\"bodyEndOffsetNs\\\":%%llu,\\\"bodyNs\\\":%%llu,\\\"releaseEndOffsetNs\\\":%%llu}\", mtDenseBreakdownWindowAllOwnerMTask.mtaskId, (unsigned)mtDenseBreakdownWindowAllOwnerMTask.ownerThreadId, (unsigned)mtDenseBreakdownWindowAllOwnerMTask.readyTokenStoreCount, (unsigned long long)mtDenseBreakdownWindowAllOwnerMTask.bodyStartOffsetNs, (unsigned long long)mtDenseBreakdownWindowAllOwnerMTask.bodyEndOffsetNs, (unsigned long long)mtDenseBreakdownWindowAllOwnerMTask.bodyNs, (unsigned long long)mtDenseBreakdownWindowAllOwnerMTask.releaseEndOffsetNs) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"],\\\"waits\\\":[\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(3, "bool mtDenseBreakdownWindowFirstWait = true;\n");
+      emitBodyLock(3, "for (int worker = 0; worker < mtDenseBreakdownProfileWorkerCount; worker ++) {\n");
+      emitBodyLock(4, "const uint32_t mtDenseBreakdownWindowWaitCount = mtDenseBreakdownWindowWaitCounts[c][worker];\n");
+      emitBodyLock(4, "const uint32_t mtDenseBreakdownWindowWaitCapacity = (uint32_t)(kDenseBreakdownWindowWaitLaneOffsets[worker + 1] - kDenseBreakdownWindowWaitLaneOffsets[worker]);\n");
+      emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowWaitCount > mtDenseBreakdownWindowWaitCapacity)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] corrupt window ready-wait count\\n\"); abort(); }\n");
+      emitBodyLock(4, "for (uint32_t w = 0; w < mtDenseBreakdownWindowWaitCount; w ++) {\n");
+      emitBodyLock(5, "const MtDenseBreakdownWindowWait &mtDenseBreakdownWindowWait = mtDenseBreakdownWindowWaits[c][kDenseBreakdownWindowWaitLaneOffsets[worker] + w];\n");
+      emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindowWait.cycleSlot != (uint16_t)c || mtDenseBreakdownWindowWait.threadId != (uint16_t)worker)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] corrupt window ready-wait lane\\n\"); abort(); }\n");
+      emitBodyLock(5, "if (!mtDenseBreakdownWindowFirstWait && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(5, "mtDenseBreakdownWindowFirstWait = false;\n");
+      emitBodyLock(5, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"cycleSlot\\\":%%u,\\\"threadId\\\":%%u,\\\"consumerMtaskId\\\":%%u,\\\"slot\\\":%%u,\\\"blockedNs\\\":%%llu,\\\"endOffsetNs\\\":%%llu}\", (unsigned)mtDenseBreakdownWindowWait.cycleSlot, (unsigned)mtDenseBreakdownWindowWait.threadId, mtDenseBreakdownWindowWait.consumerMtaskId, mtDenseBreakdownWindowWait.readySlot, (unsigned long long)mtDenseBreakdownWindowWait.blockedNs, (unsigned long long)mtDenseBreakdownWindowWait.endOffsetNs) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"]}\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(2, "if (fprintf(mtDenseBreakdownWindowFile, \"]}\\n\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(2, "if (fflush(mtDenseBreakdownWindowFile) != 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "if (fclose(mtDenseBreakdownWindowFile) != 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      emitBodyLock(2, "if (mtDenseBreakdownWindowWriteError) { fprintf(stderr, \"[mt-dense-breakdown] failed to write window output path=%%s\\n\", mtDenseBreakdownWindowOutPath); abort(); }\n");
+      emitBodyLock(1, "}\n");
+    }
+    emitBodyLock(0, "}\n");
+  }
+
+  if (activationEventTraceCodegen) {
+    emitFuncDecl(0, "void S%s::initMtActivationEventTrace() {\n", name.c_str());
+    emitBodyLock(1, "mtActivationEventTraceFile = nullptr;\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleStart = 0;\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleLimit = 0;\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleOpen = false;\n");
+    emitBodyLock(1, "mtActivationEventTraceRecords.clear();\n");
+    emitBodyLock(1, "mtActivationEventTracePendingRecords.clear();\n");
+    emitBodyLock(1, "const char *tracePath = getenv(\"GSIM_MT_ACTIVATION_EVENT_TRACE\");\n");
+    emitBodyLock(1, "if (tracePath == nullptr || tracePath[0] == '\\0') return;\n");
+    emitBodyLock(1, "const char *startEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_START\");\n");
+    emitBodyLock(1, "const char *cyclesEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_CYCLES\");\n");
+    emitBodyLock(1, "uint64_t traceStart = (startEnv != nullptr && startEnv[0] != '\\0') ? strtoull(startEnv, nullptr, 10) : 0;\n");
+    emitBodyLock(1, "uint64_t traceCount = (cyclesEnv != nullptr && cyclesEnv[0] != '\\0') ? strtoull(cyclesEnv, nullptr, 10) : 0;\n");
+    emitBodyLock(1, "if (traceCount == 0 || traceCount > UINT64_MAX - traceStart) return;\n");
+    emitBodyLock(1, "gAssert(mtConfiguredWorkerCount == 1, \"GSIM_MT_ACTIVATION_EVENT_TRACE requires GSIM_THREADS=1 (got %%d)\", mtConfiguredWorkerCount);\n");
+    emitBodyLock(1, "if (mtConfiguredWorkerCount != 1) abort();\n");
+    if (denseExecutorValid) {
+      emitBodyLock(1, "gAssert(!mtUseDenseExecutor, \"GSIM_MT_ACTIVATION_EVENT_TRACE is sparse-only; GSIM_MT_EXECUTOR=dense is unsupported\");\n");
+      emitBodyLock(1, "if (mtUseDenseExecutor) abort();\n");
+    }
+    emitBodyLock(1, "const uint16_t endianProbe = 1;\n");
+    emitBodyLock(1, "gAssert(*(const uint8_t *)&endianProbe == 1, \"GSIM_MT_ACTIVATION_EVENT_TRACE requires little-endian byte order\");\n");
+    emitBodyLock(1, "if (*(const uint8_t *)&endianProbe != 1) abort();\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleStart = traceStart;\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleLimit = traceStart + traceCount;\n");
+    emitBodyLock(1, "mtActivationEventTraceFile = fopen(tracePath, \"wb\");\n");
+    emitBodyLock(1, "gAssert(mtActivationEventTraceFile != nullptr, \"failed to open GSIM_MT_ACTIVATION_EVENT_TRACE=%%s\", tracePath);\n");
+    emitBodyLock(1, "if (mtActivationEventTraceFile == nullptr) abort();\n");
+    emitBodyLock(1, "MtActivationEventTraceHeader header = {};\n");
+    emitBodyLock(1, "const uint8_t magic[8] = {'G', 'S', 'I', 'M', 'A', 'E', 'V', 'T'};\n");
+    emitBodyLock(1, "memcpy(header.magic, magic, sizeof(magic));\n");
+    emitBodyLock(1, "header.version = 2;\n");
+    emitBodyLock(1, "header.headerSize = (uint16_t)sizeof(MtActivationEventTraceHeader);\n");
+    emitBodyLock(1, "header.activeWidth = (uint16_t)%d;\n", ACTIVE_WIDTH);
+    emitBodyLock(1, "header.taskCount = (uint32_t)%d;\n", superId);
+    emitBodyLock(1, "header.recordSize = (uint32_t)sizeof(MtActivationEventTraceRecord);\n");
+    emitBodyLock(1, "header.traceStart = traceStart;\n");
+    emitBodyLock(1, "header.traceCount = traceCount;\n");
+    emitBodyLock(1, "if (fwrite(&header, sizeof(header), 1, mtActivationEventTraceFile) != 1) {\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-activation-event-trace] failed to write header path=%%s\\n\", tracePath);\n");
+    emitBodyLock(2, "fclose(mtActivationEventTraceFile);\n");
+    emitBodyLock(2, "mtActivationEventTraceFile = nullptr;\n");
+    emitBodyLock(2, "abort();\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "fprintf(stderr, \"[mt-activation-event-trace] path=%%s start=%%lu cycles=%%lu\\n\", tracePath, traceStart, traceCount);\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::recordMtActivationEvent(int32_t sourceCppId, uint32_t activeWordBase, uint64_t mask, MtActivationEventKind kind) {\n", name.c_str());
+    emitBodyLock(1, "if (mtActivationEventTraceFile == nullptr || mask == 0) return;\n");
+    emitBodyLock(1, "if (cycles < mtActivationEventTraceCycleStart || cycles >= mtActivationEventTraceCycleLimit) return;\n");
+    emitBodyLock(1, "MtActivationEventTraceRecord record = {};\n");
+    emitBodyLock(1, "record.cycle = cycles;\n");
+    emitBodyLock(1, "record.sourceCppId = sourceCppId;\n");
+    emitBodyLock(1, "record.activeWordBase = activeWordBase;\n");
+    emitBodyLock(1, "record.mask = mask;\n");
+    emitBodyLock(1, "record.kind = kind;\n");
+    emitBodyLock(1, "if (mtActivationEventTraceCycleOpen) mtActivationEventTraceRecords.push_back(record);\n");
+    emitBodyLock(1, "else mtActivationEventTracePendingRecords.push_back(record);\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::beginMtActivationEventTraceCycle() {\n", name.c_str());
+    emitBodyLock(1, "if (mtActivationEventTraceFile == nullptr) return;\n");
+    emitBodyLock(1, "gAssert(!mtActivationEventTraceCycleOpen, \"activation-event trace cycle already open at cycle %%lu\", cycles);\n");
+    emitBodyLock(1, "if (mtActivationEventTraceCycleOpen) abort();\n");
+    emitBodyLock(1, "if (cycles >= mtActivationEventTraceCycleStart && cycles < mtActivationEventTraceCycleLimit) {\n");
+    emitBodyLock(2, "for (uint32_t base = 0; base < (uint32_t)%d; base += (uint32_t)(64 / %d)) {\n", activeFlagNum, ACTIVE_WIDTH);
+    emitBodyLock(3, "uint64_t mask = 0;\n");
+    emitBodyLock(3, "for (uint32_t i = 0; i < (uint32_t)(64 / %d) && base + i < (uint32_t)%d; i ++) mask |= (uint64_t)activeFlags[base + i] << (i * %d);\n", ACTIVE_WIDTH, activeFlagNum, ACTIVE_WIDTH);
+    emitBodyLock(3, "if (mask != 0) {\n");
+    emitBodyLock(4, "MtActivationEventTraceRecord record = {};\n");
+    emitBodyLock(4, "record.cycle = cycles;\n");
+    emitBodyLock(4, "record.sourceCppId = -1;\n");
+    emitBodyLock(4, "record.activeWordBase = base;\n");
+    emitBodyLock(4, "record.mask = mask;\n");
+    emitBodyLock(4, "record.kind = MT_ACTIVATION_EVENT_FRONTIER;\n");
+    emitBodyLock(4, "mtActivationEventTraceRecords.push_back(record);\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "mtActivationEventTraceRecords.insert(mtActivationEventTraceRecords.end(), mtActivationEventTracePendingRecords.begin(), mtActivationEventTracePendingRecords.end());\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "mtActivationEventTracePendingRecords.clear();\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleOpen = true;\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::flushMtActivationEventTraceCycle() {\n", name.c_str());
+    emitBodyLock(1, "if (mtActivationEventTraceFile == nullptr) return;\n");
+    emitBodyLock(1, "if (cycles >= mtActivationEventTraceCycleStart && cycles < mtActivationEventTraceCycleLimit) {\n");
+    emitBodyLock(2, "MtActivationEventTraceRecord cycleEnd = {};\n");
+    emitBodyLock(2, "cycleEnd.cycle = cycles;\n");
+    emitBodyLock(2, "cycleEnd.sourceCppId = -1;\n");
+    emitBodyLock(2, "cycleEnd.kind = MT_ACTIVATION_EVENT_CYCLE_END;\n");
+    emitBodyLock(2, "mtActivationEventTraceRecords.push_back(cycleEnd);\n");
+    emitBodyLock(2, "size_t recordCount = mtActivationEventTraceRecords.size();\n");
+    emitBodyLock(2, "size_t written = fwrite(mtActivationEventTraceRecords.data(), sizeof(MtActivationEventTraceRecord), recordCount, mtActivationEventTraceFile);\n");
+    emitBodyLock(2, "if (written != recordCount) { fprintf(stderr, \"[mt-activation-event-trace] short write cycle=%%lu expected=%%zu written=%%zu\\n\", cycles, recordCount, written); abort(); }\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "mtActivationEventTraceRecords.clear();\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleOpen = false;\n");
+    emitBodyLock(1, "if (cycles >= mtActivationEventTraceCycleLimit - 1) closeMtActivationEventTrace();\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::closeMtActivationEventTrace() {\n", name.c_str());
+    emitBodyLock(1, "if (mtActivationEventTraceFile != nullptr) {\n");
+    emitBodyLock(2, "int mtActivationEventTraceFlushStatus = fflush(mtActivationEventTraceFile);\n");
+    emitBodyLock(2, "int mtActivationEventTraceCloseStatus = fclose(mtActivationEventTraceFile);\n");
+    emitBodyLock(2, "mtActivationEventTraceFile = nullptr;\n");
+    emitBodyLock(2, "if (mtActivationEventTraceFlushStatus != 0 || mtActivationEventTraceCloseStatus != 0) { fprintf(stderr, \"[mt-activation-event-trace] close failed fflush=%%d fclose=%%d\\n\", mtActivationEventTraceFlushStatus, mtActivationEventTraceCloseStatus); abort(); }\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "mtActivationEventTraceRecords.clear();\n");
+    emitBodyLock(1, "mtActivationEventTracePendingRecords.clear();\n");
+    emitBodyLock(1, "mtActivationEventTraceCycleOpen = false;\n");
+    emitBodyLock(0, "}\n");
+  }
 
   emitFuncDecl(0, "S%s::~S%s() {\n", name.c_str(), name.c_str());
   if (useMtHelpers && useCoarseMt && mtUseWaitProbeCodegen()) emitBodyLock(1, "runMtWaitProbeEmptyBarrier();\n");
   if (useMtHelpers) emitBodyLock(1, "stopMtWorkerPool();\n");
+  if (useMtHelpers && mtUseWorkerPoolFlagJoinCodegen()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
+    emitBodyLock(1, "delete[] mtWorkerPoolDoneFlags; mtWorkerPoolDoneFlags = nullptr;\n");
+    emitBodyLock(1, "#endif\n");
+  }
+  if (denseBreakdownProfileCodegen) emitBodyLock(1, "dumpMtDenseBreakdownProfile();\n");
   emitBodyLock(1, "if (wallfracCommitBrackets + wallfracCombBrackets > 0) {\n");
   emitBodyLock(2, "uint64_t __wf_tot = wallfracCommitCycles + wallfracCombCycles;\n");
   emitBodyLock(2, "fprintf(stderr, \"[wallfrac] commit_cycles=%%lu comb_cycles=%%lu commit_brackets=%%lu comb_brackets=%%lu commit_frac=%%.4f comb_frac=%%.4f\\n\", wallfracCommitCycles, wallfracCombCycles, wallfracCommitBrackets, wallfracCombBrackets, __wf_tot? (double)wallfracCommitCycles/__wf_tot : 0.0, __wf_tot? (double)wallfracCombCycles/__wf_tot : 0.0);\n");
@@ -12259,6 +14511,7 @@ void graph::cppEmitter() {
   emitBodyLock(1, "dumpMtProfile();\n");
   if (useCoarseMt && mtUseWaitProbeCodegen()) emitBodyLock(1, "dumpMtWaitProbe();\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) { fclose(mtProfileDynamicTraceFile); mtProfileDynamicTraceFile = nullptr; }\n");
+  if (activationEventTraceCodegen) emitBodyLock(1, "closeMtActivationEventTrace();\n");
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::recordMtProfileTask(int cppId, bool pureTask, uint64_t elapsedNs) {\n", name.c_str());
@@ -12427,10 +14680,18 @@ void graph::cppEmitter() {
   }
 
   /* activation all nodes for reset */
-  fprintf(header, "void activateAll();\n");
-  emitFuncDecl(0, "void S%s::activateAll() {\n"
-               "  memset(activeFlags, 0xff, sizeof(activeFlags));\n"
-               "}\n", name.c_str());
+  if (activationEventTraceCodegen) {
+    fprintf(header, "void activateAll(int32_t sourceCppId = -1);\n");
+    emitFuncDecl(0, "void S%s::activateAll(int32_t sourceCppId) {\n"
+                 "  memset(activeFlags, 0xff, sizeof(activeFlags));\n"
+                 "  recordMtActivationEvent(sourceCppId, 0, UINT64_MAX, MT_ACTIVATION_EVENT_ACTIVATE_ALL);\n"
+                 "}\n", name.c_str());
+  } else {
+    fprintf(header, "void activateAll();\n");
+    emitFuncDecl(0, "void S%s::activateAll() {\n"
+                 "  memset(activeFlags, 0xff, sizeof(activeFlags));\n"
+                 "}\n", name.c_str());
+  }
 
    /* input/output interface */
   for (Node* node : input) {
@@ -12450,10 +14711,17 @@ void graph::cppEmitter() {
     genResetAllDense();
   }
   for (int i = 0; i < resetFuncNum; i ++) {
-    fprintf(header, "void subReset%d();\n", i);
+    if (mtUseActivationEventTraceCodegen()) fprintf(header, "void subReset%d(int32_t traceSourceCppId);\n", i);
+    else fprintf(header, "void subReset%d();\n", i);
     if (denseExecutorValid) fprintf(header, "void subResetDense%d();\n", i);
-    if (globalConfig.MtHelperMode == "buffered-seq") fprintf(header, "void subReset%d(ActiveBuffer &nextActive);\n", i);
-    if (useMtHelpers) fprintf(header, "void subReset%d(ActivationDelta &nextActive);\n", i);
+    if (globalConfig.MtHelperMode == "buffered-seq") {
+      if (mtUseActivationEventTraceCodegen()) fprintf(header, "void subReset%d(ActiveBuffer &nextActive, int32_t traceSourceCppId);\n", i);
+      else fprintf(header, "void subReset%d(ActiveBuffer &nextActive);\n", i);
+    }
+    if (useMtHelpers) {
+      if (mtUseActivationEventTraceCodegen()) fprintf(header, "void subReset%d(ActivationDelta &nextActive, int32_t traceSourceCppId);\n", i);
+      else fprintf(header, "void subReset%d(ActivationDelta &nextActive);\n", i);
+    }
   }
 
   /* main evaluation loop (step) */
