@@ -17,6 +17,25 @@
 
 #define MUX_OPT true
 
+// V355: default-off cost-gated ternary for width-1 muxes with expensive arms.
+// The wide path already emits ternary `?:` (short-circuit) when any arm opNum>1;
+// the width-1 path forces the branchless both-arm bitmask unconditionally, which
+// double-evaluates expensive/nested arms. When GSIM_MUX_SHORTCIRCUIT=1, width-1
+// muxes whose max arm opNum exceeds a threshold (GSIM_MUX_SHORTCIRCUIT_THRESHOLD,
+// default 3) also emit ternary so only one arm is evaluated. Cheap (opNum<=thr)
+// arms keep the branchless bitmask to avoid branch misprediction. Semantics are
+// identical (ternary reads a strict subset of what the bitmask reads).
+static bool mtUseMuxShortCircuit() {
+  const char* env = std::getenv("GSIM_MUX_SHORTCIRCUIT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+static int mtMuxShortCircuitThreshold() {
+  const char* env = std::getenv("GSIM_MUX_SHORTCIRCUIT_THRESHOLD");
+  if (env == nullptr || env[0] == '\0') return 3;
+  int v = atoi(env);
+  return v < 1 ? 1 : v;
+}
+
 #define Child(id, name) getChild(id)->name
 #define ChildInfo(id, name) getChild(id)->computeInfo->name
 
@@ -241,7 +260,10 @@ valInfo* ENode::instsMux(Node* node, std::string lvalue, bool isRoot) {
     } else if (ChildInfo(2, status) == VAL_CONSTANT && mpz_sgn(ChildInfo(2, consVal)) != 0) {
       ret->valStr = format("((!%s) | %s)", ChildInfo(0, valStr).c_str(), ChildInfo(1, valStr).c_str());
     } else {
-      if (MUX_OPT) {
+      bool muxSC = mtUseMuxShortCircuit()
+                   && (ChildInfo(1, opNum) > mtMuxShortCircuitThreshold()
+                       || ChildInfo(2, opNum) > mtMuxShortCircuitThreshold());
+      if (MUX_OPT && !muxSC) {
         ret->valStr = format("((%s & %s) | ((!%s) & %s))", ChildInfo(0, valStr).c_str(), ChildInfo(1, valStr).c_str(), ChildInfo(0, valStr).c_str(), ChildInfo(2, valStr).c_str());
       } else {
         std::string trueStr = ChildInfo(1, valStr);
