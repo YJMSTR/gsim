@@ -2732,20 +2732,12 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
 // earliest-start schedule order -- Verilator's static per-worker chain behavior -- with no
 // runtime change. The order is a valid topological order (only ready MTasks are scheduled), so
 // ids stay topo-monotone (succ>from) as the runtime protocol / transitive reduction require.
-// v368: optional measured per-MTask body costs (perf-attributed, keyed by PRE-renumber id)
-// override schedCost/staticCost in priorities, the 30% cross-worker sandbag, and completion.
 static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount,
-                                      std::vector<int>& outAssign, std::vector<int>& outOrder,
-                                      const std::vector<long long>* costOverride = nullptr) {
+                                      std::vector<int>& outAssign, std::vector<int>& outOrder) {
   if (threadCount < 1) threadCount = 1;
   const int n = static_cast<int>(mtasks.size());
   const bool v3Policy = mtUseDenseV3ContractPolicy();
-  auto costOf = [&](int i) -> long long {
-    if (costOverride && i >= 0 && i < static_cast<int>(costOverride->size()) && (*costOverride)[(size_t)i] > 0)
-      return (*costOverride)[(size_t)i];
-    const MtDenseMTask& m = mtasks[(size_t)i];
-    return m.schedCost > 0 ? m.schedCost : m.staticCost;
-  };
+  auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
   outAssign.assign((size_t)n, -1);
   outOrder.clear(); outOrder.reserve((size_t)n);
   std::vector<long long> completion((size_t)n, 0);
@@ -2758,7 +2750,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   for (int i = n - 1; i >= 0; i --) {
     long long best = 0;
     for (int succ : mtasks[(size_t)i].succMTasks) if (succ >= 0 && succ < n) best = std::max(best, priority[(size_t)succ]);
-    priority[(size_t)i] = costOf(i) + best;
+    priority[(size_t)i] = costOf(mtasks[(size_t)i]) + best;
   }
   std::vector<int> ready;
   for (int i = 0; i < n; i ++) if (remainingPreds[(size_t)i] == 0) ready.push_back(i);
@@ -2780,7 +2772,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           long long predEnd = completion[(size_t)pred];
           int predWorker = outAssign[(size_t)pred];
           if (predWorker >= 0 && predWorker != worker) {
-            predEnd += (long long)(costOf(pred)) * 30 / 100;
+            predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
             // V3 PackThreads bounds a cross-thread estimate by the end of the next task
             // already packed on the predecessor's worker, avoiding a priority inversion.
             int next = v3Policy ? nextOnWorker[(size_t)pred] : -1;
@@ -2800,7 +2792,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     }
     if (bestMTask < 0) break;
     outAssign[(size_t)bestMTask] = bestWorker;
-    completion[(size_t)bestMTask] = bestTime + std::max(1LL, costOf(bestMTask));
+    completion[(size_t)bestMTask] = bestTime + std::max(1, costOf(mtasks[(size_t)bestMTask]));
     int previousOnWorker = lastOnWorker[(size_t)bestWorker];
     if (previousOnWorker >= 0) nextOnWorker[(size_t)previousOnWorker] = bestMTask;
     lastOnWorker[(size_t)bestWorker] = bestMTask;
@@ -2818,7 +2810,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     for (int mtaskId = 0; mtaskId < n; ++mtaskId) {
       makespan = std::max(makespan, completion[(size_t)mtaskId]);
       int worker = outAssign[(size_t)mtaskId];
-      if (worker >= 0 && worker < threadCount) workerLoads[(size_t)worker] += costOf(mtaskId);
+      if (worker >= 0 && worker < threadCount) workerLoads[(size_t)worker] += costOf(mtasks[(size_t)mtaskId]);
     }
     fprintf(stderr, "[mt-dense-v3-schedule] predicted_makespan=%lld worker_loads=", makespan);
     for (int worker = 0; worker < threadCount; ++worker) fprintf(stderr, "%s%lld", worker ? "," : "", workerLoads[(size_t)worker]);
@@ -2831,33 +2823,6 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     for (int i = 0; i < n; i ++) if (!seen[(size_t)i]) { outOrder.push_back(i); if (outAssign[(size_t)i] < 0) outAssign[(size_t)i] = mtasks[(size_t)i].workerZeroOnly ? 0 : 0; }
   }
 }
-// v368: default-off measured per-MTask cost file (runtime-id cost per line, '#'-comments ok).
-// Costs come from perf sample attribution on a previous bit-identical build; they are body-only
-// cycles (waits live in the worker function, not in stepDenseMTask* bodies).
-static std::vector<long long> mtLoadDenseCostFile() {
-  std::vector<long long> costs;
-  const char* path = std::getenv("GSIM_MT_DENSE_COST_FILE");
-  if (!path || !path[0]) return costs;
-  FILE* fp = std::fopen(path, "r");
-  Assert(fp != nullptr, "GSIM_MT_DENSE_COST_FILE %s unreadable", path);
-  char line[256];
-  size_t entries = 0;
-  while (std::fgets(line, sizeof(line), fp)) {
-    if (line[0] == '#' || line[0] == '\n') continue;
-    char* end = nullptr;
-    long long id = std::strtoll(line, &end, 10);
-    if (end == line || id < 0) continue;
-    long long cost = std::strtoll(end, &end, 10);
-    if (cost <= 0) continue;
-    if (static_cast<size_t>(id) >= costs.size()) costs.resize((size_t)id + 1, 0);
-    costs[(size_t)id] = cost;
-    entries ++;
-  }
-  std::fclose(fp);
-  fprintf(stderr, "[mt-dense-costfile] loaded %zu measured MTask costs from %s\n", entries, path);
-  return costs;
-}
-
 static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {
   MtDenseSchedule schedule;
   schedule.codegenEnabled = codegenEnabled;
@@ -3203,28 +3168,6 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
       std::vector<int> assignTmp, orderTmp;
       mtBuildDenseScheduleOrder(schedule.mtasks, threadCount, assignTmp, orderTmp);
       const int n = static_cast<int>(schedule.mtasks.size());
-      // v368: re-schedule with perf-measured body costs. The static run above reproduces the
-      // runtime-id numbering of the reference build deterministically, so runtime-id costs map
-      // into this run's pre-renumber space via orderTmp. Partition/DAG are untouched.
-      std::vector<long long> runtimeCosts = mtLoadDenseCostFile();
-      if (!runtimeCosts.empty() && static_cast<int>(orderTmp.size()) == n) {
-        std::vector<long long> preCosts((size_t)n, 0);
-        size_t matched = 0;
-        for (size_t rt = 0; rt < runtimeCosts.size() && rt < (size_t)n; rt ++) {
-          if (runtimeCosts[rt] <= 0) continue;
-          preCosts[(size_t)orderTmp[rt]] = runtimeCosts[rt];
-          matched ++;
-        }
-        std::vector<int> assign2, order2;
-        mtBuildDenseScheduleOrder(schedule.mtasks, threadCount, assign2, order2, &preCosts);
-        if (static_cast<int>(order2.size()) == n) {
-          assignTmp.swap(assign2);
-          orderTmp.swap(order2);
-          fprintf(stderr, "[mt-dense-costfile] re-scheduled %d MTasks with %zu measured costs\n", n, matched);
-        } else {
-          fprintf(stderr, "[mt-dense-costfile] WARNING: measured reschedule incomplete; keeping static order\n");
-        }
-      }
       if (static_cast<int>(orderTmp.size()) == n) {
         std::vector<int> newId((size_t)n, -1);
         for (int newPos = 0; newPos < n; newPos ++) newId[(size_t)orderTmp[(size_t)newPos]] = newPos;
