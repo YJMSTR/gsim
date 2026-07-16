@@ -525,6 +525,19 @@ static bool mtUseDenseMemberMetadata() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// v370: default-off. Verilator runs display/print MTasks distributed across
+// workers (VL_PRINTF_MT posts to a message queue); gsim instead pins every
+// task containing printf/assert/exit ops on worker0, which serializes ~70% of
+// worker0's pinned work (52% of the T16 wall at C50000). This knob excludes
+// "special" from the DENSE worker0-only classification only; sparse/coarse
+// fallback predicates keep the conservative reason set. Print side effects are
+// serialized by a gprintf mutex; log printf is compiled out in benchmark
+// builds and assert/exit races are benign (first abort wins).
+static bool mtUseDenseUnpinSpecial() {
+  const char* env = std::getenv("GSIM_MT_DENSE_UNPIN_SPECIAL");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 // v198: When enabled, exclude backward (cross-cycle) activation edges from the dense SCC graph.
 // Backward activation edges are next-cycle activations that create false within-cycle cycles.
 static bool mtUseDenseForwardActivationOnly() {
@@ -978,6 +991,21 @@ static bool mtTasksHaveDirectedEdge(SuperNode* from, SuperNode* to) {
 // review I5 conservative. super_type_SUPER_EXTMOD covers the alwaysActive set.
 static bool hasWorker0OnlyReason(const std::vector<std::string>& reasons) {
   for (const std::string& r : reasons) {
+    if (r == "external" || r == "memory_write" ||
+        r == "memory_read_unsupported" || r == "special" ||
+        r == "super_type_SUPER_EXTMOD") {
+      return true;
+    }
+  }
+  return false;
+}
+
+// v370: dense worker0 pinning predicate; identical to hasWorker0OnlyReason
+// except "special" unpinned when GSIM_MT_DENSE_UNPIN_SPECIAL=1.
+static bool hasWorker0OnlyReasonDense(const std::vector<std::string>& reasons) {
+  const bool unpinSpecial = mtUseDenseUnpinSpecial();
+  for (const std::string& r : reasons) {
+    if (unpinSpecial && r == "special") continue;
     if (r == "external" || r == "memory_write" ||
         r == "memory_read_unsupported" || r == "special" ||
         r == "super_type_SUPER_EXTMOD") {
@@ -2935,7 +2963,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
       stack.pop_back();
       scc.cppIds.push_back(node);
       auto taskIter = tasks.find(node);
-      if (taskIter != tasks.end() && hasWorker0OnlyReason(taskIter->second.serialReasons)) {
+      if (taskIter != tasks.end() && hasWorker0OnlyReasonDense(taskIter->second.serialReasons)) {
         scc.workerZeroOnly = true;
         scc.worker0OnlyTaskCount ++;
         schedule.worker0OnlyCppIds.push_back(node);
@@ -6479,7 +6507,7 @@ void graph::dumpMtDenseScheduleJson() {
     fprintf(fp, "\"task_kind\": \"%s\", \"dense_mtask_id\": %d, \"serial_reasons\": ", mtTask.taskKind.c_str(), denseMTaskId);
     dumpJsonStringArray(fp, mtTask.serialReasons);
     fprintf(fp, ", \"worker0_only\": %s, \"is_always_active\": %s, ",
-            hasWorker0OnlyReason(mtTask.serialReasons) ? "true" : "false",
+            hasWorker0OnlyReasonDense(mtTask.serialReasons) ? "true" : "false",
             isAlwaysActive(cppId) ? "true" : "false");
     fprintf(fp, "\"active_word\": %d, \"active_mask\": \"0x%" PRIx64 "\", ", activeWord, activeMask);
     fprintf(fp, "\"static_cost\": %d, \"member_node_cost\": %zu, ", mtTaskEstimatedCost(mtTasks, cppId), super->member.size());
@@ -13108,6 +13136,11 @@ bool graph::__emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const ch
 
 void graph::emitPrintf() {
   emitFuncDecl(0, "void gprintf(const char *fmt, ...) {\n");
+  if (mtUseDenseUnpinSpecial()) {
+    emitBodyLock(0,
+    "  static std::mutex gGprintfMutex;\n"
+    "  std::lock_guard<std::mutex> gprintfLock(gGprintfMutex);\n");
+  }
   emitBodyLock(0,
   "  FILE *fp = stderr;\n"
   "  va_list args;\n"
