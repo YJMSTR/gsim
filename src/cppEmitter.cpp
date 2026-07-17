@@ -1403,6 +1403,29 @@ static bool mtUseDenseSharedHelpers() {
 }
 
 
+// v384 activity-driven dense evaluation (2026-07-17): gate each MTask body behind an epoch flag so
+// only MTasks whose inputs may have changed evaluate. The dense executor otherwise recomputes the
+// full DAG every cycle although measured activation is ~1.5% of body work per cycle. Design:
+//   * Per-MTask uint32 epoch flag (single-value stores, release/acquire like owner-ready tokens).
+//     A MTask runs its body iff flag == mtDenseActivityCounter (incremented once per cycle after
+//     the pool join; wraparound resets all flags at the barrier).
+//   * Activation sources: state-commit MTasks (REG_SRC / REG_RESET writes). After a commit body
+//     runs, each written scalar field is compared against a shadow copy; changed fields set the
+//     epoch flags of their reader MTasks (fanout precomputed from MtBoundaryInfo read/write sets).
+//     Wide (>64b) and array fields conservatively activate all readers on any writer run.
+//   * Propagation: a running MTask sets the epoch flags of all runtime DAG successors (redirected
+//     through elided MTasks). The owner-ready TOKEN protocol (waits/signals) is unchanged and runs
+//     for every MTask every cycle, so dependency counts settle exactly as before; only bodies are
+//     gated. worker0-only side-effect MTasks stay always-active.
+//   * Correctness closure: if a reader runs, all its producers ran (flags propagate down before);
+//     skipped producers leave outputs unchanged and unchanged cones evaluate bit-identically.
+// Default-off; requires owner-ready fixed-owner execution without breakdown codegen.
+static bool mtUseDenseActivity() {
+  const char* env = std::getenv("GSIM_MT_DENSE_ACTIVITY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
 // Sparse-in-dense hybrid (2026-07-09): run each dense MTask member under gsim's per-super
 // activeFlags gate + activation production, instead of unconditionally. Dense execution order
 // (MTask-id major, cppId ascending minor) is a valid topological order of the dependency+
@@ -12320,6 +12343,106 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     sharedHelpers = false;
   }
   if (sharedHelpers) fprintf(stderr, "[mt-dense-shared-helpers] enabled\n");
+  bool activity = mtUseDenseActivity();
+  if (activity && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen || tableDispatch)) {
+    fprintf(stderr, "[mt-dense-activity] requires owner-ready fixed-owner execution without breakdown/table-dispatch; disabled\n");
+    activity = false;
+  }
+  struct MtActivityCommitField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
+  std::vector<std::vector<MtActivityCommitField>> activityCommitFields;
+  std::vector<std::vector<int>> activitySuccFlags;
+  std::vector<int> activityFanoutList;
+  int activityShadowCount = 0;
+  int activitySuccTotal = 0;
+  int activityConservativeFields = 0;
+  int activityScalarFields = 0;
+  if (activity) {
+    const int nM = nMTasks;
+    std::vector<std::set<std::string>> readFields((size_t)nM);
+    std::vector<std::set<std::string>> commitFields((size_t)nM);
+    std::map<std::string, Node*> commitTargetNode;
+    for (int m = 0; m < nM; m++) {
+      const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+      for (int sccId : mt.sccIds) {
+        if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+        const MtDenseScc& scc = denseSchedule.sccs[(size_t)sccId];
+        for (int cppId : scc.cppIds) {
+          auto superIter = cppId2Super.find(cppId);
+          if (superIter == cppId2Super.end() || !superIter->second) continue;
+          SuperNode* super = superIter->second;
+          int dummyCost = 0;
+          MtBoundaryInfo b = collectMtBoundaryInfo(super, dummyCost);
+          for (const std::string& r : b.rhsReadStateTargetNames) readFields[(size_t)m].insert(r);
+          if (b.stateSourceCommitCount > 0 || b.stateResetUpdateCount > 0) {
+            for (const std::string& f : b.stateTargetNames) commitFields[(size_t)m].insert(f);
+            for (Node* member : super->member) {
+              if (!nodeHasStateUpdate(member)) continue;
+              std::string tn;
+              if (!stateTargetNameForNode(member, tn)) continue;
+              Node* target = member->type == NODE_REG_SRC ? member
+                           : (member->type == NODE_REG_DST ? member->getSrc() : member->getResetSrc());
+              if (target) commitTargetNode[tn] = target;
+            }
+          }
+        }
+      }
+    }
+    std::vector<char> activityElided((size_t)nM, 0);
+    for (int m = 0; m < nM; m++) if (denseSchedule.mtaskThreadAssign[(size_t)m] < 0) activityElided[(size_t)m] = 1;
+    // runtime successors redirected through elided MTasks (they never run, so their successors
+    // would never receive a flag from them)
+    activitySuccFlags.assign((size_t)nM, {});
+    for (int m = 0; m < nM; m++) {
+      if (activityElided[(size_t)m]) continue;
+      std::vector<int> stack;
+      std::vector<char> seen((size_t)nM, 0);
+      for (int s : denseSchedule.mtasks[(size_t)m].succMTasks) if (s >= 0 && s < nM) stack.push_back(s);
+      while (!stack.empty()) {
+        int s = stack.back(); stack.pop_back();
+        if (seen[(size_t)s]) continue; seen[(size_t)s] = 1;
+        if (activityElided[(size_t)s]) {
+          for (int s2 : denseSchedule.mtasks[(size_t)s].succMTasks) if (s2 >= 0 && s2 < nM && !seen[(size_t)s2]) stack.push_back(s2);
+        } else {
+          activitySuccFlags[(size_t)m].push_back(s);
+        }
+      }
+      activitySuccTotal += (int)activitySuccFlags[(size_t)m].size();
+    }
+    std::map<std::string, std::vector<int>> fieldReaders;
+    for (int m = 0; m < nM; m++) {
+      if (activityElided[(size_t)m]) continue;
+      for (const std::string& r : readFields[(size_t)m]) fieldReaders[r].push_back(m);
+    }
+    activityCommitFields.assign((size_t)nM, {});
+    for (int m = 0; m < nM; m++) {
+      if (activityElided[(size_t)m]) continue;
+      for (const std::string& f : commitFields[(size_t)m]) {
+        MtActivityCommitField cf; cf.name = f;
+        Node* target = nullptr;
+        auto nodeIter = commitTargetNode.find(f);
+        if (nodeIter != commitTargetNode.end()) target = nodeIter->second;
+        bool scalar = target != nullptr && target->type != NODE_MEMORY && !target->isArray() && target->width <= 64;
+        if (scalar) {
+          cf.mask = target->width >= 64 ? ~0ULL : ((1ULL << target->width) - 1);
+          cf.shadowSlot = activityShadowCount++;
+          activityScalarFields++;
+        } else {
+          cf.conservative = true;
+          activityConservativeFields++;
+        }
+        cf.fanoutBegin = (int)activityFanoutList.size();
+        auto readerIter = fieldReaders.find(f);
+        if (readerIter != fieldReaders.end()) for (int r : readerIter->second) activityFanoutList.push_back(r);
+        cf.fanoutEnd = (int)activityFanoutList.size();
+        activityCommitFields[(size_t)m].push_back(cf);
+      }
+    }
+    int activityCommitMTasks = 0;
+    for (int m = 0; m < nM; m++) activityCommitMTasks += !activityCommitFields[(size_t)m].empty() ? 1 : 0;
+    fprintf(stderr, "[mt-dense-activity] mtasks=%d commit_mtasks=%d scalar_fields=%d conservative_fields=%d fanout=%zu succ_flags=%d shadow=%d\n",
+            nM, activityCommitMTasks,
+            activityScalarFields, activityConservativeFields, activityFanoutList.size(), activitySuccTotal, activityShadowCount);
+  }
   std::vector<int> denseDispatchWorkerCounts;
   std::vector<uint32_t> denseDispatchWaitBegin, denseDispatchWaitEnd;
   std::vector<uint32_t> denseDispatchStoreBegin, denseDispatchStoreEnd;
@@ -12531,6 +12654,43 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     if (sharedHelpers) {
       fprintf(header, "void mtDenseWaitOwnerReady(int slot, uint8_t target);\n");
       fprintf(header, "void mtDenseSignalOwnerReady(int storeBegin, int storeEnd, uint8_t target);\n");
+    }
+    if (activity) {
+      fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActivityEpoch[%d];\n", nMTasks);
+      fprintf(header, "uint32_t mtDenseActivityCounter = 1;\n");
+      fprintf(header, "uint64_t mtDenseActivityShadow[%d] = {};\n", std::max(1, activityShadowCount));
+      fprintf(header, "static constexpr int kDenseActivityFanout[%d] = {", std::max(1, (int)activityFanoutList.size()));
+      for (size_t i = 0; i < activityFanoutList.size(); i++) fprintf(header, "%s%d", i ? "," : "", activityFanoutList[i]);
+      if (activityFanoutList.empty()) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseActivitySuccOffsets[%d] = {", nMTasks + 1);
+      {
+        int off = 0;
+        for (int m = 0; m < nMTasks; m++) {
+          if (m > 0) fprintf(header, ",");
+          fprintf(header, "%d", off);
+          off += (int)activitySuccFlags[(size_t)m].size();
+        }
+        fprintf(header, ",%d};\n", off);
+      }
+      fprintf(header, "static constexpr int kDenseActivitySuccList[%d] = {", std::max(1, activitySuccTotal));
+      {
+        bool first = true;
+        for (int m = 0; m < nMTasks; m++) {
+          for (int s : activitySuccFlags[(size_t)m]) {
+            if (!first) fprintf(header, ",");
+            fprintf(header, "%d", s);
+            first = false;
+          }
+        }
+        if (first) fprintf(header, "0");
+        fprintf(header, "};\n");
+      }
+      // v384 fix: shared noinline helpers keep the per-site fanout/succ stores as calls.
+      // The first V384 build inlined constant-bounded loops; clang -O3 unrolled ~400K of them
+      // and SimTop1217.cpp compiled for 90+ minutes before the build was killed.
+      fprintf(header, "void mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd);\n");
+      fprintf(header, "void mtDenseActivitySuccStore(int mtask);\n");
     }
     fprintf(header, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
     emitDenseDepCounts();
@@ -12955,7 +13115,41 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
           emitBodyLock(3, "}\n");
         } else {
-          emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+          if (activity && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly) {
+            emitBodyLock(3, "if (mtDenseActivityEpoch[%d].load(std::memory_order_acquire) == mtDenseActivityCounter) {\n", mtaskId);
+            emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
+            if (mtaskId < static_cast<int>(activityCommitFields.size()) && !activityCommitFields[(size_t)mtaskId].empty()) {
+              for (const MtActivityCommitField& cf : activityCommitFields[(size_t)mtaskId]) {
+                if (cf.conservative) {
+                  emitBodyLock(4, "mtDenseActivityFanoutStore(%d, %d);\n", cf.fanoutBegin, cf.fanoutEnd);
+                } else {
+                  emitBodyLock(4, "{ uint64_t nv = ((uint64_t)%s) & 0x%llxULL; if (nv != mtDenseActivityShadow[%d]) { mtDenseActivityShadow[%d] = nv; mtDenseActivityFanoutStore(%d, %d); } }\n",
+                               cf.name.c_str(), (unsigned long long)cf.mask, cf.shadowSlot, cf.shadowSlot, cf.fanoutBegin, cf.fanoutEnd);
+                }
+              }
+            }
+            if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
+              emitBodyLock(4, "mtDenseActivitySuccStore(%d);\n", mtaskId);
+            }
+            emitBodyLock(3, "}\n");
+          } else if (activity) {
+            emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+            if (mtaskId < static_cast<int>(activityCommitFields.size()) && !activityCommitFields[(size_t)mtaskId].empty()) {
+              for (const MtActivityCommitField& cf : activityCommitFields[(size_t)mtaskId]) {
+                if (cf.conservative) {
+                  emitBodyLock(3, "mtDenseActivityFanoutStore(%d, %d);\n", cf.fanoutBegin, cf.fanoutEnd);
+                } else {
+                  emitBodyLock(3, "{ uint64_t nv = ((uint64_t)%s) & 0x%llxULL; if (nv != mtDenseActivityShadow[%d]) { mtDenseActivityShadow[%d] = nv; mtDenseActivityFanoutStore(%d, %d); } }\n",
+                               cf.name.c_str(), (unsigned long long)cf.mask, cf.shadowSlot, cf.shadowSlot, cf.fanoutBegin, cf.fanoutEnd);
+                }
+              }
+            }
+            if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
+              emitBodyLock(3, "mtDenseActivitySuccStore(%d);\n", mtaskId);
+            }
+          } else {
+            emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+          }
         }
         const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
         if (!ownerReadyFlags) {
@@ -13056,6 +13250,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
 
     emitBodyLock(0, "}\n");
   };
+  if (activity) {
+    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd) {\n", name.c_str());
+    emitBodyLock(1, "for (int j = fanoutBegin; j < fanoutEnd; j++)\n");
+    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivityFanout[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
+    emitBodyLock(0, "}\n");
+    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivitySuccStore(int mtask) {\n", name.c_str());
+    emitBodyLock(1, "for (int j = kDenseActivitySuccOffsets[mtask]; j < kDenseActivitySuccOffsets[mtask + 1]; j++)\n");
+    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivitySuccList[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
+    emitBodyLock(0, "}\n");
+  }
   if (sharedHelpers) {
     emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseWaitOwnerReady(int slot, uint8_t target) {\n", name.c_str());
     emitBodyLock(1, "unsigned ct = 0;\n");
@@ -13208,6 +13412,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(3, "for (int i = 0; i < kDenseOwnerReadyTokenCount; i++)\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[i]].ready.store(mtDenseOwnerReadyRephaseValue, std::memory_order_relaxed);\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokensPrimed = true;\n");
+    if (activity) {
+      emitBodyLock(3, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed);\n", nMTasks);
+      emitBodyLock(3, "mtDenseActivityCounter = 1;\n");
+    }
     emitBodyLock(2, "}\n");
     emitBodyLock(2, "#endif\n");
   }
@@ -13239,6 +13447,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
 
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
+  if (activity) {
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(2, "if (++mtDenseActivityCounter == 0) { for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(0, std::memory_order_relaxed); mtDenseActivityCounter = 1; }\n", nMTasks);
+    emitBodyLock(2, "#endif\n");
+  }
   if (denseBreakdownWindowCodegen) {
     emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle && mtDenseBreakdownWindowCausalChainMode)) {\n");
     emitBodyLock(3, "const int mtDenseBreakdownWindowCausalSlot = mtDenseBreakdownWindowCurrentSlot;\n");
