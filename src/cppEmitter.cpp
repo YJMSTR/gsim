@@ -538,6 +538,114 @@ static bool mtUseDenseUnpinSpecial() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// v376: default-off yield-threshold override for dense wait stubs. Default 256
+// preserves the promoted literal (v294 measured 256 > 64); larger thresholds
+// trade pause-spin time for fewer yield syscalls. Affects every dense
+// depsDone/owner-ready wait stub.
+static int mtDensePollYieldThreshold() {
+  const char* env = std::getenv("GSIM_MT_DENSE_POLL_YIELD_THRESHOLD");
+  if (env == nullptr || env[0] == '\0') return 256;
+  int value = std::atoi(env);
+  return value < 1 ? 256 : value;
+}
+
+// v377: default-off observability-cone elimination (user-approved scope
+// 2026-07-17). Perf-counter/debug-observability nodes whose ENTIRE data and
+// activation fanout is itself observability or print-only are droppable: their
+// assignment spans are not emitted. [PERF] printout values become stale/zero
+// (accepted); NEMU architectural endpoints must stay exact, so classification
+// is fail-closed: any architectural consumer (data or activation) keeps the
+// node alive, and supers with unbalanced assignment-marker spans emit everything.
+static bool mtUseDenseElideObservability() {
+  const char* env = std::getenv("GSIM_MT_DENSE_ELIDE_OBSERVABILITY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static bool mtDenseObservabilityNameClassified(const std::string& name) {
+  if (name.rfind("logEndpoint__DOT__", 0) == 0) return true;
+  if (name.find("perfCtrl") != std::string::npos || name.find("perfEvents") != std::string::npos ||
+      name.find("PerfCtf") != std::string::npos || name.find("perf_") != std::string::npos) return true;
+  if (name.find("debugModule") != std::string::npos || name.find("dtm") != std::string::npos ||
+      name.find("DTM") != std::string::npos || name.find("jtag") != std::string::npos ||
+      name.find("JTAG") != std::string::npos) return false;
+  if (name.find("debug_") != std::string::npos || name.find("Debug") != std::string::npos) return true;
+  return false;
+}
+
+static const std::set<Node*>& mtDenseObservabilityDroppableSet() {
+  static std::set<Node*> droppable;
+  static bool computed = false;
+  if (computed) return droppable;
+  computed = true;
+  if (!mtUseDenseElideObservability()) return droppable;
+  std::vector<Node*> candidates;
+  for (int cppId = 0; cppId < superId; cppId ++) {
+    auto superIter = cppId2Super.find(cppId);
+    if (superIter == cppId2Super.end() || !superIter->second) continue;
+    for (Node* node : superIter->second->member) {
+      if (!node || node->status != VALID_NODE || node->type != NODE_OTHERS) continue;
+      if (node->isArray() || node->parent || node->inAggr || node->isClock || node->isReset() || node->isExt()) continue;
+      if (!node->member.empty()) continue;
+      if (!mtDenseObservabilityNameClassified(node->name)) continue;
+      candidates.push_back(node);
+    }
+  }
+  auto fullyDroppableSuper = [&](SuperNode* super) {
+    if (!super) return false;
+    for (Node* member : super->member) {
+      if (!member) continue;
+      if (member->type == NODE_SPECIAL) continue;
+      if (droppable.find(member) == droppable.end()) return false;
+    }
+    return true;
+  };
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Node* node : candidates) {
+      if (droppable.find(node) != droppable.end()) continue;
+      bool alive = false;
+      auto consumerAlive = [&](Node* consumer) {
+        return consumer && droppable.find(consumer) == droppable.end();
+      };
+      for (Node* consumer : node->next) if (consumerAlive(consumer)) { alive = true; break; }
+      if (!alive) for (Node* consumer : node->depNext) if (consumerAlive(consumer)) { alive = true; break; }
+      if (!alive) {
+        for (int target : node->nextActiveId) {
+          auto targetIter = cppId2Super.find(target);
+          if (targetIter == cppId2Super.end() || !fullyDroppableSuper(targetIter->second)) { alive = true; break; }
+        }
+      }
+      if (!alive) {
+        for (int target : node->nextNeedActivate) {
+          auto targetIter = cppId2Super.find(target);
+          if (targetIter == cppId2Super.end() || !fullyDroppableSuper(targetIter->second)) { alive = true; break; }
+        }
+      }
+      if (!alive) {
+        droppable.insert(node);
+        changed = true;
+      }
+    }
+  }
+  fprintf(stderr, "[mt-dense-elide-observability] candidates=%zu droppable=%zu\n",
+          candidates.size(), droppable.size());
+  return droppable;
+}
+
+static bool mtDenseObservabilitySpansBalanced(const std::vector<InstInfo>& insts) {
+  std::vector<Node*> stack;
+  for (const InstInfo& inst : insts) {
+    if (inst.infoType == SUPER_INFO_ASSIGN_BEG) {
+      stack.push_back(inst.node);
+    } else if (inst.infoType == SUPER_INFO_ASSIGN_END) {
+      if (stack.empty() || stack.back() != inst.node) return false;
+      stack.pop_back();
+    }
+  }
+  return stack.empty();
+}
+
 // v198: When enabled, exclude backward (cross-cycle) activation edges from the dense SCC graph.
 // Backward activation edges are next-cycle activations that create false within-cycle cycles.
 static bool mtUseDenseForwardActivationOnly() {
@@ -9282,8 +9390,34 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
         emitBodyLock(indent, "%s %s;\n", widthUType(n->width).c_str(), n->name.c_str());
       }
     }
-    for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+    if (mtUseDenseElideObservability() && mtDenseObservabilitySpansBalanced(super->insts)) {
+      const std::set<Node*>& droppable = mtDenseObservabilityDroppableSet();
+      if (!droppable.empty()) {
+        std::vector<Node*> frameStack;
+        for (InstInfo inst : super->insts) {
+          if (inst.infoType == SUPER_INFO_ASSIGN_BEG) {
+            frameStack.push_back(inst.node);
+            if (droppable.find(inst.node) == droppable.end()) indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+            continue;
+          }
+          if (inst.infoType == SUPER_INFO_ASSIGN_END) {
+            Node* endNode = inst.node;
+            if (!frameStack.empty()) frameStack.pop_back();
+            if (droppable.find(endNode) == droppable.end()) indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+            continue;
+          }
+          if (!frameStack.empty() && droppable.find(frameStack.back()) != droppable.end()) continue;
+          indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+        }
+      } else {
+        for (InstInfo inst : super->insts) {
+          indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+        }
+      }
+    } else {
+      for (InstInfo inst : super->insts) {
+        indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+      }
     }
     if (super->superType == SUPER_ASYNC_RESET) {
       int resetId = super2ResetId[super->resetNode].second;
@@ -12512,7 +12646,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             }
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
             if (ownerBankCounters) emitBodyLock(3, "#endif\n");
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
             emitBodyLock(3, "}\n");
           }
         } else {
@@ -12530,7 +12664,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
               emitBodyLock(5, "if (!mtDenseBreakdownBlocked) { mtDenseBreakdownBlocked = true; mtDenseBreakdownBlockedBegin = std::chrono::steady_clock::now(); }\n");
-              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
+              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", mtDensePollYieldThreshold());
               emitBodyLock(4, "}\n");
               emitBodyLock(4, "if (mtDenseBreakdownBlocked) {\n");
               emitBodyLock(5, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
@@ -12566,7 +12700,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(3, "  } else {\n");
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
+              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", mtDensePollYieldThreshold());
               emitBodyLock(4, "}\n");
               emitBodyLock(3, "  }\n");
               emitBodyLock(3, "}\n");
@@ -12574,7 +12708,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
               emitBodyLock(3, "  unsigned ct = 0;\n");
               emitBodyLock(3, "  while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+              emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
               emitBodyLock(3, "}\n");
             }
 
@@ -12584,7 +12718,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
             emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#else\n");
@@ -12592,7 +12726,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
             emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#endif\n");
