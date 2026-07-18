@@ -94,10 +94,6 @@ static bool mtDenseSparseGateAtomicEmit = false;
 // single-thread sparse-dense executor body. Activation writes then mark the
 // static reverse-index candidates directly; no repeated active-word scans.
 static bool mtDenseActiveWorklistEmit = false;
-// v387 worklist gate: per-edge epoch delta for activation marks. Activation for a REG_DST
-// ($NEXT) producer targets the next cycle (cross-cycle buffer semantics: the producer at cycle N
-// is read by the commit at cycle N+1); everything else targets the current cycle.
-static int mtDenseWorklistMarkDelta = 0;
 // Suppress sparse activation-event calls while emitting the optional dense executor body.
 static bool mtActivationEventTraceSuppressed = false;
 // Codegen-time semantic source: admitted sparse mtTask cppId, or -1 for reset/external paths.
@@ -1394,6 +1390,28 @@ static bool mtUseDenseTableDispatch() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+
+// Shared sparse-gate prefilter predicate builder (body R3 prefilter + hoisted call-site gate).
+// Returns false when the MTask must always run (any always-active member, or empty footprint);
+// otherwise fills guard with the word-OR predicate for `if (guard) body();`.
+static bool mtDenseBuildSparseGatePrefilter(const MtDenseSchedule& denseSchedule, int mtaskId, bool atomic, std::string& guard) {
+  bool safe = true;
+  std::set<int> footprintWords;
+  for (int sccId : denseSchedule.mtasks[(size_t)mtaskId].sccIds) {
+    if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+    for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+      if (isAlwaysActive(cppId)) { safe = false; break; }
+      footprintWords.insert(cppId / ACTIVE_WIDTH);
+    }
+    if (!safe) break;
+  }
+  if (!safe || footprintWords.empty()) return false;
+  for (int w : footprintWords) {
+    if (!guard.empty()) guard += " | ";
+    guard += atomic ? format("__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED)", w) : format("activeFlags[%d]", w);
+  }
+  return true;
+}
 
 // v381 shared helpers (2026-07-17): emit per-site owner-ready waits/signals as calls to shared
 // noinline helpers instead of inline poll/store loops. iTLB measured at 38.8% miss on 27.8MB text;
@@ -8841,7 +8859,6 @@ std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBuf
       uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
       if (byteMask == 0) continue;
       s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)0x%lx, __ATOMIC_RELAXED); ", idx + i, ACTIVE_WIDTH, byteMask);
-      if (mtDenseActiveWorklistEmit) s += format("markDenseActiveWorklistWordD(%d, %d); ", idx + i, mtDenseWorklistMarkDelta);
     }
     return s;
   }
@@ -8867,7 +8884,7 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
       // single-byte target word idx, bit set from cond shifted to uniqueId
       return format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(%s%s), __ATOMIC_RELAXED); %s",
                     idx, ACTIVE_WIDTH, cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str(),
-                    mtDenseActiveWorklistEmit ? format("markDenseActiveWorklistWordD(%d, %d);", idx, mtDenseWorklistMarkDelta).c_str() : "");
+                    mtDenseActiveWorklistEmit ? format("markDenseActiveWorklistWord(%d);", idx).c_str() : "");
     }
     std::string s;
     for (int i = 0; i * ACTIVE_WIDTH < 64; i ++) {
@@ -8875,7 +8892,6 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
       if (byteMask == 0) continue;
       s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); ",
                   idx + i, ACTIVE_WIDTH, ACTIVE_WIDTH, cond.c_str(), byteMask);
-      if (mtDenseActiveWorklistEmit) s += format("markDenseActiveWorklistWordD(%d, %d); ", idx + i, mtDenseWorklistMarkDelta);
     }
     return s;
   }
@@ -9293,7 +9309,6 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   }
   auto condName = std::string("cond_") + nodeName;
   bool opt{false};
-  mtDenseWorklistMarkDelta = (node->type == NODE_REG_DST) ? 1 : 0;
 
   std::map<uint64_t, ActiveType> bitMapInfo;
   ActiveType curMask;
@@ -9340,7 +9355,7 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
       } else if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
       else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
       if (mtDenseActiveWorklistEmit && activeBufferName.empty() && accumFlagName.empty()) {
-        emitBodyLock(indent, "markDenseActiveWorklistWordD(%d, %d);\n", node->super->cppId / ACTIVE_WIDTH, mtDenseWorklistMarkDelta);
+        emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", node->super->cppId / ACTIVE_WIDTH);
       }
       if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
         if (opt) {
@@ -13008,27 +13023,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const bool activeWorklistMt = activeWorklistPush && threadCount > 1;
   std::vector<std::vector<int>> activeWorklistWordMTasks;
   std::vector<char> activeWorklistAlwaysMTasks;
-  std::vector<char> activeWorklistIsCommit;
   if (activeWorklistPush) {
     activeWorklistWordMTasks.resize((size_t)activeFlagNum);
     activeWorklistAlwaysMTasks.assign((size_t)nMTasks, false);
-    activeWorklistIsCommit.assign((size_t)nMTasks, false);
-    if (activeWorklistMt) {
-      for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)mtaskId];
-        for (int sccId : mt.sccIds) {
-          if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
-          for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
-            auto superIter = cppId2Super.find(cppId);
-            if (superIter == cppId2Super.end() || !superIter->second) continue;
-            int dummyCost = 0;
-            MtBoundaryInfo b = collectMtBoundaryInfo(superIter->second, dummyCost);
-            if (b.stateSourceCommitCount > 0 || b.stateResetUpdateCount > 0) { activeWorklistIsCommit[(size_t)mtaskId] = true; break; }
-          }
-          if (activeWorklistIsCommit[(size_t)mtaskId]) break;
-        }
-      }
-    }
     for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
       std::set<int> words;
       for (int sccId : denseSchedule.mtasks[(size_t)mtaskId].sccIds) {
@@ -13060,10 +13057,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "};\n");
     fprintf(header, "static constexpr bool kDenseActiveWorklistAlwaysMTasks[%d] = {", std::max(1, nMTasks));
     for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) fprintf(header, "%s%s", mtaskId ? "," : "", activeWorklistAlwaysMTasks[(size_t)mtaskId] ? "true" : "false");
-    if (nMTasks == 0) fprintf(header, "false");
-    fprintf(header, "};\n");
-    fprintf(header, "static constexpr bool kDenseActiveWorklistIsCommit[%d] = {", std::max(1, nMTasks));
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) fprintf(header, "%s%s", mtaskId ? "," : "", activeWorklistIsCommit[(size_t)mtaskId] ? "true" : "false");
     if (nMTasks == 0) fprintf(header, "false");
     fprintf(header, "};\n");
     if (activeWorklistMt) {
@@ -13128,24 +13121,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // none of its footprint words are set. Converts the 0.18%-active reality into skipped bodies
     // instead of 45313 idle per-super gate loads/cycle. Guard uses the same relaxed atomic load as
     // the per-super gate (ordered by the dep-counter HB, so no missed activation).
-    bool prefilterSafe = sparseGate;
-    std::set<int> footprintWords;
-    for (int cppId : memberCppIds) {
-      if (isAlwaysActive(cppId)) { prefilterSafe = false; break; }
-      footprintWords.insert(cppId / ACTIVE_WIDTH);
+    // When activeWorklistMt hoisting is enabled, the identical predicate already runs at the call
+    // site; suppress the duplicate in-body prefilter.
+    std::string prefilterGuard;
+    if (sparseGate && !activeWorklistMt && mtDenseBuildSparseGatePrefilter(denseSchedule, mtaskId, sparseGateAtomic, prefilterGuard)) {
+      emitBodyLock(1, "if (!(%s)) return;\n", prefilterGuard.c_str());
     }
-    bool prefilterEmitted = false;
-    if (prefilterSafe && !footprintWords.empty()) {
-      std::string guard;
-      for (int w : footprintWords) {
-        if (!guard.empty()) guard += " | ";
-        if (sparseGateAtomic) guard += format("__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED)", w);
-        else guard += format("activeFlags[%d]", w);
-      }
-      emitBodyLock(1, "if (!(%s)) return;\n", guard.c_str());
-      prefilterEmitted = true;
-    }
-    (void)prefilterEmitted;
     for (int cppId : memberCppIds) {
       auto superIter = cppId2Super.find(cppId);
       if (superIter == cppId2Super.end() || !superIter->second) continue;
@@ -13174,7 +13155,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         bool savedAtomic = mtDenseSparseGateAtomicEmit;
         bool savedActiveWorklistEmit = mtDenseActiveWorklistEmit;
         mtDenseSparseGateAtomicEmit = atomicGate;
-        mtDenseActiveWorklistEmit = activeWorklistPush;
+        mtDenseActiveWorklistEmit = activeWorklistPush && threadCount == 1;
         genSuperEval(super, format("activeFlags[%d]", wordId), "", localIndent, true);
         mtDenseActiveWorklistEmit = savedActiveWorklistEmit;
         mtDenseSparseGateAtomicEmit = savedAtomic;
@@ -13202,18 +13183,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(1, "}\n");
     emitBodyLock(0, "}\n");
-    if (activeWorklistMt) {
-      emitFuncDecl(0, "void S%s::markDenseActiveWorklistWordD(int wordId, int delta) {\n", name.c_str());
-      emitBodyLock(1, "if (wordId < 0 || wordId >= kDenseActiveWorklistWordCount) return;\n");
-      emitBodyLock(1, "const uint32_t e = mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed) + (uint32_t)delta;\n");
-      emitBodyLock(1, "for (int i = kDenseActiveWorklistWordOffsets[wordId]; i < kDenseActiveWorklistWordOffsets[wordId + 1]; i++)\n");
-      emitBodyLock(2, "mtDenseActiveWorklistMTaskEpoch[kDenseActiveWorklistWordMTasks[i]].store(e, std::memory_order_release);\n");
-      emitBodyLock(0, "}\n");
-    }
     emitFuncDecl(0, "void S%s::markDenseActiveWorklistAll() {\n", name.c_str());
     if (activeWorklistMt) {
-      emitBodyLock(1, "const uint32_t e = mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed) + 1;\n");
-      emitBodyLock(1, "for (int mtaskId = 0; mtaskId < %d; mtaskId++) mtDenseActiveWorklistMTaskEpoch[mtaskId].store(e, std::memory_order_release);\n", nMTasks);
+      emitBodyLock(1, "const uint32_t e = mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed);\n");
+      emitBodyLock(1, "for (int mtaskId = 0; mtaskId < %d; mtaskId++) {\n", nMTasks);
+      emitBodyLock(2, "mtDenseActiveWorklistMTaskEpoch[mtaskId].store(e, std::memory_order_release);\n");
+      emitBodyLock(1, "}\n");
     } else {
       emitBodyLock(1, "for (int mtaskId = mtDenseActiveWorklistNextMTask; mtaskId < %d; mtaskId++) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n", nMTasks);
     }
@@ -13483,7 +13458,17 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             }
           } else {
             if (activeWorklistMt && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly) {
-              emitBodyLock(3, "if (mtDenseActiveWorklistMTaskEpoch[%d].load(std::memory_order_acquire) == mtDenseActiveWorklistEpoch.load(std::memory_order_acquire)) { stepDenseMTask%d(); }\n", mtaskId, mtaskId);
+              // Hoisted exact prefilter (same predicate as the body's R3 prefilter, shared helper):
+              // skip the body when no member super's activeFlags word is set. A bit set by a
+              // producer before this site in topo order is seen now; a bit set later persists and
+              // is seen next cycle. No extra timing state: activeFlags bits are the activation
+              // lifecycle (set by production, consumed by the inner per-super gates).
+              std::string hoistedGuard;
+              if (mtDenseBuildSparseGatePrefilter(denseSchedule, mtaskId, true, hoistedGuard)) {
+                emitBodyLock(3, "if (%s) stepDenseMTask%d();\n", hoistedGuard.c_str(), mtaskId);
+              } else {
+                emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+              }
             } else {
               emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
             }
@@ -13767,9 +13752,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(3, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed);\n", nMTasks);
       emitBodyLock(3, "mtDenseActivityCounter = 1;\n");
     }
-    if (activeWorklistMt) {
-      emitBodyLock(3, "for (int i = 0; i < %d; i++) mtDenseActiveWorklistMTaskEpoch[i].store(1, std::memory_order_relaxed);\n", nMTasks);
-    }
     emitBodyLock(2, "}\n");
     emitBodyLock(2, "#endif\n");
   }
@@ -13813,9 +13795,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
 
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
-  if (activeWorklistMt) {
-    emitBodyLock(2, "mtDenseActiveWorklistEpoch.fetch_add(1, std::memory_order_release);\n");
-  }
   if (activity) {
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
     emitBodyLock(2, "if (++mtDenseActivityCounter == 0) { for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed); mtDenseActivityCounter = 1; }\n", nMTasks);
