@@ -1390,6 +1390,41 @@ static bool mtUseDenseTableDispatch() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Default-off bounded lookahead.  A positive value is the candidate window;
+// unset, empty, and zero retain the strict-order dispatch path byte-for-byte.
+static int mtDenseLookaheadWindow() {
+  const char* env = std::getenv("GSIM_MT_DENSE_LOOKAHEAD");
+  if (env == nullptr || env[0] == '\0') return 0;
+  char* end = nullptr;
+  const long window = std::strtol(env, &end, 10);
+  Assert(end != env && end != nullptr && *end == '\0' && window >= 0
+             && window <= std::numeric_limits<int>::max(),
+         "GSIM_MT_DENSE_LOOKAHEAD must be 0 or an integer window N >= 1 (got %s)", env);
+  return static_cast<int>(window);
+}
+
+
+// Shared sparse-gate prefilter predicate builder (body R3 prefilter + hoisted call-site gate).
+// Returns false when the MTask must always run (any always-active member, or empty footprint);
+// otherwise fills guard with the word-OR predicate for `if (guard) body();`.
+static bool mtDenseBuildSparseGatePrefilter(const MtDenseSchedule& denseSchedule, int mtaskId, bool atomic, std::string& guard) {
+  bool safe = true;
+  std::set<int> footprintWords;
+  for (int sccId : denseSchedule.mtasks[(size_t)mtaskId].sccIds) {
+    if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+    for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+      if (isAlwaysActive(cppId)) { safe = false; break; }
+      footprintWords.insert(cppId / ACTIVE_WIDTH);
+    }
+    if (!safe) break;
+  }
+  if (!safe || footprintWords.empty()) return false;
+  for (int w : footprintWords) {
+    if (!guard.empty()) guard += " | ";
+    guard += atomic ? format("__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED)", w) : format("activeFlags[%d]", w);
+  }
+  return true;
+}
 
 // v381 shared helpers (2026-07-17): emit per-site owner-ready waits/signals as calls to shared
 // noinline helpers instead of inline poll/store loops. iTLB measured at 38.8% miss on 27.8MB text;
@@ -1400,6 +1435,56 @@ static bool mtUseDenseTableDispatch() {
 static bool mtUseDenseSharedHelpers() {
   const char* env = std::getenv("GSIM_MT_DENSE_SHARED_HELPERS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+
+// v384 activity local collector: register reads (REG_SRC) plus MEMORY/array reads. The shared
+// MtBoundaryInfo read set only records NODE_REG_SRC names; memory readers (NODE_READER /
+// READWRITER / WRITER / MEMORY) were missing from the activation fanout, leaving a wavefront
+// closure hole (L2/array-driven one-hot assertions fired on the first V384 build). The collector
+// must be COMPLETE: any missed read is a closure hole that lets a body compute from stale inputs
+// (the v384-activity4 rab one-hot divergence: deqPtrOH stuck at 0). No truncation budget.
+// Speed (v384-activity5 generation took 52min vs 27min baseline): memoize per-Node read sets —
+// shared subexpression nodes are expanded once globally, cppIds merge cached sets.
+struct MtActivityReads { std::set<std::string> src; std::set<std::string> dst; };
+static std::map<Node*, MtActivityReads> mtActivityReadCache;
+static const MtActivityReads& mtActivityReadsForNode(Node* n);
+static void mtActivityCollectFromTree(ENode* root, MtActivityReads& out) {
+  if (!root) return;
+  std::stack<ENode*> st;
+  st.push(root);
+  std::set<ENode*> seen;
+  while (!st.empty()) {
+    ENode* t = st.top(); st.pop();
+    if (!t || seen.count(t)) continue;
+    seen.insert(t);
+    for (ENode* c : t->child) st.push(c);
+    Node* n = t->nodePtr;
+    if (!n) continue;
+    if (n->type == NODE_REG_SRC) { out.src.insert(n->name); continue; }
+    if (n->type == NODE_REG_DST) { Node* s = n->getSrc(); if (s) out.dst.insert(s->name); continue; }
+    if (n->type == NODE_REG_RESET) { Node* s = n->getResetSrc(); if (s) out.dst.insert(s->name); continue; }
+    if (n->type == NODE_MEMORY || n->type == NODE_READER || n->type == NODE_READWRITER || n->type == NODE_WRITER) {
+      if (n->parent) out.src.insert(n->parent->name);
+      out.src.insert(n->name);
+      continue;
+    }
+    if (!n->assignTree.empty()) {
+      const MtActivityReads& sub = mtActivityReadsForNode(n);
+      out.src.insert(sub.src.begin(), sub.src.end());
+      out.dst.insert(sub.dst.begin(), sub.dst.end());
+      continue;
+    }
+    if (n->type == NODE_INP) { out.src.insert(n->name); continue; }
+  }
+}
+static const MtActivityReads& mtActivityReadsForNode(Node* n) {
+  auto it = mtActivityReadCache.find(n);
+  if (it != mtActivityReadCache.end()) return it->second;
+  // insert placeholder first to terminate on any unexpected self-reference cycle
+  auto res = mtActivityReadCache.emplace(n, MtActivityReads());
+  for (ExpTree* t : n->assignTree) mtActivityCollectFromTree(t->getRoot(), res.first->second);
+  return res.first->second;
 }
 
 
@@ -2416,6 +2501,7 @@ struct MtDenseOwnerReadyLayout {
   int physicalSlotCount = 0;
   int pairBankCount = 0;
   std::vector<MtDenseOwnerReadyTokenProvenance> tokenProvenanceByLogicalToken;
+  std::vector<std::vector<int>> sourceMTasksByLogicalToken;
   std::vector<int> logicalTokenByPhysicalSlot;
   std::vector<std::vector<int>> waitSlotsByMTask;
   std::vector<std::vector<int>> storeSlotsByMTask;
@@ -2578,6 +2664,7 @@ static MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
 
   layout.tokenProvenanceByLogicalToken.assign(
       (size_t)layout.tokenCount, MtDenseOwnerReadyTokenProvenance());
+  layout.sourceMTasksByLogicalToken.assign((size_t)layout.tokenCount, std::vector<int>());
   layout.logicalTokenByPhysicalSlot.assign((size_t)nextSlot, -1);
   std::set<int> uniqueSlots;
   for (const Group& group : groups) {
@@ -2598,6 +2685,7 @@ static MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
     provenance.producerOwner = group.producerOwner;
     provenance.consumerMTask = group.destination;
     provenance.consumerOwner = group.consumerOwner;
+    layout.sourceMTasksByLogicalToken[(size_t)group.logicalToken] = group.sources;
     layout.logicalTokenByPhysicalSlot[(size_t)group.slot] = group.logicalToken;
     layout.waitSlotsByMTask[(size_t)group.destination].push_back(group.slot);
     layout.storeSlotsByMTask[(size_t)group.lastSource].push_back(group.slot);
@@ -2720,14 +2808,19 @@ static MtDenseBreakdownWindowAllOwnerLayout mtBuildDenseBreakdownWindowAllOwnerL
   return layout;
 }
 
+// Runtime token reduction models each worker's strict chain so a cross-worker
+// token is only retained when the chain cannot carry its reachability.  B7 also
+// needs an independent reduction of the real MTask DAG, without those synthetic
+// chains, for slow-path epoch readiness.
 static int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& runtimeSuccs,
-                                               const std::vector<int>& assignment) {
+                                               const std::vector<int>& assignment,
+                                               bool injectWorkerChains = true) {
   const int nMTasks = static_cast<int>(runtimeSuccs.size());
   if (nMTasks <= 1) return 0;
   std::vector<std::vector<int>> effectiveSuccs = runtimeSuccs;
   int maxWorker = -1;
   for (int worker : assignment) maxWorker = std::max(maxWorker, worker);
-  if (maxWorker >= 0) {
+  if (injectWorkerChains && maxWorker >= 0) {
     std::vector<int> previousOnWorker((size_t)maxWorker + 1, -1);
     for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
       int worker = mtaskId < static_cast<int>(assignment.size()) ? assignment[(size_t)mtaskId] : -1;
@@ -8787,7 +8880,6 @@ std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBuf
       uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
       if (byteMask == 0) continue;
       s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)0x%lx, __ATOMIC_RELAXED); ", idx + i, ACTIVE_WIDTH, byteMask);
-      if (mtDenseActiveWorklistEmit) s += format("markDenseActiveWorklistWord(%d); ", idx + i);
     }
     return s;
   }
@@ -8821,7 +8913,6 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
       if (byteMask == 0) continue;
       s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); ",
                   idx + i, ACTIVE_WIDTH, ACTIVE_WIDTH, cond.c_str(), byteMask);
-      if (mtDenseActiveWorklistEmit) s += format("markDenseActiveWorklistWord(%d); ", idx + i);
     }
     return s;
   }
@@ -9968,7 +10059,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "std::thread& t = mtWorkerPoolThreads.back();\n");
   emitBodyLock(2, "#ifdef __linux\n");
   emitBodyLock(2, "if (!mtAllowedCpus.empty()) {\n");
-  emitBodyLock(3, "int mtCpu = mtAllowedCpus[(mtCpuAffinityBase + worker - 1) %% (int)mtAllowedCpus.size()];\n");
+  emitBodyLock(3, "int mtCpu = mtAllowedCpus[(mtCpuAffinityBase + worker - 1) % (int)mtAllowedCpus.size()];\n");
   emitBodyLock(3, "cpu_set_t mtCpuset;\n");
   emitBodyLock(3, "CPU_ZERO(&mtCpuset);\n");
   emitBodyLock(3, "CPU_SET(mtCpu, &mtCpuset);\n");
@@ -12332,6 +12423,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     ownerReadyLayout = mtBuildDenseOwnerReadyLayout(
         denseRuntimeSuccs, denseSchedule.mtaskThreadAssign, threadCount);
   }
+  const int denseLookaheadWindow = mtDenseLookaheadWindow();
+  const bool denseLookahead = denseLookaheadWindow > 0;
+  Assert(!denseLookahead || ownerReadyFlags,
+         "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!denseLookahead || !workSteal,
+         "GSIM_MT_DENSE_LOOKAHEAD is incompatible with GSIM_MT_DENSE_WORKSTEAL");
+  Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
+         "GSIM_MT_DENSE_LOOKAHEAD is incompatible with dense breakdown codegen");
   bool tableDispatch = mtUseDenseTableDispatch();
   if (tableDispatch && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen)) {
     fprintf(stderr, "[mt-dense-table-dispatch] requires owner-ready fixed-owner execution without breakdown codegen; disabled\n");
@@ -12344,22 +12443,56 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   if (sharedHelpers) fprintf(stderr, "[mt-dense-shared-helpers] enabled\n");
   bool activity = mtUseDenseActivity();
-  if (activity && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen || tableDispatch)) {
-    fprintf(stderr, "[mt-dense-activity] requires owner-ready fixed-owner execution without breakdown/table-dispatch; disabled\n");
+  if (activity && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen || tableDispatch || denseLookahead)) {
+    fprintf(stderr, "[mt-dense-activity] requires owner-ready fixed-owner execution without breakdown/table-dispatch/lookahead; disabled\n");
     activity = false;
   }
   struct MtActivityCommitField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
+  struct MtActivityInputField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
+  std::vector<MtActivityInputField> activityInputFields;
   std::vector<std::vector<MtActivityCommitField>> activityCommitFields;
   std::vector<std::vector<int>> activitySuccFlags;
+  std::vector<std::vector<int>> activitySuccLite;
+  std::vector<std::vector<int>> activityNextEdges;
   std::vector<int> activityFanoutList;
+  std::vector<char> activityIsCommitMTask;
+  std::vector<char> activityAlwaysActive;
+  std::vector<char> activityResetHandler;
+  std::vector<int> activityRegionOf;
+  std::vector<std::string> activityRegionNames;
   int activityShadowCount = 0;
   int activitySuccTotal = 0;
+  int activitySuccLiteTotal = 0;
+  int activityNextTotal = 0;
   int activityConservativeFields = 0;
   int activityScalarFields = 0;
+  int activityAlwaysActiveCount = 0;
   if (activity) {
     const int nM = nMTasks;
+    activityAlwaysActive.assign((size_t)nM, 0);
+    activityResetHandler.assign((size_t)nM, 0);
+    // Region-level activity (v384-r): group MTasks into subsystem regions; a region runs fully
+    // when any member is activated. Fine-grained gating breaks intra-subsystem queue invariants
+    // (yank/missQueue/ldu asserts from one-cycle-late comb signals); region granularity preserves
+    // them because all producers+consumers in the region evaluate together. Region assignment by
+    // top module path of member nodes.
+    activityRegionOf.assign((size_t)nM, 0);
+    std::map<std::string, int> regionIds;
+    auto regionOfSuper = [&](SuperNode* super) -> std::string {
+      for (Node* member : super->member) {
+        const std::string& nm = member->name;
+        if (nm.rfind("cpu__DOT__l_soc__DOT__core_with_l2__DOT__core__DOT__frontend", 0) == 0) return "frontend";
+        if (nm.rfind("cpu__DOT__l_soc__DOT__core_with_l2__DOT__core__DOT__memBlock", 0) == 0) return "memblock";
+        if (nm.rfind("cpu__DOT__l_soc__DOT__core_with_l2__DOT__l2top", 0) == 0) return "l2";
+        if (nm.rfind("cpu__DOT__l_soc__DOT__chi_openllc", 0) == 0) return "linkmon";
+        if (nm.rfind("cpu__DOT__l_simMMIO", 0) == 0) return "mmio";
+      }
+      return "other";
+    };
     std::vector<std::set<std::string>> readFields((size_t)nM);
+    std::vector<std::set<std::string>> dstReadFields((size_t)nM);
     std::vector<std::set<std::string>> commitFields((size_t)nM);
+    std::vector<std::set<std::string>> nextWriteFields((size_t)nM);
     std::map<std::string, Node*> commitTargetNode;
     for (int m = 0; m < nM; m++) {
       const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
@@ -12372,7 +12505,26 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           SuperNode* super = superIter->second;
           int dummyCost = 0;
           MtBoundaryInfo b = collectMtBoundaryInfo(super, dummyCost);
+          if ((b.hasStateUpdate && b.hasAmbiguousStateTarget) || b.hasActivateAllPath) activityAlwaysActive[(size_t)m] = 1;
+          if (super->superType == SUPER_ASYNC_RESET || b.hasAsyncReset) activityResetHandler[(size_t)m] = 1;
+          if (activityRegionOf[(size_t)m] == 0) {
+            std::string rn = regionOfSuper(super);
+            auto rid = regionIds.find(rn);
+            if (rid == regionIds.end()) rid = regionIds.emplace(rn, (int)regionIds.size()).first;
+            activityRegionOf[(size_t)m] = rid->second + 1;
+          }
           for (const std::string& r : b.rhsReadStateTargetNames) readFields[(size_t)m].insert(r);
+          for (Node* member : super->member) {
+            for (ExpTree* tree : member->assignTree) {
+              MtActivityReads tr;
+              mtActivityCollectFromTree(tree->getRoot(), tr);
+              readFields[(size_t)m].insert(tr.src.begin(), tr.src.end());
+              dstReadFields[(size_t)m].insert(tr.dst.begin(), tr.dst.end());
+            }
+            if (member->type == NODE_WRITER || member->type == NODE_READWRITER) {
+              if (member->parent) commitFields[(size_t)m].insert(member->parent->name);
+            }
+          }
           if (b.stateSourceCommitCount > 0 || b.stateResetUpdateCount > 0) {
             for (const std::string& f : b.stateTargetNames) commitFields[(size_t)m].insert(f);
             for (Node* member : super->member) {
@@ -12383,6 +12535,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                            : (member->type == NODE_REG_DST ? member->getSrc() : member->getResetSrc());
               if (target) commitTargetNode[tn] = target;
             }
+          }
+          if (b.stateNextUpdateCount > 0) {
+            for (const std::string& f : b.stateTargetNames) nextWriteFields[(size_t)m].insert(f);
           }
         }
       }
@@ -12408,10 +12563,83 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       }
       activitySuccTotal += (int)activitySuccFlags[(size_t)m].size();
     }
+    // next-state edges: nextWriter[X] -> nextReader[X]. The dense DAG excludes $NEXT reads
+    // (next-state objects are cross-cycle buffers: the producer at cycle N is read by the
+    // commit at cycle N+1), so no DAG edge exists and the succ-flag propagation would never
+    // reach commit MTasks (activity5: OH commit MTask 1018 has 0 DAG preds and starved).
+    std::map<std::string, std::vector<int>> nextWriters;
+    std::map<std::string, std::vector<int>> nextReaders;
+    for (int m = 0; m < nM; m++) {
+      if (activityElided[(size_t)m]) continue;
+      for (const std::string& f : nextWriteFields[(size_t)m]) nextWriters[f].push_back(m);
+      for (const std::string& f : dstReadFields[(size_t)m]) nextReaders[f].push_back(m);
+      for (const std::string& f : commitFields[(size_t)m]) nextReaders[f].push_back(m);
+    }
+    activityNextEdges.assign((size_t)nM, {});
+    for (int m = 0; m < nM; m++) {
+      if (activityElided[(size_t)m]) continue;
+      if (nextWriteFields[(size_t)m].empty()) continue;
+      std::set<int> targets;
+      for (const std::string& f : nextWriteFields[(size_t)m]) {
+        auto it = nextReaders.find(f);
+        if (it == nextReaders.end()) continue;
+        for (int r : it->second) if (r != m) targets.insert(r);
+      }
+      activityNextEdges[(size_t)m].assign(targets.begin(), targets.end());
+      activityNextTotal += (int)activityNextEdges[(size_t)m].size();
+    }
     std::map<std::string, std::vector<int>> fieldReaders;
     for (int m = 0; m < nM; m++) {
       if (activityElided[(size_t)m]) continue;
       for (const std::string& r : readFields[(size_t)m]) fieldReaders[r].push_back(m);
+    }
+    // harness-driven input watcher: io_* input fields change exogenously (no commit fires), so
+    // their readers must be activated by a shadow-compare pass in stepDense before each cycle.
+    activityInputFields.clear();
+    {
+      std::set<std::string> inputNames;
+      for (int m = 0; m < nM; m++) {
+        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+        for (int sccId : mt.sccIds) {
+          if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+          for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+            auto superIter = cppId2Super.find(cppId);
+            if (superIter == cppId2Super.end() || !superIter->second) continue;
+            for (Node* member : superIter->second->member) {
+              if (member->type == NODE_INP && !member->name.empty()) inputNames.insert(member->name);
+            }
+          }
+        }
+      }
+      for (const std::string& f : inputNames) {
+        MtActivityInputField inf; inf.name = f;
+        Node* node = nullptr;
+        for (int m = 0; m < nM && node == nullptr; m++) {
+          const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+          for (int sccId : mt.sccIds) {
+            if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+            for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+              auto superIter = cppId2Super.find(cppId);
+              if (superIter == cppId2Super.end() || !superIter->second) continue;
+              for (Node* member : superIter->second->member) if (member->type == NODE_INP && member->name == f) { node = member; break; }
+              if (node) break;
+            }
+            if (node) break;
+          }
+        }
+        bool scalar = node != nullptr && !node->isArray() && node->width <= 64;
+        if (scalar) {
+          inf.mask = node->width >= 64 ? ~0ULL : ((1ULL << node->width) - 1);
+          inf.shadowSlot = activityShadowCount++;
+        } else {
+          inf.conservative = true;
+        }
+        inf.fanoutBegin = (int)activityFanoutList.size();
+        auto readerIter = fieldReaders.find(f);
+        if (readerIter != fieldReaders.end()) for (int r : readerIter->second) activityFanoutList.push_back(r);
+        inf.fanoutEnd = (int)activityFanoutList.size();
+        activityInputFields.push_back(inf);
+      }
     }
     activityCommitFields.assign((size_t)nM, {});
     for (int m = 0; m < nM; m++) {
@@ -12437,17 +12665,52 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         activityCommitFields[(size_t)m].push_back(cf);
       }
     }
+    // succLite for commit MTasks: successors NOT covered by the commit fanout (i.e. consumers of
+    // non-state wire outputs). Commit MTasks fire only compare+fanout (tight) plus succLite;
+    // without this split the conservative succ store keeps the whole DAG active forever (no decay).
+    activitySuccLite.assign((size_t)nM, {});
+    for (int m = 0; m < nM; m++) {
+      if (activityElided[(size_t)m] || activityCommitFields[(size_t)m].empty()) continue;
+      std::set<int> covered;
+      for (const MtActivityCommitField& cf : activityCommitFields[(size_t)m])
+        for (int j = cf.fanoutBegin; j < cf.fanoutEnd; j++) covered.insert(activityFanoutList[(size_t)j]);
+      for (int s : activitySuccFlags[(size_t)m])
+        if (!covered.count(s)) activitySuccLite[(size_t)m].push_back(s);
+      activitySuccLiteTotal += (int)activitySuccLite[(size_t)m].size();
+    }
     int activityCommitMTasks = 0;
-    for (int m = 0; m < nM; m++) activityCommitMTasks += !activityCommitFields[(size_t)m].empty() ? 1 : 0;
-    fprintf(stderr, "[mt-dense-activity] mtasks=%d commit_mtasks=%d scalar_fields=%d conservative_fields=%d fanout=%zu succ_flags=%d shadow=%d\n",
-            nM, activityCommitMTasks,
-            activityScalarFields, activityConservativeFields, activityFanoutList.size(), activitySuccTotal, activityShadowCount);
+    activityIsCommitMTask.assign((size_t)nMTasks, 0);
+    for (int m = 0; m < nMTasks; m++) {
+      activityIsCommitMTask[(size_t)m] = !activityCommitFields[(size_t)m].empty() ? 1 : 0;
+      activityCommitMTasks += activityIsCommitMTask[(size_t)m];
+      activityAlwaysActiveCount += activityAlwaysActive[(size_t)m] ? 1 : 0;
+    }
+    int activityResetHandlerCount = 0;
+    for (int m = 0; m < nMTasks; m++) activityResetHandlerCount += activityResetHandler[(size_t)m] ? 1 : 0;
+    activityRegionNames.assign(regionIds.size() + 1, "other");
+    for (const auto& kv : regionIds) activityRegionNames[(size_t)kv.second + 1] = kv.first;
+    // The CHI link layer does cycle-precise credit accounting that is hostile to any staleness;
+    // keep it always-active (small share of the model). Same for l2/mmio: their queue invariants
+    // span the link<->DUT boundary and fail under any gating (yank/missQueue/L-credit asserts).
+    // memblock (LSU/dcache/missQueue) is the same class of cycle-precise queue accounting.
+    // frontend/other stay fine-grained sparse.
+    for (int m = 0; m < nMTasks; m++) {
+      const std::string& rn = activityRegionNames[(size_t)activityRegionOf[(size_t)m]];
+      if (rn == "linkmon" || rn == "l2" || rn == "mmio" || rn == "memblock") activityAlwaysActive[(size_t)m] = 1;
+    }
+    std::map<std::string, int> regionMTaskCounts;
+    for (int m = 0; m < nMTasks; m++) regionMTaskCounts[activityRegionNames[(size_t)activityRegionOf[(size_t)m]]]++;
+    fprintf(stderr, "[mt-dense-activity] mtasks=%d commit_mtasks=%d always_active=%d reset_handlers=%d input_fields=%zu scalar_fields=%d conservative_fields=%d fanout=%zu succ_flags=%d next_edges=%d shadow=%d regions=",
+            nMTasks, activityCommitMTasks, activityAlwaysActiveCount, activityResetHandlerCount, activityInputFields.size(),
+            activityScalarFields, activityConservativeFields, activityFanoutList.size(), activitySuccTotal, activityNextTotal, activityShadowCount);
+    for (const auto& kv : regionMTaskCounts) fprintf(stderr, "%s:%d ", kv.first.c_str(), kv.second);
+    fprintf(stderr, "\n");
   }
   std::vector<int> denseDispatchWorkerCounts;
   std::vector<uint32_t> denseDispatchWaitBegin, denseDispatchWaitEnd;
   std::vector<uint32_t> denseDispatchStoreBegin, denseDispatchStoreEnd;
   uint32_t denseDispatchWaitTotal = 0;
-  if (tableDispatch) {
+  if (tableDispatch && !denseLookahead) {
     denseDispatchWorkerCounts.assign((size_t)threadCount, 0);
     denseDispatchWaitBegin.assign((size_t)nMTasks, 0);
     denseDispatchWaitEnd.assign((size_t)nMTasks, 0);
@@ -12508,6 +12771,123 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             nMTasks, denseMTaskPhysicalSlotCount, denseMTaskPhysicalSlotCount - nMTasks,
             threadCount, ownerBankCountersDiag ? 1 : 0);
   }
+  std::vector<uint32_t> denseLookaheadLocalBegin, denseLookaheadLocalEnd,
+      denseLookaheadLocalPrereqs;
+  std::vector<uint8_t> denseLookaheadLocalPrereqKinds;
+  std::vector<std::vector<int>> denseLookaheadDagOnlySuccs;
+  int denseLookaheadDagOnlyKeptEdges = 0;
+  int denseLookaheadCrossEdgeCount = 0;
+  int denseLookaheadSameWorkerPredCount = 0;
+  int denseLookaheadPublisherConstrainedEntryCount = 0;
+  int denseLookaheadPublisherSiblingPositionCount = 0;
+  if (denseLookahead) {
+    // The B1 token layout reduces the complete MTask DAG without the synthetic
+    // fixed-worker chains used by the strict Step-A token layout.
+    denseLookaheadDagOnlySuccs = mtBuildDenseRuntimeSuccs(
+        denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, false);
+    mtReduceDenseRuntimeSuccsTransitive(
+        denseLookaheadDagOnlySuccs, denseSchedule.mtaskThreadAssign, false);
+    denseLookaheadDagOnlyKeptEdges = mtDenseRuntimeEdgeCount(denseLookaheadDagOnlySuccs);
+    std::vector<std::vector<int>> denseLookaheadCrossWorkerSuccs((size_t)nMTasks);
+    for (int pred = 0; pred < nMTasks; ++pred) {
+      for (int succ : denseLookaheadDagOnlySuccs[(size_t)pred]) {
+        if (denseSchedule.mtaskThreadAssign[(size_t)pred] != denseSchedule.mtaskThreadAssign[(size_t)succ])
+          denseLookaheadCrossWorkerSuccs[(size_t)pred].push_back(succ);
+      }
+    }
+    ownerReadyLayout = mtBuildDenseOwnerReadyLayout(
+        denseLookaheadCrossWorkerSuccs, denseSchedule.mtaskThreadAssign, threadCount);
+
+    std::vector<int> positionByMTask((size_t)nMTasks, -1);
+    for (int worker = 0; worker < threadCount; ++worker) {
+      int position = 0;
+      for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
+        if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] == worker)
+          positionByMTask[(size_t)mtaskId] = position++;
+      }
+    }
+    std::vector<std::set<uint32_t>> sameWorkerPredsByMTask((size_t)nMTasks);
+    std::vector<std::set<uint32_t>> publisherSiblingsByMTask((size_t)nMTasks);
+    std::vector<char> publisherConstrained((size_t)nMTasks, 0);
+    for (int pred = 0; pred < nMTasks; ++pred) {
+      for (int succ : denseLookaheadDagOnlySuccs[(size_t)pred]) {
+        Assert(succ > pred && succ < nMTasks,
+               "lookahead DAG-only reduction produced invalid edge %d -> %d", pred, succ);
+        const int predOwner = denseSchedule.mtaskThreadAssign[(size_t)pred];
+        const int succOwner = denseSchedule.mtaskThreadAssign[(size_t)succ];
+        if (predOwner == succOwner) {
+          Assert(positionByMTask[(size_t)pred] >= 0
+                     && positionByMTask[(size_t)pred] < positionByMTask[(size_t)succ],
+                 "lookahead same-worker predecessor %d is not before successor %d", pred, succ);
+          sameWorkerPredsByMTask[(size_t)succ].insert(
+              static_cast<uint32_t>(positionByMTask[(size_t)pred]));
+        } else {
+          ++denseLookaheadCrossEdgeCount;
+        }
+      }
+    }
+    for (int token = 0; token < ownerReadyLayout.tokenCount; ++token) {
+      const MtDenseOwnerReadyTokenProvenance& provenance =
+          ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token];
+      const std::vector<int>& sources =
+          ownerReadyLayout.sourceMTasksByLogicalToken[(size_t)token];
+      Assert(!sources.empty() && sources.back() == provenance.producerMTask,
+             "lookahead token %d has invalid publisher membership", token);
+      if (sources.size() > 1) publisherConstrained[(size_t)provenance.producerMTask] = 1;
+      for (int source : sources) {
+        if (source == provenance.producerMTask) continue;
+        Assert(denseSchedule.mtaskThreadAssign[(size_t)source] == provenance.producerOwner
+                   && positionByMTask[(size_t)source] < positionByMTask[(size_t)provenance.producerMTask],
+               "lookahead publisher %d does not follow sibling %d", provenance.producerMTask, source);
+        publisherSiblingsByMTask[(size_t)provenance.producerMTask].insert(
+            static_cast<uint32_t>(positionByMTask[(size_t)source]));
+      }
+    }
+    denseLookaheadLocalBegin.assign((size_t)nMTasks, 0);
+    denseLookaheadLocalEnd.assign((size_t)nMTasks, 0);
+    for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
+      const std::set<uint32_t>& direct = sameWorkerPredsByMTask[(size_t)mtaskId];
+      const std::set<uint32_t>& siblings = publisherSiblingsByMTask[(size_t)mtaskId];
+      std::set<uint32_t> local = direct;
+      local.insert(siblings.begin(), siblings.end());
+      denseLookaheadLocalBegin[(size_t)mtaskId] =
+          static_cast<uint32_t>(denseLookaheadLocalPrereqs.size());
+      for (uint32_t position : local) {
+        Assert(position < static_cast<uint32_t>(positionByMTask[(size_t)mtaskId]),
+               "lookahead local prerequisite position %u is not before MTask %d", position, mtaskId);
+        denseLookaheadLocalPrereqs.push_back(position);
+        denseLookaheadLocalPrereqKinds.push_back(
+            static_cast<uint8_t>((direct.count(position) ? 1u : 0u)
+                                 | (siblings.count(position) ? 2u : 0u)));
+      }
+      denseLookaheadLocalEnd[(size_t)mtaskId] =
+          static_cast<uint32_t>(denseLookaheadLocalPrereqs.size());
+      denseLookaheadSameWorkerPredCount += static_cast<int>(direct.size());
+      denseLookaheadPublisherSiblingPositionCount += static_cast<int>(siblings.size());
+      denseLookaheadPublisherConstrainedEntryCount += publisherConstrained[(size_t)mtaskId] ? 1 : 0;
+    }
+    denseDispatchWorkerCounts.assign((size_t)threadCount, 0);
+    denseDispatchWaitBegin.assign((size_t)nMTasks, 0);
+    denseDispatchWaitEnd.assign((size_t)nMTasks, 0);
+    denseDispatchStoreBegin.assign((size_t)nMTasks, 0);
+    denseDispatchStoreEnd.assign((size_t)nMTasks, 0);
+    uint32_t storeOff = 0;
+    for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
+      denseDispatchStoreBegin[(size_t)mtaskId] = storeOff;
+      storeOff += static_cast<uint32_t>(ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].size());
+      denseDispatchStoreEnd[(size_t)mtaskId] = storeOff;
+    }
+    denseDispatchWaitTotal = 0;
+    for (int worker = 0; worker < threadCount; ++worker) {
+      for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
+        if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] != worker) continue;
+        ++denseDispatchWorkerCounts[(size_t)worker];
+        denseDispatchWaitBegin[(size_t)mtaskId] = denseDispatchWaitTotal;
+        denseDispatchWaitTotal += static_cast<uint32_t>(ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId].size());
+        denseDispatchWaitEnd[(size_t)mtaskId] = denseDispatchWaitTotal;
+      }
+    }
+  }
   if (ownerReadyFlags) {
     fprintf(stderr,
             "[mt-dense-owner-ready] mtasks=%d edges=%d tokens=%d slots=%d padding=%d banks=%d threads=%d\n",
@@ -12515,6 +12895,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             ownerReadyLayout.physicalSlotCount,
             ownerReadyLayout.physicalSlotCount - ownerReadyLayout.tokenCount,
             ownerReadyLayout.pairBankCount, threadCount);
+  }
+  if (denseLookahead) {
+    fprintf(stderr,
+            "[mt-dense-lookahead] window=%d dag_only_kept_edges=%d cross_edges=%d same_worker_preds=%d groups=%d wait_entries=%d store_entries=%d publisher_constrained_entries=%d sibling_positions=%d\n",
+            denseLookaheadWindow, denseLookaheadDagOnlyKeptEdges, denseLookaheadCrossEdgeCount,
+            denseLookaheadSameWorkerPredCount, ownerReadyLayout.tokenCount,
+            ownerReadyLayout.tokenCount, ownerReadyLayout.tokenCount,
+            denseLookaheadPublisherConstrainedEntryCount,
+            denseLookaheadPublisherSiblingPositionCount);
   }
 
   auto emitDenseDepCounts = [&]() {
@@ -12628,7 +13017,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "alignas(64) MtDenseOwnerReadyToken mtDenseOwnerReadyTokens[%d];\n",
             ownerReadyLayout.physicalSlotCount);
     fprintf(header, "bool mtDenseOwnerReadyTokensPrimed = false;\n");
-    if (tableDispatch) {
+    if (tableDispatch || denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
               std::max(1, (int)denseDispatchWaitTotal));
       bool firstSlot = true;
@@ -12644,8 +13033,53 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       }
       if (firstSlot) fprintf(header, "0");
       fprintf(header, "};\n");
-      fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; };\n",
-              name.c_str());
+      if (denseLookahead) {
+        int denseLookaheadDoneWordCount = 1;
+        for (int count : denseDispatchWorkerCounts)
+          denseLookaheadDoneWordCount = std::max(denseLookaheadDoneWordCount, (count + 63) / 64);
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadWindow = %du;\n", denseLookaheadWindow);
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadDoneWordCount = %du;\n", denseLookaheadDoneWordCount);
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadLocalPrereqs[%zu] = {", std::max<size_t>(1, denseLookaheadLocalPrereqs.size()));
+        for (size_t i = 0; i < denseLookaheadLocalPrereqs.size(); ++i) fprintf(header, "%s%u", i ? "," : "", denseLookaheadLocalPrereqs[i]);
+        if (denseLookaheadLocalPrereqs.empty()) fprintf(header, "0");
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr uint8_t kDenseLookaheadLocalPrereqKinds[%zu] = {", std::max<size_t>(1, denseLookaheadLocalPrereqKinds.size()));
+        for (size_t i = 0; i < denseLookaheadLocalPrereqKinds.size(); ++i) fprintf(header, "%s%u", i ? "," : "", static_cast<unsigned>(denseLookaheadLocalPrereqKinds[i]));
+        if (denseLookaheadLocalPrereqKinds.empty()) fprintf(header, "0");
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadGroupDestination[%d] = {", std::max(1, ownerReadyLayout.tokenCount));
+        for (int token = 0; token < ownerReadyLayout.tokenCount; ++token) fprintf(header, "%s%u", token ? "," : "", static_cast<unsigned>(ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerMTask));
+        if (ownerReadyLayout.tokenCount == 0) fprintf(header, "0");
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadGroupProducerOwner[%d] = {", std::max(1, ownerReadyLayout.tokenCount));
+        for (int token = 0; token < ownerReadyLayout.tokenCount; ++token) fprintf(header, "%s%u", token ? "," : "", static_cast<unsigned>(ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].producerOwner));
+        if (ownerReadyLayout.tokenCount == 0) fprintf(header, "0");
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadGroupPublisher[%d] = {", std::max(1, ownerReadyLayout.tokenCount));
+        for (int token = 0; token < ownerReadyLayout.tokenCount; ++token) fprintf(header, "%s%u", token ? "," : "", static_cast<unsigned>(ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].producerMTask));
+        if (ownerReadyLayout.tokenCount == 0) fprintf(header, "0");
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadGroupSourceOffsets[%d] = {", ownerReadyLayout.tokenCount + 1);
+        uint32_t sourceOffset = 0;
+        for (int token = 0; token < ownerReadyLayout.tokenCount; ++token) {
+          fprintf(header, "%s%u", token ? "," : "", sourceOffset);
+          sourceOffset += static_cast<uint32_t>(ownerReadyLayout.sourceMTasksByLogicalToken[(size_t)token].size());
+        }
+        fprintf(header, "%s%u};\n", ownerReadyLayout.tokenCount ? "," : "", sourceOffset);
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadGroupSources[%u] = {", std::max(1u, sourceOffset));
+        bool firstSource = true;
+        for (const std::vector<int>& sources : ownerReadyLayout.sourceMTasksByLogicalToken) {
+          for (int source : sources) { fprintf(header, "%s%u", firstSource ? "" : ",", static_cast<unsigned>(source)); firstSource = false; }
+        }
+        if (firstSource) fprintf(header, "0");
+        fprintf(header, "};\n");
+        fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; uint32_t localBegin; uint32_t localEnd; };\n",
+                name.c_str());
+        fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target);\n");
+      } else {
+        fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; };\n",
+                name.c_str());
+      }
       for (int t = 0; t < threadCount; t++) {
         fprintf(header, "static const MtDenseDispatchEntry kDenseDispatchTableW%d[%d];\n",
                 t, std::max(1, denseDispatchWorkerCounts[(size_t)t]));
@@ -12657,6 +13091,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     if (activity) {
       fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActivityEpoch[%d];\n", nMTasks);
+      fprintf(header, "static constexpr int kDenseActivityRegionOf[%d] = {", nMTasks);
+      for (int m = 0; m < nMTasks; m++) fprintf(header, "%s%d", m ? "," : "", activityRegionOf[(size_t)m]);
+      fprintf(header, "};\n");
       fprintf(header, "uint32_t mtDenseActivityCounter = 1;\n");
       fprintf(header, "uint64_t mtDenseActivityShadow[%d] = {};\n", std::max(1, activityShadowCount));
       fprintf(header, "static constexpr int kDenseActivityFanout[%d] = {", std::max(1, (int)activityFanoutList.size()));
@@ -12686,11 +13123,59 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         if (first) fprintf(header, "0");
         fprintf(header, "};\n");
       }
+      fprintf(header, "static constexpr int kDenseActivityNextOffsets[%d] = {", nMTasks + 1);
+      {
+        int off = 0;
+        for (int m = 0; m < nMTasks; m++) {
+          if (m > 0) fprintf(header, ",");
+          fprintf(header, "%d", off);
+          off += (int)activityNextEdges[(size_t)m].size();
+        }
+        fprintf(header, ",%d};\n", off);
+      }
+      fprintf(header, "static constexpr int kDenseActivityNextList[%d] = {", std::max(1, activityNextTotal));
+      {
+        bool first = true;
+        for (int m = 0; m < nMTasks; m++) {
+          for (int s : activityNextEdges[(size_t)m]) {
+            if (!first) fprintf(header, ",");
+            fprintf(header, "%d", s);
+            first = false;
+          }
+        }
+        if (first) fprintf(header, "0");
+        fprintf(header, "};\n");
+      }
+      fprintf(header, "static constexpr int kDenseActivitySuccLiteOffsets[%d] = {", nMTasks + 1);
+      {
+        int off = 0;
+        for (int m = 0; m < nMTasks; m++) {
+          if (m > 0) fprintf(header, ",");
+          fprintf(header, "%d", off);
+          off += (int)activitySuccLite[(size_t)m].size();
+        }
+        fprintf(header, ",%d};\n", off);
+      }
+      fprintf(header, "static constexpr int kDenseActivitySuccLiteList[%d] = {", std::max(1, activitySuccLiteTotal));
+      {
+        bool first = true;
+        for (int m = 0; m < nMTasks; m++) {
+          for (int s : activitySuccLite[(size_t)m]) {
+            if (!first) fprintf(header, ",");
+            fprintf(header, "%d", s);
+            first = false;
+          }
+        }
+        if (first) fprintf(header, "0");
+        fprintf(header, "};\n");
+      }
       // v384 fix: shared noinline helpers keep the per-site fanout/succ stores as calls.
       // The first V384 build inlined constant-bounded loops; clang -O3 unrolled ~400K of them
       // and SimTop1217.cpp compiled for 90+ minutes before the build was killed.
       fprintf(header, "void mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd);\n");
       fprintf(header, "void mtDenseActivitySuccStore(int mtask);\n");
+      fprintf(header, "void mtDenseActivitySuccLiteStore(int mtask);\n");
+      fprintf(header, "void mtDenseActivityNextStore(int mtask);\n");
     }
     fprintf(header, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
     emitDenseDepCounts();
@@ -12733,10 +13218,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const bool activeWorklistPush = mtUseDenseActiveWorklistPush();
   Assert(!activeWorklistPush || sparseGate,
          "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH requires GSIM_MT_DENSE_SPARSE_GATE");
-  Assert(!activeWorklistPush || threadCount == 1,
-         "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH is a T1 de-risk path");
   Assert(!activeWorklistPush || sparseGateAtomic,
          "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH requires atomic sparse-gate updates");
+  const bool activeWorklistMt = activeWorklistPush && threadCount > 1;
   std::vector<std::vector<int>> activeWorklistWordMTasks;
   std::vector<char> activeWorklistAlwaysMTasks;
   if (activeWorklistPush) {
@@ -12775,10 +13259,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) fprintf(header, "%s%s", mtaskId ? "," : "", activeWorklistAlwaysMTasks[(size_t)mtaskId] ? "true" : "false");
     if (nMTasks == 0) fprintf(header, "false");
     fprintf(header, "};\n");
-    fprintf(header, "uint32_t mtDenseActiveWorklistEpoch = 0;\n");
-    fprintf(header, "uint32_t mtDenseActiveWorklistMTaskEpoch[%d] = {};\n", std::max(1, nMTasks));
+    if (activeWorklistMt) {
+      fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActiveWorklistEpoch{1};\n");
+      fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActiveWorklistMTaskEpoch[%d];\n", std::max(1, nMTasks));
+    } else {
+      fprintf(header, "uint32_t mtDenseActiveWorklistEpoch = 0;\n");
+      fprintf(header, "uint32_t mtDenseActiveWorklistMTaskEpoch[%d] = {};\n", std::max(1, nMTasks));
+    }
     fprintf(header, "int mtDenseActiveWorklistNextMTask = 0;\n");
     fprintf(header, "void markDenseActiveWorklistWord(int wordId);\n");
+    fprintf(header, "void markDenseActiveWorklistWordD(int wordId, int delta);\n");
     fprintf(header, "void markDenseActiveWorklistAll();\n");
     fprintf(header, "void stepDenseActiveWorklistSingleThread();\n");
     fprintf(stderr, "[mt-dense-active-worklist-push] mtasks=%d words=%d reverse_entries=%d\n", nMTasks, activeFlagNum, entries);
@@ -12831,24 +13321,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // none of its footprint words are set. Converts the 0.18%-active reality into skipped bodies
     // instead of 45313 idle per-super gate loads/cycle. Guard uses the same relaxed atomic load as
     // the per-super gate (ordered by the dep-counter HB, so no missed activation).
-    bool prefilterSafe = sparseGate;
-    std::set<int> footprintWords;
-    for (int cppId : memberCppIds) {
-      if (isAlwaysActive(cppId)) { prefilterSafe = false; break; }
-      footprintWords.insert(cppId / ACTIVE_WIDTH);
+    // When activeWorklistMt hoisting is enabled, the identical predicate already runs at the call
+    // site; suppress the duplicate in-body prefilter.
+    std::string prefilterGuard;
+    if (sparseGate && !activeWorklistMt && mtDenseBuildSparseGatePrefilter(denseSchedule, mtaskId, sparseGateAtomic, prefilterGuard)) {
+      emitBodyLock(1, "if (!(%s)) return;\n", prefilterGuard.c_str());
     }
-    bool prefilterEmitted = false;
-    if (prefilterSafe && !footprintWords.empty()) {
-      std::string guard;
-      for (int w : footprintWords) {
-        if (!guard.empty()) guard += " | ";
-        if (sparseGateAtomic) guard += format("__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED)", w);
-        else guard += format("activeFlags[%d]", w);
-      }
-      emitBodyLock(1, "if (!(%s)) return;\n", guard.c_str());
-      prefilterEmitted = true;
-    }
-    (void)prefilterEmitted;
     for (int cppId : memberCppIds) {
       auto superIter = cppId2Super.find(cppId);
       if (superIter == cppId2Super.end() || !superIter->second) continue;
@@ -12877,7 +13355,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         bool savedAtomic = mtDenseSparseGateAtomicEmit;
         bool savedActiveWorklistEmit = mtDenseActiveWorklistEmit;
         mtDenseSparseGateAtomicEmit = atomicGate;
-        mtDenseActiveWorklistEmit = activeWorklistPush;
+        mtDenseActiveWorklistEmit = activeWorklistPush && threadCount == 1;
         genSuperEval(super, format("activeFlags[%d]", wordId), "", localIndent, true);
         mtDenseActiveWorklistEmit = savedActiveWorklistEmit;
         mtDenseSparseGateAtomicEmit = savedAtomic;
@@ -12898,11 +13376,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "if (wordId < 0 || wordId >= kDenseActiveWorklistWordCount) return;\n");
     emitBodyLock(1, "for (int i = kDenseActiveWorklistWordOffsets[wordId]; i < kDenseActiveWorklistWordOffsets[wordId + 1]; i++) {\n");
     emitBodyLock(2, "const int mtaskId = kDenseActiveWorklistWordMTasks[i];\n");
-    emitBodyLock(2, "if (mtaskId >= mtDenseActiveWorklistNextMTask) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n");
+    if (activeWorklistMt) {
+      emitBodyLock(2, "mtDenseActiveWorklistMTaskEpoch[mtaskId].store(mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed), std::memory_order_release);\n");
+    } else {
+      emitBodyLock(2, "if (mtaskId >= mtDenseActiveWorklistNextMTask) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n");
+    }
     emitBodyLock(1, "}\n");
     emitBodyLock(0, "}\n");
     emitFuncDecl(0, "void S%s::markDenseActiveWorklistAll() {\n", name.c_str());
-    emitBodyLock(1, "for (int mtaskId = mtDenseActiveWorklistNextMTask; mtaskId < %d; mtaskId++) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n", nMTasks);
+    if (activeWorklistMt) {
+      emitBodyLock(1, "const uint32_t e = mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed);\n");
+      emitBodyLock(1, "for (int mtaskId = 0; mtaskId < %d; mtaskId++) {\n", nMTasks);
+      emitBodyLock(2, "mtDenseActiveWorklistMTaskEpoch[mtaskId].store(e, std::memory_order_release);\n");
+      emitBodyLock(1, "}\n");
+    } else {
+      emitBodyLock(1, "for (int mtaskId = mtDenseActiveWorklistNextMTask; mtaskId < %d; mtaskId++) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n", nMTasks);
+    }
     emitBodyLock(0, "}\n");
     emitFuncDecl(0, "void S%s::stepDenseActiveWorklistSingleThread() {\n", name.c_str());
     emitBodyLock(1, "if (unlikely(++mtDenseActiveWorklistEpoch == 0)) { std::memset(mtDenseActiveWorklistMTaskEpoch, 0, sizeof(mtDenseActiveWorklistMTaskEpoch)); mtDenseActiveWorklistEpoch = 1; }\n");
@@ -12959,23 +13448,44 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "switch (threadId) {\n");
     for (int t = 0; t < threadCount; t++) {
       emitBodyLock(2, "case %d: {\n", t);
-      if (tableDispatch) {
+      if (tableDispatch || denseLookahead) {
         emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-        emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
-        emitBodyLock(3, "  const MtDenseDispatchEntry *mtDenseDispatchEntry = kDenseDispatchTableW%d;\n", t);
-        emitBodyLock(3, "  const MtDenseDispatchEntry *mtDenseDispatchEnd = mtDenseDispatchEntry + %d;\n", denseDispatchWorkerCounts[(size_t)t]);
-        emitBodyLock(3, "  for (; mtDenseDispatchEntry != mtDenseDispatchEnd; ++mtDenseDispatchEntry) {\n");
-        emitBodyLock(4, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
-        emitBodyLock(5, "unsigned ct = 0;\n");
-        emitBodyLock(5, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
-        emitBodyLock(6, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
-        emitBodyLock(4, "}\n");
-        emitBodyLock(4, "(this->*mtDenseDispatchEntry->fn)();\n");
-        emitBodyLock(4, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
-        emitBodyLock(5, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
-        emitBodyLock(4, "}\n");
-        emitBodyLock(3, "  }\n");
-        emitBodyLock(3, "}\n");
+        if (denseLookahead) {
+          emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
+          int tablePosition = 0;
+          for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
+            if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] != t) continue;
+            emitBodyLock(4, "{ bool mtDenseInlineReady = true;\n");
+            for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
+              emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
+            }
+            emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); return; }\n",
+                         t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+            emitBodyLock(5, "stepDenseMTask%d();\n", mtaskId);
+            for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
+              emitBodyLock(5, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
+            }
+            emitBodyLock(4, "}\n");
+            ++tablePosition;
+          }
+          emitBodyLock(3, "}\n");
+        } else {
+          emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
+          emitBodyLock(3, "  const MtDenseDispatchEntry *mtDenseDispatchEntry = kDenseDispatchTableW%d;\n", t);
+          emitBodyLock(3, "  const MtDenseDispatchEntry *mtDenseDispatchEnd = mtDenseDispatchEntry + %d;\n", denseDispatchWorkerCounts[(size_t)t]);
+          emitBodyLock(3, "  for (; mtDenseDispatchEntry != mtDenseDispatchEnd; ++mtDenseDispatchEntry) {\n");
+          emitBodyLock(4, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+          emitBodyLock(5, "unsigned ct = 0;\n");
+          emitBodyLock(5, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
+          emitBodyLock(6, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+          emitBodyLock(4, "}\n");
+          emitBodyLock(4, "(this->*mtDenseDispatchEntry->fn)();\n");
+          emitBodyLock(4, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
+          emitBodyLock(5, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
+          emitBodyLock(4, "}\n");
+          emitBodyLock(3, "  }\n");
+          emitBodyLock(3, "}\n");
+        }
         emitBodyLock(3, "#else\n");
       }
       for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
@@ -13115,9 +13625,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
           emitBodyLock(3, "}\n");
         } else {
-          if (activity && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly) {
+          if (activity && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly && !activityAlwaysActive[(size_t)mtaskId]) {
             emitBodyLock(3, "if (mtDenseActivityEpoch[%d].load(std::memory_order_acquire) == mtDenseActivityCounter) {\n", mtaskId);
             emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
+            if (mtaskId < static_cast<int>(activityResetHandler.size()) && activityResetHandler[(size_t)mtaskId]) {
+              emitBodyLock(4, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(mtDenseActivityCounter + 1, std::memory_order_release);\n", nMTasks);
+            }
             if (mtaskId < static_cast<int>(activityCommitFields.size()) && !activityCommitFields[(size_t)mtaskId].empty()) {
               for (const MtActivityCommitField& cf : activityCommitFields[(size_t)mtaskId]) {
                 if (cf.conservative) {
@@ -13128,12 +13641,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                 }
               }
             }
-            if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
+            if (activityIsCommitMTask[(size_t)mtaskId]) {
+              if (mtaskId < static_cast<int>(activitySuccLite.size()) && !activitySuccLite[(size_t)mtaskId].empty()) {
+                emitBodyLock(4, "mtDenseActivitySuccLiteStore(%d);\n", mtaskId);
+              }
+            } else if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
               emitBodyLock(4, "mtDenseActivitySuccStore(%d);\n", mtaskId);
+            }
+            if (mtaskId < static_cast<int>(activityNextEdges.size()) && !activityNextEdges[(size_t)mtaskId].empty()) {
+              emitBodyLock(4, "mtDenseActivityNextStore(%d);\n", mtaskId);
             }
             emitBodyLock(3, "}\n");
           } else if (activity) {
             emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+            if (mtaskId < static_cast<int>(activityResetHandler.size()) && activityResetHandler[(size_t)mtaskId]) {
+              emitBodyLock(3, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(mtDenseActivityCounter + 1, std::memory_order_release);\n", nMTasks);
+            }
             if (mtaskId < static_cast<int>(activityCommitFields.size()) && !activityCommitFields[(size_t)mtaskId].empty()) {
               for (const MtActivityCommitField& cf : activityCommitFields[(size_t)mtaskId]) {
                 if (cf.conservative) {
@@ -13144,11 +13667,32 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                 }
               }
             }
-            if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
+            if (activityIsCommitMTask[(size_t)mtaskId]) {
+              if (mtaskId < static_cast<int>(activitySuccLite.size()) && !activitySuccLite[(size_t)mtaskId].empty()) {
+                emitBodyLock(3, "mtDenseActivitySuccLiteStore(%d);\n", mtaskId);
+              }
+            } else if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
               emitBodyLock(3, "mtDenseActivitySuccStore(%d);\n", mtaskId);
             }
+            if (mtaskId < static_cast<int>(activityNextEdges.size()) && !activityNextEdges[(size_t)mtaskId].empty()) {
+              emitBodyLock(3, "mtDenseActivityNextStore(%d);\n", mtaskId);
+            }
           } else {
-            emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+            if (activeWorklistMt && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly) {
+              // Hoisted exact prefilter (same predicate as the body's R3 prefilter, shared helper):
+              // skip the body when no member super's activeFlags word is set. A bit set by a
+              // producer before this site in topo order is seen now; a bit set later persists and
+              // is seen next cycle. No extra timing state: activeFlags bits are the activation
+              // lifecycle (set by production, consumed by the inner per-super gates).
+              std::string hoistedGuard;
+              if (mtDenseBuildSparseGatePrefilter(denseSchedule, mtaskId, true, hoistedGuard)) {
+                emitBodyLock(3, "if (%s) stepDenseMTask%d();\n", hoistedGuard.c_str(), mtaskId);
+              } else {
+                emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+              }
+            } else {
+              emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
+            }
           }
         }
         const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
@@ -13220,7 +13764,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           emitBodyLock(3, "}\n");
         }
       }
-      if (tableDispatch) {
+      if (tableDispatch || denseLookahead) {
         emitBodyLock(3, "#endif\n");
       }
       emitBodyLock(3, "break;\n");
@@ -13251,6 +13795,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(0, "}\n");
   };
   if (activity) {
+    // Activations produced during cycle N target cycle N+1: the counter is incremented after
+    // the pool join, so stores must write counter+1 (the upcoming cycle's epoch). The first
+    // V384 build stored the current counter, leaving cycle 1+ with no active MTasks (frozen
+    // core, C5000 hang).
     emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd) {\n", name.c_str());
     emitBodyLock(1, "for (int j = fanoutBegin; j < fanoutEnd; j++)\n");
     emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivityFanout[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
@@ -13258,6 +13806,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivitySuccStore(int mtask) {\n", name.c_str());
     emitBodyLock(1, "for (int j = kDenseActivitySuccOffsets[mtask]; j < kDenseActivitySuccOffsets[mtask + 1]; j++)\n");
     emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivitySuccList[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
+    emitBodyLock(0, "}\n");
+    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivitySuccLiteStore(int mtask) {\n", name.c_str());
+    emitBodyLock(1, "for (int j = kDenseActivitySuccLiteOffsets[mtask]; j < kDenseActivitySuccLiteOffsets[mtask + 1]; j++)\n");
+    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivitySuccLiteList[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
+    emitBodyLock(0, "}\n");
+    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivityNextStore(int mtask) {\n", name.c_str());
+    emitBodyLock(1, "const uint32_t mtDenseActivityNext = mtDenseActivityCounter + 1;\n");
+    emitBodyLock(1, "for (int j = kDenseActivityNextOffsets[mtask]; j < kDenseActivityNextOffsets[mtask + 1]; j++)\n");
+    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivityNextList[j]].store(mtDenseActivityNext, std::memory_order_release);\n");
     emitBodyLock(0, "}\n");
   }
   if (sharedHelpers) {
@@ -13271,20 +13828,101 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(0, "}\n");
   }
-  if (tableDispatch) {
+  if (denseLookahead) {
+    emitBodyLock(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitFuncDecl(0, "void S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target) {\n", name.c_str());
+    emitBodyLock(1, "const uint32_t mtDenseDispatchCount = static_cast<uint32_t>(mtDenseDispatchEnd - mtDenseDispatchBegin);\n");
+    emitBodyLock(1, "uint64_t mtDenseDoneBits[kDenseLookaheadDoneWordCount] = {};\n");
+    emitBodyLock(1, "bool anyOutOfOrder = false;\n");
+    emitBodyLock(1, "uint32_t head = startHead;\n");
+    emitBodyLock(1, "while (head < mtDenseDispatchCount) {\n");
+    emitBodyLock(2, "const MtDenseDispatchEntry* mtDenseDispatchEntry = mtDenseDispatchBegin + head;\n");
+    emitBodyLock(2, "bool mtDenseEntryReady = true;\n");
+    emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+    emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "if (mtDenseEntryReady) {\n");
+    emitBodyLock(3, "(this->*mtDenseDispatchEntry->fn)();\n");
+    emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
+    emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "++head;\n");
+    emitBodyLock(3, "while (head < mtDenseDispatchCount && anyOutOfOrder && (mtDenseDoneBits[head >> 6] & (uint64_t{1} << (head & 63))) != 0) {\n");
+    emitBodyLock(4, "mtDenseDoneBits[head >> 6] &= ~(uint64_t{1} << (head & 63));\n");
+    emitBodyLock(4, "++head;\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "continue;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "bool progressed = false;\n");
+    emitBodyLock(2, "uint32_t mtDenseScanEnd = head + 1u + kDenseLookaheadWindow;\n");
+    emitBodyLock(2, "if (mtDenseScanEnd > mtDenseDispatchCount) mtDenseScanEnd = mtDenseDispatchCount;\n");
+    emitBodyLock(2, "for (uint32_t j = head + 1u; j < mtDenseScanEnd; ++j) {\n");
+    emitBodyLock(3, "if (anyOutOfOrder && (mtDenseDoneBits[j >> 6] & (uint64_t{1} << (j & 63))) != 0) continue;\n");
+    emitBodyLock(3, "const MtDenseDispatchEntry* mtDenseCandidate = mtDenseDispatchBegin + j;\n");
+    emitBodyLock(3, "bool mtDenseCandidateReady = true;\n");
+    emitBodyLock(3, "for (uint32_t mtDenseLocalPrereq = mtDenseCandidate->localBegin; mtDenseLocalPrereq < mtDenseCandidate->localEnd; ++mtDenseLocalPrereq) {\n");
+    emitBodyLock(4, "const uint32_t mtDensePredPosition = kDenseLookaheadLocalPrereqs[mtDenseLocalPrereq];\n");
+    emitBodyLock(4, "if (!(mtDensePredPosition < head || (anyOutOfOrder && (mtDenseDoneBits[mtDensePredPosition >> 6] & (uint64_t{1} << (mtDensePredPosition & 63))) != 0))) { mtDenseCandidateReady = false; break; }\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
+    emitBodyLock(3, "for (uint32_t mtDenseDispatchWait = mtDenseCandidate->waitBegin; mtDenseDispatchWait < mtDenseCandidate->waitEnd; ++mtDenseDispatchWait) {\n");
+    emitBodyLock(4, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; break; }\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
+    emitBodyLock(3, "(this->*mtDenseCandidate->fn)();\n");
+    emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseCandidate->storeBegin; mtDenseDispatchStore < mtDenseCandidate->storeEnd; ++mtDenseDispatchStore) {\n");
+    emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
+    emitBodyLock(3, "}\n");
+    emitBodyLock(3, "mtDenseDoneBits[j >> 6] |= uint64_t{1} << (j & 63);\n");
+    emitBodyLock(3, "anyOutOfOrder = true;\n");
+    emitBodyLock(3, "progressed = true;\n");
+    emitBodyLock(3, "break;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "if (progressed) continue;\n");
+    emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+    emitBodyLock(3, "unsigned ct = 0;\n");
+    emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
+    emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
+    emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
+    emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "++head;\n");
+    emitBodyLock(2, "while (head < mtDenseDispatchCount && anyOutOfOrder && (mtDenseDoneBits[head >> 6] & (uint64_t{1} << (head & 63))) != 0) {\n");
+    emitBodyLock(3, "mtDenseDoneBits[head >> 6] &= ~(uint64_t{1} << (head & 63));\n");
+    emitBodyLock(3, "++head;\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+    emitBodyLock(0, "#endif\n");
+  }
+  if (tableDispatch || denseLookahead) {
     for (int t = 0; t < threadCount; t++) {
       int cnt = denseDispatchWorkerCounts[(size_t)t];
       emitBodyLock(0, "const S%s::MtDenseDispatchEntry S%s::kDenseDispatchTableW%d[%d] = {\n",
                    name.c_str(), name.c_str(), t, std::max(1, cnt));
       if (cnt == 0) {
-        emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u}\n");
+        if (denseLookahead) {
+          emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u}\n");
+        } else {
+          emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u}\n");
+        }
       } else {
         for (int m = 0; m < nMTasks; m++) {
           if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
-          emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu},\n",
-                       name.c_str(), m,
-                       denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
-                       denseDispatchStoreBegin[(size_t)m], denseDispatchStoreEnd[(size_t)m]);
+          if (denseLookahead) {
+            emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu, %uu, %uu},\n",
+                         name.c_str(), m,
+                         denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
+                         denseDispatchStoreBegin[(size_t)m], denseDispatchStoreEnd[(size_t)m],
+                         denseLookaheadLocalBegin[(size_t)m], denseLookaheadLocalEnd[(size_t)m]);
+          } else {
+            emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu},\n",
+                         name.c_str(), m,
+                         denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
+                         denseDispatchStoreBegin[(size_t)m], denseDispatchStoreEnd[(size_t)m]);
+          }
         }
       }
       emitBodyLock(0, "};\n");
@@ -13423,6 +14061,18 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "std::chrono::steady_clock::time_point mtDenseBreakdownPoolIdleBegin;\n");
     emitBodyLock(2, "std::chrono::steady_clock::time_point mtDenseBreakdownPoolDoneBegin;\n");
   }
+  if (activity && !activityInputFields.empty()) {
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    for (const MtActivityInputField& inf : activityInputFields) {
+      if (inf.conservative) {
+        emitBodyLock(2, "mtDenseActivityFanoutStore(%d, %d);\n", inf.fanoutBegin, inf.fanoutEnd);
+      } else {
+        emitBodyLock(2, "{ uint64_t nv = ((uint64_t)%s) & 0x%llxULL; if (nv != mtDenseActivityShadow[%d]) { mtDenseActivityShadow[%d] = nv; mtDenseActivityFanoutStore(%d, %d); } }\n",
+                     inf.name.c_str(), (unsigned long long)inf.mask, inf.shadowSlot, inf.shadowSlot, inf.fanoutBegin, inf.fanoutEnd);
+      }
+    }
+    emitBodyLock(2, "#endif\n");
+  }
 
   emitBodyLock(2, "mtWorkerPoolPost();\n");
   if (denseBreakdownProfileCodegen) {
@@ -13449,7 +14099,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
   if (activity) {
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-    emitBodyLock(2, "if (++mtDenseActivityCounter == 0) { for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(0, std::memory_order_relaxed); mtDenseActivityCounter = 1; }\n", nMTasks);
+    emitBodyLock(2, "if (++mtDenseActivityCounter == 0) { for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed); mtDenseActivityCounter = 1; }\n", nMTasks);
     emitBodyLock(2, "#endif\n");
   }
   if (denseBreakdownWindowCodegen) {
