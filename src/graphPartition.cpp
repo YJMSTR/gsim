@@ -11,31 +11,67 @@
 // #define SUPER_BOUND 35
 
 void graph::resort() {
+  // v432: GSIM_STABLE_ORDER=1 selects the deterministic frontier (see topoSort).
+  const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   std::map<SuperNode*, int>times;
-  std::set<SuperNode*, SuperNodeStableLess> s;
+  if (stableOrder) {
+    std::set<SuperNode*, SuperNodeStableLess> s;
+    std::set<SuperNode*> visited;
+    std::vector<SuperNode*> prevSuper(sortedSuper);
+
+    size_t prevSize = sortedSuper.size();
+    for (SuperNode* node : sortedSuper) {
+      if (node->depPrev.size() == 0) s.insert(node);
+      times[node] = 0;
+    }
+    sortedSuper.clear();
+
+    while(!s.empty()) {
+      SuperNode* top = *s.begin();
+      s.erase(s.begin());
+      Assert(visited.find(top) == visited.end(), "superNode %d is already visited\n", top->id);
+      visited.insert(top);
+      sortedSuper.push_back(top);
+      for (SuperNode* next : stableOrdered(top->depNext)) {
+        times[next] ++;
+        if (times[next] == (int)next->depPrev.size()) s.insert(next);
+      }
+    }
+    Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", prevSize, sortedSuper.size());
+    orderAllNodes();
+    return;
+  }
+  std::stack<SuperNode*> s;
   std::set<SuperNode*> visited;
   std::vector<SuperNode*> prevSuper(sortedSuper);
 
   size_t prevSize = sortedSuper.size();
   for (SuperNode* node : sortedSuper) {
-    if (node->depPrev.size() == 0) s.insert(node);
+    if (node->depPrev.size() == 0) s.push(node);
     times[node] = 0;
   }
   sortedSuper.clear();
 
   while(!s.empty()) {
-    SuperNode* top = *s.begin();
-    s.erase(s.begin());
+    SuperNode* top = s.top();
+    s.pop();
     Assert(visited.find(top) == visited.end(), "superNode %d is already visited\n", top->id);
     visited.insert(top);
     sortedSuper.push_back(top);
-    for (SuperNode* next : stableOrdered(top->depNext)) {
+#ifdef ORDERED_TOPO_SORT
+    std::vector<SuperNode*> sortedNext;
+    sortedNext.insert(sortedNext.end(), top->depNext.begin(), top->depNext.end());
+    std::sort(sortedNext.begin(), sortedNext.end(), [](SuperNode* a, SuperNode* b) {return a->id < b->id;});
+    for (SuperNode* next : sortedNext) {
+#else
+    for (SuperNode* next : top->depNext) {
+#endif
       times[next] ++;
-      if (times[next] == (int)next->depPrev.size()) s.insert(next);
+      if (times[next] == (int)next->depPrev.size()) s.push(next);
     }
   }
 
-  Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", sortedSuper.size(), prevSize);
+  Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", prevSize, sortedSuper.size());
   orderAllNodes();
 }
 

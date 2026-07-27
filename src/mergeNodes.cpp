@@ -103,13 +103,18 @@ void graph::mergeWhenNodes() {
       std::fclose(dumpFp);
     }
   }
+  // v432: GSIM_STABLE_ORDER=1 selects the deterministic stable-order path (reproducible
+  // generation); default keeps the original pointer-order behavior.
+  const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   std::queue<SuperNode*> s;
   std::queue<SuperNode*> cond;
-  std::set<SuperNode*, SuperNodeStableLess> condWait;
   std::map<SuperNode*, std::set<SuperNode*>> allCond;
   std::map<SuperNode*, SuperNode*> node2Cond;
   std::map<SuperNode*, int>times;
-  std::map<SuperNode*, std::vector<SuperNode*>, SuperNodeStableLess> whenMap;
+  std::set<SuperNode*, SuperNodeStableLess> condWaitStable;
+  std::map<SuperNode*, std::vector<SuperNode*>, SuperNodeStableLess> whenMapStable;
+  std::set<SuperNode*> condWaitOrig;
+  std::map<SuperNode*, std::vector<SuperNode*>> whenMapOrig;
   /* generator all cond nodes */
   for (SuperNode* super : sortedSuper) {
     times[super] = 0;
@@ -128,21 +133,31 @@ void graph::mergeWhenNodes() {
     }
   }
 
-  auto addCond = [&cond, &condWait, &allCond, &times](SuperNode* super) {
+  auto addCond = [&](SuperNode* super) {
     int num = 0;
-    for (SuperNode* s : allCond[super]) {
-      if (times[s] + 1 == s->depPrev.size()) num ++;
+    for (SuperNode* s2 : allCond[super]) {
+      if (times[s2] + 1 == (int)s2->depPrev.size()) num ++;
     }
     if (num >= 2) cond.push(super);
-    else condWait.insert(super);
+    else if (stableOrder) condWaitStable.insert(super);
+    else condWaitOrig.insert(super);
   };
 
-  auto cond2Queue = [&cond, &condWait](SuperNode* super) {
-    if (condWait.find(super) != condWait.end()) {
-      condWait.erase(super);
-      cond.push(super);
+  auto cond2Queue = [&](SuperNode* super) {
+    if (stableOrder) {
+      if (condWaitStable.find(super) != condWaitStable.end()) {
+        condWaitStable.erase(super);
+        cond.push(super);
+      }
+    } else {
+      if (condWaitOrig.find(super) != condWaitOrig.end()) {
+        condWaitOrig.erase(super);
+        cond.push(super);
+      }
     }
   };
+  auto condWaitEmpty = [&]() { return stableOrder ? condWaitStable.empty() : condWaitOrig.empty(); };
+  auto condWaitTop = [&]() { return stableOrder ? *condWaitStable.begin() : *condWaitOrig.begin(); };
 
   std::vector<SuperNode*> initialRoots;
   for (SuperNode* super : sortedSuper) {
@@ -151,51 +166,58 @@ void graph::mergeWhenNodes() {
       else initialRoots.push_back(super);
     }
   }
-  std::sort(initialRoots.begin(), initialRoots.end(), SuperNodeStableLess());
+  if (stableOrder) std::sort(initialRoots.begin(), initialRoots.end(), SuperNodeStableLess());
   for (SuperNode* root : initialRoots) s.push(root);
   while (!s.empty()) {
     SuperNode* top = s.front();
     s.pop();
-    for (SuperNode* next : stableOrdered(top->depNext)) {
+    for (SuperNode* next : (stableOrder ? stableOrdered(top->depNext) : std::vector<SuperNode*>(top->depNext.begin(), top->depNext.end()))) {
       times[next] ++;
-      if (times[next] + 1 == next->depPrev.size()) {
+      if (times[next] + 1 == (int)next->depPrev.size()) {
         if (node2Cond.find(next) != node2Cond.end()) {
           cond2Queue(node2Cond[next]);
         }
       }
-      if (times[next] == next->depPrev.size()) {
+      if (times[next] == (int)next->depPrev.size()) {
         if (allCond.find(next) != allCond.end()) addCond(next);
         else s.push(next);
       }
     }
-    while (s.empty() && (!cond.empty() || condWait.size() > 0)) {
+    while (s.empty() && (!cond.empty() || !condWaitEmpty())) {
       if (cond.empty()) {
-        cond2Queue(*condWait.begin());
+        cond2Queue(condWaitTop());
       }
       SuperNode* mergeCond = cond.front();
       cond.pop();
       std::vector<SuperNode*> mergeSuper;
-      for (SuperNode* next : stableOrdered(mergeCond->depNext)) {
+      for (SuperNode* next : (stableOrder ? stableOrdered(mergeCond->depNext) : std::vector<SuperNode*>(mergeCond->depNext.begin(), mergeCond->depNext.end()))) {
         times[next] ++;
-        if (times[next] == next->depPrev.size()) {
+        if (times[next] == (int)next->depPrev.size()) {
           if (allCond[mergeCond].find(next) != allCond[mergeCond].end()) mergeSuper.push_back(next);
           s.push(next);
         }
       }
-      if (mergeSuper.size() > globalConfig.MergeWhenSize) whenMap[mergeCond] = mergeSuper;
-    }
-  }
-  for (auto iter : whenMap) {
-    std::vector<SuperNode*> allSuper = iter.second;
-    SuperNode* mergeSuper = allSuper[0];
-    for (size_t i = 1; i < allSuper.size(); i ++) {
-      for (Node* member : allSuper[i]->member) {
-        mergeSuper->add_member(member);
-        member->super = mergeSuper;
+      if (mergeSuper.size() > globalConfig.MergeWhenSize) {
+        if (stableOrder) whenMapStable[mergeCond] = mergeSuper;
+        else whenMapOrig[mergeCond] = mergeSuper;
       }
-      allSuper[i]->member.clear();
     }
   }
+  auto applyWhenMap = [](auto& whenMap) {
+    for (auto iter : whenMap) {
+      std::vector<SuperNode*> allSuper = iter.second;
+      SuperNode* mergeSuper = allSuper[0];
+      for (size_t i = 1; i < allSuper.size(); i ++) {
+        for (Node* member : allSuper[i]->member) {
+          mergeSuper->add_member(member);
+          member->super = mergeSuper;
+        }
+        allSuper[i]->member.clear();
+      }
+    }
+  };
+  if (stableOrder) applyWhenMap(whenMapStable);
+  else applyWhenMap(whenMapOrig);
   size_t prevSuper = sortedSuper.size();
   removeEmptySuper();
   reconnectSuper();
