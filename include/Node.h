@@ -430,4 +430,30 @@ public:
   void reorderMember();
 };
 
+// v430: stable semantic order for graph passes. Pointer-ordered containers made pass
+// outcomes depend on allocator/address layout (v430 nondeterminism). Key chain:
+// first member name, member count, full member-name list, dep sizes; id only as a last
+// resort and emits a stderr warning (allocator-unstable, investigate if ever hit).
+struct SuperNodeStableLess {
+  bool operator()(const SuperNode* a, const SuperNode* b) const {
+    const std::string& na = a->member.empty() ? std::string() : a->member[0]->name;
+    const std::string& nb = b->member.empty() ? std::string() : b->member[0]->name;
+    if (na != nb) return na < nb;
+    if (a->member.size() != b->member.size()) return a->member.size() < b->member.size();
+    for (size_t i = 0; i < a->member.size() && i < b->member.size(); i ++) {
+      if (a->member[i]->name != b->member[i]->name) return a->member[i]->name < b->member[i]->name;
+    }
+    if (a->depPrev.size() != b->depPrev.size()) return a->depPrev.size() < b->depPrev.size();
+    if (a->depNext.size() != b->depNext.size()) return a->depNext.size() < b->depNext.size();
+    static bool warned = false;
+    if (!warned) { warned = true; fprintf(stderr, "[stable-order] id fallback hit: %d vs %d (names %s | %s)\n", a->id, b->id, na.c_str(), nb.c_str()); }
+    return a->id < b->id;
+  }
+};
+static inline std::vector<SuperNode*> stableOrdered(const std::set<SuperNode*>& ends) {
+  std::vector<SuperNode*> ordered(ends.begin(), ends.end());
+  std::sort(ordered.begin(), ordered.end(), SuperNodeStableLess());
+  return ordered;
+}
+
 #endif

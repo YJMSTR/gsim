@@ -537,12 +537,15 @@ int main(int argc, char** argv) {
   FUNC_TIMER(g->detectLoop());
 
   FUNC_WRAPPER(g->topoSort(), "TopoSort");
+  g->canonDumpTag("pass.topoSort");
 
   FUNC_TIMER(g->inferAllWidth());
 
   FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+  g->canonDumpTag("pass.removeDeadNodes");
 
   FUNC_WRAPPER(g->exprOpt(), "ExprOpt");
+  g->canonDumpTag("pass.exprOpt");
 
   FUNC_TIMER(g->usedBits());
 
@@ -561,13 +564,17 @@ int main(int argc, char** argv) {
   FUNC_WRAPPER(g->patternDetect(), "PatternDetect");
 
   FUNC_WRAPPER(g->commonExpr(), "CommonExpr");
+  g->canonDumpTag("pass.commonExpr");
 
   FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+  g->canonDumpTag("pass.removeDeadNodes2");
 
   FUNC_WRAPPER(g->graphPartition(), "graphPartition");
+  g->canonDumpTag("pass.graphPartition");
 
   if (!globalConfig.DisableReplicationOpt) {
     FUNC_WRAPPER(g->replicationOpt(), "Replication");
+    g->canonDumpTag("pass.replication");
   }
 
   // FUNC_WRAPPER(g->mergeRegister(), "MergeRegister");

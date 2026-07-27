@@ -76,13 +76,40 @@ void graph::mergeWhenNodes() {
 }
 #else
 void graph::mergeWhenNodes() {
+  // v430 diagnostic (env value = dump filepath): canonical pre-merge graph record per
+  // super: id, member names, sorted depPrev/depNext endpoint ids and names. Lets two
+  // runs verify both id stability and whole-graph equality at this point.
+  if (const char* dumpPath = std::getenv("GSIM_DEBUG_DUMP_SUPER_IDS")) {
+    FILE* dumpFp = std::fopen(dumpPath, "w");
+    if (dumpFp) {
+      std::vector<SuperNode*> sortedById;
+      for (SuperNode* super : sortedSuper) if (super->superType == SUPER_VALID) sortedById.push_back(super);
+      std::sort(sortedById.begin(), sortedById.end(), [](const SuperNode* a, const SuperNode* b) { return a->id < b->id; });
+      auto dumpEnds = [dumpFp](const std::set<SuperNode*>& ends) {
+        std::vector<std::pair<int, std::string>> keyed;
+        for (SuperNode* e : ends) keyed.push_back({e->id, e->member.empty() ? std::string("-") : e->member[0]->name});
+        std::sort(keyed.begin(), keyed.end());
+        for (const auto& k : keyed) std::fprintf(dumpFp, "%d:%s,", k.first, k.second.c_str());
+      };
+      for (SuperNode* super : sortedById) {
+        std::fprintf(dumpFp, "%d|%zu|", super->id, super->member.size());
+        for (Node* member : super->member) std::fprintf(dumpFp, "%s,", member->name.c_str());
+        std::fprintf(dumpFp, "|");
+        dumpEnds(super->depPrev);
+        std::fprintf(dumpFp, "|");
+        dumpEnds(super->depNext);
+        std::fprintf(dumpFp, "\n");
+      }
+      std::fclose(dumpFp);
+    }
+  }
   std::queue<SuperNode*> s;
   std::queue<SuperNode*> cond;
-  std::set<SuperNode*> condWait;
+  std::set<SuperNode*, SuperNodeStableLess> condWait;
   std::map<SuperNode*, std::set<SuperNode*>> allCond;
   std::map<SuperNode*, SuperNode*> node2Cond;
   std::map<SuperNode*, int>times;
-  std::map<SuperNode*, std::vector<SuperNode*>> whenMap;
+  std::map<SuperNode*, std::vector<SuperNode*>, SuperNodeStableLess> whenMap;
   /* generator all cond nodes */
   for (SuperNode* super : sortedSuper) {
     times[super] = 0;
@@ -117,16 +144,19 @@ void graph::mergeWhenNodes() {
     }
   };
 
+  std::vector<SuperNode*> initialRoots;
   for (SuperNode* super : sortedSuper) {
     if (super->depPrev.size() == 0) {
       if (allCond.find(super) != allCond.end()) addCond(super);
-      else s.push(super);
+      else initialRoots.push_back(super);
     }
   }
+  std::sort(initialRoots.begin(), initialRoots.end(), SuperNodeStableLess());
+  for (SuperNode* root : initialRoots) s.push(root);
   while (!s.empty()) {
     SuperNode* top = s.front();
     s.pop();
-    for (SuperNode* next : top->depNext) {
+    for (SuperNode* next : stableOrdered(top->depNext)) {
       times[next] ++;
       if (times[next] + 1 == next->depPrev.size()) {
         if (node2Cond.find(next) != node2Cond.end()) {
@@ -145,7 +175,7 @@ void graph::mergeWhenNodes() {
       SuperNode* mergeCond = cond.front();
       cond.pop();
       std::vector<SuperNode*> mergeSuper;
-      for (SuperNode* next : mergeCond->depNext) {
+      for (SuperNode* next : stableOrdered(mergeCond->depNext)) {
         times[next] ++;
         if (times[next] == next->depPrev.size()) {
           if (allCond[mergeCond].find(next) != allCond[mergeCond].end()) mergeSuper.push_back(next);

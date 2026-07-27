@@ -11,6 +11,10 @@ struct MtCoarseRegionPlan;
 struct MtDenseSchedule;
 
 class graph {
+public:
+  // v430 diagnostic: content-canonical pass-boundary hashes (GSIM_DEBUG_CANON_DIR).
+  void canonDumpTag(const char* tag);
+private:
   FILE *srcFp;
   int srcFileIdx;
   int srcFileBytes;

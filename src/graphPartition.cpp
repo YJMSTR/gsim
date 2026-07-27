@@ -12,33 +12,26 @@
 
 void graph::resort() {
   std::map<SuperNode*, int>times;
-  std::stack<SuperNode*> s;
+  std::set<SuperNode*, SuperNodeStableLess> s;
   std::set<SuperNode*> visited;
   std::vector<SuperNode*> prevSuper(sortedSuper);
 
   size_t prevSize = sortedSuper.size();
   for (SuperNode* node : sortedSuper) {
-    if (node->depPrev.size() == 0) s.push(node);
+    if (node->depPrev.size() == 0) s.insert(node);
     times[node] = 0;
   }
   sortedSuper.clear();
 
   while(!s.empty()) {
-    SuperNode* top = s.top();
-    s.pop();
+    SuperNode* top = *s.begin();
+    s.erase(s.begin());
     Assert(visited.find(top) == visited.end(), "superNode %d is already visited\n", top->id);
     visited.insert(top);
     sortedSuper.push_back(top);
-#ifdef ORDERED_TOPO_SORT
-    std::vector<SuperNode*> sortedNext;
-    sortedNext.insert(sortedNext.end(), top->depNext.begin(), top->depNext.end());
-    std::sort(sortedNext.begin(), sortedNext.end(), [](SuperNode* a, SuperNode* b) {return a->id < b->id;});
-    for (SuperNode* next : sortedNext) {
-#else
-    for (SuperNode* next : top->depNext) {
-#endif
+    for (SuperNode* next : stableOrdered(top->depNext)) {
       times[next] ++;
-      if (times[next] == (int)next->depPrev.size()) s.push(next);
+      if (times[next] == (int)next->depPrev.size()) s.insert(next);
     }
   }
 
@@ -47,15 +40,61 @@ void graph::resort() {
 }
 
 // coarsen phase
+// v430 diagnostic: compact canonical graph fingerprint at pass boundaries. Per VALID
+// super one record (member names in order + sorted prev/next/depPrev/depNext endpoint
+// keys); records sorted in memory and stream-hashed (FNV-1a 64) — no files, no GB dumps.
+// GSIM_DEBUG_CANON_HASH=1 enables; GSIM_DEBUG_CANON_STOP_AFTER=<tag> exits after a tag.
+void graph::canonDumpTag(const char* tag) {
+  if (!std::getenv("GSIM_DEBUG_CANON_HASH")) return;
+  auto keyOf = [](SuperNode* e) {
+    std::string k;
+    for (Node* m : e->member) { k += m->name; k += ';'; }
+    return k;
+  };
+  auto sortedEnds = [&](const std::set<SuperNode*>& ends) {
+    std::vector<std::string> keys;
+    for (SuperNode* e : ends) keys.push_back(keyOf(e));
+    std::sort(keys.begin(), keys.end());
+    std::string joined;
+    for (const std::string& k : keys) { joined += k; joined += ','; }
+    return joined;
+  };
+  std::vector<std::string> records;
+  records.reserve(sortedSuper.size());
+  uint64_t orderHash = 1469598103934665603ULL;
+  auto mixStr = [&](uint64_t h, const std::string& s) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+  };
+  for (SuperNode* super : sortedSuper) {
+    if (super->superType != SUPER_VALID) continue;
+    std::string rec = keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext);
+    orderHash = mixStr(orderHash, rec);
+    records.push_back(std::move(rec));
+  }
+  std::sort(records.begin(), records.end());
+  uint64_t recHash = 1469598103934665603ULL;
+  for (const std::string& r : records) recHash = mixStr(recHash, r);
+  fprintf(stderr, "[canon] %-24s records=%016zx order=%016zx count=%zu\n", tag, recHash, orderHash, records.size());
+  const char* stop = std::getenv("GSIM_DEBUG_CANON_STOP_AFTER");
+  if (stop && std::string(stop) == tag) { std::fprintf(stderr, "[canon] stop after %s\n", tag); std::exit(0); }
+}
+
 void graph::graphCoarsen() {
+  canonDumpTag("coarsen.entry");
   mergeResetAll();
+  canonDumpTag("coarsen.resetAll");
 
   mergeWhenNodes();
   resort();
+  canonDumpTag("coarsen.when");
 
   mergeOut1();
+  canonDumpTag("coarsen.out1");
   mergeIn1();
+  canonDumpTag("coarsen.in1");
   mergeSublings();
+  canonDumpTag("coarsen.sublings");
 }
 
 // initial partition
@@ -377,10 +416,12 @@ void graph::graphPartition() {
 /* initial partition */
   phaseSuper = sortedSuper.size();
   graphInitPartition();
+  canonDumpTag("partition.init");
   orderAllNodes();
   printf("[InitPartition] remove %ld superNodes (%ld -> %ld)\n", phaseSuper - sortedSuper.size(), phaseSuper, sortedSuper.size());
 /* refine & uncoarsen phase */
   // graphRefine();
   phaseSuper = sortedSuper.size();
+  canonDumpTag("partition.post");
   printf("[graphPartition] remove %ld superNodes (%ld -> %ld)\n", totalSuper - phaseSuper, totalSuper, phaseSuper);
 }

@@ -6857,10 +6857,18 @@ void graph::dumpMtDenseScheduleJson() {
   fprintf(fp, "  ],\n");
 
   fprintf(fp, "  \"edges\": [\n");
-  for (size_t i = 0; i < schedule.edges.size(); i ++) {
-    const MtDenseEdge& edge = schedule.edges[i];
+  // v430: edge enumeration follows allocator-sensitive pointer iteration order. Emit in
+  // a deterministic canonical order so identical schedules produce identical files.
+  std::vector<MtDenseEdge> canonEdges(schedule.edges.begin(), schedule.edges.end());
+  std::sort(canonEdges.begin(), canonEdges.end(), [](const MtDenseEdge& a, const MtDenseEdge& b) {
+    if (a.fromCppId != b.fromCppId) return a.fromCppId < b.fromCppId;
+    if (a.toCppId != b.toCppId) return a.toCppId < b.toCppId;
+    return a.kind < b.kind;
+  });
+  for (size_t i = 0; i < canonEdges.size(); i ++) {
+    const MtDenseEdge& edge = canonEdges[i];
     fprintf(fp, "    {\"from_cpp_id\": %d, \"to_cpp_id\": %d, \"kind\": \"%s\"}%s\n",
-            edge.fromCppId, edge.toCppId, edge.kind.c_str(), i + 1 == schedule.edges.size() ? "" : ",");
+            edge.fromCppId, edge.toCppId, edge.kind.c_str(), i + 1 == canonEdges.size() ? "" : ",");
   }
   fprintf(fp, "  ],\n");
   dumpMtDenseActivationOrigins(fp);
