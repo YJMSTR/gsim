@@ -13,7 +13,35 @@
 void graph::resort() {
   // v432: GSIM_STABLE_ORDER=1 selects the deterministic frontier (see topoSort).
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
+  const bool seedReplay = mtSeedReplayActive();
   std::map<SuperNode*, int>times;
+  if (seedReplay) {
+    std::set<SuperNode*, SeedRankLess> s;
+    std::set<SuperNode*> visited;
+    std::vector<SuperNode*> prevSuper(sortedSuper);
+
+    size_t prevSize = sortedSuper.size();
+    for (SuperNode* node : sortedSuper) {
+      if (node->depPrev.size() == 0) s.insert(node);
+      times[node] = 0;
+    }
+    sortedSuper.clear();
+
+    while(!s.empty()) {
+      SuperNode* top = *s.begin();
+      s.erase(s.begin());
+      Assert(visited.find(top) == visited.end(), "superNode %d is already visited\n", top->id);
+      visited.insert(top);
+      sortedSuper.push_back(top);
+      for (SuperNode* next : seedRankOrdered(top->depNext)) {
+        times[next] ++;
+        if (times[next] == (int)next->depPrev.size()) s.insert(next);
+      }
+    }
+    Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", prevSize, sortedSuper.size());
+    orderAllNodes();
+    return;
+  }
   if (stableOrder) {
     std::set<SuperNode*, SuperNodeStableLess> s;
     std::set<SuperNode*> visited;
@@ -114,6 +142,39 @@ void graph::canonDumpTag(const char* tag) {
   fprintf(stderr, "[canon] %-24s records=%016zx order=%016zx count=%zu\n", tag, recHash, orderHash, records.size());
   const char* stop = std::getenv("GSIM_DEBUG_CANON_STOP_AFTER");
   if (stop && std::string(stop) == tag) { std::fprintf(stderr, "[canon] stop after %s\n", tag); std::exit(0); }
+}
+
+// Canonical order-free content hash of the current graph (seed input identity).
+// Same record construction as canonDumpTag: member names in order + sorted
+// prev/next/depPrev/depNext endpoint keys; ids/addresses excluded.
+uint64_t graph::canonInputHash() {
+  auto keyOf = [](SuperNode* e) {
+    std::string k;
+    for (Node* m : e->member) { k += m->name; k += ';'; }
+    return k;
+  };
+  auto sortedEnds = [&](const std::set<SuperNode*>& ends) {
+    std::vector<std::string> keys;
+    for (SuperNode* e : ends) keys.push_back(keyOf(e));
+    std::sort(keys.begin(), keys.end());
+    std::string joined;
+    for (const std::string& k : keys) { joined += k; joined += ','; }
+    return joined;
+  };
+  auto mixStr = [](uint64_t h, const std::string& s) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+  };
+  std::vector<std::string> records;
+  records.reserve(sortedSuper.size());
+  for (SuperNode* super : sortedSuper) {
+    if (super->superType != SUPER_VALID) continue;
+    records.push_back(keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext));
+  }
+  std::sort(records.begin(), records.end());
+  uint64_t recHash = 1469598103934665603ULL;
+  for (const std::string& r : records) recHash = mixStr(recHash, r);
+  return recHash;
 }
 
 void graph::graphCoarsen() {

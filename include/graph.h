@@ -14,6 +14,8 @@ class graph {
 public:
   // v430 diagnostic: content-canonical pass-boundary hashes (GSIM_DEBUG_CANON_DIR).
   void canonDumpTag(const char* tag);
+  // Canonical order-free content hash of the current graph (seed input identity).
+  uint64_t canonInputHash();
 private:
   FILE *srcFp;
   int srcFileIdx;

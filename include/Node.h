@@ -436,6 +436,11 @@ public:
 // resort and emits a stderr warning (allocator-unstable, investigate if ever hit).
 struct SuperNodeStableLess {
   bool operator()(const SuperNode* a, const SuperNode* b) const {
+    // v432: deterministic key approximating parse/creation order (pointer order quality
+    // without allocator dependence). lineno is content-stable; -1 for generated nodes.
+    const long long la = a->member.empty() ? LLONG_MAX : (long long)a->member[0]->lineno;
+    const long long lb = b->member.empty() ? LLONG_MAX : (long long)b->member[0]->lineno;
+    if (la != lb) return la < lb;
     const std::string& na = a->member.empty() ? std::string() : a->member[0]->name;
     const std::string& nb = b->member.empty() ? std::string() : b->member[0]->name;
     if (na != nb) return na < nb;
@@ -453,6 +458,31 @@ struct SuperNodeStableLess {
 static inline std::vector<SuperNode*> stableOrdered(const std::set<SuperNode*>& ends) {
   std::vector<SuperNode*> ordered(ends.begin(), ends.end());
   std::sort(ordered.begin(), ordered.end(), SuperNodeStableLess());
+  return ordered;
+}
+
+// GSIM_SCHEDULE_SEED fixed-order replay (src/seedOrder.cpp; design docs/schedule-pinning-design.md).
+bool mtSeedReplayActive();
+bool mtSeedWriteActive();
+void mtSeedAssertCompatible();
+long long mtSeedRankOf(const SuperNode* super);
+void mtSeedVerifyInputHash(uint64_t computedInputHash);
+void mtSeedWrite(const char* path, const std::vector<SuperNode*>& sortedSuper, uint64_t inputHash, const char* generatorTag);
+struct SeedRankLess {
+  bool operator()(const SuperNode* a, const SuperNode* b) const {
+    const long long ra = mtSeedRankOf(a), rb = mtSeedRankOf(b);
+    if (ra != rb) return ra < rb;
+    if (ra == LLONG_MAX) {
+      // Seed-missing nodes (created after the seed point, e.g. replication): fall back to
+      // the content-name order so the comparator stays deterministic across allocators.
+      return SuperNodeStableLess()(a, b);
+    }
+    return a < b;  // pointer only as a last-resort tie-break (never hit on a matching seed)
+  }
+};
+static inline std::vector<SuperNode*> seedRankOrdered(const std::set<SuperNode*>& ends) {
+  std::vector<SuperNode*> ordered(ends.begin(), ends.end());
+  std::sort(ordered.begin(), ordered.end(), SeedRankLess());
   return ordered;
 }
 

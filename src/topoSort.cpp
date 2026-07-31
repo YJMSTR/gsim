@@ -11,7 +11,38 @@ void graph::topoSort() {
   // (reproducible generation); default keeps the original pointer-order traversal
   // (current schedule-quality baseline) while the stable path is validated further.
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
+  const bool seedReplay = mtSeedReplayActive();
+  const bool seedWrite = mtSeedWriteActive();
+  uint64_t seedInputHash = 0;
+  if (seedReplay || seedWrite) seedInputHash = canonInputHash();
+  if (seedReplay) mtSeedVerifyInputHash(seedInputHash);
+  if (seedWrite) mtSeedAssertCompatible();
   std::map<SuperNode*, int>times;
+  if (seedReplay) {
+    std::set<SuperNode*, SeedRankLess> s;
+    for (SuperNode* node : supersrc) {
+      if (node->depPrev.size() == 0) s.insert(node);
+    }
+    std::vector<SuperNode*> potentialRegs;
+    std::set<SuperNode*> visited;
+    while(!s.empty()) {
+      SuperNode* top = *s.begin();
+      s.erase(s.begin());
+      Assert(visited.find(top) == visited.end(), "superNode %d is already visited\n", top->id);
+      visited.insert(top);
+      sortedSuper.push_back(top);
+      for (SuperNode* next : seedRankOrdered(top->depNext)) {
+        if (times.find(next) == times.end()) times[next] = 0;
+        times[next] ++;
+        if (times[next] == (int)next->depPrev.size()) {
+          s.insert(next);
+        }
+      }
+    }
+    sortedSuper.insert(sortedSuper.end(), potentialRegs.begin(), potentialRegs.end());
+    orderAllNodes();
+    return;
+  }
   if (stableOrder) {
     std::set<SuperNode*, SuperNodeStableLess> s;
     for (SuperNode* node : supersrc) {
@@ -35,6 +66,7 @@ void graph::topoSort() {
     }
     sortedSuper.insert(sortedSuper.end(), potentialRegs.begin(), potentialRegs.end());
     orderAllNodes();
+    if (seedWrite) mtSeedWrite(std::getenv("GSIM_SCHEDULE_SEED_WRITE"), sortedSuper, seedInputHash, "wip/dense-b1-lookahead");
     return;
   }
   std::stack<SuperNode*> s;
@@ -69,5 +101,6 @@ void graph::topoSort() {
   sortedSuper.insert(sortedSuper.end(), potentialRegs.begin(), potentialRegs.end());
   /* order sortedSuper */
   orderAllNodes();
+  if (seedWrite) mtSeedWrite(std::getenv("GSIM_SCHEDULE_SEED_WRITE"), sortedSuper, seedInputHash, "wip/dense-b1-lookahead");
 }
 
