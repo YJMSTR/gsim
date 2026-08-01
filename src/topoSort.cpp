@@ -14,11 +14,13 @@ void graph::topoSort() {
   const bool seedReplay = mtSeedReplayActive();
   const bool seedWrite = mtSeedWriteActive();
   const bool seed2Write = mtSeed2WriteActive();
+  const bool seed2Replay = mtSeed2ReplayActive();
   uint64_t seedInputHash = 0;
-  if (seedReplay || seedWrite || seed2Write) seedInputHash = canonInputHash();
+  if (seedReplay || seedWrite || seed2Write || seed2Replay) seedInputHash = canonInputHash();
   if (seedReplay) mtSeedVerifyInputHash(seedInputHash);
   if (seedWrite) mtSeedAssertCompatible();
   if (seed2Write) { mtSeed2AssertCompatible(); mtSeed2SetInputHash(seedInputHash); }
+  if (seed2Replay) mtSeed2VerifyInputHash(seedInputHash);
   std::map<SuperNode*, int>times;
   if (seedReplay) {
     std::set<SuperNode*, SeedRankLess> s;
@@ -70,6 +72,7 @@ void graph::topoSort() {
     orderAllNodes();
     if (seedWrite) mtSeedWrite(std::getenv("GSIM_SCHEDULE_SEED_WRITE"), sortedSuper, seedInputHash, "wip/dense-b1-lookahead");
     if (seed2Write) mtSeed2RecordPoint("pass.topoSort", sortedSuper, canonInputHash());
+    if (seed2Replay) { mtSeed2ApplyPoint("pass.topoSort", sortedSuper, canonInputHash()); orderAllNodes(); }
     return;
   }
   std::stack<SuperNode*> s;
@@ -106,5 +109,6 @@ void graph::topoSort() {
   orderAllNodes();
   if (seedWrite) mtSeedWrite(std::getenv("GSIM_SCHEDULE_SEED_WRITE"), sortedSuper, seedInputHash, "wip/dense-b1-lookahead");
   if (seed2Write) mtSeed2RecordPoint("pass.topoSort", sortedSuper, canonInputHash());
+  if (seed2Replay) { mtSeed2ApplyPoint("pass.topoSort", sortedSuper, canonInputHash()); orderAllNodes(); }
 }
 

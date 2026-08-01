@@ -494,5 +494,8 @@ bool mtSeed2ReplayActive();
 void mtSeed2AssertCompatible();
 void mtSeed2SetInputHash(uint64_t h);
 void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSuper, uint64_t canonHash);
+void mtSeed2VerifyInputHash(uint64_t computedInputHash);
+void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, uint64_t currentCanonHash);
+bool mtSeed2ReplayPointPending(const char* tag);
 
 #endif

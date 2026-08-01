@@ -164,3 +164,130 @@ void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSu
   fprintf(stderr, "[schedule-seed2] recorded %-24s nodes=%zu canon=%016zx\n",
           tag, sortedSuper.size(), (size_t)canonHash);
 }
+
+// ---------------- replay side (S2) ----------------
+
+namespace {
+
+struct Seed2Reader {
+  bool loaded = false;
+  uint64_t inputHash = 0;
+  std::vector<std::string> keys;
+  std::vector<Seed2Point> points;
+  size_t cursor = 0;
+};
+
+Seed2Reader& seed2Reader() {
+  static Seed2Reader r;
+  return r;
+}
+
+uint32_t seed2ReadU32(FILE* fp, const char* path) {
+  uint32_t v;
+  Assert(std::fread(&v, 4, 1, fp) == 1, "seed2: truncated file %s", path);
+  return v;
+}
+uint64_t seed2ReadU64(FILE* fp, const char* path) {
+  uint64_t v;
+  Assert(std::fread(&v, 8, 1, fp) == 1, "seed2: truncated file %s", path);
+  return v;
+}
+std::string seed2ReadStr(FILE* fp, const char* path) {
+  uint32_t n = seed2ReadU32(fp, path);
+  std::string s(n, '\0');
+  if (n) Assert(std::fread(s.data(), 1, n, fp) == n, "seed2: truncated file %s", path);
+  return s;
+}
+
+void mtSeed2Load() {
+  Seed2Reader& r = seed2Reader();
+  if (r.loaded) return;
+  mtSeed2AssertCompatible();
+  const char* path = std::getenv("GSIM_SCHEDULE_SEED2");
+  Assert(path != nullptr, "mtSeed2Load without GSIM_SCHEDULE_SEED2");
+  FILE* fp = std::fopen(path, "rb");
+  Assert(fp != nullptr, "cannot open schedule seed2 %s", path);
+  char magic[4];
+  Assert(std::fread(magic, 1, 4, fp) == 4 && std::memcmp(magic, SEED2_MAGIC, 4) == 0,
+         "seed2: bad magic in %s (not a GS2 file)", path);
+  uint32_t version = seed2ReadU32(fp, path);
+  Assert(version == SEED2_VERSION, "seed2: unsupported version %u in %s", version, path);
+  r.inputHash = seed2ReadU64(fp, path);
+  std::string generator = seed2ReadStr(fp, path);
+  uint32_t pointCount = seed2ReadU32(fp, path);
+  uint32_t nameCount = seed2ReadU32(fp, path);
+  uint32_t whenGroupCount = seed2ReadU32(fp, path);
+  r.keys.reserve(nameCount);
+  for (uint32_t i = 0; i < nameCount; i++) r.keys.push_back(seed2ReadStr(fp, path));
+  r.points.reserve(pointCount);
+  for (uint32_t i = 0; i < pointCount; i++) {
+    Seed2Point p;
+    p.tag = seed2ReadStr(fp, path);
+    p.canonHash = seed2ReadU64(fp, path);
+    uint32_t n = seed2ReadU32(fp, path);
+    p.nameIds.resize(n);
+    if (n) Assert(std::fread(p.nameIds.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
+    r.points.push_back(std::move(p));
+  }
+  // whenMap section is consumed by S3; skip its bytes here (format fixed in S1).
+  for (uint32_t i = 0; i < whenGroupCount; i++) {
+    (void)seed2ReadU32(fp, path);
+    uint32_t n = seed2ReadU32(fp, path);
+    if (n) Assert(std::fseek(fp, 4L * n, SEEK_CUR) == 0, "seed2: truncated file %s", path);
+  }
+  std::fclose(fp);
+  r.loaded = true;
+  fprintf(stderr, "[schedule-seed2] loaded %s: generator=%s points=%zu names=%zu whenGroups=%u\n",
+          path, generator.c_str(), r.points.size(), r.keys.size(), whenGroupCount);
+}
+
+}  // namespace
+
+void mtSeed2VerifyInputHash(uint64_t computedInputHash) {
+  mtSeed2Load();
+  Seed2Reader& r = seed2Reader();
+  Assert(r.inputHash == computedInputHash,
+         "seed2 input mismatch: seed has %016zx, this run computes %016zx (different RTL/front-end state)",
+         (size_t)r.inputHash, (size_t)computedInputHash);
+}
+
+// Force sortedSuper to the recorded permutation of the NEXT expected point.
+// The caller recomputes order fields (orderAllNodes) after this returns.
+void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, uint64_t currentCanonHash) {
+  mtSeed2Load();
+  Seed2Reader& r = seed2Reader();
+  Assert(r.cursor < r.points.size(),
+         "seed2 replay: run produced point %s but the seed has only %zu points (config mismatch)",
+         tag, r.points.size());
+  const Seed2Point& p = r.points[r.cursor];
+  Assert(p.tag == tag,
+         "seed2 replay divergence: run reached point %s but the seed expects %s (pass-flow mismatch)",
+         p.tag.c_str(), tag);
+  Assert(p.canonHash == currentCanonHash,
+         "seed2 replay divergence at %s: seed canon %016zx vs run %016zx (an upstream order-consuming point was not pinned)",
+         tag, (size_t)p.canonHash, (size_t)currentCanonHash);
+  Assert(p.nameIds.size() == sortedSuper.size(),
+         "seed2 replay divergence at %s: seed has %zu nodes, run has %zu",
+         tag, p.nameIds.size(), sortedSuper.size());
+  std::unordered_map<std::string, SuperNode*> byKey;
+  byKey.reserve(sortedSuper.size() * 2);
+  for (SuperNode* super : sortedSuper) byKey.emplace(seed2KeyOf(super), super);
+  std::vector<SuperNode*> forced;
+  forced.reserve(sortedSuper.size());
+  for (uint32_t id : p.nameIds) {
+    auto it = byKey.find(r.keys[id]);
+    Assert(it != byKey.end(), "seed2 replay: recorded node key missing at %s (seed/run graph mismatch)", tag);
+    forced.push_back(it->second);
+  }
+  sortedSuper = std::move(forced);
+  r.cursor++;
+  fprintf(stderr, "[schedule-seed2] applied  %-24s nodes=%zu canon=%016zx (%zu/%zu)\n",
+          tag, sortedSuper.size(), (size_t)currentCanonHash, r.cursor, r.points.size());
+}
+
+bool mtSeed2ReplayPointPending(const char* tag) {
+  if (!mtSeed2ReplayActive()) return false;
+  mtSeed2Load();
+  Seed2Reader& r = seed2Reader();
+  return r.cursor < r.points.size() && r.points[r.cursor].tag == tag;
+}

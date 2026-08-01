@@ -15,7 +15,14 @@ void graph::resort(const char* seed2Tag) {
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   const bool seedReplay = mtSeedReplayActive();
   const bool seed2Write = mtSeed2WriteActive();
-  auto recordSeed2 = [&]() { if (seed2Write && seed2Tag) mtSeed2RecordPoint(seed2Tag, sortedSuper, canonInputHash()); };
+  const bool seed2Replay = mtSeed2ReplayActive();
+  auto recordSeed2 = [&]() {
+    if (seed2Write && seed2Tag) mtSeed2RecordPoint(seed2Tag, sortedSuper, canonInputHash());
+    if (seed2Replay && seed2Tag) {
+      mtSeed2ApplyPoint(seed2Tag, sortedSuper, canonInputHash());
+      orderAllNodes();
+    }
+  };
   std::map<SuperNode*, int>times;
   if (seedReplay) {
     std::set<SuperNode*, SeedRankLess> s;
