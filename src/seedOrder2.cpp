@@ -165,6 +165,18 @@ void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSu
           tag, sortedSuper.size(), (size_t)canonHash);
 }
 
+// S3: record one mergeWhenNodes group (application order = call order).
+void mtSeed2RecordWhenGroup(const SuperNode* cond, const std::vector<SuperNode*>& sources) {
+  mtSeed2AssertCompatible();
+  Seed2Writer& w = seed2Writer();
+  Assert(!sources.empty(), "seed2: when group with no sources");
+  Seed2WhenGroup g;
+  g.condKey = w.intern(seed2KeyOf(cond));
+  g.sources.reserve(sources.size());
+  for (const SuperNode* s : sources) g.sources.push_back(w.intern(seed2KeyOf(s)));
+  w.whenGroups.push_back(std::move(g));
+}
+
 // ---------------- replay side (S2) ----------------
 
 namespace {
@@ -174,6 +186,7 @@ struct Seed2Reader {
   uint64_t inputHash = 0;
   std::vector<std::string> keys;
   std::vector<Seed2Point> points;
+  std::vector<Seed2WhenGroup> whenGroups;
   size_t cursor = 0;
 };
 
@@ -229,11 +242,15 @@ void mtSeed2Load() {
     if (n) Assert(std::fread(p.nameIds.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
     r.points.push_back(std::move(p));
   }
-  // whenMap section is consumed by S3; skip its bytes here (format fixed in S1).
+  // whenMap section (S3): recorded merge groups in application order.
+  r.whenGroups.reserve(whenGroupCount);
   for (uint32_t i = 0; i < whenGroupCount; i++) {
-    (void)seed2ReadU32(fp, path);
+    Seed2WhenGroup g;
+    g.condKey = seed2ReadU32(fp, path);
     uint32_t n = seed2ReadU32(fp, path);
-    if (n) Assert(std::fseek(fp, 4L * n, SEEK_CUR) == 0, "seed2: truncated file %s", path);
+    g.sources.resize(n);
+    if (n) Assert(std::fread(g.sources.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
+    r.whenGroups.push_back(std::move(g));
   }
   std::fclose(fp);
   r.loaded = true;
@@ -290,4 +307,27 @@ bool mtSeed2ReplayPointPending(const char* tag) {
   mtSeed2Load();
   Seed2Reader& r = seed2Reader();
   return r.cursor < r.points.size() && r.points[r.cursor].tag == tag;
+}
+
+// S3 replay accessors: recorded when groups as key strings, in application order.
+std::string mtSeed2KeyOf(const SuperNode* super) { return seed2KeyOf(super); }
+
+size_t mtSeed2WhenGroupCount() {
+  mtSeed2Load();
+  return seed2Reader().whenGroups.size();
+}
+
+std::string mtSeed2WhenGroupCondKey(size_t i) {
+  Seed2Reader& r = seed2Reader();
+  Assert(i < r.whenGroups.size(), "seed2: when group index %zu out of range", i);
+  return r.keys[r.whenGroups[i].condKey];
+}
+
+std::vector<std::string> mtSeed2WhenGroupSourceKeys(size_t i) {
+  Seed2Reader& r = seed2Reader();
+  Assert(i < r.whenGroups.size(), "seed2: when group index %zu out of range", i);
+  std::vector<std::string> out;
+  out.reserve(r.whenGroups[i].sources.size());
+  for (uint32_t id : r.whenGroups[i].sources) out.push_back(r.keys[id]);
+  return out;
 }

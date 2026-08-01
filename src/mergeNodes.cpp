@@ -4,6 +4,7 @@
 #include <vector>
 #include <stack>
 #include <set>
+#include <unordered_map>
 #include "common.h"
 #define MAX_NODES_PER_SUPER 7000
 #define MAX_SUBLINGS 30
@@ -107,6 +108,33 @@ void graph::mergeWhenNodes() {
   // generation); default keeps the original pointer-order behavior.
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   const bool seedReplay = mtSeedReplayActive();
+  const bool seed2Write = mtSeed2WriteActive();
+  const bool seed2Replay = mtSeed2ReplayActive();
+  if (seed2Replay) {
+    // S3 exact replay: the frontier traversal below only exists to DECIDE the merge
+    // groups; replay applies the recorded groups verbatim against the pre-merge graph.
+    std::unordered_map<std::string, SuperNode*> byKey;
+    for (SuperNode* super : sortedSuper)
+      if (super->superType == SUPER_VALID) byKey.emplace(mtSeed2KeyOf(super), super);
+    const size_t groupCount = mtSeed2WhenGroupCount();
+    for (size_t gi = 0; gi < groupCount; gi++) {
+      std::vector<std::string> srcKeys = mtSeed2WhenGroupSourceKeys(gi);
+      Assert(!srcKeys.empty(), "seed2 replay: empty when group %zu", gi);
+      auto tit = byKey.find(srcKeys[0]);
+      Assert(tit != byKey.end(), "seed2 replay: when target key missing for group %zu (pre-merge graph mismatch)", gi);
+      SuperNode* target = tit->second;
+      for (size_t i = 1; i < srcKeys.size(); i++) {
+        auto sit = byKey.find(srcKeys[i]);
+        Assert(sit != byKey.end(), "seed2 replay: when source key missing for group %zu (pre-merge graph mismatch)", gi);
+        SuperNode* src = sit->second;
+        for (Node* member : src->member) {
+          target->add_member(member);
+          member->super = target;
+        }
+        src->member.clear();
+      }
+    }
+  } else {
   std::queue<SuperNode*> s;
   std::queue<SuperNode*> cond;
   std::map<SuperNode*, std::set<SuperNode*>> allCond;
@@ -227,9 +255,18 @@ void graph::mergeWhenNodes() {
       }
     }
   };
+  if (seed2Write) {
+    // S3: record groups with PRE-merge keys (applyWhenMap empties the sources).
+    // Iteration order matches the applyWhenMap call below exactly.
+    auto recordGroups = [](auto& m) { for (auto& kv : m) mtSeed2RecordWhenGroup(kv.first, kv.second); };
+    if (seedReplay) recordGroups(whenMapSeed);
+    else if (stableOrder) recordGroups(whenMapStable);
+    else recordGroups(whenMapOrig);
+  }
   if (seedReplay) applyWhenMap(whenMapSeed);
   else if (stableOrder) applyWhenMap(whenMapStable);
   else applyWhenMap(whenMapOrig);
+  }  // end else (seed2Replay verbatim application above)
   size_t prevSuper = sortedSuper.size();
   removeEmptySuper();
   reconnectSuper();
