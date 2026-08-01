@@ -10,10 +10,12 @@
 
 // #define SUPER_BOUND 35
 
-void graph::resort() {
+void graph::resort(const char* seed2Tag) {
   // v432: GSIM_STABLE_ORDER=1 selects the deterministic frontier (see topoSort).
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   const bool seedReplay = mtSeedReplayActive();
+  const bool seed2Write = mtSeed2WriteActive();
+  auto recordSeed2 = [&]() { if (seed2Write && seed2Tag) mtSeed2RecordPoint(seed2Tag, sortedSuper, canonInputHash()); };
   std::map<SuperNode*, int>times;
   if (seedReplay) {
     std::set<SuperNode*, SeedRankLess> s;
@@ -40,6 +42,7 @@ void graph::resort() {
     }
     Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", prevSize, sortedSuper.size());
     orderAllNodes();
+    recordSeed2();
     return;
   }
   if (stableOrder) {
@@ -67,6 +70,7 @@ void graph::resort() {
     }
     Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", prevSize, sortedSuper.size());
     orderAllNodes();
+    recordSeed2();
     return;
   }
   std::stack<SuperNode*> s;
@@ -101,6 +105,7 @@ void graph::resort() {
 
   Assert(sortedSuper.size() == prevSize, "invalid size %ld %ld\n", prevSize, sortedSuper.size());
   orderAllNodes();
+  recordSeed2();
 }
 
 // coarsen phase
@@ -183,7 +188,7 @@ void graph::graphCoarsen() {
   canonDumpTag("coarsen.resetAll");
 
   mergeWhenNodes();
-  resort();
+  resort("coarsen.when.resort");
   canonDumpTag("coarsen.when");
 
   mergeOut1();
@@ -507,7 +512,7 @@ void graph::graphPartition() {
 
 /* coarsen phase */
   graphCoarsen();
-  resort();
+  resort("partition.postCoarsen.resort");
   printf("[graphCoarsen] remove %ld superNodes (%ld -> %ld)\n", phaseSuper - sortedSuper.size(), phaseSuper, sortedSuper.size());
 
 /* initial partition */

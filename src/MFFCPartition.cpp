@@ -204,7 +204,7 @@ void graph::essentPartition(){
   for (SuperNode* super : sortedSuper) {
     std::sort(super->member.begin(), super->member.end(), sortOrderCmp);
   }
-  resort();
+  resort("essent.mffc.resort");
   printf("[mergeNodes-MFFC] remove %ld superNodes (%ld -> %ld)\n", phaseSuper - sortedSuper.size(), phaseSuper, sortedSuper.size());
 
   phaseSuper = sortedSuper.size();
@@ -222,7 +222,7 @@ void graph::essentPartition(){
   for (SuperNode* super : sortedSuper) {
     std::sort(super->member.begin(), super->member.end(), sortOrderCmp);
   }
-  resort();
+  resort("essent.smallSib1.resort");
 
   printf("[mergeNodes-smallSib1] remove %ld superNodes (%ld -> %ld)\n", phaseSuper - sortedSuper.size(), phaseSuper, sortedSuper.size());
   phaseSuper = sortedSuper.size();
@@ -230,7 +230,7 @@ void graph::essentPartition(){
   for (SuperNode* super : sortedSuper) {
     std::sort(super->member.begin(), super->member.end(), sortOrderCmp);
   }
-  resort();
+  resort("essent.smallSib2.resort");
 
   printf("[mergeNodes-smallSib2] remove %ld superNodes (%ld -> %ld)\n", phaseSuper - sortedSuper.size(), phaseSuper, sortedSuper.size());
   phaseSuper = sortedSuper.size();

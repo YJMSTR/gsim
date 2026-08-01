@@ -486,4 +486,13 @@ static inline std::vector<SuperNode*> seedRankOrdered(const std::set<SuperNode*>
   return ordered;
 }
 
+// GSIM_SCHEDULE_SEED2 exact replay (src/seedOrder2.cpp; design docs/exact-replay-v2-design.md).
+// v2 records per-point OUTCOMES (topoSort + every resort + whenMap) and replays them
+// verbatim, removing v1's policy-derived shape tax.
+bool mtSeed2WriteActive();
+bool mtSeed2ReplayActive();
+void mtSeed2AssertCompatible();
+void mtSeed2SetInputHash(uint64_t h);
+void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSuper, uint64_t canonHash);
+
 #endif

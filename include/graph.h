@@ -83,7 +83,7 @@ private:
   void graphCoarsen();
   void graphInitPartition();
   void graphRefine();
-  void resort();
+  void resort(const char* seed2Tag = nullptr);
   void detectSortedSuperLoop();
   void when2mux();
  public:
