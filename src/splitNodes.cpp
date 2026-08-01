@@ -787,9 +787,22 @@ void graph::splitNodes() {
       if (next->isArray()) arrayMember.insert(node);
     }
   }
+  // v441: iterate the split loop in node->order (derived from sortedSuper, pinned by
+  // seed2 replay) instead of pointer order. Pointer order made the split/re-infer
+  // sequence allocator-layout-dependent and could even crash inferComponent
+  // ("not visited when infer") when a re-infer ran before its dependency's component
+  // was ready. Membership stays in std::set; only iteration order changes.
+  auto orderedOf = [](const std::set<Node*>& ends) {
+    std::vector<Node*> v(ends.begin(), ends.end());
+    std::sort(v.begin(), v.end(), [](const Node* a, const Node* b) {
+      if (a->order != b->order) return a->order < b->order;
+      return a->name < b->name;  // unique-name tie-break (newly split nodes share order-1)
+    });
+    return v;
+  };
   while (!checkNodes.empty()) {
     /* split common nodes */
-    for (Node* node : checkNodes) {
+    for (Node* node : orderedOf(checkNodes)) {
       // printf("node %s(w = %d, type %d):\n", node->name.c_str(), node->width, node->type);
       Node* updateNode = node->type == NODE_REG_SRC ? node->getDst() : node;
       // for (auto cut : nodeSegments[node].first->boundCount) printf("[%d]=%d ", cut.first, cut.second);

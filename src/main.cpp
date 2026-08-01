@@ -531,10 +531,13 @@ int main(int argc, char** argv) {
   munmap(strbuf, mapSize);
 
   FUNC_WRAPPER(g = AST2Graph(globalRoot), "Init");
+  if (std::getenv("GSIM_DEBUG_PRE_CANON")) fprintf(stderr, "[pre-canon] ast2graph %016zx\n", (size_t)g->canonRawHash());
 
   FUNC_TIMER(g->splitArray());
+  if (std::getenv("GSIM_DEBUG_PRE_CANON")) fprintf(stderr, "[pre-canon] splitArray %016zx\n", (size_t)g->canonRawHash());
 
   FUNC_TIMER(g->detectLoop());
+  if (std::getenv("GSIM_DEBUG_PRE_CANON")) fprintf(stderr, "[pre-canon] detectLoop %016zx\n", (size_t)g->canonRawHash());
 
   FUNC_WRAPPER(g->topoSort(), "TopoSort");
   g->canonDumpTag("pass.topoSort");

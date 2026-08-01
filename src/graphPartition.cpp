@@ -152,6 +152,11 @@ void graph::canonDumpTag(const char* tag) {
   uint64_t recHash = 1469598103934665603ULL;
   for (const std::string& r : records) recHash = mixStr(recHash, r);
   fprintf(stderr, "[canon] %-24s records=%016zx order=%016zx count=%zu\n", tag, recHash, orderHash, records.size());
+  if (const char* dumpDir = std::getenv("GSIM_DEBUG_CANON_DUMP")) {
+    std::string p = std::string(dumpDir) + "/canon-" + tag + ".txt";
+    FILE* df = std::fopen(p.c_str(), "w");
+    if (df) { for (const std::string& r : records) std::fprintf(df, "%s\n", r.c_str()); std::fclose(df); }
+  }
   const char* stop = std::getenv("GSIM_DEBUG_CANON_STOP_AFTER");
   if (stop && std::string(stop) == tag) { std::fprintf(stderr, "[canon] stop after %s\n", tag); std::exit(0); }
 }
@@ -180,6 +185,38 @@ uint64_t graph::canonInputHash() {
   std::vector<std::string> records;
   records.reserve(sortedSuper.size());
   for (SuperNode* super : sortedSuper) {
+    if (super->superType != SUPER_VALID) continue;
+    records.push_back(keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext));
+  }
+  std::sort(records.begin(), records.end());
+  uint64_t recHash = 1469598103934665603ULL;
+  for (const std::string& r : records) recHash = mixStr(recHash, r);
+  return recHash;
+}
+
+// Pre-topoSort variant over supersrc (sortedSuper is empty before topoSort).
+// Same record construction so hashes are comparable with canonInputHash.
+uint64_t graph::canonRawHash() {
+  auto keyOf = [](SuperNode* e) {
+    std::string k;
+    for (Node* m : e->member) { k += m->name; k += ';'; }
+    return k;
+  };
+  auto sortedEnds = [&](const std::set<SuperNode*>& ends) {
+    std::vector<std::string> keys;
+    for (SuperNode* e : ends) keys.push_back(keyOf(e));
+    std::sort(keys.begin(), keys.end());
+    std::string joined;
+    for (const std::string& k : keys) { joined += k; joined += ','; }
+    return joined;
+  };
+  auto mixStr = [](uint64_t h, const std::string& s) {
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+  };
+  std::vector<std::string> records;
+  records.reserve(supersrc.size());
+  for (SuperNode* super : supersrc) {
     if (super->superType != SUPER_VALID) continue;
     records.push_back(keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext));
   }

@@ -16,6 +16,8 @@ public:
   void canonDumpTag(const char* tag);
   // Canonical order-free content hash of the current graph (seed input identity).
   uint64_t canonInputHash();
+  // Pre-topoSort variant over supersrc (GSIM_DEBUG_PRE_CANON bisect).
+  uint64_t canonRawHash();
 private:
   FILE *srcFp;
   int srcFileIdx;
