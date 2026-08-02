@@ -96,6 +96,7 @@ class AggrParentNode {  // virtual type_aggregate node, used for aggregate conne
 class Node {
   static int counter;
  public:
+  static void setCounter(int v) { counter = v; }
 
   Node(NodeType _type = NODE_OTHERS) {
     type    = _type;

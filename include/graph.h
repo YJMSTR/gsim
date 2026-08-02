@@ -18,6 +18,8 @@ public:
   uint64_t canonInputHash();
   // Pre-topoSort variant over supersrc (GSIM_DEBUG_PRE_CANON bisect).
   uint64_t canonRawHash();
+  // Renumber all emittable nodes by name (content-stable ids for emission).
+  void renumberNodesContentStable();
   // seed2 pin-point wrappers (record/apply + canon verify at a pass boundary).
   void canonSeed2Record(const char* tag);
   void canonSeed2Apply(const char* tag);
