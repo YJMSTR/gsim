@@ -17,6 +17,7 @@ void graph::renumberNodesContentStable() {
   int next = 1;
   for (Node* n : all) n->id = next ++;
   Node::setCounter(next);
+  fprintf(stderr, "[renumber] %zu nodes content-stably renumbered\n", all.size());
 }
 
 void graph::reconnectAll() {

@@ -596,6 +596,9 @@ int main(int argc, char** argv) {
   if (mtSeed2ReplayActive()) g->canonSeed2Apply("pass.preEmit");
   g->canonDumpTag("pass.preEmit");
 
+
+  g->renumberNodesContentStable();
+
   FUNC_WRAPPER(g->cppEmitter(), "Final");
 
   TIMER_END(total);
