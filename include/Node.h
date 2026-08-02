@@ -498,6 +498,7 @@ void mtSeed2VerifyInputHash(uint64_t computedInputHash);
 void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, uint64_t currentCanonHash);
 bool mtSeed2ReplayPointPending(const char* tag);
 std::string mtSeed2KeyOf(const SuperNode* super);
+std::string mtSeed2FullKeyOf(const SuperNode* super);
 void mtSeed2RecordWhenGroup(const SuperNode* cond, const std::vector<SuperNode*>& sources);
 size_t mtSeed2WhenGroupCount();
 std::string mtSeed2WhenGroupCondKey(size_t i);

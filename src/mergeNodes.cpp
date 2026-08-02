@@ -115,7 +115,7 @@ void graph::mergeWhenNodes() {
     // groups; replay applies the recorded groups verbatim against the pre-merge graph.
     std::unordered_map<std::string, SuperNode*> byKey;
     for (SuperNode* super : sortedSuper)
-      if (super->superType == SUPER_VALID) byKey.emplace(mtSeed2KeyOf(super), super);
+      if (super->superType == SUPER_VALID) byKey.emplace(mtSeed2FullKeyOf(super), super);
     const size_t groupCount = mtSeed2WhenGroupCount();
     for (size_t gi = 0; gi < groupCount; gi++) {
       std::vector<std::string> srcKeys = mtSeed2WhenGroupSourceKeys(gi);

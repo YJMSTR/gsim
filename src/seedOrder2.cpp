@@ -35,6 +35,7 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <deque>
 #include <vector>
 #include "common.h"
 
@@ -100,6 +101,40 @@ std::string seed2KeyOf(const SuperNode* super) {
   return k;
 }
 
+// Full-record key (member names + endpoint keys, same construction as canonInputHash).
+// Used to disambiguate supers whose name-key collides (e.g. empty-member shells all
+// hash to ""): identical full records are interchangeable, distinct ones get distinct keys.
+std::string seed2FullKeyOf(const SuperNode* super) {
+  auto keyOf = [](const SuperNode* e) {
+    std::string k;
+    for (Node* m : e->member) { k += m->name; k += ';'; }
+    return k;
+  };
+  auto sortedEnds = [&](const std::set<SuperNode*>& ends) {
+    std::vector<std::string> keys;
+    for (SuperNode* e : ends) keys.push_back(keyOf(e));
+    std::sort(keys.begin(), keys.end());
+    std::string joined;
+    for (const std::string& k : keys) { joined += k; joined += ','; }
+    return joined;
+  };
+  return keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext);
+}
+
+// Name-key with duplicate disambiguation: cheap name-key for unique supers, full-record
+// key for colliding ones. dupCounts must be computed over the same super set (record side
+// and replay side compute it independently; canon-verified identical content makes them agree).
+static std::string seed2NodeKey(const SuperNode* super, const std::unordered_map<std::string, int>& dupCounts) {
+  std::string k = seed2KeyOf(super);
+  auto it = dupCounts.find(k);
+  if (it != dupCounts.end() && it->second > 1) return "\x01" + seed2FullKeyOf(super);
+  return k;
+}
+
+static void seed2CountKeys(const std::vector<SuperNode*>& supers, std::unordered_map<std::string, int>& out) {
+  for (const SuperNode* super : supers) out[seed2KeyOf(super)]++;
+}
+
 void seed2WriteU32(FILE* fp, uint32_t v) { std::fwrite(&v, 4, 1, fp); }
 void seed2WriteU64(FILE* fp, uint64_t v) { std::fwrite(&v, 8, 1, fp); }
 void seed2WriteStr(FILE* fp, const std::string& s) {
@@ -159,21 +194,25 @@ void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSu
   p.tag = tag;
   p.canonHash = canonHash;
   p.nameIds.reserve(sortedSuper.size());
-  for (SuperNode* super : sortedSuper) p.nameIds.push_back(w.intern(seed2KeyOf(super)));
+  std::unordered_map<std::string, int> dupCounts;
+  seed2CountKeys(sortedSuper, dupCounts);
+  for (SuperNode* super : sortedSuper) p.nameIds.push_back(w.intern(seed2NodeKey(super, dupCounts)));
   w.points.push_back(std::move(p));
   fprintf(stderr, "[schedule-seed2] recorded %-24s nodes=%zu canon=%016zx\n",
           tag, sortedSuper.size(), (size_t)canonHash);
 }
 
 // S3: record one mergeWhenNodes group (application order = call order).
+// Keys are FULL-record keys: no duplicate-count pass needed, and empty-member/merged
+// shells stay distinguishable. Group count is small (thousands), size is irrelevant.
 void mtSeed2RecordWhenGroup(const SuperNode* cond, const std::vector<SuperNode*>& sources) {
   mtSeed2AssertCompatible();
   Seed2Writer& w = seed2Writer();
   Assert(!sources.empty(), "seed2: when group with no sources");
   Seed2WhenGroup g;
-  g.condKey = w.intern(seed2KeyOf(cond));
+  g.condKey = w.intern("\x01" + seed2FullKeyOf(cond));
   g.sources.reserve(sources.size());
-  for (const SuperNode* s : sources) g.sources.push_back(w.intern(seed2KeyOf(s)));
+  for (const SuperNode* s : sources) g.sources.push_back(w.intern("\x01" + seed2FullKeyOf(s)));
   w.whenGroups.push_back(std::move(g));
 }
 
@@ -286,15 +325,22 @@ void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, ui
   Assert(p.nameIds.size() == sortedSuper.size(),
          "seed2 replay divergence at %s: seed has %zu nodes, run has %zu",
          tag, p.nameIds.size(), sortedSuper.size());
-  std::unordered_map<std::string, SuperNode*> byKey;
+  // Resolve with duplicate disambiguation (same scheme as RecordPoint). Colliding
+  // name-keys (e.g. empty-member shells) fall back to full-record keys; supers with
+  // identical full records are interchangeable, so queue order within a key is free.
+  std::unordered_map<std::string, int> dupCounts;
+  seed2CountKeys(sortedSuper, dupCounts);
+  std::unordered_map<std::string, std::deque<SuperNode*>> byKey;
   byKey.reserve(sortedSuper.size() * 2);
-  for (SuperNode* super : sortedSuper) byKey.emplace(seed2KeyOf(super), super);
+  for (SuperNode* super : sortedSuper) byKey[seed2NodeKey(super, dupCounts)].push_back(super);
   std::vector<SuperNode*> forced;
   forced.reserve(sortedSuper.size());
   for (uint32_t id : p.nameIds) {
     auto it = byKey.find(r.keys[id]);
-    Assert(it != byKey.end(), "seed2 replay: recorded node key missing at %s (seed/run graph mismatch)", tag);
-    forced.push_back(it->second);
+    Assert(it != byKey.end() && !it->second.empty(),
+           "seed2 replay: recorded node key missing at %s (seed/run graph mismatch)", tag);
+    forced.push_back(it->second.front());
+    it->second.pop_front();
   }
   sortedSuper = std::move(forced);
   r.cursor++;
@@ -311,6 +357,7 @@ bool mtSeed2ReplayPointPending(const char* tag) {
 
 // S3 replay accessors: recorded when groups as key strings, in application order.
 std::string mtSeed2KeyOf(const SuperNode* super) { return seed2KeyOf(super); }
+std::string mtSeed2FullKeyOf(const SuperNode* super) { return "\x01" + seed2FullKeyOf(super); }
 
 size_t mtSeed2WhenGroupCount() {
   mtSeed2Load();
