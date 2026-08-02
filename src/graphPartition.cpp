@@ -194,6 +194,9 @@ uint64_t graph::canonInputHash() {
   return recHash;
 }
 
+void graph::canonSeed2Record(const char* tag) { mtSeed2RecordPoint(tag, sortedSuper, canonInputHash()); }
+void graph::canonSeed2Apply(const char* tag) { mtSeed2ApplyPoint(tag, sortedSuper, canonInputHash()); orderAllNodes(); }
+
 // Pre-topoSort variant over supersrc (sortedSuper is empty before topoSort).
 // Same record construction so hashes are comparable with canonInputHash.
 uint64_t graph::canonRawHash() {
@@ -235,11 +238,25 @@ void graph::graphCoarsen() {
   resort("coarsen.when.resort");
   canonDumpTag("coarsen.when");
 
+  // v441: pin every order-consuming pass outcome, not just resorts. mergeOut1/In1/
+  // Sublings mutate content AND order; recording the post-pass sortedSuper (with canon
+  // verification) closes the gap where run-to-run content variance was observed
+  // (partition.postCoarsen canon 70725c vs 2237bc across identical write runs).
+  const bool seed2Write = mtSeed2WriteActive();
+  const bool seed2Replay = mtSeed2ReplayActive();
+  auto pinSeed2 = [&](const char* tag) {
+    if (seed2Write) mtSeed2RecordPoint(tag, sortedSuper, canonInputHash());
+    if (seed2Replay) { mtSeed2ApplyPoint(tag, sortedSuper, canonInputHash()); orderAllNodes(); }
+  };
+
   mergeOut1();
+  pinSeed2("coarsen.out1");
   canonDumpTag("coarsen.out1");
   mergeIn1();
+  pinSeed2("coarsen.in1");
   canonDumpTag("coarsen.in1");
   mergeSublings();
+  pinSeed2("coarsen.sublings");
   canonDumpTag("coarsen.sublings");
 }
 
@@ -562,6 +579,8 @@ void graph::graphPartition() {
 /* initial partition */
   phaseSuper = sortedSuper.size();
   graphInitPartition();
+  if (mtSeed2WriteActive()) mtSeed2RecordPoint("partition.init", sortedSuper, canonInputHash());
+  if (mtSeed2ReplayActive()) { mtSeed2ApplyPoint("partition.init", sortedSuper, canonInputHash()); orderAllNodes(); }
   canonDumpTag("partition.init");
   orderAllNodes();
   printf("[InitPartition] remove %ld superNodes (%ld -> %ld)\n", phaseSuper - sortedSuper.size(), phaseSuper, sortedSuper.size());

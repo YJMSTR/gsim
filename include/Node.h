@@ -356,6 +356,7 @@ public:
   InstInfo(std::string _inst, SuperInfo _type = SUPER_INFO_STR) {
     infoType = _type;
     inst = _inst;
+    node = nullptr;
   }
   InstInfo(SuperInfo _infoType, Node* _node, std::string _inst) {
     node = _node;
@@ -365,6 +366,13 @@ public:
   bool operator<(const InstInfo& other) const {
     if (infoType != other.infoType) return infoType < other.infoType;
     if (inst != other.inst) return inst < other.inst;
+    // v441: pointer tie-break made std::set<InstInfo> iteration (StmtNode::compute's
+    // assign bookkeeping) allocator-layout-dependent -> activation bookkeeping lines
+    // moved within emitted functions run-to-run (seed2 preEmit byte-diff). Name is
+    // unique and content-stable; pointer remains only as an unreachable final resort.
+    if ((node == nullptr) != (other.node == nullptr)) return node == nullptr;
+    if (node == nullptr) return false;
+    if (node->name != other.node->name) return node->name < other.node->name;
     return node < other.node;
   }
 };

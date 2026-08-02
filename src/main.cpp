@@ -577,6 +577,9 @@ int main(int argc, char** argv) {
 
   if (!globalConfig.DisableReplicationOpt) {
     FUNC_WRAPPER(g->replicationOpt(), "Replication");
+    // v441: pin the replication outcome (content + order) like the graph passes.
+    if (mtSeed2WriteActive()) g->canonSeed2Record("pass.replication");
+    if (mtSeed2ReplayActive()) g->canonSeed2Apply("pass.replication");
     g->canonDumpTag("pass.replication");
   }
 
@@ -586,6 +589,12 @@ int main(int argc, char** argv) {
   FUNC_TIMER(g->generateStmtTree());
 
   FUNC_TIMER(g->instsGenerator());
+
+  // v441: final pin before emission - the generated source is a pure function of the
+  // graph at this point; a canon match here means byte-identical output.
+  if (mtSeed2WriteActive()) g->canonSeed2Record("pass.preEmit");
+  if (mtSeed2ReplayActive()) g->canonSeed2Apply("pass.preEmit");
+  g->canonDumpTag("pass.preEmit");
 
   FUNC_WRAPPER(g->cppEmitter(), "Final");
 

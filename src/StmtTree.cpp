@@ -243,10 +243,20 @@ void StmtTree::mergeStmtTree(StmtTree* tree) {
  * @param allPath A map of all paths. The path of depPrev(s) are read from it.
  *
  */
-void prevOrderPath(Node* node, std::vector<int>& prevPath, std::map<Node*, std::vector<int>>& allPath) {
+void prevOrderPath(Node* node, std::vector<int>& prevPath, std::map<Node*, std::vector<int>>& allPath, const std::map<Node*, int>& memberRank) {
   if (node->depPrev.size() == 0) return;
+  // v441: merge predecessor paths in member-rank order (pinned), not pointer order -
+  // the merge below is non-commutative (break on decrease), so pointer order leaked
+  // allocator layout into the statement-tree paths.
+  std::vector<Node*> prevs;
   for (Node* prev : node->depPrev) {
     if (prev->super != node->super) continue;
+    prevs.push_back(prev);
+  }
+  std::sort(prevs.begin(), prevs.end(), [&](Node* a, Node* b) {
+    return memberRank.at(a) < memberRank.at(b);
+  });
+  for (Node* prev : prevs) {
     Assert(allPath.find(prev) != allPath.end(), "path of %s not exits", prev->name.c_str());
     /* merge prevPath */
     for (size_t i = 0; i < allPath[prev].size(); i ++) {
@@ -335,23 +345,29 @@ void SuperNode::reorderMember() {
       if (prev->super == this) nodePrev[node] ++;
     }
   }
-  std::stack<Node*> s;
-  for (auto iter : nodePrev) {
-    if (iter.second == 0) {
-      newMember.push_back(iter.first);
-      s.push(iter.first);
-    }
-  }
-  while (!s.empty()) {
-    Node* node = s.top();
-    s.pop();
-    for (Node* next : node->depNext) {
-      if (next->super == this) {
-        nodePrev[next] --;
-        if (nodePrev[next] == 0) {
-          newMember.push_back(next);
-          s.push(next);
-        }
+  // v441: stable topological reorder. The original seeded the Kahn frontier from the
+  // pointer-keyed nodePrev map and walked depNext in pointer order, so the resulting
+  // member order varied with allocator layout (caught by the seed2 preEmit canon gate).
+  // Frontier and successor visits now follow the CURRENT member order (pinned by replay).
+  std::map<Node*, int> rank;
+  for (size_t i = 0; i < member.size(); i ++) rank[member[i]] = (int)i;
+  auto rankLess = [&](Node* a, Node* b) { return rank[a] < rank[b]; };
+  std::vector<Node*> frontier;
+  for (Node* node : member) if (nodePrev[node] == 0) frontier.push_back(node);
+  std::sort(frontier.begin(), frontier.end(), rankLess);
+  size_t head = 0;
+  while (head < frontier.size()) {
+    Node* node = frontier[head ++];
+    newMember.push_back(node);
+    std::vector<Node*> nexts;
+    for (Node* next : node->depNext) if (next->super == this) nexts.push_back(next);
+    std::sort(nexts.begin(), nexts.end(), rankLess);
+    for (Node* next : nexts) {
+      nodePrev[next] --;
+      if (nodePrev[next] == 0) {
+        // keep frontier sorted by rank (insertion into an almost-sorted vector)
+        auto pos = std::lower_bound(frontier.begin() + head, frontier.end(), next, rankLess);
+        frontier.insert(pos, next);
       }
     }
   }
@@ -394,10 +410,14 @@ void graph::generateStmtTree() {
   for (SuperNode* super : sortedSuper) {
     super->stmtTree = new StmtTree();
     super->stmtTree->root = new StmtNode(OP_STMT_SEQ);
+    // v441: rank in the post-reorder member vector (reorderMember changed it after
+    // orderAllNodes set orderInSuper); lookup-only map, feeds prevOrderPath ordering.
+    std::map<Node*, int> memberRank;
+    for (size_t i = 0; i < super->member.size(); i ++) memberRank[super->member[i]] = (int)i;
     for (Node* node : super->member) {
       std::vector<int> prevPath; // The max path within all depPrev node within the same supernode
       std::vector<int> nodePath; // For node with multiple assignTree, the path of lastest visited tree
-      prevOrderPath(node, prevPath, allPath);
+      prevOrderPath(node, prevPath, allPath, memberRank);
       for (ExpTree* tree : node->assignTree) {
         super->stmtTree->mergeExpTree(tree, prevPath, nodePath, node);
         /* update reg_dst when asyreset arrives */
