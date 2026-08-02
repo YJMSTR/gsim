@@ -659,15 +659,19 @@ static bool mtUseDenseForwardActivationOnly() {
 static void dumpMtDenseMemberMetadataForTask(FILE* fp, SuperNode* super) {
   fprintf(fp, ", \"member_nodes\": [");
   bool first = true;
+  int memberIdx = 0;  // v441: content-stable local index (node->id drifts, see oldName)
   for (Node* node : super->member) {
     if (!node) continue;
     if (!first) fprintf(fp, ", ");
     first = false;
     fprintf(fp, "{\"node_id\": %d, \"node_name\": \"%s\", \"node_type\": \"%s\"}",
-            node->id, jsonEscape(node->name).c_str(), nodeTypeName(node->type));
+            memberIdx ++, jsonEscape(node->name).c_str(), nodeTypeName(node->type));
   }
   fprintf(fp, "], \"instruction_ownership\": [");
   first = true;
+  // v441: owner ids as content-stable member indices (node->id drifts, see oldName).
+  std::map<Node*, int> memberIndex;
+  for (size_t mi = 0; mi < super->member.size(); mi ++) memberIndex[super->member[mi]] = (int)mi;
   for (const InstInfo& inst : super->insts) {
     if (!first) fprintf(fp, ", ");
     first = false;
@@ -675,8 +679,10 @@ static void dumpMtDenseMemberMetadataForTask(FILE* fp, SuperNode* super) {
     // Only ASSIGN_BEG/ASSIGN_END constructors initialize InstInfo::node;
     // the string constructor leaves it uninitialized, so check infoType first.
     if ((inst.infoType == SUPER_INFO_ASSIGN_BEG || inst.infoType == SUPER_INFO_ASSIGN_END) && inst.node) {
+      auto miIt = memberIndex.find(inst.node);
+      int ownerId = miIt == memberIndex.end() ? -1 : miIt->second;
       fprintf(fp, ", \"owner_node_id\": %d, \"owner_node_name\": \"%s\", \"owner_node_type\": \"%s\"",
-              inst.node->id, jsonEscape(inst.node->name).c_str(), nodeTypeName(inst.node->type));
+              ownerId, jsonEscape(inst.node->name).c_str(), nodeTypeName(inst.node->type));
     }
     fprintf(fp, "}");
   }

@@ -597,7 +597,6 @@ int main(int argc, char** argv) {
   g->canonDumpTag("pass.preEmit");
 
 
-  g->renumberNodesContentStable();
 
   FUNC_WRAPPER(g->cppEmitter(), "Final");
 
