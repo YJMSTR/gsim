@@ -352,7 +352,14 @@ void graph::mergeResetAll() {
       else uintSuper->add_member(resetRegDst);
     }
   }
-  for (auto iter : resetSuper) {
+  // v441: resetSuper is keyed by Node* (pointer order), which leaked allocator layout
+  // into allReset order and hence into the emission order of the reset functions
+  // (whole 100K-line subReset blocks moved within SimTop*.cpp across runs, caught by
+  // seed2 byte-diff after all canon gates passed - canon covers sortedSuper, not
+  // allReset). Emit in resetNode-name order (unique, content-stable).
+  std::vector<std::pair<Node*, std::pair<SuperNode*, SuperNode*>>> orderedReset(resetSuper.begin(), resetSuper.end());
+  std::sort(orderedReset.begin(), orderedReset.end(), [](const auto& a, const auto& b) { return a.first->name < b.first->name; });
+  for (auto iter : orderedReset) {
     SuperNode* uintSuper = iter.second.first;
     SuperNode* asyncSuper = iter.second.second;
     if (uintSuper->member.size() != 0) {
