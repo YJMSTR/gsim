@@ -6005,7 +6005,7 @@ void graph::dumpMtScheduleJson() {
     fprintf(fp, "    {\n");
     fprintf(fp, "      \"cpp_id\": %d,\n", cppId);
     fprintf(fp, "      \"scan_index\": %d,\n", cppId);
-    fprintf(fp, "      \"super_id\": %d,\n", super->id);
+    fprintf(fp, "      \"super_id\": %d,\n", super->cppId);  // v441: cppId is pinned/content-stable (super->id drifts)
     fprintf(fp, "      \"super_type\": \"%s\",\n", superTypeName(super->superType));
     fprintf(fp, "      \"task_kind\": \"%s\",\n", mtTask.taskKind.c_str());
     fprintf(fp, "      \"serial_reasons\": ");
@@ -6835,7 +6835,7 @@ void graph::dumpMtDenseScheduleJson() {
     uint64_t activeMask;
     std::tie(activeWord, activeMask) = setIdxMask(cppId);
     int denseMTaskId = cppId < static_cast<int>(cppIdToDenseMTask.size()) ? cppIdToDenseMTask[(size_t)cppId] : -1;
-    fprintf(fp, "    {\"cpp_id\": %d, \"scan_index\": %d, \"super_id\": %d, \"super_type\": \"%s\", ", cppId, cppId, super->id, superTypeName(super->superType));
+    fprintf(fp, "    {\"cpp_id\": %d, \"scan_index\": %d, \"super_id\": %d, \"super_type\": \"%s\", ", cppId, cppId, super->cppId, superTypeName(super->superType));  // v441: cppId for super->id
     fprintf(fp, "\"task_kind\": \"%s\", \"dense_mtask_id\": %d, \"serial_reasons\": ", mtTask.taskKind.c_str(), denseMTaskId);
     dumpJsonStringArray(fp, mtTask.serialReasons);
     fprintf(fp, ", \"worker0_only\": %s, \"is_always_active\": %s, ",
