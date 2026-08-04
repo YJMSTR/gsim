@@ -12481,7 +12481,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   int activityConservativeFields = 0;
   int activityScalarFields = 0;
   int activityAlwaysActiveCount = 0;
-  if (activity) {
+  // The PEG dump (GSIM_MT_DENSE_PEG_DUMP) needs the field read/write sets computed in
+  // this block even when the activity feature itself is off (e.g. under LOOKAHEAD,
+  // which force-disables activity). Widen the gate; the activity-only outputs remain
+  // unused locals when activity=false.
+  const bool pegDump = std::getenv("GSIM_MT_DENSE_PEG_DUMP") != nullptr;
+  if (activity || pegDump) {
     const int nM = nMTasks;
     activityAlwaysActive.assign((size_t)nM, 0);
     activityResetHandler.assign((size_t)nM, 0);
