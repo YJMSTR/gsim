@@ -12589,6 +12589,48 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       for (const std::string& f : dstReadFields[(size_t)m]) nextReaders[f].push_back(m);
       for (const std::string& f : commitFields[(size_t)m]) nextReaders[f].push_back(m);
     }
+    // GSIM_MT_DENSE_PEG_DUMP=<prefix>: dump the precedence event graph for recurrence
+    // (max-cycle-ratio) analysis: within-cycle dependency edges (dist=0), cross-cycle
+    // register-feedback edges writer->reader (dist=1), mcost per MTask. Format matches
+    // the mcr tooling (int32 u,v,dist triples; double costs).
+    if (const char* pegPath = std::getenv("GSIM_MT_DENSE_PEG_DUMP")) {
+      std::string edgePath = std::string(pegPath) + "-edges.bin";
+      std::string costPath = std::string(pegPath) + "-cost.bin";
+      FILE* pe = std::fopen(edgePath.c_str(), "wb");
+      FILE* pc = std::fopen(costPath.c_str(), "wb");
+      Assert(pe && pc, "cannot open PEG dump %s", pegPath);
+      int64_t depEdges = 0, wrapEdges = 0;
+      for (int m = 0; m < nM; m++) {
+        if (activityElided[(size_t)m]) continue;
+        for (int succ : denseSchedule.mtasks[(size_t)m].succMTasks) {
+          if (succ < 0 || succ >= nM || activityElided[(size_t)succ]) continue;
+          int32_t t[3] = {m, succ, 0};
+          std::fwrite(t, 4, 3, pe);
+          depEdges ++;
+        }
+      }
+      for (const auto& kv : nextWriters) {
+        auto it = nextReaders.find(kv.first);
+        if (it == nextReaders.end()) continue;
+        for (int w : kv.second) {
+          for (int r : it->second) {
+            if (r == w) continue;
+            int32_t t[3] = {w, r, 1};
+            std::fwrite(t, 4, 3, pe);
+            wrapEdges ++;
+          }
+        }
+      }
+      for (int m = 0; m < nM; m++) {
+        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+        double c = activityElided[(size_t)m] ? 0.0 : (double)(mt.schedCost > 0 ? mt.schedCost : mt.staticCost);
+        std::fwrite(&c, 8, 1, pc);
+      }
+      std::fclose(pe);
+      std::fclose(pc);
+      fprintf(stderr, "[mt-dense-peg] dumped %d nodes dep=%lld wrap=%lld to %s-{edges,cost}.bin\n",
+              nM, (long long)depEdges, (long long)wrapEdges, pegPath);
+    }
     activityNextEdges.assign((size_t)nM, {});
     for (int m = 0; m < nM; m++) {
       if (activityElided[(size_t)m]) continue;
