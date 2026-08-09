@@ -1,6 +1,6 @@
 #include "common.h"
 
-// v441: node->id is assigned from a global allocation-sequence counter, which drifts
+// node->id is assigned from a global allocation-sequence counter, which drifts
 // with pointer-order-driven creation counts (e.g. temporary dup()s) and leaks into
 // emitted names (oldName = name + "$old$" + id) and JSON metadata. Renumber by name
 // once the graph is final: deterministic ids, byte-identical emission.

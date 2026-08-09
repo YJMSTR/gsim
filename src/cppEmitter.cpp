@@ -284,7 +284,7 @@ struct MtDenseMTask {
   int staticCost = 0;
   int taskCount = 0;
   bool workerZeroOnly = false;
-  // v236: real dense scheduling cost (sum of member-node work of contained SCCs).
+  // real dense scheduling cost (sum of member-node work of contained SCCs).
   // staticCost is ~1 for serial tasks, a weak PackThreads signal; schedCost drives
   // the CP-contraction path's priority/end-time when > 0, else falls back to staticCost.
   int schedCost = 0;
@@ -525,7 +525,7 @@ static bool mtUseDenseMemberMetadata() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// v370: default-off. Verilator runs display/print MTasks distributed across
+// default-off. Verilator runs display/print MTasks distributed across
 // workers (VL_PRINTF_MT posts to a message queue); gsim instead pins every
 // task containing printf/assert/exit ops on worker0, which serializes ~70% of
 // worker0's pinned work (52% of the T16 wall at C50000). This knob excludes
@@ -538,8 +538,8 @@ static bool mtUseDenseUnpinSpecial() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// v376: default-off yield-threshold override for dense wait stubs. Default 256
-// preserves the promoted literal (v294 measured 256 > 64); larger thresholds
+// default-off yield-threshold override for dense wait stubs. Default 256
+// preserves the promoted literal (measured 256 > 64); larger thresholds
 // trade pause-spin time for fewer yield syscalls. Affects every dense
 // depsDone/owner-ready wait stub.
 static int mtDensePollYieldThreshold() {
@@ -549,7 +549,7 @@ static int mtDensePollYieldThreshold() {
   return value < 1 ? 256 : value;
 }
 
-// v377: default-off observability-cone elimination (user-approved scope
+// default-off observability-cone elimination (user-approved scope
 // 2026-07-17). Perf-counter/debug-observability nodes whose ENTIRE data and
 // activation fanout is itself observability or print-only are droppable: their
 // assignment spans are not emitted. [PERF] printout values become stale/zero
@@ -646,20 +646,20 @@ static bool mtDenseObservabilitySpansBalanced(const std::vector<InstInfo>& insts
   return stack.empty();
 }
 
-// v198: When enabled, exclude backward (cross-cycle) activation edges from the dense SCC graph.
+// When enabled, exclude backward (cross-cycle) activation edges from the dense SCC graph.
 // Backward activation edges are next-cycle activations that create false within-cycle cycles.
 static bool mtUseDenseForwardActivationOnly() {
   const char* env = std::getenv("GSIM_MT_DENSE_FORWARD_ACTIVATION_ONLY");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// v194: dump member-node and instruction-ownership metadata for a single dense task.
+// dump member-node and instruction-ownership metadata for a single dense task.
 // Reads already-computed super->insts (populated by instsGenerator before cppEmitter);
 // never calls StmtTree::compute and never mutates super->insts.
 static void dumpMtDenseMemberMetadataForTask(FILE* fp, SuperNode* super) {
   fprintf(fp, ", \"member_nodes\": [");
   bool first = true;
-  int memberIdx = 0;  // v441: content-stable local index (node->id drifts, see oldName)
+  int memberIdx = 0;  // content-stable local index (node->id drifts, see oldName)
   for (Node* node : super->member) {
     if (!node) continue;
     if (!first) fprintf(fp, ", ");
@@ -669,7 +669,7 @@ static void dumpMtDenseMemberMetadataForTask(FILE* fp, SuperNode* super) {
   }
   fprintf(fp, "], \"instruction_ownership\": [");
   first = true;
-  // v441: owner ids as content-stable member indices (node->id drifts, see oldName).
+  // owner ids as content-stable member indices (node->id drifts, see oldName).
   std::map<Node*, int> memberIndex;
   for (size_t mi = 0; mi < super->member.size(); mi ++) memberIndex[super->member[mi]] = (int)mi;
   for (const InstInfo& inst : super->insts) {
@@ -1114,7 +1114,7 @@ static bool hasWorker0OnlyReason(const std::vector<std::string>& reasons) {
   return false;
 }
 
-// v370: dense worker0 pinning predicate; identical to hasWorker0OnlyReason
+// dense worker0 pinning predicate; identical to hasWorker0OnlyReason
 // except "special" unpinned when GSIM_MT_DENSE_UNPIN_SPECIAL=1.
 static bool hasWorker0OnlyReasonDense(const std::vector<std::string>& reasons) {
   const bool unpinSpecial = mtUseDenseUnpinSpecial();
@@ -1309,7 +1309,7 @@ static bool mtUseDenseStaticEmptyElide() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// v280: optionally emit compile-exclusive identity and owner-banked fixed-order dependency layouts.
+// optionally emit compile-exclusive identity and owner-banked fixed-order dependency layouts.
 // Generation is default-off; one generated schedule can be compiled twice without a runtime branch.
 static bool mtUseDenseOwnerBankCounters() {
   const char* env = std::getenv("GSIM_MT_DENSE_OWNER_BANK_COUNTERS");
@@ -1321,7 +1321,7 @@ static bool mtUseDenseOwnerBankCountersDiag() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// v285: optionally emit compile-exclusive producer-owner ready flags beside the
+// optionally emit compile-exclusive producer-owner ready flags beside the
 // v280 fixed-order owner-banked and identity dependency-counter layouts.
 static bool mtUseDenseOwnerReadyFlags() {
   const char* env = std::getenv("GSIM_MT_DENSE_OWNER_READY_FLAGS");
@@ -1374,7 +1374,7 @@ static bool mtUseDenseBreakdownWindowCodegen() {
 }
 
 
-// v290b: reorder only dense MTask function emission by fixed owner so each worker's hot text is
+// reorder only dense MTask function emission by fixed owner so each worker's hot text is
 // contiguous. Logical IDs, bodies, owner call order, dependency protocol, and schedule are unchanged.
 static bool mtUseDenseWorkerMajorText() {
   const char* env = std::getenv("GSIM_MT_DENSE_WORKER_MAJOR_TEXT");
@@ -1449,8 +1449,8 @@ static bool mtUseDenseSharedHelpers() {
 // READWRITER / WRITER / MEMORY) were missing from the activation fanout, leaving a wavefront
 // closure hole (L2/array-driven one-hot assertions fired on the first V384 build). The collector
 // must be COMPLETE: any missed read is a closure hole that lets a body compute from stale inputs
-// (the v384-activity4 rab one-hot divergence: deqPtrOH stuck at 0). No truncation budget.
-// Speed (v384-activity5 generation took 52min vs 27min baseline): memoize per-Node read sets —
+// (the activity4 rab one-hot divergence: deqPtrOH stuck at 0). No truncation budget.
+// Speed (activity5 generation took 52min vs 27min baseline): memoize per-Node read sets —
 // shared subexpression nodes are expanded once globally, cppIds merge cached sets.
 struct MtActivityReads { std::set<std::string> src; std::set<std::string> dst; };
 static std::map<Node*, MtActivityReads> mtActivityReadCache;
@@ -1546,7 +1546,7 @@ static bool mtUseDenseSplitWorker0MTasks() {
   const char* env = std::getenv("GSIM_MT_DENSE_SPLIT_WORKER0_MTASKS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
-// v236: Verilator-style critical-path MTask contraction. Default-off. Replaces the
+// Verilator-style critical-path MTask contraction. Default-off. Replaces the
 // fixed 30-SCC topological chunking in mtBuildDenseMTasks with edge/sibling-score
 // contraction bounded by cpLimit and maxMTasks (see docs/verilator-partition-spec.md).
 static bool mtUseDenseCpContraction() {
@@ -1564,7 +1564,7 @@ static bool mtUseDenseV3ContractPolicy() {
 
 
 
-// v236: wire the Verilator-like PackThreads DAG-aware assignment (already used only
+// wire the Verilator-like PackThreads DAG-aware assignment (already used only
 // for the report) into the codegen mtaskThreadAssign, replacing i % threadCount.
 static bool mtUseDensePackThreadsAssignment() {
   const char* env = std::getenv("GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT");
@@ -1572,7 +1572,7 @@ static bool mtUseDensePackThreadsAssignment() {
 }
 
 
-// v239: dense runtime work-stealing. Default-off. Replaces the fixed ascending-id per-thread
+// dense runtime work-stealing. Default-off. Replaces the fixed ascending-id per-thread
 // MTask execution (which spin-stalls on cross-thread deps) with owner-affine ready deques +
 // steal-from-tail: a worker runs any READY assigned MTask, steals when idle. Lifts scaling
 // past the ~3x cap of the fixed-order executor. See docs/codex-dense-direction.md.
@@ -1854,8 +1854,8 @@ static void mtDenseAddSuperEdges(MtDenseSchedule& schedule,
   }
 }
 
-// v248: faithful Verilator V3OrderParallel edge contraction on the SCC DAG. The key detail that
-// makes contraction tractable (missed by v237's budget-limited BFS that gave 3.2M false cycle
+// faithful Verilator V3OrderParallel edge contraction on the SCC DAG. The key detail that
+// makes contraction tractable (missed by budget-limited BFS that gave 3.2M false cycle
 // rejections) is Verilator's CP-bound-pruned, generation-tagged cycle check: a path fromp~>top
 // cannot exist if fromp.cpRev < top.cpRev+top.step OR fromp.cpFwd+fromp.step > top.cpFwd, so most
 // checks resolve in O(1). Merges the lowest edgeScore (merged local critical path) until liveCount
@@ -2202,7 +2202,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSc
   // between them), so grouping same-level SCCs is ALWAYS cycle-free (sibling contraction).
   // Within a level, non-worker0 SCCs are bucketed across threads balancing member-node cost
   // (LPT); worker0-only SCCs form their own separate MTask (never mixed with parallel SCCs,
-  // preserving the v235 worker0 boundary). One MTask per (level, bucket). MTask ids follow
+  // preserving the worker0 boundary). One MTask per (level, bucket). MTask ids follow
   // (level, bucket) order, and every SCC edge goes to a strictly greater level, so ids are
   // topologically monotone (succ>from) as the runtime protocol / transitive reduction require.
   const int nSccs = static_cast<int>(schedule.sccs.size());
@@ -2271,7 +2271,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSc
   //     Verilator's depth ~15 shape, merge each MTask with a successor MTask when they are within
   //     the same worker AND merging creates no cycle, using union-find + bounded reachability on the
   //     (small, ~few-thousand) MTask graph. Gated by GSIM_MT_DENSE_BAND_CONTRACT (levels per band);
-  //     0/unset disables (pure level-bucket). Cycle checks are cheap here vs v237's 45k-node graph.
+  //     0/unset disables (pure level-bucket). Cycle checks are cheap here vs 45k-node graph.
   int bandContract = 0;
   { const char* env = std::getenv("GSIM_MT_DENSE_BAND_CONTRACT"); if (env && env[0]) bandContract = std::atoi(env); }
   if (bandContract > 0 && static_cast<int>(mtasks.size()) > threadCount) {
@@ -2939,7 +2939,7 @@ static int mtReduceDenseMTaskEdgesTransitive(std::vector<MtDenseMTask>& mtasks) 
 static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const std::vector<MtDenseMTask>& mtasks,
                                                                           int threadCount) {
   if (threadCount < 1) threadCount = 1;
-  // v236: prefer the real dense scheduling cost when present; fall back to staticCost.
+  // prefer the real dense scheduling cost when present; fall back to staticCost.
   auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
   std::vector<int> assignment(mtasks.size(), -1);
   std::vector<int> completion(mtasks.size(), 0);
@@ -3011,7 +3011,7 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
 }
 
 
-// v243: list-scheduler that returns BOTH the worker assignment AND the schedule order (the
+// list-scheduler that returns BOTH the worker assignment AND the schedule order (the
 // sequence in which MTasks are scheduled). Renumbering MTask ids by this order makes the
 // fixed-order runtime (which runs each worker's MTasks in ascending global id) execute them in
 // earliest-start schedule order -- Verilator's static per-worker chain behavior -- with no
@@ -3047,7 +3047,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
       const MtDenseMTask& mtask = mtasks[(size_t)mtaskId];
       // Reserve thread 0 for worker0-only (pinned side-effect) MTasks: non-worker0 MTasks start
       // their thread search at 1 when threadCount>1, so the scheduler does not pile parallel work
-      // onto thread 0 and then serialize the pinned load behind it (the v246 52x imbalance).
+      // onto thread 0 and then serialize the pinned load behind it (the 52x imbalance).
       int workerStart = mtask.workerZeroOnly ? 0 : (threadCount > 1 ? 1 : 0);
       int workerLimit = mtask.workerZeroOnly ? 1 : threadCount;
       for (int worker = workerStart; worker < workerLimit; worker ++) {
@@ -3097,7 +3097,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
       int worker = outAssign[(size_t)mtaskId];
       if (worker >= 0 && worker < threadCount) workerLoads[(size_t)worker] += costOf(mtasks[(size_t)mtaskId]);
     }
-    fprintf(stderr, "[mt-dense-v3-schedule] predicted_makespan=%lld worker_loads=", makespan);
+    fprintf(stderr, "[mt-dense-schedule] predicted_makespan=%lld worker_loads=", makespan);
     for (int worker = 0; worker < threadCount; ++worker) fprintf(stderr, "%s%lld", worker ? "," : "", workerLoads[(size_t)worker]);
     fprintf(stderr, "\n");
   }
@@ -3195,7 +3195,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     mtDenseAddSuperEdges(schedule, succSets, predSets, edgeKinds, cppId, super->depNext, "dependency");
   }
 
-  // v198: When GSIM_MT_DENSE_FORWARD_ACTIVATION_ONLY=1, compute a dependency-only
+  // When GSIM_MT_DENSE_FORWARD_ACTIVATION_ONLY=1, compute a dependency-only
   // topological rank and only add activation edges that are forward (rank[from] < rank[to]).
   // Backward activation edges are cross-cycle (next-cycle) activations that create false
   // cycles in the within-cycle SCC graph. Excluding them makes the graph acyclic.
@@ -3355,7 +3355,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     }
   }
 
-  // v201b: Coarsen SCC DAG by merging chains (edges A->B where A has 1 succ
+  // Coarsen SCC DAG by merging chains (edges A->B where A has 1 succ
   // and B has 1 pred). This reduces layer depth and barrier count without
   // reducing parallelism. Inspired by Verilator's V3OrderParallel edge contraction.
   {
@@ -3510,7 +3510,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     }
     if (v3Policy) {
       const int removed = mtReduceDenseMTaskEdgesTransitive(schedule.mtasks);
-      fprintf(stderr, "[mt-dense-v3-policy] removed_full_dag_transitive_edges=%d\n", removed);
+      fprintf(stderr, "[mt-dense-policy] removed_full_dag_transitive_edges=%d\n", removed);
     }
     // Executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
     // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.
@@ -3554,7 +3554,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     bool lptAssign = false;
     { const char* e = std::getenv("GSIM_MT_DENSE_LPT_ASSIGN"); lptAssign = e && e[0] && e[0] != '0'; }
     if (!lptAssign && !schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
-      // v243: schedule-order ids WITHOUT LPT -> use the list-scheduler's own (earliest-free)
+      // schedule-order ids WITHOUT LPT -> use the list-scheduler's own (earliest-free)
       // assignment, co-designed with the order. With LPT on, we instead keep schedule-order ids
       // (reduced stalls) but override with cost-balanced LPT assignment below.
       for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : schedOrderAssign[(size_t)i];
@@ -3588,7 +3588,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     } else {
       for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : (i % threadCount);
     }
-    // v243: verify MTask ids are topologically monotone (every edge from<to) after any renumber.
+    // verify MTask ids are topologically monotone (every edge from<to) after any renumber.
     for (int mi = 0; mi < nMTasks; mi ++) {
       for (int s : schedule.mtasks[(size_t)mi].succMTasks) {
         Assert(s > mi, "dense MTask id order not topo-monotone: edge %d->%d", mi, s);
@@ -6005,7 +6005,7 @@ void graph::dumpMtScheduleJson() {
     fprintf(fp, "    {\n");
     fprintf(fp, "      \"cpp_id\": %d,\n", cppId);
     fprintf(fp, "      \"scan_index\": %d,\n", cppId);
-    fprintf(fp, "      \"super_id\": %d,\n", super->cppId);  // v441: cppId is pinned/content-stable (super->id drifts)
+    fprintf(fp, "      \"super_id\": %d,\n", super->cppId);  // cppId is pinned/content-stable (super->id drifts)
     fprintf(fp, "      \"super_type\": \"%s\",\n", superTypeName(super->superType));
     fprintf(fp, "      \"task_kind\": \"%s\",\n", mtTask.taskKind.c_str());
     fprintf(fp, "      \"serial_reasons\": ");
@@ -6835,7 +6835,7 @@ void graph::dumpMtDenseScheduleJson() {
     uint64_t activeMask;
     std::tie(activeWord, activeMask) = setIdxMask(cppId);
     int denseMTaskId = cppId < static_cast<int>(cppIdToDenseMTask.size()) ? cppIdToDenseMTask[(size_t)cppId] : -1;
-    fprintf(fp, "    {\"cpp_id\": %d, \"scan_index\": %d, \"super_id\": %d, \"super_type\": \"%s\", ", cppId, cppId, super->cppId, superTypeName(super->superType));  // v441: cppId for super->id
+    fprintf(fp, "    {\"cpp_id\": %d, \"scan_index\": %d, \"super_id\": %d, \"super_type\": \"%s\", ", cppId, cppId, super->cppId, superTypeName(super->superType));  // cppId for super->id
     fprintf(fp, "\"task_kind\": \"%s\", \"dense_mtask_id\": %d, \"serial_reasons\": ", mtTask.taskKind.c_str(), denseMTaskId);
     dumpJsonStringArray(fp, mtTask.serialReasons);
     fprintf(fp, ", \"worker0_only\": %s, \"is_always_active\": %s, ",
@@ -6863,7 +6863,7 @@ void graph::dumpMtDenseScheduleJson() {
   fprintf(fp, "  ],\n");
 
   fprintf(fp, "  \"edges\": [\n");
-  // v430: edge enumeration follows allocator-sensitive pointer iteration order. Emit in
+  // edge enumeration follows allocator-sensitive pointer iteration order. Emit in
   // a deterministic canonical order so identical schedules produce identical files.
   std::vector<MtDenseEdge> canonEdges(schedule.edges.begin(), schedule.edges.end());
   std::sort(canonEdges.begin(), canonEdges.end(), [](const MtDenseEdge& a, const MtDenseEdge& b) {
@@ -12490,7 +12490,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     const int nM = nMTasks;
     activityAlwaysActive.assign((size_t)nM, 0);
     activityResetHandler.assign((size_t)nM, 0);
-    // Region-level activity (v384-r): group MTasks into subsystem regions; a region runs fully
+    // Region-level activity (r): group MTasks into subsystem regions; a region runs fully
     // when any member is activated. Fine-grained gating breaks intra-subsystem queue invariants
     // (yank/missQueue/ldu asserts from one-cycle-late comb signals); region granularity preserves
     // them because all producers+consumers in the region evaluate together. Region assignment by
@@ -13890,7 +13890,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(0, "}\n");
   }
   if (denseLookahead) {
-    // v455: emit the #if guard atomically with the function start. A file-split
+    // emit the #if guard atomically with the function start. A file-split
     // boundary between them orphaned the guard (SimTop1209 ended with #if,
     // SimTop1210 began with the body -> #endif without #if at MAXMT=800).
     emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target) {\n", name.c_str());

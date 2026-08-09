@@ -787,7 +787,7 @@ void graph::splitNodes() {
       if (next->isArray()) arrayMember.insert(node);
     }
   }
-  // v441: iterate the split loop in node->order (derived from sortedSuper, pinned by
+  // iterate the split loop in node->order (derived from sortedSuper, pinned by
   // seed2 replay) instead of pointer order. Pointer order made the split/re-infer
   // sequence allocator-layout-dependent and could even crash inferComponent
   // ("not visited when infer") when a re-infer ran before its dependency's component

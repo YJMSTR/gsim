@@ -11,7 +11,7 @@
 // #define SUPER_BOUND 35
 
 void graph::resort(const char* seed2Tag) {
-  // v432: GSIM_STABLE_ORDER=1 selects the deterministic frontier (see topoSort).
+  // GSIM_STABLE_ORDER=1 selects the deterministic frontier (see topoSort).
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   const bool seedReplay = mtSeedReplayActive();
   const bool seed2Write = mtSeed2WriteActive();
@@ -116,7 +116,7 @@ void graph::resort(const char* seed2Tag) {
 }
 
 // coarsen phase
-// v430 diagnostic: compact canonical graph fingerprint at pass boundaries. Per VALID
+// diagnostic: compact canonical graph fingerprint at pass boundaries. Per VALID
 // super one record (member names in order + sorted prev/next/depPrev/depNext endpoint
 // keys); records sorted in memory and stream-hashed (FNV-1a 64) — no files, no GB dumps.
 // GSIM_DEBUG_CANON_HASH=1 enables; GSIM_DEBUG_CANON_STOP_AFTER=<tag> exits after a tag.
@@ -238,7 +238,7 @@ void graph::graphCoarsen() {
   resort("coarsen.when.resort");
   canonDumpTag("coarsen.when");
 
-  // v441: pin every order-consuming pass outcome, not just resorts. mergeOut1/In1/
+  // pin every order-consuming pass outcome, not just resorts. mergeOut1/In1/
   // Sublings mutate content AND order; recording the post-pass sortedSuper (with canon
   // verification) closes the gap where run-to-run content variance was observed
   // (partition.postCoarsen canon 70725c vs 2237bc across identical write runs).

@@ -120,7 +120,7 @@ enum ResetType { UNCERTAIN, ASYRESET, UINTRESET, ZERO_RESET };
 
 #define newBasic(node) (node->name + "$new")
 #define newName(node) newBasic(node)
-// v441: node->id drifts with allocation-sequence variance (temporary dup counts)
+// node->id drifts with allocation-sequence variance (temporary dup counts)
 // and leaked into emitted locals (enqidx_0$old$5524776 vs $5524660 across runs).
 // Node names are already unique, so the id suffix bought nothing.
 #define oldName(node) (node->name + "$old$")

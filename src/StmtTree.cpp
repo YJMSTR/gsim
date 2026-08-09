@@ -245,7 +245,7 @@ void StmtTree::mergeStmtTree(StmtTree* tree) {
  */
 void prevOrderPath(Node* node, std::vector<int>& prevPath, std::map<Node*, std::vector<int>>& allPath, const std::map<Node*, int>& memberRank) {
   if (node->depPrev.size() == 0) return;
-  // v441: merge predecessor paths in member-rank order (pinned), not pointer order -
+  // merge predecessor paths in member-rank order (pinned), not pointer order -
   // the merge below is non-commutative (break on decrease), so pointer order leaked
   // allocator layout into the statement-tree paths.
   std::vector<Node*> prevs;
@@ -345,7 +345,7 @@ void SuperNode::reorderMember() {
       if (prev->super == this) nodePrev[node] ++;
     }
   }
-  // v441: stable topological reorder. The original seeded the Kahn frontier from the
+  // stable topological reorder. The original seeded the Kahn frontier from the
   // pointer-keyed nodePrev map and walked depNext in pointer order, so the resulting
   // member order varied with allocator layout (caught by the seed2 preEmit canon gate).
   // Frontier and successor visits now follow the CURRENT member order (pinned by replay).
@@ -410,7 +410,7 @@ void graph::generateStmtTree() {
   for (SuperNode* super : sortedSuper) {
     super->stmtTree = new StmtTree();
     super->stmtTree->root = new StmtNode(OP_STMT_SEQ);
-    // v441: rank in the post-reorder member vector (reorderMember changed it after
+    // rank in the post-reorder member vector (reorderMember changed it after
     // orderAllNodes set orderInSuper); lookup-only map, feeds prevOrderPath ordering.
     std::map<Node*, int> memberRank;
     for (size_t i = 0; i < super->member.size(); i ++) memberRank[super->member[i]] = (int)i;

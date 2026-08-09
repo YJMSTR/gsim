@@ -367,7 +367,7 @@ public:
   bool operator<(const InstInfo& other) const {
     if (infoType != other.infoType) return infoType < other.infoType;
     if (inst != other.inst) return inst < other.inst;
-    // v441: pointer tie-break made std::set<InstInfo> iteration (StmtNode::compute's
+    // pointer tie-break made std::set<InstInfo> iteration (StmtNode::compute's
     // assign bookkeeping) allocator-layout-dependent -> activation bookkeeping lines
     // moved within emitted functions run-to-run (seed2 preEmit byte-diff). Name is
     // unique and content-stable; pointer remains only as an unreachable final resort.
@@ -439,13 +439,13 @@ public:
   void reorderMember();
 };
 
-// v430: stable semantic order for graph passes. Pointer-ordered containers made pass
-// outcomes depend on allocator/address layout (v430 nondeterminism). Key chain:
+// stable semantic order for graph passes. Pointer-ordered containers made pass
+// outcomes depend on allocator/address layout (nondeterminism). Key chain:
 // first member name, member count, full member-name list, dep sizes; id only as a last
 // resort and emits a stderr warning (allocator-unstable, investigate if ever hit).
 struct SuperNodeStableLess {
   bool operator()(const SuperNode* a, const SuperNode* b) const {
-    // v432: deterministic key approximating parse/creation order (pointer order quality
+    // deterministic key approximating parse/creation order (pointer order quality
     // without allocator dependence). lineno is content-stable; -1 for generated nodes.
     const long long la = a->member.empty() ? LLONG_MAX : (long long)a->member[0]->lineno;
     const long long lb = b->member.empty() ? LLONG_MAX : (long long)b->member[0]->lineno;
@@ -495,9 +495,9 @@ static inline std::vector<SuperNode*> seedRankOrdered(const std::set<SuperNode*>
   return ordered;
 }
 
-// GSIM_SCHEDULE_SEED2 exact replay (src/seedOrder2.cpp; design docs/exact-replay-v2-design.md).
+// GSIM_SCHEDULE_SEED2 exact replay (src/seedOrder2.cpp; design docs/exact-replay-design.md).
 // v2 records per-point OUTCOMES (topoSort + every resort + whenMap) and replays them
-// verbatim, removing v1's policy-derived shape tax.
+// verbatim, removing policy-derived shape tax.
 bool mtSeed2WriteActive();
 bool mtSeed2ReplayActive();
 void mtSeed2AssertCompatible();

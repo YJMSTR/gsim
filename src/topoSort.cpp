@@ -7,7 +7,7 @@
 #include <map>
 
 void graph::topoSort() {
-  // v432: GSIM_STABLE_ORDER=1 selects the deterministic stable-order frontier
+  // GSIM_STABLE_ORDER=1 selects the deterministic stable-order frontier
   // (reproducible generation); default keeps the original pointer-order traversal
   // (current schedule-quality baseline) while the stable path is validated further.
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();

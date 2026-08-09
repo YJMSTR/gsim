@@ -1,7 +1,7 @@
-// GSIM_SCHEDULE_SEED2 exact replay (design: docs/exact-replay-v2-design.md).
-// Seed v2 records the OUTCOME of every order-consuming graph point (topoSort and every
-// resort, plus mergeWhenNodes' whenMap) so replay can force each point verbatim instead
-// of re-deriving it with a policy comparator (v1's +32% shape tax, v436).
+// GSIM_SCHEDULE_SEED2 exact replay: record outcomes at every order-consuming graph
+// point (topoSort, every resort, and mergeWhenNodes' whenMap) so replay can force each
+// point verbatim instead of re-deriving it with a policy comparator (the first text-format
+// seed replay re-derived downstream order from a policy and paid a +32% shape tax).
 //
 // Binary format (little-endian), file extension convention *.gsimseed2:
 //   char  magic[4]   = "GS2\0"
@@ -49,7 +49,7 @@ void mtSeed2AssertCompatible() {
   Assert(!(mtSeed2WriteActive() && mtSeed2ReplayActive()),
          "GSIM_SCHEDULE_SEED2 and GSIM_SCHEDULE_SEED2_WRITE are mutually exclusive");
   Assert(!(mtSeed2WriteActive() && (mtSeedReplayActive() || mtSeedWriteActive())),
-         "GSIM_SCHEDULE_SEED2_WRITE and GSIM_SCHEDULE_SEED(_WRITE) are mutually exclusive (record v1 with v1, v2 with v2)");
+         "GSIM_SCHEDULE_SEED2_WRITE and GSIM_SCHEDULE_SEED(_WRITE) are mutually exclusive (use one seed format at a time)");
   Assert(!(mtSeed2ReplayActive() && (mtSeedReplayActive() || mtSeedWriteActive())),
          "GSIM_SCHEDULE_SEED2 and GSIM_SCHEDULE_SEED(_WRITE) are mutually exclusive");
   // GSIM_STABLE_ORDER + SEED2_WRITE is allowed (records a stable-order run).

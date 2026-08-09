@@ -77,7 +77,7 @@ void graph::mergeWhenNodes() {
 }
 #else
 void graph::mergeWhenNodes() {
-  // v430 diagnostic (env value = dump filepath): canonical pre-merge graph record per
+  // diagnostic (env value = dump filepath): canonical pre-merge graph record per
   // super: id, member names, sorted depPrev/depNext endpoint ids and names. Lets two
   // runs verify both id stability and whole-graph equality at this point.
   if (const char* dumpPath = std::getenv("GSIM_DEBUG_DUMP_SUPER_IDS")) {
@@ -104,7 +104,7 @@ void graph::mergeWhenNodes() {
       std::fclose(dumpFp);
     }
   }
-  // v432: GSIM_STABLE_ORDER=1 selects the deterministic stable-order path (reproducible
+  // GSIM_STABLE_ORDER=1 selects the deterministic stable-order path (reproducible
   // generation); default keeps the original pointer-order behavior.
   const bool stableOrder = [](){ const char* e = std::getenv("GSIM_STABLE_ORDER"); return e && e[0] && e[0] != '0'; }();
   const bool seedReplay = mtSeedReplayActive();
@@ -352,7 +352,7 @@ void graph::mergeResetAll() {
       else uintSuper->add_member(resetRegDst);
     }
   }
-  // v441: resetSuper is keyed by Node* (pointer order), which leaked allocator layout
+  // resetSuper is keyed by Node* (pointer order), which leaked allocator layout
   // into allReset order and hence into the emission order of the reset functions
   // (whole 100K-line subReset blocks moved within SimTop*.cpp across runs, caught by
   // seed2 byte-diff after all canon gates passed - canon covers sortedSuper, not

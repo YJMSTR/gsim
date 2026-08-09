@@ -368,10 +368,10 @@ void graph::splitArrayNode(Node* node) {
     if (n->resetTree) n->resetTree->updateWithSplittedArray(n, node, arrayMember);
   }
 
-  // v441: two passes, not an interleave. updateDep(R) propagates dep edges through
+  // two passes, not an interleave. updateDep(R) propagates dep edges through
   // R->next, which is only complete after EVERY consumer's updateConnect has run.
   // Interleaving connect/dep over the pointer-ordered checkNodes set made the
-  // propagated dep-edge set allocator-layout-dependent (v441: reset -> state$NEXT
+  // propagated dep-edge set allocator-layout-dependent (reset -> state$NEXT
   // edges present or missing run-to-run, caught by seed2 canon gates).
   for (Node* n : checkNodes) {
     n->updateConnect();

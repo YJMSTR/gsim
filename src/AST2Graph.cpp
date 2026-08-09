@@ -1642,7 +1642,7 @@ graph* AST2Graph(PNode* root) {
   for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
     it->second->invalidArrayOptimize();
   }
-  // v441: two passes, not an interleave (same bug class as splitArrayNode).
+  // two passes, not an interleave (same bug class as splitArrayNode).
   // updateDep(R) reads R->next; that set is only complete after every consumer's
   // updateConnect ran. Name order happens to place $NEXT nodes before their regs,
   // but any consumer sorting after its reg was silently missed by the propagation.
