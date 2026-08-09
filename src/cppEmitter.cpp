@@ -62,10 +62,14 @@ static bool generatedOutputFilesEqual(const std::string& lhsPath, const std::str
 static void commitStableOutputFile(const std::string& tmpPath, const std::string& finalPath) {
   if (tmpPath.empty()) return;
   if (generatedOutputFilesEqual(tmpPath, finalPath)) {
-    assert(std::remove(tmpPath.c_str()) == 0);
+    // Never embed filesystem side effects in assert(): under -DNDEBUG the call is
+    // compiled out and the tmp file would never be removed/installed.
+    int rc = std::remove(tmpPath.c_str());
+    Assert(rc == 0, "failed to remove identical tmp output %s", tmpPath.c_str());
     return;
   }
-  assert(std::rename(tmpPath.c_str(), finalPath.c_str()) == 0);
+  int rc = std::rename(tmpPath.c_str(), finalPath.c_str());
+  Assert(rc == 0, "failed to install stable output %s -> %s", tmpPath.c_str(), finalPath.c_str());
 }
 
 #define RESET_NAME(node) (node->name + "$RESET")
@@ -13961,6 +13965,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(0, "#endif\n");
   }
   if (tableDispatch || denseLookahead) {
+    // The entry type, table declarations and the lookahead tail are all gated on the
+    // owner-ready compile macro; the definitions must match or a macro-less compile
+    // sees definitions of undeclared members (build failure).
+    emitBodyLock(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
     for (int t = 0; t < threadCount; t++) {
       int cnt = denseDispatchWorkerCounts[(size_t)t];
       emitBodyLock(0, "const S%s::MtDenseDispatchEntry S%s::kDenseDispatchTableW%d[%d] = {\n",
@@ -13990,6 +13998,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       }
       emitBodyLock(0, "};\n");
     }
+    emitBodyLock(0, "#endif\n");
   }
   if (workSteal) {
     emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
@@ -14102,7 +14111,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
     emitBodyLock(1, "#endif\n");
   } else {
-    emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
+    // Fixed-owner counter path: ownership was baked in at generation time, so a
+    // runtime worker-count mismatch would silently omit whole worker lanes. Require
+    // the generated count; otherwise the caller falls through to the serial path.
+    emitBodyLock(1, "if (mtConfiguredWorkerCount == %d && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n", threadCount);
   }
   emitBodyLock(2, "mtWorkerPoolJobKind = 7;\n");
   emitBodyLock(2, "mtWorkerPoolCurrentWorkerCount = mtConfiguredWorkerCount;\n");

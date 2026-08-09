@@ -139,19 +139,18 @@ void seed2WriteU32(FILE* fp, uint32_t v) { std::fwrite(&v, 4, 1, fp); }
 void seed2WriteU64(FILE* fp, uint64_t v) { std::fwrite(&v, 8, 1, fp); }
 void seed2WriteStr(FILE* fp, const std::string& s) {
   seed2WriteU32(fp, (uint32_t)s.size());
-  if (!s.empty()) std::fwrite(s.data(), 1, s.size(), fp);
+  if (!s.empty()) Assert(std::fwrite(s.data(), 1, s.size(), fp) == s.size(), "seed2: write failed (disk full?)");
 }
 
 void mtSeed2Finalize() {
   Seed2Writer& w = seed2Writer();
   if (w.finalized || w.points.empty()) return;
-  w.finalized = true;
   const char* path = std::getenv("GSIM_SCHEDULE_SEED2_WRITE");
   Assert(path != nullptr, "mtSeed2Finalize without GSIM_SCHEDULE_SEED2_WRITE");
   Assert(w.inputHashSet, "seed2: input hash was never set (topoSort record missing)");
   FILE* fp = std::fopen(path, "wb");
   Assert(fp != nullptr, "cannot open seed2 output %s", path);
-  std::fwrite(SEED2_MAGIC, 1, 4, fp);
+  Assert(std::fwrite(SEED2_MAGIC, 1, 4, fp) == 4, "seed2: write failed on %s", path);
   seed2WriteU32(fp, SEED2_VERSION);
   seed2WriteU64(fp, w.inputHash);
   seed2WriteStr(fp, "wip/dense-b1-lookahead");
@@ -163,14 +162,22 @@ void mtSeed2Finalize() {
     seed2WriteStr(fp, p.tag);
     seed2WriteU64(fp, p.canonHash);
     seed2WriteU32(fp, (uint32_t)p.nameIds.size());
-    if (!p.nameIds.empty()) std::fwrite(p.nameIds.data(), 4, p.nameIds.size(), fp);
+    if (!p.nameIds.empty())
+      Assert(std::fwrite(p.nameIds.data(), 4, p.nameIds.size(), fp) == p.nameIds.size(),
+             "seed2: write failed on %s (disk full?)", path);
   }
   for (const Seed2WhenGroup& g : w.whenGroups) {
     seed2WriteU32(fp, g.condKey);
     seed2WriteU32(fp, (uint32_t)g.sources.size());
-    if (!g.sources.empty()) std::fwrite(g.sources.data(), 4, g.sources.size(), fp);
+    if (!g.sources.empty())
+      Assert(std::fwrite(g.sources.data(), 4, g.sources.size(), fp) == g.sources.size(),
+             "seed2: write failed on %s (disk full?)", path);
   }
-  std::fclose(fp);
+  // Verify flush/close BEFORE declaring success: a delayed write error (full disk) must
+  // never leave a silently truncated seed behind (observed in the campaign).
+  Assert(std::fflush(fp) == 0, "seed2: flush failed on %s (disk full?)", path);
+  Assert(std::fclose(fp) == 0, "seed2: close failed on %s (disk full?)", path);
+  w.finalized = true;
   size_t bytes = 0;
   for (const std::string& k : w.keys) bytes += 4 + k.size();
   fprintf(stderr, "[schedule-seed2] wrote %s: points=%zu names=%zu whenGroups=%zu table=%.1fMB\n",
@@ -244,8 +251,13 @@ uint64_t seed2ReadU64(FILE* fp, const char* path) {
   Assert(std::fread(&v, 8, 1, fp) == 1, "seed2: truncated file %s", path);
   return v;
 }
-std::string seed2ReadStr(FILE* fp, const char* path) {
+std::string seed2ReadStr(FILE* fp, const char* path, long fileBytes) {
   uint32_t n = seed2ReadU32(fp, path);
+  // Bound the allocation by the remaining file size before touching memory: a corrupt
+  // length of 0xffffffff must fail here, not in a 4 GiB allocation.
+  long remaining = fileBytes >= 0 ? fileBytes - std::ftell(fp) : -1;
+  Assert(remaining < 0 || (long)n <= remaining,
+         "seed2: string length %u exceeds remaining file size in %s (corrupt seed)", n, path);
   std::string s(n, '\0');
   if (n) Assert(std::fread(s.data(), 1, n, fp) == n, "seed2: truncated file %s", path);
   return s;
@@ -259,24 +271,38 @@ void mtSeed2Load() {
   Assert(path != nullptr, "mtSeed2Load without GSIM_SCHEDULE_SEED2");
   FILE* fp = std::fopen(path, "rb");
   Assert(fp != nullptr, "cannot open schedule seed2 %s", path);
+  Assert(std::fseek(fp, 0, SEEK_END) == 0, "seed2: cannot seek %s", path);
+  const long fileBytes = std::ftell(fp);
+  Assert(std::fseek(fp, 0, SEEK_SET) == 0, "seed2: cannot seek %s", path);
   char magic[4];
   Assert(std::fread(magic, 1, 4, fp) == 4 && std::memcmp(magic, SEED2_MAGIC, 4) == 0,
          "seed2: bad magic in %s (not a GS2 file)", path);
   uint32_t version = seed2ReadU32(fp, path);
   Assert(version == SEED2_VERSION, "seed2: unsupported version %u in %s", version, path);
   r.inputHash = seed2ReadU64(fp, path);
-  std::string generator = seed2ReadStr(fp, path);
+  std::string generator = seed2ReadStr(fp, path, fileBytes);
   uint32_t pointCount = seed2ReadU32(fp, path);
   uint32_t nameCount = seed2ReadU32(fp, path);
   uint32_t whenGroupCount = seed2ReadU32(fp, path);
+  // Bound every count by the file size before reserving: each entry costs >= 4 bytes on
+  // disk (a name needs >= 4 for its length; a rank id 4), so counts beyond fileBytes/4
+  // are impossible and indicate a corrupt seed.
+  const uint64_t maxEntries = fileBytes > 0 ? (uint64_t)fileBytes / 4 : 0;
+  Assert((uint64_t)nameCount <= maxEntries && (uint64_t)pointCount <= maxEntries &&
+         (uint64_t)whenGroupCount <= maxEntries,
+         "seed2: implausible counts (points=%u names=%u groups=%u) for %ld-byte file %s",
+         pointCount, nameCount, whenGroupCount, fileBytes, path);
   r.keys.reserve(nameCount);
-  for (uint32_t i = 0; i < nameCount; i++) r.keys.push_back(seed2ReadStr(fp, path));
+  for (uint32_t i = 0; i < nameCount; i++) r.keys.push_back(seed2ReadStr(fp, path, fileBytes));
   r.points.reserve(pointCount);
   for (uint32_t i = 0; i < pointCount; i++) {
     Seed2Point p;
-    p.tag = seed2ReadStr(fp, path);
+    p.tag = seed2ReadStr(fp, path, fileBytes);
     p.canonHash = seed2ReadU64(fp, path);
     uint32_t n = seed2ReadU32(fp, path);
+    long remaining = fileBytes - std::ftell(fp);
+    Assert((uint64_t)n * 4 <= (uint64_t)std::max(0L, remaining),
+           "seed2: rank count %u exceeds remaining file size in %s (corrupt seed)", n, path);
     p.nameIds.resize(n);
     if (n) Assert(std::fread(p.nameIds.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
     r.points.push_back(std::move(p));
@@ -287,11 +313,25 @@ void mtSeed2Load() {
     Seed2WhenGroup g;
     g.condKey = seed2ReadU32(fp, path);
     uint32_t n = seed2ReadU32(fp, path);
+    long remaining = fileBytes - std::ftell(fp);
+    Assert((uint64_t)n * 4 <= (uint64_t)std::max(0L, remaining),
+           "seed2: when-group size %u exceeds remaining file size in %s (corrupt seed)", n, path);
     g.sources.resize(n);
     if (n) Assert(std::fread(g.sources.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
     r.whenGroups.push_back(std::move(g));
   }
   std::fclose(fp);
+  // Validate every table ID before any indexing: an out-of-range id would otherwise be
+  // an out-of-bounds vector access (UB) instead of a clean compatibility error.
+  const uint32_t nameTotal = (uint32_t)r.keys.size();
+  for (const Seed2Point& p : r.points)
+    for (uint32_t id : p.nameIds)
+      Assert(id < nameTotal, "seed2: rank id %u out of range (%u names) in %s", id, nameTotal, path);
+  for (const Seed2WhenGroup& g : r.whenGroups) {
+    Assert(g.condKey < nameTotal, "seed2: cond key %u out of range (%u names) in %s", g.condKey, nameTotal, path);
+    for (uint32_t id : g.sources)
+      Assert(id < nameTotal, "seed2: when-group source id %u out of range (%u names) in %s", id, nameTotal, path);
+  }
   r.loaded = true;
   fprintf(stderr, "[schedule-seed2] loaded %s: generator=%s points=%zu names=%zu whenGroups=%u\n",
           path, generator.c_str(), r.points.size(), r.keys.size(), whenGroupCount);
@@ -328,19 +368,37 @@ void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, ui
   // Resolve with duplicate disambiguation (same scheme as RecordPoint). Colliding
   // name-keys (e.g. empty-member shells) fall back to full-record keys; supers with
   // identical full records are interchangeable, so queue order within a key is free.
+  // Memory: one inline pointer per unique key; only the (tiny) duplicate-key set gets
+  // deque storage. A deque per key over 7.2M keys was an OOM-prone allocation storm.
   std::unordered_map<std::string, int> dupCounts;
   seed2CountKeys(sortedSuper, dupCounts);
-  std::unordered_map<std::string, std::deque<SuperNode*>> byKey;
-  byKey.reserve(sortedSuper.size() * 2);
-  for (SuperNode* super : sortedSuper) byKey[seed2NodeKey(super, dupCounts)].push_back(super);
+  std::unordered_map<std::string, SuperNode*> firstByKey;
+  std::unordered_map<std::string, std::deque<SuperNode*>> extraByKey;
+  firstByKey.reserve(sortedSuper.size() * 2);
+  for (SuperNode* super : sortedSuper) {
+    std::string k = seed2NodeKey(super, dupCounts);
+    auto [it, inserted] = firstByKey.emplace(std::move(k), super);
+    if (!inserted) extraByKey[it->first].push_back(super);
+  }
   std::vector<SuperNode*> forced;
   forced.reserve(sortedSuper.size());
   for (uint32_t id : p.nameIds) {
-    auto it = byKey.find(r.keys[id]);
-    Assert(it != byKey.end() && !it->second.empty(),
+    if (id >= r.keys.size()) {
+      Assert(false, "seed2 replay: rank id %u out of range (table has %zu names) at %s (corrupt seed?)",
+             id, r.keys.size(), tag);
+    }
+    const std::string& key = r.keys[id];
+    auto it = firstByKey.find(key);
+    if (it != firstByKey.end()) {
+      forced.push_back(it->second);
+      firstByKey.erase(it);
+      continue;
+    }
+    auto eit = extraByKey.find(key);
+    Assert(eit != extraByKey.end() && !eit->second.empty(),
            "seed2 replay: recorded node key missing at %s (seed/run graph mismatch)", tag);
-    forced.push_back(it->second.front());
-    it->second.pop_front();
+    forced.push_back(eit->second.front());
+    eit->second.pop_front();
   }
   sortedSuper = std::move(forced);
   r.cursor++;
