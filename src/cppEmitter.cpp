@@ -9084,6 +9084,12 @@ void graph::genInterfaceOutput(Node* output) {
 
 void graph::genHeaderEnd(FILE* fp) {
   fprintf(fp, "};\n");
+  // Tail-scan instrumentation counters live OUTSIDE the class as inline namespace
+  // variables (the tail function and the dumpMtProfile print land in different
+  // SimTop*.cpp shards; class members would need out-of-line definitions).
+  fprintf(fp, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+  fprintf(fp, "inline std::atomic<uint64_t> mtDenseLookaheadTailCalls{0}, mtDenseLookaheadScanned{0}, mtDenseLookaheadFound{0}, mtDenseLookaheadFullMiss{0};\n");
+  fprintf(fp, "#endif\n");
   fprintf(fp, "#endif\n");
 }
 
@@ -13914,9 +13920,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // Counters live in the HEADER as inline variables: the tail function and the
     // dumpMtProfile print land in different SimTop*.cpp shards, so a cpp-local
     // definition would be an undefined reference at link time.
-    fprintf(header, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
-    fprintf(header, "inline std::atomic<uint64_t> mtDenseLookaheadTailCalls{0}, mtDenseLookaheadScanned{0}, mtDenseLookaheadFound{0}, mtDenseLookaheadFullMiss{0};\n");
-    fprintf(header, "#endif\n");
     // emit the #if guard atomically with the function start. A file-split
     // boundary between them orphaned the guard (SimTop1209 ended with #if,
     // SimTop1210 began with the body -> #endif without #if at MAXMT=800).
@@ -15942,7 +15945,7 @@ void graph::cppEmitter() {
 
   emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
   emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
-  emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] calls=%llu scanned=%llu found=%llu fullmiss=%llu\\n\", (unsigned long long)mtDenseLookaheadTailCalls.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadScanned.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFound.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFullMiss.load(std::memory_order_relaxed));\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] calls=%%llu scanned=%%llu found=%%llu fullmiss=%%llu\\n\", (unsigned long long)mtDenseLookaheadTailCalls.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadScanned.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFound.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFullMiss.load(std::memory_order_relaxed));\n");
   emitBodyLock(1, "#endif\n");
   emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
   if (useMtHelpers) {
