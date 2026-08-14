@@ -1404,6 +1404,15 @@ valInfo* ENode::instsExit() {
 valInfo* ENode::instsAssert() {
   valInfo* ret = computeInfo;
   ret->status = VAL_FINISH;
+  // GSIM_MT_ASSERTS=0: compile assertions out of the generated model. Passing runs are
+  // unaffected (assertions only fire on failure); failure runs would continue instead
+  // of aborting, so this is a release/verification configuration, not a debug one.
+  static const bool disableAsserts = [](){ const char* e = std::getenv("GSIM_MT_ASSERTS"); return e != nullptr && e[0] == '0'; }();
+  if (disableAsserts) {
+    ret->valStr = "";
+    ret->opNum = -1;
+    return ret;
+  }
   std::string predStr = ChildInfo(0, valStr);
   std::string enStr = ChildInfo(1, valStr);
   std::string assertInst;

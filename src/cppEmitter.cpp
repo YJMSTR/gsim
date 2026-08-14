@@ -59,6 +59,15 @@ static bool generatedOutputFilesEqual(const std::string& lhsPath, const std::str
   return true;
 }
 
+// Report-only: classify emitted old-value snapshots by whether their change detection
+// feeds any activation consumer (nextActiveId). Answers the per-node DCE question for
+// the largest bookkeeping class without touching emitted semantics.
+static uint64_t mtOldSnapWithConsumers = 0, mtOldSnapNoConsumers = 0;
+static bool mtOldValueHistogramEnabled() {
+  const char* env = std::getenv("GSIM_MT_DENSE_OLDVALUE_HISTOGRAM");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 static void commitStableOutputFile(const std::string& tmpPath, const std::string& finalPath) {
   if (tmpPath.empty()) return;
   if (generatedOutputFilesEqual(tmpPath, finalPath)) {
@@ -9559,6 +9568,13 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
       break;
     case SUPER_INFO_ASSIGN_BEG:
       if (inst.node->isLocal() || inst.node->isArray() || inst.node->type == NODE_WRITER) break;
+      // Report-only histogram (GSIM_MT_DENSE_OLDVALUE_HISTOGRAM=1): does this snapshot's
+      // change-detection feed any activation consumer? nextActiveId empty = candidate for
+      // per-node dead-code elimination (the audit's largest bookkeeping class).
+      if (mtOldValueHistogramEnabled()) {
+        if (inst.node->nextActiveId.empty()) mtOldSnapNoConsumers ++;
+        else mtOldSnapWithConsumers ++;
+      }
       emitBodyLock(indent, "%s %s = %s;\n", widthUType(inst.node->width).c_str(), oldName(inst.node).c_str(), inst.node->name.c_str());
       break;
     case SUPER_INFO_ASSIGN_END:
@@ -13894,6 +13910,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(0, "}\n");
   }
   if (denseLookahead) {
+    // Tail-scan instrumentation (E3): zero-cost unless the stats compile macro is set.
+    // Counters live in the HEADER as inline variables: the tail function and the
+    // dumpMtProfile print land in different SimTop*.cpp shards, so a cpp-local
+    // definition would be an undefined reference at link time.
+    fprintf(header, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    fprintf(header, "inline std::atomic<uint64_t> mtDenseLookaheadTailCalls{0}, mtDenseLookaheadScanned{0}, mtDenseLookaheadFound{0}, mtDenseLookaheadFullMiss{0};\n");
+    fprintf(header, "#endif\n");
     // emit the #if guard atomically with the function start. A file-split
     // boundary between them orphaned the guard (SimTop1209 ended with #if,
     // SimTop1210 began with the body -> #endif without #if at MAXMT=800).
@@ -13908,6 +13931,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
     emitBodyLock(2, "}\n");
+    // Tail-scan instrumentation (E3): zero-cost unless the stats compile macro is set.
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(2, "if (!mtDenseEntryReady) mtDenseLookaheadTailCalls.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(2, "#endif\n");
     emitBodyLock(2, "if (mtDenseEntryReady) {\n");
     emitBodyLock(3, "(this->*mtDenseDispatchEntry->fn)();\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
@@ -13924,6 +13951,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "uint32_t mtDenseScanEnd = head + 1u + kDenseLookaheadWindow;\n");
     emitBodyLock(2, "if (mtDenseScanEnd > mtDenseDispatchCount) mtDenseScanEnd = mtDenseDispatchCount;\n");
     emitBodyLock(2, "for (uint32_t j = head + 1u; j < mtDenseScanEnd; ++j) {\n");
+    emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(3, "mtDenseLookaheadScanned.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(3, "#endif\n");
     emitBodyLock(3, "if (anyOutOfOrder && (mtDenseDoneBits[j >> 6] & (uint64_t{1} << (j & 63))) != 0) continue;\n");
     emitBodyLock(3, "const MtDenseDispatchEntry* mtDenseCandidate = mtDenseDispatchBegin + j;\n");
     emitBodyLock(3, "bool mtDenseCandidateReady = true;\n");
@@ -13936,6 +13966,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(4, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; break; }\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
+    emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(3, "mtDenseLookaheadFound.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(3, "#endif\n");
     emitBodyLock(3, "(this->*mtDenseCandidate->fn)();\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseCandidate->storeBegin; mtDenseDispatchStore < mtDenseCandidate->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
@@ -13945,6 +13978,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(3, "progressed = true;\n");
     emitBodyLock(3, "break;\n");
     emitBodyLock(2, "}\n");
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(2, "if (!progressed) mtDenseLookaheadFullMiss.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(2, "#endif\n");
     emitBodyLock(2, "if (progressed) continue;\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
@@ -15905,6 +15941,9 @@ void graph::cppEmitter() {
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
+  emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] calls=%llu scanned=%llu found=%llu fullmiss=%llu\\n\", (unsigned long long)mtDenseLookaheadTailCalls.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadScanned.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFound.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFullMiss.load(std::memory_order_relaxed));\n");
+  emitBodyLock(1, "#endif\n");
   emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
   if (useMtHelpers) {
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] helper_mode=%%s worker_count=%%d worker_pool=%%d lazy_worker_pool=%%d worker_pool_threads=%%d min_batch_tasks=%%d max_worker_count=%%d cycles=%%lu active_word_count=%%lu serial_tasks=%%lu pure_tasks=%%lu pure_batch_count=%%lu true_parallel_batch_count=%%lu skipped_fake_parallel_batch_count=%%lu serial_fast_task_count=%%lu batch_wall_ns=%%lu true_parallel_wall_ns=%%lu serial_wall_ns=%%lu merge_wall_ns=%%lu total_step_ns=%%lu\\n\", mtProfileHelperMode, mtProfileConfiguredWorkerCount, mtWorkerPoolEnabled ? 1 : 0, mtWorkerPoolLazyStart ? 1 : 0, mtWorkerPoolThreadCount, mtMinBatchTasks, mtProfileMaxWorkerCount, cycles, mtProfileActiveWordCount, mtProfileSerialTasks, mtProfilePureTasks, mtProfilePureBatchCount, mtProfileTrueParallelBatchCount, mtProfileSkippedFakeParallelBatchCount, mtProfileSerialFastTaskCount, mtProfileBatchWallNs, mtProfileTrueParallelWallNs, mtProfileSerialWallNs, mtProfileMergeWallNs, mtProfileTotalStepNs);\n");
@@ -16164,5 +16203,11 @@ void graph::cppEmitter() {
 #endif
 
   printf("[cppEmitter] define %ld nodes %d superNodes\n", definedNode.size(), superId);
+  if (mtOldValueHistogramEnabled()) {
+    fprintf(stderr, "[mt-oldvalue-histogram] with_activation_consumers=%llu no_consumers=%llu (no-consumer share %.2f%%)\n",
+            (unsigned long long)mtOldSnapWithConsumers, (unsigned long long)mtOldSnapNoConsumers,
+            (mtOldSnapWithConsumers + mtOldSnapNoConsumers) ?
+              100.0 * (double)mtOldSnapNoConsumers / (double)(mtOldSnapWithConsumers + mtOldSnapNoConsumers) : 0.0);
+  }
   std::cout << "[cppEmitter] finish writing " << srcFileIdx << " cpp files to " + globalConfig.OutputDir + "/" << std::endl;
 }
