@@ -46,6 +46,8 @@ Reference: clean single-thread gsim 18.96 s; sparse-vs-dense crossover is at ~5 
 ¹ `GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS=4`: below ~6 workers the sparse runtime's batch bookkeeping costs more than the parallelism it finds, so the model should run the lean serial-fast path (beats even plain single-thread).
 ² `GSIM_MT_CPU_AFFINITY=auto`: unpinned dense runs at ≥8 workers show a migration-churn bistability (random 2–3× slow modes); pinning is required for these numbers.
 
+Build flags: plain `-O3 -march=znver4`. PGO was measured and is **not** used — a clang `-fprofile-generate/-fprofile-use` pipeline on this model runs ~7.5% slower (5.76s vs 5.35s, 5-pair pinned, NEMU-exact); profile-guided layout degrades the 12K-hot-body instruction-cache behavior vs the default layout. LTO is not used either.
+
 All `GSIM_MT_DENSE_*` knobs are default-off; with none of them set, generation output is byte-identical to upstream.
 
 ### Quick start (XiangShan SimTop netlist, 32 threads)
