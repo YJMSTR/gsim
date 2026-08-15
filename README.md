@@ -29,6 +29,23 @@ GSIM accepts chirrtl, and compiles it to C++
 
 This branch adds a multithreaded dense execution engine: the design is condensed into SCCs, contracted into MTasks, statically assigned to worker threads, and emitted as a fixed-order executor synchronized by owner-ready tokens, with an optional bounded-lookahead fill for stalled workers. On the XiangShan RISC-V SoC design (the SimTop netlist) it reaches **5.47s for 50K CoreMark cycles at 32 threads (2.04x Verilator T16)** and 6.43s at 16 threads, bit-exact against NEMU (C5000 528/4941/0x800027ba, C50000 46540/50000).
 
+### Benchmarks (XiangShan SimTop, CoreMark C50000, NEMU bit-exact)
+
+| Threads | gsim-mt (best config) | Verilator (same machine/RTL) | gsim-mt speedup |
+|---|---:|---:|---:|
+| 1 | 18.7 s (sparse serial) | 71.95 s | 3.85× |
+| 2 | 17.7 s (serial-fast fallback¹) | — | — |
+| 4 | 17.8 s (serial-fast fallback¹) | — | — |
+| 6 | 12.5 s (dense) | — | — |
+| 8 | 8.9–9.2 s (dense, pinned²) | 14.18 s | ~1.6× |
+| 16 | 6.43 s (dense, registered; 6.08–6.26 s pinned today) | 11.15 s | 1.73× |
+| 32 | **5.47 s** (dense, registered; 5.33–5.37 s pinned today) | 9.73–9.84 s | 1.78–1.80× |
+
+Reference: clean single-thread gsim 18.96 s; sparse-vs-dense crossover is at ~5 threads (sparse wins ≤T4, dense wins ≥T6). All gsim-mt numbers are same-workload NEMU-exact C50000 runs on an AMD EPYC 9654.
+
+¹ `GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS=4`: below ~6 workers the sparse runtime's batch bookkeeping costs more than the parallelism it finds, so the model should run the lean serial-fast path (beats even plain single-thread).
+² `GSIM_MT_CPU_AFFINITY=auto`: unpinned dense runs at ≥8 workers show a migration-churn bistability (random 2–3× slow modes); pinning is required for these numbers.
+
 All `GSIM_MT_DENSE_*` knobs are default-off; with none of them set, generation output is byte-identical to upstream.
 
 ### Quick start (XiangShan SimTop netlist, 32 threads)
