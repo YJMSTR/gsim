@@ -62,7 +62,7 @@ build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
   --dir <OUT_DIR> SimTop.fir                 # <OUT_DIR> must exist; ~33 min for XiangShan
 ```
 
-Then build and run the emitted model with your MT harness (a difftest-based flow is one option), with `GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense` at runtime.
+Then build and run the emitted model with your MT harness (a difftest-based flow is one option), with `GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense GSIM_MT_CPU_AFFINITY=auto` at runtime.
 
 ### Knob overview
 
@@ -86,6 +86,8 @@ Then build and run the emitted model with your MT harness (a difftest-based flow
 | `GSIM_THREADS` | 1 | Worker count for the emitted model |
 | `GSIM_MT_EXECUTOR=dense` | unset (sparse/layered path) | Select the dense executor when the model was generated with it |
 | `GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS` | 1 | At worker counts ≤ N the non-dense step takes the lean serial-fast path and the worker pool is not started (unless the dense executor or profiling is selected). On XiangShan the sparse runtime loses to single-thread serial below 6 workers — every MTask batch falls below the minimum batch size, so MT bookkeeping is pure overhead with zero parallel gain. Set to 4 for 2–4 worker deployments: measured 17.7s vs 19.4s at 2 workers for 50K CoreMark cycles (vs 18.7s single-thread) |
+| `GSIM_MT_CPU_AFFINITY` | unset (workers unpinned) | Pin worker w to CPU (base+w−1): `auto` (base 0) or a CPU list. **Always set for dense runs at ≥8 workers**: unpinned spinning workers migrate across CPUs, and a lagging/migrated worker makes the others' lookahead windows churn — a positive-feedback bistability with 2–3× slow runs. Pinning removes it and speeds the fast mode too (T8: 13s→9s; T32: erratic 8.6–18.2s → stable 5.33–5.37s, NEMU-exact) |
+| `GSIM_MT_DENSE_DUTY` | off (gen-time and runtime) | Perturbation-free duty-cycle instrumentation: per-thread, per-cycle chrono into 64B-padded per-lane counters (chain span / lookahead tail / in-chain token block / pool spin / coordinator reset+join+step wall), printed as `[mt-duty]` lines at exit. ~8 clock reads per worker per cycle; measured distortion +0.63%. Unlike `GSIM_MT_PROFILE` (per-task chrono on one shared cache line, ~19× observer effect), this is safe for overhead accounting |
 
 ### Exact replay (deterministic regeneration)
 
