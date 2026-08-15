@@ -79,6 +79,14 @@ Then build and run the emitted model with your MT harness (a difftest-based flow
 | `GSIM_MT_DENSE_UNPIN_SPECIAL` | off | Distribute printf-style special tasks off worker 0 |
 | `GSIM_MT_WORKER_POOL_FLAG_JOIN` | off | Per-worker completion-flag cycle join |
 
+### Runtime knobs
+
+| Knob | Default | Effect |
+|---|---|---|
+| `GSIM_THREADS` | 1 | Worker count for the emitted model |
+| `GSIM_MT_EXECUTOR=dense` | unset (sparse/layered path) | Select the dense executor when the model was generated with it |
+| `GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS` | 1 | At worker counts ≤ N the non-dense step takes the lean serial-fast path and the worker pool is not started (unless the dense executor or profiling is selected). On XiangShan the sparse runtime loses to single-thread serial below 6 workers — every MTask batch falls below the minimum batch size, so MT bookkeeping is pure overhead with zero parallel gain. Set to 4 for 2–4 worker deployments: measured 17.7s vs 19.4s at 2 workers for 50K CoreMark cycles (vs 18.7s single-thread) |
+
 ### Exact replay (deterministic regeneration)
 
 ```bash
