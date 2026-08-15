@@ -40,7 +40,10 @@ This branch adds a multithreaded dense execution engine: the design is condensed
 | 8 | 8.9–9.2 s (dense, pinned²) | 14.18 s | ~1.6× |
 | 16 | 6.43 s (dense, registered; 6.08–6.26 s pinned today) | 11.15 s | 1.73× |
 | 32 | **5.47 s** (dense, registered; 5.33–5.37 s pinned today) | 9.73–9.84 s | 1.78–1.80× |
+| 48 | 5.75 s (dense, pinned) | — | — |
+| 64 | 5.89 s (dense, pinned) | — | — |
 
+Scaling peaks at 32 threads on this design+machine: beyond it, cross-CCD/socket token latency (290–322ns vs 24.5ns same-CCD) and per-MTask protocol cost outgrow the shorter chains (T48 with doubled MTask granularity is 6.60s — worse, ruling out mis-tuning). 
 Reference: clean single-thread gsim 18.96 s; sparse-vs-dense crossover is at ~5 threads (sparse wins ≤T4, dense wins ≥T6). All gsim-mt numbers are same-workload NEMU-exact C50000 runs on an AMD EPYC 9654.
 
 ¹ `GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS=4`: below ~6 workers the sparse runtime's batch bookkeeping costs more than the parallelism it finds, so the model should run the lean serial-fast path (beats even plain single-thread).
