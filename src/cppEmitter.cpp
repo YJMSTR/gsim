@@ -1422,6 +1422,15 @@ static int mtDenseLookaheadWindow() {
   return static_cast<int>(window);
 }
 
+// Default-off perturbation-free duty-cycle instrumentation.  Per-cycle, per-thread
+// chrono into 64B-padded per-lane counters (no shared cache line, ~8 clock reads
+// per worker per cycle, ~0.2% of a 106us cycle) — replaces the per-task chrono
+// whose single shared counter line distorted profiled runs ~19x (v470 retraction).
+static bool mtDenseDutyCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_DUTY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // Shared sparse-gate prefilter predicate builder (body R3 prefilter + hoisted call-site gate).
 // Returns false when the MTask must always run (any always-active member, or empty footprint);
@@ -9958,6 +9967,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   }
   emitBodyLock(1, "while (true) {\n");
   emitBodyLock(2, "uint64_t generation = seenGeneration;\n");
+  if (mtDenseDutyCodegen()) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutySpinBegin; if (mtDutyEnabled) mtDutySpinBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "while (true) {\n");
   emitBodyLock(3, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
   if (mtUseWorkerPoolWakeShardCodegen()) {
@@ -9972,6 +9982,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(3, "if (generation != seenGeneration) break;\n");
   emitBodyLock(3, "mtWorkerPoolPause();\n");
   emitBodyLock(2, "}\n");
+  if (mtDenseDutyCodegen()) emitBodyLock(2, "if (mtDutyEnabled && worker >= 1 && worker <= kDenseDutyLaneMax) mtDutyLanes[worker].spinNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutySpinBegin).count();\n");
   emitBodyLock(2, "seenGeneration = generation;\n");
   emitBodyLock(2, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
   emitBodyLock(2, "const int workerCount = mtWorkerPoolCurrentWorkerCount;\n");
@@ -12454,8 +12465,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   const int denseLookaheadWindow = mtDenseLookaheadWindow();
   const bool denseLookahead = denseLookaheadWindow > 0;
+  const bool denseDuty = mtDenseDutyCodegen();
   Assert(!denseLookahead || ownerReadyFlags,
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!denseDuty || ownerReadyFlags,
+         "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseLookahead || !workSteal,
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
@@ -13086,6 +13100,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       fprintf(header, "};\n");
     }
     fprintf(header, "struct MtDenseOwnerReadyToken { std::atomic<uint8_t> ready{0}; };\n");
+    if (denseDuty) {
+      fprintf(header, "struct alignas(64) MtDenseDutyLane { uint64_t spinNs = 0, spanNs = 0, tailNs = 0, blockNs = 0, resetNs = 0, joinNs = 0, stepWallNs = 0, count = 0; };\n");
+      fprintf(header, "MtDenseDutyLane mtDutyLanes[%d];\n", threadCount + 1);
+      fprintf(header, "static constexpr int kDenseDutyLaneMax = %d;\n", threadCount);
+      fprintf(header, "bool mtDutyEnabled = false;\n");
+      // RAII span recorder: survives the early returns inside the worker switch cases.
+      fprintf(header, "struct MtDenseDutyGuard { uint64_t* acc; std::chrono::steady_clock::time_point t0; MtDenseDutyGuard(uint64_t* a) : acc(a), t0(std::chrono::steady_clock::now()) {} ~MtDenseDutyGuard() { if (acc) *acc += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } };\n");
+    }
     fprintf(header, "static_assert(sizeof(std::atomic<uint8_t>) == 1, \"owner-ready atomic must occupy one byte\");\n");
     fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"owner-ready atomic must be lock-free\");\n");
     fprintf(header, "static_assert(sizeof(MtDenseOwnerReadyToken) == 1, \"owner-ready slots must have one-byte extent\");\n");
@@ -13151,7 +13173,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         fprintf(header, "};\n");
         fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; uint32_t localBegin; uint32_t localEnd; };\n",
                 name.c_str());
-        fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target);\n");
+        if (denseDuty) {
+          fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane);\n");
+        } else {
+          fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target);\n");
+        }
       } else {
         fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; };\n",
                 name.c_str());
@@ -13520,6 +13546,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfile)) mtDenseBreakdownDispatchBegin = std::chrono::steady_clock::now();\n");
     }
 
+    if (denseDuty) emitBodyLock(1, "MtDenseDutyGuard mtDutyGuard(mtDutyEnabled && threadId >= 0 && threadId <= %d ? &mtDutyLanes[threadId].spanNs : nullptr);\n", threadCount);
     emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
     emitBodyLock(1, "switch (threadId) {\n");
     for (int t = 0; t < threadCount; t++) {
@@ -13535,8 +13562,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
               emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
             }
-            emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); return; }\n",
-                         t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+            if (denseDuty) {
+              emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
+                           t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
+            } else {
+              emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); return; }\n",
+                           t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+            }
             emitBodyLock(5, "stepDenseMTask%d();\n", mtaskId);
             for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
               emitBodyLock(5, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
@@ -13912,7 +13944,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // emit the #if guard atomically with the function start. A file-split
     // boundary between them orphaned the guard (SimTop1209 ended with #if,
     // SimTop1210 began with the body -> #endif without #if at MAXMT=800).
-    emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target) {\n", name.c_str());
+    if (denseDuty) {
+      emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane) {\n", name.c_str());
+    } else {
+      emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target) {\n", name.c_str());
+    }
+    if (denseDuty) emitBodyLock(1, "MtDenseDutyGuard mtDutyTailGuard(mtDutyEnabled ? &mtDutyLanes[mtDutyLane].tailNs : nullptr);\n");
     emitBodyLock(1, "const uint32_t mtDenseDispatchCount = static_cast<uint32_t>(mtDenseDispatchEnd - mtDenseDispatchBegin);\n");
     emitBodyLock(1, "uint64_t mtDenseDoneBits[kDenseLookaheadDoneWordCount] = {};\n");
     emitBodyLock(1, "bool anyOutOfOrder = false;\n");
@@ -13974,11 +14011,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "if (!progressed) mtDenseLookaheadFullMiss.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(2, "#endif\n");
     emitBodyLock(2, "if (progressed) continue;\n");
+    if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
     emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
     emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
     emitBodyLock(2, "}\n");
+    if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
@@ -14092,6 +14131,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitFixedDenseThreadWorker("stepDenseThreadWorker");
   }
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
+  if (denseDuty) emitBodyLock(1, "MtDenseDutyGuard mtDutyStepGuard(mtDutyEnabled ? &mtDutyLanes[%d].stepWallNs : nullptr);\n", threadCount);
   if (denseBreakdownWindowCodegen) {
     emitBodyLock(1, "const bool mtDenseBreakdownWindowInCycle = mtDenseBreakdownWindowEnabled && cycles >= mtDenseBreakdownWindowStart && cycles - mtDenseBreakdownWindowStart < mtDenseBreakdownWindowCycles;\n");
     emitBodyLock(1, "const bool mtDenseBreakdownProfileInCycle = mtDenseBreakdownProfileEnabled && mtDenseBreakdownWindowInCycle;\n");
@@ -14111,8 +14151,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // cross-cycle activation carry is preserved (the gated bodies clear bits as they consume them).
   // Default dense path keeps resetAllDense() (memset + reset activation, fine when bodies are
   // unconditional).
+  if (denseDuty) emitBodyLock(1, "std::chrono::steady_clock::time_point mtDutyResetBegin; if (mtDutyEnabled) mtDutyResetBegin = std::chrono::steady_clock::now();\n");
   if (sparseGate) emitBodyLock(1, "resetAll();\n");
   else emitBodyLock(1, "resetAllDense();\n");
+  if (denseDuty) emitBodyLock(1, "if (mtDutyEnabled) mtDutyLanes[%d].resetNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyResetBegin).count();\n", threadCount);
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
       if (member->isReset() && member->type == NODE_REG_SRC) {
@@ -14199,7 +14241,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "}\n");
   }
 
+  if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyJoinBegin; if (mtDutyEnabled) mtDutyJoinBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
+  if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[%d].joinNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyJoinBegin).count();\n", threadCount);
   if (activity) {
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
     emitBodyLock(2, "if (++mtDenseActivityCounter == 0) { for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed); mtDenseActivityCounter = 1; }\n", nMTasks);
@@ -15259,6 +15303,10 @@ void graph::cppEmitter() {
   emitBodyLock(1, "if (sparseSerialFastEnv != nullptr) mtSparseSerialFastMaxWorkers = atoi(sparseSerialFastEnv);\n");
   emitBodyLock(1, "if (mtSparseSerialFastMaxWorkers < 1) mtSparseSerialFastMaxWorkers = 1;\n");
   emitBodyLock(1, "this->mtSparseSerialFastMaxWorkers = mtSparseSerialFastMaxWorkers;\n");
+  if (mtDenseDutyCodegen()) {
+    emitBodyLock(1, "const char *dutyEnv = getenv(\"GSIM_MT_DENSE_DUTY\");\n");
+    emitBodyLock(1, "mtDutyEnabled = dutyEnv != nullptr && dutyEnv[0] != '\\0' && dutyEnv[0] != '0';\n");
+  }
   emitBodyLock(1, "int mtCoarseMinActiveBits = 0;\n");
   emitBodyLock(1, "const char *coarseMinActiveBitsEnv = getenv(\"GSIM_MT_COARSE_MIN_ACTIVE_BITS\");\n");
   emitBodyLock(1, "if (coarseMinActiveBitsEnv != nullptr) mtCoarseMinActiveBits = atoi(coarseMinActiveBitsEnv);\n");
@@ -15942,6 +15990,18 @@ void graph::cppEmitter() {
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::dumpMtProfile() {\n", name.c_str());
+  if (mtDenseDutyCodegen()) {
+    // Per-lane duty-cycle report: coordinator lane = threadCount (reset/join/stepWall),
+    // worker lanes 0..threadCount-1 (span=chain busy incl. tail, tail=lookahead scan+OOO work,
+    // block=in-chain token spin, spin=pool between-cycle wait).  %%.3f => ms.
+    emitBodyLock(1, "if (mtDutyEnabled) {\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-duty] lane spinMs spanMs tailMs blockMs resetMs joinMs stepWallMs\\n\");\n");
+    emitBodyLock(2, "for (int i = 0; i <= kDenseDutyLaneMax; i++) {\n");
+    emitBodyLock(3, "MtDenseDutyLane &L = mtDutyLanes[i];\n");
+    emitBodyLock(3, "fprintf(stderr, \"[mt-duty] %%d %%.3f %%.3f %%.3f %%.3f %%.3f %%.3f %%.3f\\n\", i, L.spinNs/1e6, L.spanNs/1e6, L.tailNs/1e6, L.blockNs/1e6, L.resetNs/1e6, L.joinNs/1e6, L.stepWallNs/1e6);\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+  }
   emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] calls=%%llu scanned=%%llu found=%%llu fullmiss=%%llu\\n\", (unsigned long long)mtDenseLookaheadTailCalls.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadScanned.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFound.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFullMiss.load(std::memory_order_relaxed));\n");
   emitBodyLock(1, "#endif\n");
