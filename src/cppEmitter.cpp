@@ -9082,17 +9082,6 @@ void graph::genInterfaceOutput(Node* output) {
                output->name.c_str(), output->status == CONSTANT_NODE ? output->computeInfo->valStr.c_str() : output->name.c_str());
 }
 
-void graph::genHeaderEnd(FILE* fp) {
-  fprintf(fp, "};\n");
-  // Tail-scan instrumentation counters live OUTSIDE the class as inline namespace
-  // variables (the tail function and the dumpMtProfile print land in different
-  // SimTop*.cpp shards; class members would need out-of-line definitions).
-  fprintf(fp, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
-  fprintf(fp, "inline std::atomic<uint64_t> mtDenseLookaheadTailCalls{0}, mtDenseLookaheadScanned{0}, mtDenseLookaheadFound{0}, mtDenseLookaheadFullMiss{0};\n");
-  fprintf(fp, "#endif\n");
-  fprintf(fp, "#endif\n");
-}
-
 static void emitActiveBufferDef(FILE* header, int activeWords) {
   int packedActiveWords = 64 / ACTIVE_WIDTH;
   fprintf(header,
@@ -16198,7 +16187,13 @@ void graph::cppEmitter() {
   genStep(subStepIdxMax, serialFastSubStepMax, serialFastSuffix, denseExecutorValid);
 
   /* end of file */
+  // Tail-scan instrumentation counters live OUTSIDE the class as inline namespace
+  // variables (the tail function and the dumpMtProfile print land in different
+  // SimTop*.cpp shards; class members would need out-of-line definitions).
   fprintf(header, "};\n"
+                  "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n"
+                  "inline std::atomic<uint64_t> mtDenseLookaheadTailCalls{0}, mtDenseLookaheadScanned{0}, mtDenseLookaheadFound{0}, mtDenseLookaheadFullMiss{0};\n"
+                  "#endif\n"
                   "#endif\n");
   fclose(header);
   commitStableOutputFile(headerTmpFilePath, headerFilePath);

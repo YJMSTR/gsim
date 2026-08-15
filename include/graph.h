@@ -42,7 +42,6 @@ private:
                           const std::string& accumFlagName = "", bool emitActivation = true);
 
   FILE* genHeaderStart();
-  void genHeaderEnd(FILE* fp);
   void genNodeDef(FILE* fp, Node* node);
   void genInterfaceInput(Node* input);
   void genInterfaceOutput(Node* output);
