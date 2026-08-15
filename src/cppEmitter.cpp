@@ -14401,7 +14401,7 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
     }
   }
   if (serialFastSubStepMax >= 0) {
-    emitBodyLock(1, "if (mtConfiguredWorkerCount <= 1 && !mtProfileEnabled) {\n");
+    emitBodyLock(1, "if (mtConfiguredWorkerCount <= mtSparseSerialFastMaxWorkers && !mtProfileEnabled) {\n");
     for (int i = 0; i <= serialFastSubStepMax; i ++) {
       emitBodyLock(2, "subStep%d%s();\n", i, serialFastSuffix.c_str());
     }
@@ -14921,6 +14921,7 @@ void graph::cppEmitter() {
   fprintf(header, "const char *mtProfileHelperMode;\n");
   fprintf(header, "int mtConfiguredWorkerCount;\n");
   fprintf(header, "int mtMinBatchTasks;\n");
+  fprintf(header, "int mtSparseSerialFastMaxWorkers;\n");
   fprintf(header, "int mtCoarseMinActiveBits;\n");
   fprintf(header, "int mtCoarseInlineThreshold;\n");
   if (mtUseSubchunkRuntime()) {
@@ -15163,7 +15164,10 @@ void graph::cppEmitter() {
   if (denseBreakdownProfileCodegen) emitBodyLock(1, "initMtDenseBreakdownProfile();\n");
 
   if (activationEventTraceCodegen) emitBodyLock(1, "initMtActivationEventTrace();\n");
-  if (useMtHelpers) emitBodyLock(1, "if (!mtWorkerPoolLazyStart) startMtWorkerPool();\n");
+  if (useMtHelpers) {
+    if (denseExecutorValid) emitBodyLock(1, "if (!mtWorkerPoolLazyStart && !(!mtProfileEnabled && !mtUseDenseExecutor && mtConfiguredWorkerCount <= mtSparseSerialFastMaxWorkers)) startMtWorkerPool();\n");
+    else emitBodyLock(1, "if (!mtWorkerPoolLazyStart && !(!mtProfileEnabled && mtConfiguredWorkerCount <= mtSparseSerialFastMaxWorkers)) startMtWorkerPool();\n");
+  }
   emitBodyLock(1, "init();\n");
   emitBodyLock(0, "}\n");
 
@@ -15261,6 +15265,11 @@ void graph::cppEmitter() {
   emitBodyLock(1, "if (minBatchEnv != nullptr) mtMinBatchTasks = atoi(minBatchEnv);\n");
   emitBodyLock(1, "if (mtMinBatchTasks < 1) mtMinBatchTasks = 1;\n");
   emitBodyLock(1, "this->mtMinBatchTasks = mtMinBatchTasks;\n");
+  emitBodyLock(1, "int mtSparseSerialFastMaxWorkers = 1;\n");
+  emitBodyLock(1, "const char *sparseSerialFastEnv = getenv(\"GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS\");\n");
+  emitBodyLock(1, "if (sparseSerialFastEnv != nullptr) mtSparseSerialFastMaxWorkers = atoi(sparseSerialFastEnv);\n");
+  emitBodyLock(1, "if (mtSparseSerialFastMaxWorkers < 1) mtSparseSerialFastMaxWorkers = 1;\n");
+  emitBodyLock(1, "this->mtSparseSerialFastMaxWorkers = mtSparseSerialFastMaxWorkers;\n");
   emitBodyLock(1, "int mtCoarseMinActiveBits = 0;\n");
   emitBodyLock(1, "const char *coarseMinActiveBitsEnv = getenv(\"GSIM_MT_COARSE_MIN_ACTIVE_BITS\");\n");
   emitBodyLock(1, "if (coarseMinActiveBitsEnv != nullptr) mtCoarseMinActiveBits = atoi(coarseMinActiveBitsEnv);\n");
