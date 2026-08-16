@@ -31,6 +31,8 @@ This branch adds a multithreaded dense execution engine: the design is condensed
 
 ### Benchmarks (XiangShan SimTop, CoreMark C50000, NEMU bit-exact)
 
+**RTL under test: XiangShan Default config (Kunminghu)** — `CONFIG=DefaultConfig` (XiangShan Makefile default), full out-of-order core with vector extension (the FIR contains the VPU); NOT the Minimal config. All numbers on this page are for the Default-config `SimTop` netlist (886 MB FIR, 45,163 SCCs condensed to 8,436–12,275 MTasks depending on thread count).
+
 | Threads | gsim-mt (best config) | Verilator (same machine/RTL) | gsim-mt speedup |
 |---|---:|---:|---:|
 | 1 | 18.7 s (sparse serial) | 71.95 s | 3.85× |
