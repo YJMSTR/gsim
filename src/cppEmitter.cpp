@@ -118,6 +118,7 @@ static std::map<Node*, std::pair<int, int>> super2DenseResetId;  // dense uint &
 
 extern int maxConcatNum;
 bool nameExist(std::string str);
+Node* nodeByName(std::string str);
 static int resetFuncNum = 0;
 std::pair<int, uint64_t> setIdxMask(int cppId);
 
@@ -1431,6 +1432,20 @@ static bool mtDenseDutyCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Default-off speculation hit-rate probe (GSIM_MT_DENSE_SPEC_PROBE). Instruments the
+// lookahead tail's head-blocked spin: at block entry it determines the speculative
+// prefix segment (the blocked head plus subsequent dispatch entries whose cross-worker
+// wait tokens are all satisfied, up to the next entry that would itself block), copies
+// each member's cross-worker input loci into a thread-local snapshot buffer, and after
+// the token arrives memcmps the copies against the final values. Exact value comparison
+// (no hashes): single-writer semantics make producer values final at token arrival.
+// Report-only counters, drained in dumpMtProfile like mt-duty. Gen knob emits the
+// instrumentation; the runtime env of the same name enables counting.
+static bool mtDenseSpecProbeCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_SPEC_PROBE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // Shared sparse-gate prefilter predicate builder (body R3 prefilter + hoisted call-site gate).
 // Returns false when the MTask must always run (any always-active member, or empty footprint);
@@ -1513,6 +1528,63 @@ static const MtActivityReads& mtActivityReadsForNode(Node* n) {
   auto res = mtActivityReadCache.emplace(n, MtActivityReads());
   for (ExpTree* t : n->assignTree) mtActivityCollectFromTree(t->getRoot(), res.first->second);
   return res.first->second;
+}
+
+// GSIM_MT_DENSE_SPEC_PROBE locus collectors. Unlike the activity collector above (which
+// expands comb reads down to base storage names), these keep LOCUS names: the probe must
+// snapshot/compare the actual mutable member variables that a blocked chain-head reads and
+// that its cross-worker producers write. Read loci record the names referenced by a tree
+// (comb nodes are recorded by name AND expanded, covering both variable-read and inlined
+// emission); write loci record what a supernode's emitted code assigns (tree owners, reg
+// commit targets via REG_DST/REG_RESET src, memory write parents).
+static void mtSpecProbeCollectReadLoci(ENode* root, std::set<std::string>& out, std::set<Node*>& expanded) {
+  if (!root) return;
+  std::stack<ENode*> st;
+  st.push(root);
+  std::set<ENode*> seen;
+  while (!st.empty()) {
+    ENode* t = st.top(); st.pop();
+    if (!t || seen.count(t)) continue;
+    seen.insert(t);
+    for (ENode* c : t->child) st.push(c);
+    Node* n = t->nodePtr;
+    if (!n) continue;
+    if (n->type == NODE_REG_SRC || n->type == NODE_INP) { out.insert(n->name); continue; }
+    if (n->type == NODE_MEMORY || n->type == NODE_READER || n->type == NODE_READWRITER) {
+      if (n->parent) out.insert(n->parent->name);
+      out.insert(n->name);
+      continue;
+    }
+    if (n->type == NODE_REG_DST || n->type == NODE_REG_RESET || n->type == NODE_WRITER) continue;
+    out.insert(n->name);
+    if (!n->assignTree.empty() && expanded.insert(n).second) {
+      for (ExpTree* tree : n->assignTree) mtSpecProbeCollectReadLoci(tree->getRoot(), out, expanded);
+    }
+  }
+}
+
+static void mtSpecProbeCollectWriteLoci(SuperNode* super, std::set<std::string>& out) {
+  for (Node* member : super->member) {
+    if (member->type == NODE_REG_DST) {
+      Node* s = member->getSrc();
+      if (s) out.insert(s->name);
+    } else if (member->type == NODE_REG_RESET) {
+      Node* s = member->getResetSrc();
+      if (s) out.insert(s->name);
+    } else if (member->type == NODE_WRITER) {
+      if (member->parent) out.insert(member->parent->name);
+    } else if (!member->assignTree.empty()) {
+      out.insert(member->name);
+    }
+  }
+}
+
+// A probeable locus: the name resolves to a node that genNodeDef actually declared as a
+// class member variable (so sizeof()/&name compile), and is not a whole memory array
+// (memories are excluded from snapshots; their read-port result nodes are kept).
+static bool mtSpecProbeDeclaredLocus(const std::string& nm) {
+  Node* n = nodeByName(nm);
+  return n != nullptr && definedNode.count(n) != 0 && n->type != NODE_MEMORY;
 }
 
 
@@ -12466,10 +12538,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const int denseLookaheadWindow = mtDenseLookaheadWindow();
   const bool denseLookahead = denseLookaheadWindow > 0;
   const bool denseDuty = mtDenseDutyCodegen();
+  const bool denseSpecProbe = mtDenseSpecProbeCodegen();
   Assert(!denseLookahead || ownerReadyFlags,
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseDuty || ownerReadyFlags,
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!denseSpecProbe || (ownerReadyFlags && denseLookahead),
+         "GSIM_MT_DENSE_SPEC_PROBE requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1 and GSIM_MT_DENSE_LOOKAHEAD>0");
+  Assert(!denseSpecProbe || !workSteal,
+         "GSIM_MT_DENSE_SPEC_PROBE is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || !workSteal,
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
@@ -12510,12 +12587,17 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   int activityConservativeFields = 0;
   int activityScalarFields = 0;
   int activityAlwaysActiveCount = 0;
-  // The PEG dump (GSIM_MT_DENSE_PEG_DUMP) needs the field read/write sets computed in
-  // this block even when the activity feature itself is off (e.g. under LOOKAHEAD,
-  // which force-disables activity). Widen the gate; the activity-only outputs remain
+  // The PEG dump (GSIM_MT_DENSE_PEG_DUMP) and the speculation probe
+  // (GSIM_MT_DENSE_SPEC_PROBE) need the field read/write sets computed in this block
+  // even when the activity feature itself is off (e.g. under LOOKAHEAD, which
+  // force-disables activity). Widen the gate; the activity-only outputs remain
   // unused locals when activity=false.
   const bool pegDump = std::getenv("GSIM_MT_DENSE_PEG_DUMP") != nullptr;
-  if (activity || pegDump) {
+  // Speculation-probe per-MTask cross-worker input loci (sorted, deterministic) and a
+  // blind flag for MTasks whose producer write-set resolves to no declared locus.
+  std::vector<std::vector<std::string>> specProbeFields;
+  std::vector<char> specProbeBlind;
+  if (activity || pegDump || denseSpecProbe) {
     const int nM = nMTasks;
     activityAlwaysActive.assign((size_t)nM, 0);
     activityResetHandler.assign((size_t)nM, 0);
@@ -12542,6 +12624,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     std::vector<std::set<std::string>> commitFields((size_t)nM);
     std::vector<std::set<std::string>> nextWriteFields((size_t)nM);
     std::map<std::string, Node*> commitTargetNode;
+    std::vector<std::set<std::string>> specProbeReadLoci;
+    std::vector<std::set<std::string>> specProbeWriteLoci;
+    if (denseSpecProbe) {
+      specProbeReadLoci.assign((size_t)nM, {});
+      specProbeWriteLoci.assign((size_t)nM, {});
+    }
     for (int m = 0; m < nM; m++) {
       const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
       for (int sccId : mt.sccIds) {
@@ -12562,6 +12650,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             activityRegionOf[(size_t)m] = rid->second + 1;
           }
           for (const std::string& r : b.rhsReadStateTargetNames) readFields[(size_t)m].insert(r);
+          if (denseSpecProbe) {
+            mtSpecProbeCollectWriteLoci(super, specProbeWriteLoci[(size_t)m]);
+            std::set<Node*> specExpanded;
+            for (Node* member : super->member) {
+              for (ExpTree* tree : member->assignTree) {
+                mtSpecProbeCollectReadLoci(tree->getRoot(), specProbeReadLoci[(size_t)m], specExpanded);
+              }
+            }
+          }
           for (Node* member : super->member) {
             for (ExpTree* tree : member->assignTree) {
               MtActivityReads tr;
@@ -12588,6 +12685,57 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             for (const std::string& f : b.stateTargetNames) nextWriteFields[(size_t)m].insert(f);
           }
         }
+      }
+    }
+    // Speculation probe field sets: per-MTask cross-worker INPUT loci = loci the MTask
+    // reads that are written by any cross-worker producer behind its owner-ready wait
+    // tokens (the protocol guarantees every cross-worker writer of a read locus is a
+    // wait-token producer, so this is exact up to locus-name resolution). Superset-safe:
+    // extra stable loci (e.g. commit-deferred registers) never flip an episode to
+    // "changed"; memories are excluded wholesale (their read-port result nodes remain).
+    if (denseSpecProbe) {
+      specProbeFields.assign((size_t)nM, {});
+      specProbeBlind.assign((size_t)nM, 0);
+      std::vector<std::set<int>> specProducers((size_t)nM);
+      for (int m = 0; m < nM; m++) {
+        const int myThread = denseSchedule.mtaskThreadAssign[(size_t)m];
+        if (myThread < 0) continue;
+        for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)m]) {
+          if (slot < 0 || slot >= static_cast<int>(ownerReadyLayout.logicalTokenByPhysicalSlot.size())) continue;
+          int token = ownerReadyLayout.logicalTokenByPhysicalSlot[(size_t)slot];
+          if (token < 0 || token >= ownerReadyLayout.tokenCount) continue;
+          const MtDenseOwnerReadyTokenProvenance& prov =
+              ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token];
+          if (prov.producerMTask >= 0 && prov.producerMTask != m) {
+            int w = prov.producerMTask;
+            if (w < nM && denseSchedule.mtaskThreadAssign[(size_t)w] >= 0 &&
+                denseSchedule.mtaskThreadAssign[(size_t)w] != myThread) {
+              specProducers[(size_t)m].insert(w);
+            }
+          }
+          for (int w : ownerReadyLayout.sourceMTasksByLogicalToken[(size_t)token]) {
+            if (w < 0 || w >= nM || w == m) continue;
+            if (denseSchedule.mtaskThreadAssign[(size_t)w] >= 0 &&
+                denseSchedule.mtaskThreadAssign[(size_t)w] != myThread) {
+              specProducers[(size_t)m].insert(w);
+            }
+          }
+        }
+      }
+      for (int m = 0; m < nM; m++) {
+        if (specProducers[(size_t)m].empty()) continue;
+        std::set<std::string> writes;
+        for (int w : specProducers[(size_t)m]) {
+          writes.insert(specProbeWriteLoci[(size_t)w].begin(), specProbeWriteLoci[(size_t)w].end());
+        }
+        std::set<std::string> chosen;
+        for (const std::string& nm : specProbeReadLoci[(size_t)m]) {
+          if (writes.count(nm) && mtSpecProbeDeclaredLocus(nm)) chosen.insert(nm);
+        }
+        specProbeFields[(size_t)m].assign(chosen.begin(), chosen.end());
+        // Has cross-worker producers but no resolvable input locus: inputs unverifiable;
+        // episodes headed here are counted "blind" (excluded from the equal numerator).
+        if (specProbeFields[(size_t)m].empty()) specProbeBlind[(size_t)m] = 1;
       }
     }
     std::vector<char> activityElided((size_t)nM, 0);
@@ -12664,6 +12812,95 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       std::fclose(pc);
       fprintf(stderr, "[mt-dense-peg] dumped %d nodes dep=%lld wrap=%lld to %s-{edges,cost}.bin\n",
               nM, (long long)depEdges, (long long)wrapEdges, pegPath);
+    }
+    // Report-only per-MTask provenance for offline witness attribution: the
+    // dist=1 PEG edge set is exactly nextWriteFields[u] x (dstReadFields |
+    // commitFields)[v] per shared field, so exporting these sets per MTask
+    // lets the mcr5 witness be joined back to fields and module paths without
+    // another generation. Default-off: only under GSIM_MT_DENSE_PEG_DUMP.
+    if (const char* provPegPath = std::getenv("GSIM_MT_DENSE_PEG_DUMP")) {
+      std::string provPath = std::string(provPegPath) + "-provenance.json";
+      FILE* pj = std::fopen(provPath.c_str(), "w");
+      Assert(pj != nullptr, "cannot open PEG provenance dump %s", provPath.c_str());
+      std::vector<std::string> regionNameById(regionIds.size() + 1, "other");
+      for (const auto& rn : regionIds) regionNameById[(size_t)rn.second + 1] = rn.first;
+      auto dumpProvStrSet = [&](FILE* out, const std::set<std::string>& s) {
+        fprintf(out, "[");
+        bool first = true;
+        for (const std::string& x : s) {
+          fprintf(out, "%s\"%s\"", first ? "" : ",", jsonEscape(x).c_str());
+          first = false;
+        }
+        fprintf(out, "]");
+      };
+      auto dumpProvIntVec = [&](FILE* out, const std::vector<int>& v) {
+        fprintf(out, "[");
+        bool first = true;
+        for (int x : v) { fprintf(out, "%s%d", first ? "" : ",", x); first = false; }
+        fprintf(out, "]");
+      };
+      const size_t kMaxNodeNames = 256;
+      fprintf(pj, "{\n\"format\": \"gsim.mt-dense-peg-provenance.v1\",\n\"mtask_count\": %d,\n\"mtasks\": [\n", nM);
+      for (int m = 0; m < nM; m++) {
+        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+        int worker = m < static_cast<int>(denseSchedule.mtaskThreadAssign.size())
+                       ? denseSchedule.mtaskThreadAssign[(size_t)m] : -1;
+        std::vector<int> sccIdsOut;
+        std::set<int> cppIdSet;
+        std::set<std::string> nodeNames;
+        bool namesTruncated = false;
+        std::set<std::string> modulePaths;
+        for (int sccId : mt.sccIds) {
+          if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+          sccIdsOut.push_back(sccId);
+          for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+            cppIdSet.insert(cppId);
+            auto superIter = cppId2Super.find(cppId);
+            if (superIter == cppId2Super.end() || !superIter->second) continue;
+            for (Node* member : superIter->second->member) {
+              const std::string& nm = member->name;
+              if (nm.empty()) continue;
+              if (nodeNames.size() < kMaxNodeNames) nodeNames.insert(nm);
+              else namesTruncated = true;
+              size_t cut = 0;
+              int segs = 0;
+              while (segs < 7) {
+                size_t pos = nm.find("__DOT__", cut);
+                if (pos == std::string::npos) { cut = nm.size(); break; }
+                cut = pos + 7; segs++;
+              }
+              modulePaths.insert(nm.substr(0, cut < nm.size() ? cut : nm.size()));
+            }
+          }
+        }
+        std::vector<int> cppIdsOut(cppIdSet.begin(), cppIdSet.end());
+        fprintf(pj, "  {\"id\": %d, \"worker\": %d, \"sched_cost\": %d, \"static_cost\": %d, \"task_count\": %d,\n",
+                m, worker, mt.schedCost, mt.staticCost, mt.taskCount);
+        fprintf(pj, "   \"region\": \"%s\", \"always_active\": %s, \"reset_handler\": %s,\n",
+                jsonEscape(regionNameById[(size_t)activityRegionOf[(size_t)m]]).c_str(),
+                activityAlwaysActive[(size_t)m] ? "true" : "false",
+                activityResetHandler[(size_t)m] ? "true" : "false");
+        fprintf(pj, "   \"scc_ids\": ");
+        dumpProvIntVec(pj, sccIdsOut);
+        fprintf(pj, ",\n   \"cpp_ids\": ");
+        dumpProvIntVec(pj, cppIdsOut);
+        fprintf(pj, ",\n   \"node_names_truncated\": %s,\n   \"node_names\": ", namesTruncated ? "true" : "false");
+        dumpProvStrSet(pj, nodeNames);
+        fprintf(pj, ",\n   \"module_paths\": ");
+        dumpProvStrSet(pj, modulePaths);
+        fprintf(pj, ",\n   \"read_fields\": ");
+        dumpProvStrSet(pj, readFields[(size_t)m]);
+        fprintf(pj, ",\n   \"dst_read_fields\": ");
+        dumpProvStrSet(pj, dstReadFields[(size_t)m]);
+        fprintf(pj, ",\n   \"commit_fields\": ");
+        dumpProvStrSet(pj, commitFields[(size_t)m]);
+        fprintf(pj, ",\n   \"next_write_fields\": ");
+        dumpProvStrSet(pj, nextWriteFields[(size_t)m]);
+        fprintf(pj, "}%s\n", m + 1 == nM ? "" : ",");
+      }
+      fprintf(pj, "]}\n");
+      std::fclose(pj);
+      fprintf(stderr, "[mt-dense-peg] wrote per-MTask provenance to %s\n", provPath.c_str());
     }
     activityNextEdges.assign((size_t)nM, {});
     for (int m = 0; m < nM; m++) {
@@ -13185,6 +13422,59 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       for (int t = 0; t < threadCount; t++) {
         fprintf(header, "static const MtDenseDispatchEntry kDenseDispatchTableW%d[%d];\n",
                 t, std::max(1, denseDispatchWorkerCounts[(size_t)t]));
+      }
+    }
+    if (denseSpecProbe) {
+      // Speculation probe (GSIM_MT_DENSE_SPEC_PROBE): constants + counters + per-MTask
+      // snapshot/compare helpers. All report-only; zero effect on dispatch semantics.
+      uint64_t specProbeCostTotal = 0;
+      for (int m = 0; m < nMTasks; m++) {
+        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+        specProbeCostTotal += (uint64_t)(mt.schedCost > 0 ? mt.schedCost : mt.staticCost);
+      }
+      fprintf(header, "static constexpr uint32_t kSpecProbeMaxSeg = 32u;\n");
+      fprintf(header, "static constexpr uint32_t kSpecProbeMemberBytes = 2048u;\n");
+      fprintf(header, "static constexpr uint32_t kSpecProbeBuckets = 16u;\n");
+      fprintf(header, "static constexpr uint64_t kSpecProbeBucketMaxNs[15] = {250,500,1000,2000,4000,8000,16000,32000,64000,128000,256000,512000,1024000,2048000,4096000};\n");
+      fprintf(header, "static constexpr uint64_t kSpecProbeCostTotalNs = %llu;\n", (unsigned long long)specProbeCostTotal);
+      fprintf(header, "static constexpr uint32_t kSpecProbeCost[%d] = {", std::max(1, nMTasks));
+      for (int m = 0; m < nMTasks; m++) {
+        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
+        fprintf(header, "%s%u", m ? "," : "", (unsigned)(mt.schedCost > 0 ? mt.schedCost : mt.staticCost));
+      }
+      if (nMTasks == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr uint8_t kSpecProbeBlind[%d] = {", std::max(1, nMTasks));
+      for (int m = 0; m < nMTasks; m++) fprintf(header, "%s%u", m ? "," : "", (unsigned)specProbeBlind[(size_t)m]);
+      if (nMTasks == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      for (int t = 0; t < threadCount; t++) {
+        if (denseDispatchWorkerCounts[(size_t)t] <= 0) continue;
+        fprintf(header, "static constexpr uint16_t kSpecProbeIdxW%d[%d] = {", t, denseDispatchWorkerCounts[(size_t)t]);
+        int emitted = 0;
+        for (int m = 0; m < nMTasks; m++) {
+          if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
+          fprintf(header, "%s%u", emitted ? "," : "", (unsigned)m);
+          emitted++;
+        }
+        if (emitted == 0) fprintf(header, "0");
+        fprintf(header, "};\n");
+      }
+      fprintf(header, "struct alignas(64) MtSpecProbeBucket { std::atomic<uint64_t> episodes{0}, equal{0}, diff{0}, waitNs{0}, segNs{0}, minNs{0}, cmpNs{0}, trunc{0}; };\n");
+      fprintf(header, "MtSpecProbeBucket mtSpecProbeBuckets[kSpecProbeBuckets];\n");
+      fprintf(header, "struct MtSpecProbeGlobal { std::atomic<uint64_t> episodes{0}, equal{0}, diffEpisodes{0}, blindEpisodes{0}, waitNs{0}, segNs{0}, diffSegNs{0}, minNs{0}, cmpNs{0}, members{0}, memberDiffFields{0}, truncSegs{0}, lenCapSegs{0}; };\n");
+      fprintf(header, "MtSpecProbeGlobal mtSpecProbeG;\n");
+      fprintf(header, "std::atomic<uint64_t> mtSpecProbeSegLenAll[7] = {};\n");
+      fprintf(header, "std::atomic<uint64_t> mtSpecProbeSegLenEqual[7] = {};\n");
+      fprintf(header, "bool mtSpecProbeEnabled = false;\n");
+      fprintf(header, "struct MtSpecProbeTL { uint16_t ids[kSpecProbeMaxSeg]; uint32_t offs[kSpecProbeMaxSeg]; uint32_t count; uint8_t buf[kSpecProbeMaxSeg * kSpecProbeMemberBytes]; };\n");
+      fprintf(header, "static thread_local MtSpecProbeTL mtSpecProbeTL;\n");
+      fprintf(header, "uint32_t specProbeSnapDispatch(uint32_t mtaskId, uint8_t* buf);\n");
+      fprintf(header, "uint32_t specProbeCmpDispatch(uint32_t mtaskId, const uint8_t* buf);\n");
+      for (int m = 0; m < nMTasks; m++) {
+        if (specProbeFields[(size_t)m].empty()) continue;
+        fprintf(header, "uint32_t specProbeSnapM%d(uint8_t* buf);\n", m);
+        fprintf(header, "uint32_t specProbeCmpM%d(const uint8_t* buf);\n", m);
       }
     }
     if (sharedHelpers) {
@@ -14011,6 +14301,49 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "if (!progressed) mtDenseLookaheadFullMiss.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(2, "#endif\n");
     emitBodyLock(2, "if (progressed) continue;\n");
+    if (denseSpecProbe) {
+      // Speculation probe: block-episode entry. Determine the speculative prefix segment
+      // (head plus subsequent entries whose cross-worker wait tokens are all satisfied,
+      // up to the next entry that would itself block), snapshot each member's
+      // cross-worker input loci into the thread-local buffer, then start the wait timer.
+      emitBodyLock(2, "uint64_t mtSpecSegCostNs = 0; uint32_t mtSpecMembersAll = 0; uint32_t mtSpecTrunc = 0; uint32_t mtSpecBlind = 0; uint64_t mtSpecSnapNs = 0;\n");
+      emitBodyLock(2, "std::chrono::steady_clock::time_point mtSpecT0;\n");
+      emitBodyLock(2, "if (mtSpecProbeEnabled) {\n");
+      emitBodyLock(3, "mtSpecProbeTL.count = 0u;\n");
+      emitBodyLock(3, "const uint16_t* mtSpecIdx = nullptr;\n");
+      for (int t = 0; t < threadCount; t++) {
+        if (denseDispatchWorkerCounts[(size_t)t] <= 0) continue;
+        emitBodyLock(3, "if (mtDenseDispatchBegin == kDenseDispatchTableW%d) mtSpecIdx = kSpecProbeIdxW%d;\n", t, t);
+      }
+      emitBodyLock(3, "if (mtSpecIdx != nullptr) {\n");
+      emitBodyLock(4, "uint32_t mtSpecSnapCount = 1u;\n");
+      emitBodyLock(4, "mtSpecProbeTL.ids[0] = mtSpecIdx[head];\n");
+      emitBodyLock(4, "mtSpecSegCostNs += kSpecProbeCost[mtSpecIdx[head]];\n");
+      emitBodyLock(4, "for (uint32_t j = head + 1u; j < mtDenseDispatchCount; ++j) {\n");
+      emitBodyLock(5, "if (anyOutOfOrder && (mtDenseDoneBits[j >> 6] & (uint64_t{1} << (j & 63))) != 0) continue;\n");
+      emitBodyLock(5, "const MtDenseDispatchEntry* mtSpecEntry = mtDenseDispatchBegin + j;\n");
+      emitBodyLock(5, "bool mtSpecReady = true;\n");
+      emitBodyLock(5, "for (uint32_t mtSpecW = mtSpecEntry->waitBegin; mtSpecW < mtSpecEntry->waitEnd; ++mtSpecW) {\n");
+      emitBodyLock(6, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtSpecW]].ready.load(std::memory_order_acquire) != target) { mtSpecReady = false; break; }\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(5, "if (!mtSpecReady) break;\n");
+      emitBodyLock(5, "mtSpecSegCostNs += kSpecProbeCost[mtSpecIdx[j]];\n");
+      emitBodyLock(5, "++mtSpecMembersAll;\n");
+      emitBodyLock(5, "if (mtSpecSnapCount < kSpecProbeMaxSeg) mtSpecProbeTL.ids[mtSpecSnapCount++] = mtSpecIdx[j];\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(4, "const std::chrono::steady_clock::time_point mtSpecSnapT0 = std::chrono::steady_clock::now();\n");
+      emitBodyLock(4, "uint32_t mtSpecOff = 0u;\n");
+      emitBodyLock(4, "for (uint32_t i = 0; i < mtSpecSnapCount; ++i) {\n");
+      emitBodyLock(5, "mtSpecProbeTL.offs[i] = mtSpecOff;\n");
+      emitBodyLock(5, "const uint32_t mtSpecB = specProbeSnapDispatch(mtSpecProbeTL.ids[i], mtSpecProbeTL.buf + mtSpecOff);\n");
+      emitBodyLock(5, "if ((mtSpecB & 0x80000000u) != 0u) mtSpecTrunc = 1u; else mtSpecOff += mtSpecB;\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(4, "mtSpecProbeTL.count = mtSpecSnapCount;\n");
+      emitBodyLock(4, "mtSpecSnapNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtSpecSnapT0).count();\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "mtSpecT0 = std::chrono::steady_clock::now();\n");
+      emitBodyLock(2, "}\n");
+    }
     if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
@@ -14018,6 +14351,63 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
     emitBodyLock(2, "}\n");
     if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
+    if (denseSpecProbe) {
+      // Speculation probe: block-episode exit. Token(s) arrived; recompare the snapshots
+      // against the now-final producer values (single-writer, exact memcmp), then book
+      // the episode into its wait-duration bucket. gross win per equal episode =
+      // min(wait, segment-exec); diff episodes additionally pay the segment redo.
+      emitBodyLock(2, "if (mtSpecProbeEnabled) {\n");
+      emitBodyLock(3, "const uint64_t mtSpecWaitNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtSpecT0).count();\n");
+      emitBodyLock(3, "const std::chrono::steady_clock::time_point mtSpecCmpT0 = std::chrono::steady_clock::now();\n");
+      emitBodyLock(3, "uint32_t mtSpecDiffTasks = 0u; uint32_t mtSpecDiffFields = 0u;\n");
+      emitBodyLock(3, "for (uint32_t i = 0; i < mtSpecProbeTL.count; ++i) {\n");
+      emitBodyLock(4, "const uint32_t mtSpecR = specProbeCmpDispatch(mtSpecProbeTL.ids[i], mtSpecProbeTL.buf + mtSpecProbeTL.offs[i]);\n");
+      emitBodyLock(4, "if ((mtSpecR & 0x80000000u) != 0u) mtSpecTrunc = 1u;\n");
+      emitBodyLock(4, "if ((mtSpecR & 0x7fffffffu) != 0u) ++mtSpecDiffTasks;\n");
+      emitBodyLock(4, "mtSpecDiffFields += (mtSpecR & 0x7fffffffu);\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "const uint64_t mtSpecCmpNs = mtSpecSnapNs + (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtSpecCmpT0).count();\n");
+      emitBodyLock(3, "const uint32_t mtSpecLen = mtSpecMembersAll + 1u;\n");
+      emitBodyLock(3, "uint32_t mtSpecBkt = kSpecProbeBuckets - 1u;\n");
+      emitBodyLock(3, "for (uint32_t b = 0u; b + 1u < kSpecProbeBuckets; ++b) if (mtSpecWaitNs < kSpecProbeBucketMaxNs[b]) { mtSpecBkt = b; break; }\n");
+      emitBodyLock(3, "uint32_t mtSpecLenBkt = 6u;\n");
+      emitBodyLock(3, "if (mtSpecLen <= 1u) mtSpecLenBkt = 0u; else if (mtSpecLen == 2u) mtSpecLenBkt = 1u; else if (mtSpecLen <= 4u) mtSpecLenBkt = 2u; else if (mtSpecLen <= 8u) mtSpecLenBkt = 3u; else if (mtSpecLen <= 16u) mtSpecLenBkt = 4u; else if (mtSpecLen <= 32u) mtSpecLenBkt = 5u;\n");
+      emitBodyLock(3, "bool mtSpecAnyBlind = false;\n");
+      emitBodyLock(3, "for (uint32_t i = 0; i < mtSpecProbeTL.count; ++i) if (kSpecProbeBlind[mtSpecProbeTL.ids[i]] != 0u) { mtSpecAnyBlind = true; break; }\n");
+      emitBodyLock(3, "if (mtSpecAnyBlind) mtSpecBlind = 1u;\n");
+      emitBodyLock(3, "const bool mtSpecEqual = (mtSpecDiffTasks == 0u) && !mtSpecAnyBlind;\n");
+      emitBodyLock(3, "MtSpecProbeBucket& mtSpecB = mtSpecProbeBuckets[mtSpecBkt];\n");
+      emitBodyLock(3, "mtSpecB.episodes.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecB.waitNs.fetch_add(mtSpecWaitNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecB.segNs.fetch_add(mtSpecSegCostNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecB.cmpNs.fetch_add(mtSpecCmpNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "if (mtSpecEqual) {\n");
+      emitBodyLock(4, "mtSpecB.equal.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(4, "mtSpecB.minNs.fetch_add(mtSpecWaitNs < mtSpecSegCostNs ? mtSpecWaitNs : mtSpecSegCostNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "} else if (!mtSpecAnyBlind) {\n");
+      emitBodyLock(4, "mtSpecB.diff.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "if (mtSpecTrunc != 0u) mtSpecB.trunc.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeG.episodes.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeG.waitNs.fetch_add(mtSpecWaitNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeG.segNs.fetch_add(mtSpecSegCostNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeG.cmpNs.fetch_add(mtSpecCmpNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeG.members.fetch_add(mtSpecLen, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeG.memberDiffFields.fetch_add(mtSpecDiffFields, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "mtSpecProbeSegLenAll[mtSpecLenBkt].fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "if (mtSpecEqual) {\n");
+      emitBodyLock(4, "mtSpecProbeG.equal.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(4, "mtSpecProbeG.minNs.fetch_add(mtSpecWaitNs < mtSpecSegCostNs ? mtSpecWaitNs : mtSpecSegCostNs, std::memory_order_relaxed);\n");
+      emitBodyLock(4, "mtSpecProbeSegLenEqual[mtSpecLenBkt].fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "} else if (!mtSpecAnyBlind) {\n");
+      emitBodyLock(4, "mtSpecProbeG.diffEpisodes.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(4, "mtSpecProbeG.diffSegNs.fetch_add(mtSpecSegCostNs, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "if (mtSpecBlind != 0u) mtSpecProbeG.blindEpisodes.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "if (mtSpecTrunc != 0u) mtSpecProbeG.truncSegs.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "if (mtSpecLen > kSpecProbeMaxSeg) mtSpecProbeG.lenCapSegs.fetch_add(1u, std::memory_order_relaxed);\n");
+      emitBodyLock(2, "}\n");
+    }
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
@@ -14066,6 +14456,53 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(0, "};\n");
     }
     emitBodyLock(0, "#endif\n");
+  }
+  if (denseSpecProbe) {
+    // Speculation probe support functions (unconditional definitions: they reference only
+    // always-declared members, so they compile regardless of the owner-ready compile macro;
+    // unused when the runtime env is off and the tail's probe branch is never taken).
+    // Thread-local snapshot buffer definition (single out-of-line definition in one shard).
+    emitFuncDecl(0, "thread_local S%s::MtSpecProbeTL S%s::mtSpecProbeTL;\n", name.c_str(), name.c_str());
+    // Per-MTask snapshot (memcpy prefix up to the byte budget; return bytes | 0x80000000
+    // on truncation) and compare (memcmp the same deterministic prefix; return differing
+    // field count | 0x80000000 on truncation).
+    for (int m = 0; m < nMTasks; m++) {
+      if (specProbeFields[(size_t)m].empty()) continue;
+      emitFuncDecl(0, "uint32_t S%s::specProbeSnapM%d(uint8_t* buf) {\n", name.c_str(), m);
+      emitBodyLock(1, "uint32_t off = 0u;\n");
+      for (const std::string& field : specProbeFields[(size_t)m]) {
+        emitBodyLock(1, "if (off + (uint32_t)sizeof(%s) <= kSpecProbeMemberBytes) { __builtin_memcpy(buf + off, &%s, sizeof(%s)); off += (uint32_t)sizeof(%s); } else return off | 0x80000000u;\n",
+                     field.c_str(), field.c_str(), field.c_str(), field.c_str());
+      }
+      emitBodyLock(1, "return off;\n");
+      emitBodyLock(0, "}\n");
+      emitFuncDecl(0, "uint32_t S%s::specProbeCmpM%d(const uint8_t* buf) {\n", name.c_str(), m);
+      emitBodyLock(1, "uint32_t off = 0u; uint32_t diff = 0u;\n");
+      for (const std::string& field : specProbeFields[(size_t)m]) {
+        emitBodyLock(1, "if (off + (uint32_t)sizeof(%s) <= kSpecProbeMemberBytes) { if (__builtin_memcmp(buf + off, &%s, sizeof(%s)) != 0) ++diff; off += (uint32_t)sizeof(%s); } else return diff | 0x80000000u;\n",
+                     field.c_str(), field.c_str(), field.c_str(), field.c_str());
+      }
+      emitBodyLock(1, "return diff;\n");
+      emitBodyLock(0, "}\n");
+    }
+    emitFuncDecl(0, "uint32_t S%s::specProbeSnapDispatch(uint32_t mtaskId, uint8_t* buf) {\n", name.c_str());
+    emitBodyLock(1, "switch (mtaskId) {\n");
+    for (int m = 0; m < nMTasks; m++) {
+      if (specProbeFields[(size_t)m].empty()) continue;
+      emitBodyLock(2, "case %d: return specProbeSnapM%d(buf);\n", m, m);
+    }
+    emitBodyLock(2, "default: return 0u;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+    emitFuncDecl(0, "uint32_t S%s::specProbeCmpDispatch(uint32_t mtaskId, const uint8_t* buf) {\n", name.c_str());
+    emitBodyLock(1, "switch (mtaskId) {\n");
+    for (int m = 0; m < nMTasks; m++) {
+      if (specProbeFields[(size_t)m].empty()) continue;
+      emitBodyLock(2, "case %d: return specProbeCmpM%d(buf);\n", m, m);
+    }
+    emitBodyLock(2, "default: return 0u;\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
   }
   if (workSteal) {
     emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
@@ -15307,6 +15744,10 @@ void graph::cppEmitter() {
     emitBodyLock(1, "const char *dutyEnv = getenv(\"GSIM_MT_DENSE_DUTY\");\n");
     emitBodyLock(1, "mtDutyEnabled = dutyEnv != nullptr && dutyEnv[0] != '\\0' && dutyEnv[0] != '0';\n");
   }
+  if (mtDenseSpecProbeCodegen()) {
+    emitBodyLock(1, "const char *specProbeEnv = getenv(\"GSIM_MT_DENSE_SPEC_PROBE\");\n");
+    emitBodyLock(1, "mtSpecProbeEnabled = specProbeEnv != nullptr && specProbeEnv[0] != '\\0' && specProbeEnv[0] != '0';\n");
+  }
   emitBodyLock(1, "int mtCoarseMinActiveBits = 0;\n");
   emitBodyLock(1, "const char *coarseMinActiveBitsEnv = getenv(\"GSIM_MT_COARSE_MIN_ACTIVE_BITS\");\n");
   emitBodyLock(1, "if (coarseMinActiveBitsEnv != nullptr) mtCoarseMinActiveBits = atoi(coarseMinActiveBitsEnv);\n");
@@ -15999,6 +16440,26 @@ void graph::cppEmitter() {
     emitBodyLock(2, "for (int i = 0; i <= kDenseDutyLaneMax; i++) {\n");
     emitBodyLock(3, "MtDenseDutyLane &L = mtDutyLanes[i];\n");
     emitBodyLock(3, "fprintf(stderr, \"[mt-duty] %%d %%.3f %%.3f %%.3f %%.3f %%.3f %%.3f %%.3f\\n\", i, L.spinNs/1e6, L.spanNs/1e6, L.tailNs/1e6, L.blockNs/1e6, L.resetNs/1e6, L.joinNs/1e6, L.stepWallNs/1e6);\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+  }
+  if (mtDenseSpecProbeCodegen()) {
+    // Speculation probe report: per-bucket episode stats and the headline net number.
+    // netPerCycleNs = (Σ_equal min(wait,segExec) − Σ compare overhead − Σ_diff redo) / cycles.
+    emitBodyLock(1, "if (mtSpecProbeEnabled) {\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] costTotalNs=%%llu cycles=%%lu\\n\", (unsigned long long)kSpecProbeCostTotalNs, (unsigned long)cycles);\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] episodes=%%llu equal=%%llu diff=%%llu blind=%%llu waitNs=%%llu segNs=%%llu diffSegNs=%%llu minNs=%%llu cmpNs=%%llu members=%%llu memberDiffFields=%%llu truncSegs=%%llu lenCapSegs=%%llu\\n\",\n");
+    emitBodyLock(3, "(unsigned long long)mtSpecProbeG.episodes.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.equal.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.diffEpisodes.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.blindEpisodes.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.waitNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.segNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.diffSegNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.minNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.cmpNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.members.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.memberDiffFields.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.truncSegs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.lenCapSegs.load(std::memory_order_relaxed));\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] netPerCycleNs=%%.3f\\n\", (double)(mtSpecProbeG.minNs.load(std::memory_order_relaxed) - mtSpecProbeG.cmpNs.load(std::memory_order_relaxed) - mtSpecProbeG.diffSegNs.load(std::memory_order_relaxed)) / (double)(cycles + 1));\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] seglen labels=1,2,3-4,5-8,9-16,17-32,33+ all=\");\n");
+    emitBodyLock(2, "for (int i = 0; i < 7; i++) fprintf(stderr, \"%%s%%llu\", i ? \",\" : \"\", (unsigned long long)mtSpecProbeSegLenAll[i].load(std::memory_order_relaxed));\n");
+    emitBodyLock(2, "fprintf(stderr, \" equal=\");\n");
+    emitBodyLock(2, "for (int i = 0; i < 7; i++) fprintf(stderr, \"%%s%%llu\", i ? \",\" : \"\", (unsigned long long)mtSpecProbeSegLenEqual[i].load(std::memory_order_relaxed));\n");
+    emitBodyLock(2, "fprintf(stderr, \"\\n\");\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] bucket upperNs episodes equal diff waitNs segNs minNs cmpNs trunc\\n\");\n");
+    emitBodyLock(2, "for (uint32_t b = 0u; b < kSpecProbeBuckets; ++b) {\n");
+    emitBodyLock(3, "const MtSpecProbeBucket &B = mtSpecProbeBuckets[b];\n");
+    emitBodyLock(3, "fprintf(stderr, \"[mt-specprobe] %%2u %%10llu %%6llu %%6llu %%6llu %%10llu %%10llu %%10llu %%8llu %%6llu\\n\", b, (unsigned long long)(b + 1u < kSpecProbeBuckets ? kSpecProbeBucketMaxNs[b] : ~(uint64_t)0), (unsigned long long)B.episodes.load(std::memory_order_relaxed), (unsigned long long)B.equal.load(std::memory_order_relaxed), (unsigned long long)B.diff.load(std::memory_order_relaxed), (unsigned long long)B.waitNs.load(std::memory_order_relaxed), (unsigned long long)B.segNs.load(std::memory_order_relaxed), (unsigned long long)B.minNs.load(std::memory_order_relaxed), (unsigned long long)B.cmpNs.load(std::memory_order_relaxed), (unsigned long long)B.trunc.load(std::memory_order_relaxed));\n");
     emitBodyLock(2, "}\n");
     emitBodyLock(1, "}\n");
   }
