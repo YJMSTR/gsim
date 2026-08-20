@@ -1367,6 +1367,21 @@ static bool mtUseWorkerPoolWakeShardCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Default-off trim of the wake-shard publish loop: publish only shards that
+// can have readers (threadCount/stride + 1, clamped) instead of all 16.
+// Unset emits the original full-publish loop byte-for-byte.
+static bool mtUseWorkerPoolWakeShardTrimCodegen() {
+  const char* env = std::getenv("GSIM_MT_WORKER_POOL_WAKE_SHARD_TRIM");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Default-off emission of the GSIM_MT_OWNER_CPU_MAP runtime machinery.
+// Unset emits no map text and the original upstream spawn-pinning block.
+static bool mtUseOwnerCpuMapCodegen() {
+  const char* env = std::getenv("GSIM_MT_OWNER_CPU_MAP_CODEGEN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 // Default-off dense ready-token scheduler breakdown profiler. Generation is
 // deliberately opt-in so its unset path emits no additional model text.
 static bool mtUseDenseBreakdownProfileCodegen() {
@@ -10000,14 +10015,19 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "mtWorkerPoolGeneration.fetch_add(1, std::memory_order_release);\n");
   if (mtUseWorkerPoolWakeShardCodegen()) {
     emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
-    emitBodyLock(1, "{ const uint64_t g = mtWorkerPoolGeneration.load(std::memory_order_relaxed);\n");
-    emitBodyLock(1, "  // Publish only shards that can have readers: workers are 1..threadCount, max\n");
-    emitBodyLock(1, "  // shard = threadCount/stride (exact division incl.), so threadCount/stride + 1\n");
-    emitBodyLock(1, "  // covers every reader. ceil(threadCount/stride) is WRONG when threadCount %% stride == 0\n");
-    emitBodyLock(1, "  // (worker threadCount reads shard threadCount/8 -> unpublished -> hang).\n");
-    emitBodyLock(1, "  const int mtWakePublish = mtWorkerPoolThreadCount / kMtWorkerPoolWakeShardStride + 1;\n");
-    emitBodyLock(1, "  const int mtWakePublishClamped = mtWakePublish < kMtWorkerPoolWakeShardCount ? mtWakePublish : kMtWorkerPoolWakeShardCount;\n");
-    emitBodyLock(1, "  for (int s = 0; s < mtWakePublishClamped; s ++) mtWorkerPoolGenShard[s].gen.store(g, std::memory_order_release); }\n");
+    if (mtUseWorkerPoolWakeShardTrimCodegen()) {
+      emitBodyLock(1, "{ const uint64_t g = mtWorkerPoolGeneration.load(std::memory_order_relaxed);\n");
+      emitBodyLock(1, "  // Publish only shards that can have readers: workers are 1..threadCount, max\n");
+      emitBodyLock(1, "  // shard = threadCount/stride (exact division incl.), so threadCount/stride + 1\n");
+      emitBodyLock(1, "  // covers every reader. ceil(threadCount/stride) is WRONG when threadCount %% stride == 0\n");
+      emitBodyLock(1, "  // (worker threadCount reads shard threadCount/8 -> unpublished -> hang).\n");
+      emitBodyLock(1, "  const int mtWakePublish = mtWorkerPoolThreadCount / kMtWorkerPoolWakeShardStride + 1;\n");
+      emitBodyLock(1, "  const int mtWakePublishClamped = mtWakePublish < kMtWorkerPoolWakeShardCount ? mtWakePublish : kMtWorkerPoolWakeShardCount;\n");
+      emitBodyLock(1, "  for (int s = 0; s < mtWakePublishClamped; s ++) mtWorkerPoolGenShard[s].gen.store(g, std::memory_order_release); }\n");
+    } else {
+      emitBodyLock(1, "{ const uint64_t g = mtWorkerPoolGeneration.load(std::memory_order_relaxed);\n");
+      emitBodyLock(1, "  for (int s = 0; s < kMtWorkerPoolWakeShardCount; s ++) mtWorkerPoolGenShard[s].gen.store(g, std::memory_order_release); }\n");
+    }
     emitBodyLock(1, "#endif\n");
   }
   emitBodyLock(0, "}\n");
@@ -10172,9 +10192,10 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "#endif\n");
-  // Explicit owner->CPU map (default-off, runtime env): a comma-separated CPU id
-  // per logical worker (count must equal mtConfiguredWorkerCount). Any parse,
+  // Explicit owner->CPU map (default-off codegen + runtime env): a comma-separated
+  // CPU id per logical worker. Unset emits no map text at all; any parse,
   // validation, or affinity failure aborts; there is no silent fallback.
+  if (mtUseOwnerCpuMapCodegen()) {
   emitBodyLock(1, "std::vector<int> mtOwnerCpuMap;\n");
   emitBodyLock(1, "#ifdef __linux\n");
   emitBodyLock(1, "const char *mtOwnerCpuMapEnv = getenv(\"GSIM_MT_OWNER_CPU_MAP\");\n");
@@ -10204,7 +10225,8 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "fprintf(stderr, \"[mt-owner-cpu-map] applied explicit map (%%d workers, main -> cpu %%d)\\n\", mtConfiguredWorkerCount, mtOwnerCpuMap[0]);\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "#endif\n");
-  if (mtUseWorkerPoolWakeShardCodegen()) {
+  }
+  if (mtUseWorkerPoolWakeShardCodegen() && mtUseWorkerPoolWakeShardTrimCodegen()) {
     emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
     emitBodyLock(1, "if (mtWorkerPoolThreadCount / kMtWorkerPoolWakeShardStride + 1 > kMtWorkerPoolWakeShardCount) { fprintf(stderr, \"[mt-wake-shard] %%d workers exceed shard capacity %%d\\n\", mtWorkerPoolThreadCount, kMtWorkerPoolWakeShardCount); abort(); }\n");
     emitBodyLock(1, "#endif\n");
@@ -10213,13 +10235,23 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "mtWorkerPoolThreads.emplace_back([this, worker]() { mtWorkerPoolLoop(worker); });\n");
   emitBodyLock(2, "std::thread& t = mtWorkerPoolThreads.back();\n");
   emitBodyLock(2, "#ifdef __linux\n");
-  emitBodyLock(2, "if (!mtOwnerCpuMap.empty() || !mtAllowedCpus.empty()) {\n");
-  emitBodyLock(3, "int mtCpu = !mtOwnerCpuMap.empty() ? mtOwnerCpuMap[(size_t)worker] : mtAllowedCpus[(mtCpuAffinityBase + worker - 1) % (int)mtAllowedCpus.size()];\n");
-  emitBodyLock(3, "cpu_set_t mtCpuset;\n");
-  emitBodyLock(3, "CPU_ZERO(&mtCpuset);\n");
-  emitBodyLock(3, "CPU_SET(mtCpu, &mtCpuset);\n");
-  emitBodyLock(3, "if (pthread_setaffinity_np(t.native_handle(), sizeof(mtCpuset), &mtCpuset) != 0 && !mtOwnerCpuMap.empty()) { fprintf(stderr, \"[mt-owner-cpu-map] pin worker %%d to cpu %%d failed\\n\", worker, mtCpu); abort(); }\n");
-  emitBodyLock(2, "}\n");
+  if (mtUseOwnerCpuMapCodegen()) {
+    emitBodyLock(2, "if (!mtOwnerCpuMap.empty() || !mtAllowedCpus.empty()) {\n");
+    emitBodyLock(3, "int mtCpu = !mtOwnerCpuMap.empty() ? mtOwnerCpuMap[(size_t)worker] : mtAllowedCpus[(mtCpuAffinityBase + worker - 1) % (int)mtAllowedCpus.size()];\n");
+    emitBodyLock(3, "cpu_set_t mtCpuset;\n");
+    emitBodyLock(3, "CPU_ZERO(&mtCpuset);\n");
+    emitBodyLock(3, "CPU_SET(mtCpu, &mtCpuset);\n");
+    emitBodyLock(3, "if (pthread_setaffinity_np(t.native_handle(), sizeof(mtCpuset), &mtCpuset) != 0 && !mtOwnerCpuMap.empty()) { fprintf(stderr, \"[mt-owner-cpu-map] pin worker %%d to cpu %%d failed\\n\", worker, mtCpu); abort(); }\n");
+    emitBodyLock(2, "}\n");
+  } else {
+    emitBodyLock(2, "if (!mtAllowedCpus.empty()) {\n");
+    emitBodyLock(3, "int mtCpu = mtAllowedCpus[(mtCpuAffinityBase + worker - 1) % (int)mtAllowedCpus.size()];\n");
+    emitBodyLock(3, "cpu_set_t mtCpuset;\n");
+    emitBodyLock(3, "CPU_ZERO(&mtCpuset);\n");
+    emitBodyLock(3, "CPU_SET(mtCpu, &mtCpuset);\n");
+    emitBodyLock(3, "pthread_setaffinity_np(t.native_handle(), sizeof(mtCpuset), &mtCpuset);\n");
+    emitBodyLock(2, "}\n");
+  }
   emitBodyLock(2, "#endif\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "while (mtWorkerPoolReadyCount.load(std::memory_order_acquire) < mtWorkerPoolThreadCount) mtWorkerPoolPause();\n");
