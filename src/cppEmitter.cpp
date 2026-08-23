@@ -2037,10 +2037,12 @@ static void mtDenseAddSuperEdges(MtDenseSchedule& schedule,
 // checks resolve in O(1). Merges the lowest edgeScore (merged local critical path) until liveCount
 // <= maxMTasks (=50*threads) or scoreLimit exceeded. worker0-only SCCs never merge with non-worker0.
 // Emits merged MTasks in Kahn topo order so ids are topo-monotone.
-static uint64_t mtDenseStepCostV(uint64_t c) {
-  if (c <= 1) return c;
-  uint64_t s = 1; while (s < c) s = s + s / 20 + 1; return s;
-}
+// Legacy step cost (was a per-call loop; see the trajectory table in
+// mtBuildDenseMTasksVerilatorContract for the exact same values, table-driven):
+//   uint64_t mtDenseStepCostV(uint64_t c) {
+//     if (c <= 1) return c;
+//     uint64_t s = 1; while (s < c) s = s + s / 20 + 1; return s;
+//   }
 
 static uint64_t mtDenseStepCostV3(uint64_t cost) {
   if (cost == 0) return 0;
@@ -2065,9 +2067,25 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   const auto denseNode = [firstRealMTask](int scc) { return scc + firstRealMTask; };
   auto sc = [&](int s) -> uint64_t { return (uint64_t)std::max(1, schedule.sccs[(size_t)s].memberNodeCost); };
   const uint64_t totalCost = [&]{ uint64_t c = 0; for (int scc = 0; scc < realN; ++scc) c += sc(scc); return c; }();
+  // Legacy stepCost calls mtDenseStepCostV per query (a ~log_{1.05}(cost)-iteration loop with a
+  // division); scoring does this ~10M times per T16 contraction. Precompute the fixed trajectory
+  // s_{k+1} = s_k + s_k/20 + 1 once (O(log) entries up to totalCost - every queried cost is a
+  // group cost or pair sum, both <= totalCost) and answer by binary search. Identical values by
+  // construction: the table IS the loop's trajectory, so decisions and output are unchanged.
+  std::vector<uint64_t> legacyStepSeq;
+  if (!v3Policy) {
+    legacyStepSeq.push_back(1);
+    while (legacyStepSeq.back() < totalCost) {
+      uint64_t s = legacyStepSeq.back();
+      legacyStepSeq.push_back(s + s / 20 + 1);
+    }
+  }
   std::vector<uint64_t> v3StepCostCache(v3Policy ? (size_t)totalCost + 1 : 0, 0);
-  const auto stepCost = [v3Policy, totalCost, &v3StepCostCache](uint64_t cost) -> uint64_t {
-    if (!v3Policy) return mtDenseStepCostV(cost);
+  const auto stepCost = [v3Policy, totalCost, &v3StepCostCache, &legacyStepSeq](uint64_t cost) -> uint64_t {
+    if (!v3Policy) {
+      if (cost <= 1) return cost;
+      return *std::lower_bound(legacyStepSeq.begin(), legacyStepSeq.end(), cost);
+    }
     if (cost == 0) return 0;
     if (cost <= totalCost) {
       uint64_t &cached = v3StepCostCache[(size_t)cost];
@@ -6156,10 +6174,15 @@ static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelectionForInvocat
   return mtContextCache.repCutSelectedTasks;
 }
 
-static MtCoarseRegionPlan planMtCoarseRegionsForInvocation(const std::map<int, MtTaskInfo>& tasks) {
-  if (!globalConfig.MtContextCache) return planMtCoarseRegions(tasks);
+// The coarse-region plan is a pure function of the selected task map within one generation:
+// every caller derives its argument from buildMtTaskInfoMapWithRepCutSelectionForInvocation()
+// (optionally through markMtRepCutLiteRuntimeApplied, whose fields - repcutRuntimeApplied /
+// repcutCutInEdges / repcutCutOutEdges - the planner subtree never reads), so one plan serves
+// all invocation sites. Memoize unconditionally - same provenance as the task-map cache above -
+// and hand every caller its own copy. resetMtContextCache() invalidates per generation.
+static MtCoarseRegionPlan planMtCoarseRegionsForInvocation() {
   if (!mtContextCache.hasCoarseRegionPlan) {
-    mtContextCache.coarseRegionPlan = planMtCoarseRegions(tasks);
+    mtContextCache.coarseRegionPlan = planMtCoarseRegions(buildMtTaskInfoMapWithRepCutSelectionForInvocation());
     mtContextCache.hasCoarseRegionPlan = true;
   }
   return mtContextCache.coarseRegionPlan;
@@ -7453,7 +7476,7 @@ void graph::dumpMtCoarseRegionReport() {
   const char* segmentReportEnv = std::getenv("GSIM_MT_SEGMENT_REPORT");
   bool segmentReportEnabled = segmentReportEnv != nullptr && segmentReportEnv[0] != '\0' && segmentReportEnv[0] != '0';
   if (segmentReportEnabled) markMtRepCutLiteRuntimeApplied(mtTasks);
-  MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation(mtTasks);
+  MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation();
   mtCoarseLogPhase("coarse-region.plan-regions");
   MtPureBatchPlan fallbackPlan = planMtPureBatchesActiveFrequency(mtTasks, globalConfig.MtRepCutLiteMode == "on");
   mtCoarseLogPhase("coarse-region.fallback-plan");
@@ -7991,7 +8014,7 @@ void graph::dumpMtReadyBatchReport() {
 
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   std::vector<MtStateUpdateTraceInfo> stateUpdateTraceInfo = buildMtStateUpdateTraceInfoForInvocation(mtTasks);
-  MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation(mtTasks);
+  MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation();
 
   struct ReadyBatchCapStats {
     int cap = 1;
@@ -12034,10 +12057,15 @@ int graph::genActivateSeqHelpers(bool buffered) {
 }
 
 int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& serialFastSuffix) {
-    std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
-    markMtRepCutLiteRuntimeApplied(mtTasks);
-    MtRepCutSemanticPlan semanticPlan = planMtRepCutSemantics(mtTasks);
-    MtCoarseRegionPlan coarsePlan = planMtCoarseRegionsForInvocation(mtTasks);
+    std::map<int, MtTaskInfo> mtTasks;
+    MtRepCutSemanticPlan semanticPlan;
+    MtCoarseRegionPlan coarsePlan;
+    { EmitPhaseTimer prologueTimer("Final.mtHelpers.prologue");
+      mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+      markMtRepCutLiteRuntimeApplied(mtTasks);
+      semanticPlan = planMtRepCutSemantics(mtTasks);
+      { EmitPhaseTimer planTimer("Final.mtHelpers.prologuePlan"); coarsePlan = planMtCoarseRegionsForInvocation(); }
+    }
     MtPureBatchPlan batchPlan = semanticPlan.batchPlan;
     std::map<int, int> batchEndByStart;
     for (auto batch : batchPlan.batches) {
@@ -15524,7 +15552,9 @@ void graph::cppEmitter() {
     mtSetProfileRepCutBatchBeginCppIds(mtRepCutHeaderSemanticPlan);
     mtSetProfileRepCutRuntimeCppIds(mtRepCutHeaderTasks);
     if (useCoarseMt) {
-      mtCoarseProfileFacts = mtComputeCoarseProfileFacts(planMtCoarseRegionsForInvocation(mtRepCutHeaderTasks));
+      MtCoarseRegionPlan coarsePlan;
+      { EmitPhaseTimer coarsePlanTimer("Final.schedBuild.coarsePlan"); coarsePlan = planMtCoarseRegionsForInvocation(); }
+      { EmitPhaseTimer coarseFactsTimer("Final.schedBuild.coarseFacts"); mtCoarseProfileFacts = mtComputeCoarseProfileFacts(coarsePlan); }
     }
   }
   if (useDenseExecutorCodegen) {
@@ -17098,7 +17128,7 @@ void graph::cppEmitter() {
   std::string serialFastSuffix;
   if (useMtHelpers) {
     serialFastSuffix = "SerialFast";
-    serialFastSubStepMax = genActivate(serialFastSuffix);
+    { EmitPhaseTimer genActivateTimer("Final.genActivate"); serialFastSubStepMax = genActivate(serialFastSuffix); }
     subStepIdxMax = genActivateMtHelpers(serialFastSubStepMax, serialFastSuffix);
   } else if (useSeqHelpers) {
     subStepIdxMax = genActivateSeqHelpers(useBufferedHelpers);
@@ -17156,7 +17186,8 @@ void graph::cppEmitter() {
         fprintf(header, "void mtRunCoarseStaticRefList(int regionIndex, int roundedWC, int worker, int regionBeginActiveWord, int regionActiveWordSpan, const SCoarseTaskRef *refs, int refCount);\n");
         fprintf(header, "void mtRunCoarseRegionStaticDispatch(int regionIndex, int roundedWC, int worker, int regionBeginActiveWord, int regionActiveWordSpan);\n");
         {
-          MtCoarseRegionPlan dstaticPlan = planMtCoarseRegionsForInvocation(mtRepCutHeaderTasks);
+          MtCoarseRegionPlan dstaticPlan;
+          { EmitPhaseTimer dstaticPlanTimer("Final.header.dstaticPlan"); dstaticPlan = planMtCoarseRegionsForInvocation(); }
           int regionIndex = 0;
           for (const MtCoarseRegion& region : dstaticPlan.regions) {
             if (!region.runtimeEligible) continue;
