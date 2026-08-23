@@ -104,6 +104,37 @@ struct EmitPhaseTimer {
   }
 };
 
+// Accumulating variant for sub-phases invoked many times inside one region
+// (e.g. per-pass work inside a merge loop). Aggregates wall ns across calls;
+// the owning region prints totals via emitPhaseAccumReport(). Like
+// EmitPhaseTimer this is pure measurement - it never changes emitted bytes,
+// and costs two predictable branches when GSIM_EMIT_PHASE_TIMING is unset.
+struct EmitPhaseAccum {
+  const char* phaseName = "";
+  uint64_t ns = 0;
+  uint64_t calls = 0;
+};
+class EmitPhaseAccumScope {
+ public:
+  EmitPhaseAccumScope(EmitPhaseAccum& accum, bool enabled)
+      : accum_(enabled ? &accum : nullptr),
+        begin_(enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point()) {}
+  ~EmitPhaseAccumScope() {
+    if (accum_) {
+      accum_->ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - begin_).count();
+      accum_->calls ++;
+    }
+  }
+ private:
+  EmitPhaseAccum* accum_;
+  std::chrono::steady_clock::time_point begin_;
+};
+static void emitPhaseAccumReport(const EmitPhaseAccum& accum) {
+  if (!emitPhaseTimingEnabled()) return;
+  fprintf(stderr, "[emit-phase] %s = %.1f ms (%llu calls)\n", accum.phaseName,
+          (double)accum.ns / 1e6, (unsigned long long)accum.calls);
+}
 #define RESET_NAME(node) (node->name + "$RESET")
 #define emitFuncDecl(indent, ...) __emitSrc(indent, true, true, NULL, __VA_ARGS__)
 #define emitBodyLock(indent, ...) __emitSrc(indent, false, false, NULL, __VA_ARGS__)
@@ -2045,18 +2076,49 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     }
     return mtDenseStepCostV3(cost);
   };
+  // GSIM_EMIT_PHASE_TIMING=1 sub-phase accounting (pure measurement; zero
+  // emitted-byte impact). Leaf timers (recomputeCP / pathExists /
+  // refreshBestTwo / rebuildPQ) are inclusive wherever they nest inside other
+  // timed regions - reported calls make the overlap interpretable.
+  const bool vcPhaseTiming = emitPhaseTimingEnabled();
+  EmitPhaseAccum vcAccInit{"Final.vcontract.init"};
+  EmitPhaseAccum vcAccLoop{"Final.vcontract.mergeLoop"};
+  EmitPhaseAccum vcAccRecompute{"Final.vcontract.recomputeCP"};
+  EmitPhaseAccum vcAccPath{"Final.vcontract.pathExists"};
+  EmitPhaseAccum vcAccBestTwo{"Final.vcontract.refreshBestTwo"};
+  EmitPhaseAccum vcAccRebuildPQ{"Final.vcontract.rebuildPQ"};
+  EmitPhaseAccum vcAccMergeApply{"Final.vcontract.mergeApply"};
+  EmitPhaseAccum vcAccMaterialize{"Final.vcontract.materialize"};
+  const std::chrono::steady_clock::time_point vcInitBegin =
+      vcPhaseTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   std::vector<int> uf((size_t)n); for (int i = 0; i < n; i ++) uf[(size_t)i] = i;
   std::function<int(int)> find = [&](int x){ while (uf[(size_t)x]!=x){ uf[(size_t)x]=uf[(size_t)uf[(size_t)x]]; x=uf[(size_t)x]; } return x; };
   std::vector<uint64_t> gcost((size_t)n), gF((size_t)n, 0), gR((size_t)n, 0);
+  // Relation sets as SORTED FLAT VECTORS (was std::set<int>): the merge loop, candidate scoring
+  // and cycle DFS walk these millions of times; sequential scans replace red-black-tree pointer
+  // chases. Sorted order == std::set order, so every traversal visits neighbors in exactly the
+  // same sequence as before - identical decisions, byte-identical output.
+  std::vector<std::vector<int>> gS((size_t)n), gP((size_t)n);
+  const auto relContains = [](const std::vector<int>& v, int x) -> bool {
+    return std::binary_search(v.begin(), v.end(), x);
+  };
+  const auto relInsert = [](std::vector<int>& v, int x) {
+    auto it = std::lower_bound(v.begin(), v.end(), x);
+    if (it == v.end() || *it != x) v.insert(it, x);
+  };
+  const auto relErase = [](std::vector<int>& v, int x) {
+    auto it = std::lower_bound(v.begin(), v.end(), x);
+    if (it != v.end() && *it == x) v.erase(it);
+  };
   std::vector<bool> gw0((size_t)n);
-  std::vector<std::set<int>> gS((size_t)n), gP((size_t)n);
   for (int scc = 0; scc < realN; ++scc) { int node = denseNode(scc); gcost[(size_t)node] = sc(scc); gw0[(size_t)node] = schedule.sccs[(size_t)scc].workerZeroOnly; }
-  for (int u = 0; u < realN; ++u) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < realN) { int from = denseNode(u), to = denseNode(v); gS[(size_t)from].insert(to); gP[(size_t)to].insert(from); }
+  for (int u = 0; u < realN; ++u) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < realN) { int from = denseNode(u), to = denseNode(v); gS[(size_t)from].push_back(to); gP[(size_t)to].push_back(from); }
+  for (int i = 0; i < n; i ++) { std::sort(gS[(size_t)i].begin(), gS[(size_t)i].end()); gS[(size_t)i].erase(std::unique(gS[(size_t)i].begin(), gS[(size_t)i].end()), gS[(size_t)i].end()); std::sort(gP[(size_t)i].begin(), gP[(size_t)i].end()); gP[(size_t)i].erase(std::unique(gP[(size_t)i].begin(), gP[(size_t)i].end()), gP[(size_t)i].end()); }
   if (v3Policy) {
     for (int scc = 0; scc < realN; ++scc) {
       int node = denseNode(scc);
-      if (gP[(size_t)node].empty()) { gS[(size_t)entryMTask].insert(node); gP[(size_t)node].insert(entryMTask); }
-      if (gS[(size_t)node].empty()) { gS[(size_t)node].insert(exitMTask); gP[(size_t)exitMTask].insert(node); }
+      if (gP[(size_t)node].empty()) { relInsert(gS[(size_t)entryMTask], node); relInsert(gP[(size_t)node], entryMTask); }
+      if (gS[(size_t)node].empty()) { relInsert(gS[(size_t)node], exitMTask); relInsert(gP[(size_t)exitMTask], node); }
     }
   }
   // Forward (to-end) and reverse (from-start) stepped critical paths over the SCC DAG (topo by id).
@@ -2092,13 +2154,17 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   int recomputeEvery = 256;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP_EVERY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) recomputeEvery = v; } }
   auto recomputeCP = [&]() {
+    EmitPhaseAccumScope vcScope(vcAccRecompute, vcPhaseTiming);
     // Live roots and their find()-normalized, deduped succ/pred sets.
     std::vector<int> roots; roots.reserve((size_t)n);
     for (int i = 0; i < n; i ++) if (find(i) == i) roots.push_back(i);
     std::vector<std::vector<int>> succ((size_t)n), pred((size_t)n);
     std::vector<int> indeg((size_t)n, 0);
     for (int r : roots) {
-      std::set<int> ss; for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r) ss.insert(rs); }
+      std::vector<int> ss; ss.reserve(gS[(size_t)r].size());
+      for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r) ss.push_back(rs); }
+      std::sort(ss.begin(), ss.end());
+      ss.erase(std::unique(ss.begin(), ss.end()), ss.end());
       succ[(size_t)r].assign(ss.begin(), ss.end());
       for (int rs : succ[(size_t)r]) { pred[(size_t)rs].push_back(r); }
     }
@@ -2122,36 +2188,58 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // gFmax[x] < gFmin[to]) -- conservative, so the DFS never wrongly prunes a real path.
   std::vector<uint64_t> gRmin((size_t)n), gRmax((size_t)n), gFmin((size_t)n), gFmax((size_t)n);
   for (int i = 0; i < n; i ++) { gRmin[(size_t)i] = gRmax[(size_t)i] = gR[(size_t)i]; gFmin[(size_t)i] = gFmax[(size_t)i] = gF[(size_t)i]; }
+  // Exact-answer memo, valid within one merge generation: merges are the ONLY quotient-graph
+  // mutation (recomputeCP touches only CP values, PQ churn only re-orders candidates, and the
+  // edge branch's direct-edge erase/restore is per-key transient state), so a cached
+  // (srcRoot,dstRoot) -> reachable answer equals a fresh computation until the next merge.
+  // Cleared after each applied merge; duplicate PQ entries make repeat queries common.
+  std::unordered_map<uint64_t, bool> pathMemo;
+  uint64_t pathMemoHits = 0, pathCapHits = 0;
+  std::vector<int> pathSt; pathSt.reserve(4096); // reusable DFS stack: no per-query heap traffic
   std::function<bool(int,int)> pathExists = [&](int frm, int to) -> bool {
+    EmitPhaseAccumScope vcScope(vcAccPath, vcPhaseTiming);
+    const int src = find(frm), dst = find(to);
+    if (src == dst) return true;
+    // Exact-answer memo, valid within one merge generation. Merges are the only quotient-graph
+    // mutation (the edge branch's erase/restore is per-key transient state, restored before any
+    // other query), and every (src,dst) query inside a generation sees the identical graph, so a
+    // cached answer equals the freshly computed one. Cleared after each applied merge.
+    const uint64_t memoKey = ((uint64_t)(uint32_t)src << 32) | (uint32_t)dst;
+    auto memoIt = pathMemo.find(memoKey);
+    if (memoIt != pathMemo.end()) { pathMemoHits ++; return memoIt->second; }
     curGen ++;
-    std::vector<int> st; st.push_back(find(frm));
+    pathSt.clear();
+    pathSt.push_back(src);
     long long visits = 0; const long long visitCap = 500000; // overflow -> assume reachable (reject merge, safe)
-    while (!st.empty()) {
-      int x = find(st.back()); st.pop_back();
-      if (x == to) return true;
+    bool reachable = false;
+    while (!pathSt.empty()) {
+      int x = find(pathSt.back()); pathSt.pop_back();
+      if (x == to) { reachable = true; break; }
       if (gen[(size_t)x] == curGen) continue;
       gen[(size_t)x] = curGen;
-      if (++ visits > visitCap) return true;
+      if (++ visits > visitCap) { reachable = true; ++ pathCapHits; break; } // same conservative fallback as before
       // NOTE: a CP-ordering prune here (skip x if gF[x]+step>gF[to]) is UNSOUND with bounded/
       // stale-LOW propagated CP: a stale-low gF[to] would make the prune over-fire and wrongly
       // reject a real ancestor -> a cycle-creating merge. gF is only a LOWER bound (propagation
-      // never overshoots), and comparing two lower bounds cannot soundly prune. So we keep the plain
-      // gen-tagged DFS for cycle-safety; propagated CP is used ONLY in edgeScore (merge ORDER, a
-      // heuristic that is safe for any CP value). This still captures Verilator's exact-merge-order
-      // fidelity win without the unsound prune.
-      for (int s2 : gS[(size_t)x]) { int rs = find(s2); if (rs != x) st.push_back(rs); }
+      // never overshoots), and comparing two lower bounds cannot soundly prune. So we keep the
+      // plain gen-tagged DFS for cycle-safety; propagated CP is used ONLY in edgeScore (merge
+      // ORDER, a heuristic that is safe for any CP value). This still captures Verilator's
+      // exact-merge-order fidelity win without the unsound prune.
+      for (int s2 : gS[(size_t)x]) { int rs = find(s2); if (rs != x) pathSt.push_back(rs); }
     }
-    return false;
+    pathMemo.emplace(memoKey, reachable);
+    return reachable;
   };
   uint32_t scoreCacheGeneration = 1;
   std::vector<uint32_t> incomingScoreCacheGeneration((size_t)n, 0), outgoingScoreCacheGeneration((size_t)n, 0);
   std::vector<int> incomingBestRoot((size_t)n, -1), incomingSecondRoot((size_t)n, -1), outgoingBestRoot((size_t)n, -1), outgoingSecondRoot((size_t)n, -1);
   std::vector<uint64_t> incomingBestValue((size_t)n, 0), incomingSecondValue((size_t)n, 0), outgoingBestValue((size_t)n, 0), outgoingSecondValue((size_t)n, 0);
-  auto refreshBestTwo = [&](int node, const std::set<int>& relations, const std::vector<uint64_t>& cp,
+  auto refreshBestTwo = [&](int node, const std::vector<int>& relations, const std::vector<uint64_t>& cp,
                             std::vector<uint32_t>& cacheGeneration, std::vector<int>& bestRoot,
                             std::vector<int>& secondRoot, std::vector<uint64_t>& bestValue,
                             std::vector<uint64_t>& secondValue) {
     if (cacheGeneration[(size_t)node] == scoreCacheGeneration) return;
+    EmitPhaseAccumScope vcScope(vcAccBestTwo, vcPhaseTiming);
     cacheGeneration[(size_t)node] = scoreCacheGeneration;
     bestRoot[(size_t)node] = -1; secondRoot[(size_t)node] = -1;
     bestValue[(size_t)node] = 0; secondValue[(size_t)node] = 0;
@@ -2218,7 +2306,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
           if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({candidateScore(r, rs, true), r, rs, true}); if (++ emitted >= sibCap) return; } } }
       return;
     }
-    const auto addPairs = [&](const std::set<int>& relatives, bool useForwardCp) {
+    const auto addPairs = [&](const std::vector<int>& relatives, bool useForwardCp) {
       constexpr size_t siblingEdgeLimit = 72;
       constexpr size_t nonExhaustivePairs = 3;
       std::vector<int> neighbors;
@@ -2248,6 +2336,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     addPairs(gS[(size_t)r], true);
   };
   auto rebuildPQ = [&]() {
+    EmitPhaseAccumScope vcScope(vcAccRebuildPQ, vcPhaseTiming);
     // Rebuild the candidate heap from scratch over all live roots with LIVE edgeScore. Called after
     // recomputeCP() so every candidate is scored against the freshly-recomputed critical paths
     // (a recompute can LOWER a CP, burying a now-cheaper edge under a stale-high key that on-pop
@@ -2256,7 +2345,11 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u, true); }
   };
   for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u, true); }
+  if (vcPhaseTiming) vcAccInit.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - vcInitBegin).count();
   int live = n; uint64_t merges = 0, cycRej = 0, sibMerges = 0, entryExitSkips = 0, scoreLimitEscalations = 0;
+  {
+  EmitPhaseAccumScope vcLoopScope(vcAccLoop, vcPhaseTiming);
   while (!pq.empty()) {
     if (!v3Policy && live <= maxMTasks) break;
     Cand c = pq.top(); pq.pop();
@@ -2286,26 +2379,32 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     bool cyc;
     if (c.sibling) {
       // Sibling merge: no direct edge assumed. Cycle-safe iff neither a~>b nor b~>a.
-      if (gS[(size_t)a].count(b) || gS[(size_t)b].count(a)) continue; // became adjacent; let edge path handle
+      if (relContains(gS[(size_t)a], b) || relContains(gS[(size_t)b], a)) continue; // became adjacent; let edge path handle
       cyc = pathExists(a, b) || pathExists(b, a);
       if (cyc) { cycRej ++; continue; }
     } else {
-      if (gS[(size_t)a].find(b) == gS[(size_t)a].end()) continue;
+      if (!relContains(gS[(size_t)a], b)) continue;
       // Cycle-safe iff no ALTERNATE path a~>b once the direct edge is excluded.
-      gS[(size_t)a].erase(b); gP[(size_t)b].erase(a);
+      relErase(gS[(size_t)a], b); relErase(gP[(size_t)b], a);
       cyc = pathExists(a, b);
-      if (cyc) { gS[(size_t)a].insert(b); gP[(size_t)b].insert(a); cycRej ++; continue; }
+      if (cyc) { relInsert(gS[(size_t)a], b); relInsert(gP[(size_t)b], a); cycRej ++; continue; }
     }
     // merge b into a
+    {
+    EmitPhaseAccumScope vcScope(vcAccMergeApply, vcPhaseTiming);
     uf[(size_t)b] = a; gcost[(size_t)a] += gcost[(size_t)b];
     gF[(size_t)a] = std::max(gF[(size_t)a], gF[(size_t)b]); gR[(size_t)a] = std::max(gR[(size_t)a], gR[(size_t)b]);
     gRmin[(size_t)a] = std::min(gRmin[(size_t)a], gRmin[(size_t)b]); gRmax[(size_t)a] = std::max(gRmax[(size_t)a], gRmax[(size_t)b]);
     gFmin[(size_t)a] = std::min(gFmin[(size_t)a], gFmin[(size_t)b]); gFmax[(size_t)a] = std::max(gFmax[(size_t)a], gFmax[(size_t)b]);
-    for (int s2 : gS[(size_t)b]) { int rs = find(s2); if (rs != a) { gS[(size_t)a].insert(rs); gP[(size_t)rs].insert(a); } }
-    for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) { gP[(size_t)a].insert(rp); gS[(size_t)rp].insert(a); } }
-    gS[(size_t)a].erase(a); gP[(size_t)a].erase(a); gS[(size_t)a].erase(b); gP[(size_t)a].erase(b);
+    for (int s2 : gS[(size_t)b]) { int rs = find(s2); if (rs != a) { relInsert(gS[(size_t)a], rs); relInsert(gP[(size_t)rs], a); } }
+    for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) { relInsert(gP[(size_t)a], rp); relInsert(gS[(size_t)rp], a); } }
+    relErase(gS[(size_t)a], a); relErase(gP[(size_t)a], a); relErase(gS[(size_t)a], b); relErase(gP[(size_t)a], b);
     live --; merges ++; ++scoreCacheGeneration; if (c.sibling) sibMerges ++;
+    pathMemo.clear(); // quotient graph changed: reachability answers are stale
+    }
     if (propagateCp && (merges % (uint64_t)recomputeEvery) == 0) { recomputeCP(); ++scoreCacheGeneration; rebuildPQ(); }
+    {
+    EmitPhaseAccumScope vcScope(vcAccMergeApply, vcPhaseTiming);
     pushEdges(a); if (sibEnabled) pushSiblings(a, true);
     int siblingRefreshes = 0;
     for (int p : gP[(size_t)a]) {
@@ -2313,7 +2412,11 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
       if (rp != a && gw0[(size_t)rp] == gw0[(size_t)a] && gcost[(size_t)rp] + gcost[(size_t)a] <= perMTaskCap) pq.push({candidateScore(rp, a, false), rp, a, false});
       if (v3Policy && sibEnabled && rp != a && siblingRefreshes ++ < 72) pushSiblings(rp, false);
     }
+    }
   }
+  }
+  const std::chrono::steady_clock::time_point vcMaterializeBegin =
+      vcPhaseTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
   // Materialize groups in Kahn topo order for monotone ids.
   std::map<int,int> rootIdx; for (int scc = 0; scc < realN; ++scc) { int r = find(denseNode(scc)); if (!rootIdx.count(r)) rootIdx[r] = (int)rootIdx.size(); }
   int R = (int)rootIdx.size();
@@ -2334,7 +2437,17 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   std::vector<std::set<int>> predSets((size_t)R), succSets((size_t)R);
   for (int fromScc = 0; fromScc < realN; ++fromScc) { int fm = sccToMTask[(size_t)fromScc]; if (fm < 0) continue; for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) { int tm = (toScc >= 0 && toScc < realN) ? sccToMTask[(size_t)toScc] : -1; if (tm < 0 || tm == fm) continue; succSets[(size_t)fm].insert(tm); predSets[(size_t)tm].insert(fm); } }
   for (int mi = 0; mi < R; mi ++) { mtasks[(size_t)mi].predMTasks.assign(predSets[(size_t)mi].begin(), predSets[(size_t)mi].end()); mtasks[(size_t)mi].succMTasks.assign(succSets[(size_t)mi].begin(), succSets[(size_t)mi].end()); }
-  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu entryExitSkips=%llu maxMTasks=%d v3Policy=%d scoreLimit=%llu escalations=%llu\n", realN, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, (unsigned long long)entryExitSkips, maxMTasks, v3Policy ? 1 : 0, (unsigned long long)scoreLimit, (unsigned long long)scoreLimitEscalations);
+  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu entryExitSkips=%llu maxMTasks=%d v3Policy=%d scoreLimit=%llu escalations=%llu pathMemoHits=%llu pathCapHits=%llu\n", realN, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, (unsigned long long)entryExitSkips, maxMTasks, v3Policy ? 1 : 0, (unsigned long long)scoreLimit, (unsigned long long)scoreLimitEscalations, (unsigned long long)pathMemoHits, (unsigned long long)pathCapHits);
+  if (vcPhaseTiming) vcAccMaterialize.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - vcMaterializeBegin).count();
+  emitPhaseAccumReport(vcAccInit);
+  emitPhaseAccumReport(vcAccLoop);
+  emitPhaseAccumReport(vcAccRecompute);
+  emitPhaseAccumReport(vcAccPath);
+  emitPhaseAccumReport(vcAccBestTwo);
+  emitPhaseAccumReport(vcAccRebuildPQ);
+  emitPhaseAccumReport(vcAccMergeApply);
+  emitPhaseAccumReport(vcAccMaterialize);
   return mtasks;
 }
 
@@ -3331,7 +3444,9 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
   std::vector<std::set<int>> predSets((size_t)superId);
   std::set<std::tuple<int, int, std::string>> edgeKinds;
 
+  {
   // Phase 1: Add dependency edges only.
+  EmitPhaseTimer edgesTimer("Final.denseSched.edges");
   for (int cppId = 0; cppId < superId; cppId ++) {
     auto superIter = cppId2Super.find(cppId);
     if (superIter == cppId2Super.end() || !superIter->second) continue;
@@ -3387,6 +3502,9 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
       }
     }
   }
+  }
+  {
+  EmitPhaseTimer sccTimer("Final.denseSched.scc");
 
   for (int cppId = 0; cppId < superId; cppId ++) {
     schedule.succCppIds[(size_t)cppId].assign(succSets[(size_t)cppId].begin(), succSets[(size_t)cppId].end());
@@ -3503,6 +3621,9 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
   // Coarsen SCC DAG by merging chains (edges A->B where A has 1 succ
   // and B has 1 pred). This reduces layer depth and barrier count without
   // reducing parallelism. Inspired by Verilator's V3OrderParallel edge contraction.
+  }
+  {
+  EmitPhaseTimer coarsenTimer("Final.denseSched.coarsen");
   {
     int n = static_cast<int>(schedule.sccs.size());
     std::vector<int> parent(n);
@@ -3573,7 +3694,10 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
       schedule.sccs = newSccs;
     }
   }
+  }
 
+  {
+  EmitPhaseTimer layersTimer("Final.denseSched.layers");
   std::vector<int> indegree(schedule.sccs.size(), 0);
   std::set<int> ready;
   for (size_t sccId = 0; sccId < schedule.sccs.size(); sccId ++) {
@@ -3635,10 +3759,13 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     }
     schedule.layers = splitLayers;
   }
+  }
   // Dense dependency executor: form MTasks and assign them to worker threads.
   // Default path: fixed 30-SCC topological chunking + round-robin assignment.
   // v236 (GSIM_MT_DENSE_CP_CONTRACTION): Verilator-style critical-path edge contraction.
   // v236 (GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT): DAG-aware list-scheduling assignment.
+  {
+  EmitPhaseTimer mtaskBuildTimer("Final.denseSched.mtaskBuild");
   {
     int threadCount = 8;
     const char* threadsEnv = std::getenv("GSIM_THREADS");
@@ -3739,6 +3866,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
         Assert(s > mi, "dense MTask id order not topo-monotone: edge %d->%d", mi, s);
       }
     }
+  }
   }
 
   if (!codegenEnabled) {
@@ -5658,8 +5786,9 @@ static void collectMtTaskRepCutCounts(std::map<int, MtTaskInfo>& tasks) {
 }
 
 static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCut() {
-  std::map<int, MtTaskInfo> tasks = buildMtTaskInfoMap();
-  collectMtTaskRepCutCounts(tasks);
+  std::map<int, MtTaskInfo> tasks;
+  { EmitPhaseTimer buildMapTimer("Final.infoMap.buildMap"); tasks = buildMtTaskInfoMap(); }
+  { EmitPhaseTimer repCutCountsTimer("Final.infoMap.repCutCounts"); collectMtTaskRepCutCounts(tasks); }
   return tasks;
 }
 
@@ -5971,7 +6100,8 @@ static void applyRepCutLiteSelection(std::map<int, MtTaskInfo>& tasks) {
 }
 
 static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelection() {
-  std::map<int, MtTaskInfo> tasks = buildMtTaskInfoMapWithRepCut();
+  std::map<int, MtTaskInfo> tasks;
+  { EmitPhaseTimer selectTimer("Final.infoMap.repcutSelect"); tasks = buildMtTaskInfoMapWithRepCut(); }
   applyRepCutLiteSelection(tasks);
   return tasks;
 }
@@ -5988,11 +6118,19 @@ struct MtContextCacheState {
 };
 
 static MtContextCacheState mtContextCache;
+// One-shot dense schedule hand-off: dumpMtDenseScheduleJson builds the schedule before Final
+// emission starts; with dense executor codegen Final.scheduleBuild would rebuild the exact same
+// schedule (same task map, same global graph state, nothing mutates in between), costing a
+// second full vcontract pass. resetMtContextCache() invalidates it per generation.
+static MtDenseSchedule mtDenseScheduleCache;
+static bool mtDenseScheduleCacheValid = false;
 
 static void resetMtContextCache() {
   mtContextCache = MtContextCacheState();
   mtDependencyEdgeCache.clear();
   mtActiveEdgeCache.clear();
+  mtDenseScheduleCache = MtDenseSchedule();
+  mtDenseScheduleCacheValid = false;
 }
 
 static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutForInvocation() {
@@ -6287,6 +6425,10 @@ void graph::dumpMtDenseScheduleJson() {
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   markMtRepCutLiteRuntimeApplied(mtTasks);
   MtDenseSchedule schedule = buildMtDenseSchedule(mtTasks, mtUseDenseExecutorCodegen());
+  if (schedule.codegenEnabled) {
+    mtDenseScheduleCache = schedule;
+    mtDenseScheduleCacheValid = true;
+  }
 
   int maxLayerWidth = 0;
   int worker0OnlyLayerCount = 0;
@@ -15325,9 +15467,14 @@ void graph::cppEmitter() {
   MtDenseSchedule mtDenseSchedule;
   EmitPhaseTimer scheduleTimer("Final.scheduleBuild");
   if (useMtHelpers) {
-    mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
-    markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
-    MtRepCutSemanticPlan mtRepCutHeaderSemanticPlan = planMtRepCutSemantics(mtRepCutHeaderTasks);
+    { EmitPhaseTimer infoMapTimer("Final.schedBuild.infoMap");
+      mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+      markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
+    }
+    MtRepCutSemanticPlan mtRepCutHeaderSemanticPlan;
+    { EmitPhaseTimer repCutSemTimer("Final.schedBuild.repcutSem");
+      mtRepCutHeaderSemanticPlan = planMtRepCutSemantics(mtRepCutHeaderTasks);
+    }
     mtSetProfileRepCutBatchBeginCppIds(mtRepCutHeaderSemanticPlan);
     mtSetProfileRepCutRuntimeCppIds(mtRepCutHeaderTasks);
     if (useCoarseMt) {
@@ -15337,10 +15484,19 @@ void graph::cppEmitter() {
   if (useDenseExecutorCodegen) {
     Assert(useCoarseMt, "GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation in v181");
     if (mtRepCutHeaderTasks.empty()) {
-      mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
-      markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
+      { EmitPhaseTimer infoMapTimer("Final.schedBuild.infoMap");
+        mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
+        markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
+      }
     }
-    mtDenseSchedule = buildMtDenseSchedule(mtRepCutHeaderTasks, true);
+    { EmitPhaseTimer denseSchedTimer("Final.schedBuild.denseSched");
+      if (mtDenseScheduleCacheValid && mtDenseScheduleCache.codegenEnabled) {
+        mtDenseSchedule = std::move(mtDenseScheduleCache);
+        mtDenseScheduleCacheValid = false;
+      } else {
+        mtDenseSchedule = buildMtDenseSchedule(mtRepCutHeaderTasks, true);
+      }
+    }
   }
   bool denseExecutorValid = useDenseExecutorCodegen && mtDenseSchedule.valid;
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
