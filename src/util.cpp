@@ -104,16 +104,24 @@ int upperLog2(int x) {
   return (32 - __builtin_clz(x - 1));
 }
 
-static char buf[0x4000000];
-
+// Thread-safe: the old shared 64 MiB static buffer raced once cppEmitter
+// started rendering emission units on worker threads. Fast path formats on
+// the stack; oversized payloads (huge expression text) fall back to a
+// thread-local growable buffer. Output is byte-identical to the old version.
 std::string format(const char *fmt, ...) {
+  char local[2048];
   va_list args;
   va_start(args, fmt);
-  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  int needed = std::vsnprintf(local, sizeof(local), fmt, args);
   va_end(args);
-  std::string ret = buf;
-  Assert(ret.length() < sizeof(buf) - 1, "require larger buf");
-  return ret;
+  Assert(needed >= 0, "vsnprintf encoding error");
+  if ((size_t)needed < sizeof(local)) return std::string(local, (size_t)needed);
+  static thread_local std::string big;
+  big.resize((size_t)needed + 1);
+  va_start(args, fmt);
+  std::vsnprintf(&big[0], big.size(), fmt, args);
+  va_end(args);
+  return std::string(big.data(), (size_t)needed);
 }
 
 std::string bitMask(int width) {

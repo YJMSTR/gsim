@@ -5,6 +5,10 @@
 #ifndef GRAPH_H
 #define GRAPH_H
 
+#include <functional>
+#include <vector>
+
+
 struct MtRepCutClone;
 struct MtRepCutSemanticPlan;
 struct MtCoarseRegionPlan;
@@ -32,11 +36,29 @@ private:
   std::string headerFilePath;
   std::string headerTmpFilePath;
 
+public:
+  // EmitChunk = one captured __emitSrc call (text + the byte counts/rotation
+  // flags the sequential path would have used); EmitBuf = a unit's chunks.
+  struct EmitChunk {
+    std::string text;
+    size_t countedBytes = 0;
+    bool canNewFile = false;
+    bool alreadyEndFunc = false;
+    bool hasNextFuncDef = false;
+    std::string nextFuncDef;
+  };
+  struct EmitBuf {
+    std::vector<EmitChunk> chunks;
+  };
   bool __emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const char *nextFuncDef, const char *fmt, ...);
+  void rotateSrcFile(bool alreadyEndFunc, const char* nextFuncDef);
+  void flushEmitBufs(std::vector<EmitBuf>& bufs);
+  void emitUnitsParallel(size_t unitCount, const std::function<void(size_t)>& renderUnit);
   void emitPrintf();
   void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
                     std::string activeBufferName, int indent,
                     const std::string& accumFlagName = "", bool emitActivation = true);
+private:
   void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
                           std::string activeBufferName, int indent,
                           const std::string& accumFlagName = "", bool emitActivation = true);

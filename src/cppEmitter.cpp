@@ -5,6 +5,8 @@
 #include "common.h"
 #include "util.h"
 
+#include <atomic>
+#include <thread>
 #include <cstddef>
 #include <cstdio>
 #include <cinttypes>
@@ -62,7 +64,9 @@ static bool generatedOutputFilesEqual(const std::string& lhsPath, const std::str
 // Report-only: classify emitted old-value snapshots by whether their change detection
 // feeds any activation consumer (nextActiveId). Answers the per-node DCE question for
 // the largest bookkeeping class without touching emitted semantics.
-static uint64_t mtOldSnapWithConsumers = 0, mtOldSnapNoConsumers = 0;
+// Atomic so parallel emission units can bump them without a lock; the report
+// only prints the sum, which is order-independent.
+static std::atomic<uint64_t> mtOldSnapWithConsumers{0}, mtOldSnapNoConsumers{0};
 static bool mtOldValueHistogramEnabled() {
   const char* env = std::getenv("GSIM_MT_DENSE_OLDVALUE_HISTOGRAM");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -80,6 +84,25 @@ static void commitStableOutputFile(const std::string& tmpPath, const std::string
   int rc = std::rename(tmpPath.c_str(), finalPath.c_str());
   Assert(rc == 0, "failed to install stable output %s -> %s", tmpPath.c_str(), finalPath.c_str());
 }
+
+// Final-phase breakdown instrumentation (GSIM_EMIT_PHASE_TIMING=1): wall time
+// per emission region, printed to stderr when the region scope closes. Pure
+// measurement - never changes emitted bytes.
+static bool emitPhaseTimingEnabled() {
+  const char* env = std::getenv("GSIM_EMIT_PHASE_TIMING");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+struct EmitPhaseTimer {
+  const char* phaseName;
+  std::chrono::steady_clock::time_point begin;
+  explicit EmitPhaseTimer(const char* n) : phaseName(n), begin(std::chrono::steady_clock::now()) {}
+  ~EmitPhaseTimer() {
+    if (emitPhaseTimingEnabled()) {
+      long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+      fprintf(stderr, "[emit-phase] %s = %ld ms\n", phaseName, ms);
+    }
+  }
+};
 
 #define RESET_NAME(node) (node->name + "$RESET")
 #define emitFuncDecl(indent, ...) __emitSrc(indent, true, true, NULL, __VA_ARGS__)
@@ -99,22 +122,35 @@ static std::vector<int> mtProfileRepCutRuntimeCppIds;
 static std::set<int> alwaysActive;
 static std::vector<std::vector<int>> mtStepActiveWordGuards;
 static std::vector<char> mtStepActiveWordGuardable;
+// Parallel Final emission: the four context flags below are per-thread. Worker
+// threads that render independent emission units each get their own copy;
+// emitUnitsParallel() snapshots the main-thread values into every worker.
 // Sparse-in-dense MT: when set, updateActiveStr emits per-byte __atomic_fetch_or into activeFlags
 // (ACTIVE_WIDTH==8 => each activeFlags[] is uint8_t, so byte atomics are aligned/UB-free) so
 // cross-thread same-word activations don't lose updates. Set only around the gated dense body.
-static bool mtDenseSparseGateAtomicEmit = false;
+static thread_local bool mtDenseSparseGateAtomicEmit = false;
 // V340: emit push-driven active-MTask registration only while generating the
 // single-thread sparse-dense executor body. Activation writes then mark the
 // static reverse-index candidates directly; no repeated active-word scans.
-static bool mtDenseActiveWorklistEmit = false;
+static thread_local bool mtDenseActiveWorklistEmit = false;
 // Suppress sparse activation-event calls while emitting the optional dense executor body.
-static bool mtActivationEventTraceSuppressed = false;
+static thread_local bool mtActivationEventTraceSuppressed = false;
 // Codegen-time semantic source: admitted sparse mtTask cppId, or -1 for reset/external paths.
-static int mtActivationEventTraceSourceCppId = -1;
+static thread_local int mtActivationEventTraceSourceCppId = -1;
 
 
 static std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
 static std::map<Node*, std::pair<int, int>> super2DenseResetId;  // dense uint & async reset
+
+// Read-only view of super2ResetId with std::map::operator[] value semantics:
+// returns the value-initialized pair a first operator[] access would have
+// inserted, without mutating the shared map (parallel emission units call this
+// concurrently; genResetAll has already populated every live key by then).
+static const std::pair<int, int>& super2ResetIdLookup(Node* resetNode) {
+  static const std::pair<int, int> kDefault = {0, 0};
+  auto iter = super2ResetId.find(resetNode);
+  return iter == super2ResetId.end() ? kDefault : iter->second;
+}
 
 extern int maxConcatNum;
 bool nameExist(std::string str);
@@ -9638,11 +9674,13 @@ int graph::genNodeStepEnd(SuperNode* node, int indent, bool skipAdmissionGuard) 
   return indent;
 }
 
+// Per-thread: set/cleared around a single genSuperEval call, so parallel units
+// never observe each other's replacement maps.
+static thread_local std::map<Node*, std::string> mtRepCutActiveReplacements;
 bool Node::isLocal() { // TODO: isArray is OK
   return status == VALID_NODE && type == NODE_OTHERS && !anyNextActive() && !isArray() && !isReset();
 }
 
-static std::map<Node*, std::string> mtRepCutActiveReplacements;
 
 int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName, bool emitActivation) {
   switch (inst.infoType) {
@@ -9664,8 +9702,8 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
       // change-detection feed any activation consumer? nextActiveId empty = candidate for
       // per-node dead-code elimination (the audit's largest bookkeeping class).
       if (mtOldValueHistogramEnabled()) {
-        if (inst.node->nextActiveId.empty()) mtOldSnapNoConsumers ++;
-        else mtOldSnapWithConsumers ++;
+        if (inst.node->nextActiveId.empty()) mtOldSnapNoConsumers.fetch_add(1, std::memory_order_relaxed);
+        else mtOldSnapWithConsumers.fetch_add(1, std::memory_order_relaxed);
       }
       emitBodyLock(indent, "%s %s = %s;\n", widthUType(inst.node->width).c_str(), oldName(inst.node).c_str(), inst.node->name.c_str());
       break;
@@ -9711,7 +9749,7 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     }
   } else {
     if (super->superType == SUPER_ASYNC_RESET) {
-      int resetId = super2ResetId[super->resetNode].second;
+      int resetId = super2ResetIdLookup(super->resetNode).second;
       if (!emitActivation && activeBufferName.empty()) {
         int denseResetId = -1;
         auto denseResetIt = super2DenseResetId.find(super->resetNode);
@@ -9762,7 +9800,7 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       }
     }
     if (super->superType == SUPER_ASYNC_RESET) {
-      int resetId = super2ResetId[super->resetNode].second;
+      int resetId = super2ResetIdLookup(super->resetNode).second;
       if (!emitActivation && activeBufferName.empty()) {
         int denseResetId = -1;
         auto denseResetIt = super2DenseResetId.find(super->resetNode);
@@ -11871,16 +11909,30 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
         regionIndex ++;
       }
     }
-    for (int idx = 0; idx < superId; idx ++) {
-      genMtTaskHelper(cppId2Super[idx], true, "ActivationDelta");
-      genMtTaskHelper(cppId2Super[idx], false, "ActivationDelta");
-    }
-    for (int idx = 0; idx < superId; idx ++) {
-      if (mtTasks[idx].repcutRuntimeApplied) genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx), "ActivationDelta");
+    {
+      EmitPhaseTimer helperTimer("Final.mtTaskHelpers");
+      // Per-super mtTaskN / mtRepCutLiteTaskN definitions are independent
+      // emission units: each renders one self-contained function reading only
+      // frozen state (cppId2Super, super2ResetId, semanticPlan clones) plus the
+      // per-thread emission context. Render in parallel, assemble in cppId
+      // order - byte-identical to sequential emission.
+      emitUnitsParallel((size_t)superId, [this](size_t unit) {
+        int idx = (int)unit;
+        genMtTaskHelper(cppId2Super[idx], true, "ActivationDelta");
+        genMtTaskHelper(cppId2Super[idx], false, "ActivationDelta");
+      });
+      emitUnitsParallel((size_t)superId, [this, &mtTasks, &semanticPlan](size_t unit) {
+        int idx = (int)unit;
+        auto taskIter = mtTasks.find(idx);
+        if (taskIter != mtTasks.end() && taskIter->second.repcutRuntimeApplied) {
+          genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx), "ActivationDelta");
+        }
+      });
     }
     genMtTaskRunner(semanticPlan);
     if (globalConfig.MtBatchFormationMode == "coarse") genMtCoarseRegionRunner(semanticPlan, coarsePlan);
 
+    EmitPhaseTimer subStepTimer("Final.subSteps");
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
     int indent = 1;
     (void)serialFastSubStepMax;
@@ -13772,7 +13824,17 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++)
       denseMTaskEmissionOrder.push_back(mtaskId);
   }
-  for (int mtaskId : denseMTaskEmissionOrder) {
+  {
+  EmitPhaseTimer denseBodyTimer("Final.denseMTaskBodies");
+  // Each stepDenseMTaskN body is an independent emission unit (reads frozen
+  // schedule + graph; per-super emission context flags are thread-local and
+  // saved/restored around genSuperEval exactly as in the sequential loop).
+  // Unit u renders denseMTaskEmissionOrder[u]; assembly replays buffers in
+  // emission order, so output is byte-identical.
+  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder,
+                                                     sparseGate, sparseGateAtomic, activeWorklistPush,
+                                                     activeWorklistMt, threadCount](size_t unit) {
+    int mtaskId = denseMTaskEmissionOrder[unit];
 
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
     emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
@@ -13838,7 +13900,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       }
     }
     emitBodyLock(0, "}\n");
+  });
   }
+
   if (activeWorklistPush) {
     emitFuncDecl(0, "void S%s::markDenseActiveWorklistWord(int wordId) {\n", name.c_str());
     emitBodyLock(1, "if (wordId < 0 || wordId >= kDenseActiveWorklistWordCount) return;\n");
@@ -14987,27 +15051,84 @@ bool SuperNode::instsEmpty() {
   return insts.size() == 0;
 }
 
+// ---- Parallel Final emission: capture/replay machinery ----
+// Emission units (per-super mtTask helpers, per-MTask stepDenseMTask bodies)
+// render concurrently with __emitSrc in capture mode: every call appends one
+// graph::EmitChunk to the unit's graph::EmitBuf instead of writing srcFp.
+// After the join, flushEmitBufs() replays all chunks in unit order on the
+// main thread and performs the same byte-count-based file rotation __emitSrc
+// would have, so the assembled files are byte-identical to a sequential run.
+//
+// countedBytes mirrors the original accounting quirk: indent spaces are
+// written to the file but do NOT count toward srcFileBytes/rotation, because
+// the original __emitSrc adds only the vfprintf return value.
+static thread_local graph::EmitBuf* emitCaptureTarget = nullptr;
+
+// vsnprintf into a std::string without truncation. `args` is never consumed;
+// each vsnprintf call runs on its own va_copy.
+static void appendVFormat(std::string& out, const char* fmt, va_list args) {
+  char local[1024];
+  va_list probe;
+  va_copy(probe, args);
+  int needed = std::vsnprintf(local, sizeof(local), fmt, probe);
+  va_end(probe);
+  Assert(needed >= 0, "vsnprintf encoding error");
+  if ((size_t)needed < sizeof(local)) {
+    out.append(local, (size_t)needed);
+    return;
+  }
+  size_t base = out.size();
+  out.resize(base + (size_t)needed + 1);
+  va_list work;
+  va_copy(work, args);
+  std::vsnprintf(&out[base], (size_t)needed + 1, fmt, work);
+  va_end(work);
+  out.resize(base + (size_t)needed);
+}
+
+void graph::rotateSrcFile(bool alreadyEndFunc, const char *nextFuncDef) {
+  if (srcFp != NULL) {
+    if (!alreadyEndFunc) fprintf(srcFp, "}"); // the end of the current function
+    fclose(srcFp);
+    commitStableOutputFile(srcTmpFilePath, srcFilePath);
+  }
+  srcFilePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), srcFileIdx);
+  srcTmpFilePath = globalConfig.MtStableOutput ? srcFilePath + ".tmp" : "";
+  const std::string openPath = globalConfig.MtStableOutput ? srcTmpFilePath : srcFilePath;
+  srcFp = std::fopen(openPath.c_str(), "w");
+  srcFileIdx ++;
+  assert(srcFp != NULL);
+  // 4 MiB stdio buffer: generated text is ~12 GB streamed line-by-line;
+  // the default 4-8 KB buffer turns into millions of write syscalls.
+  setvbuf(srcFp, NULL, _IOFBF, 4 * 1024 * 1024);
+  srcFileBytes = fprintf(srcFp, "#include \"%s.h\"\n", name.c_str());
+  if (nextFuncDef != NULL) {
+    srcFileBytes += fprintf(srcFp, "%s {\n", nextFuncDef);
+  }
+}
+
 bool graph::__emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const char *nextFuncDef, const char *fmt, ...) {
+  if (emitCaptureTarget != nullptr) {
+    EmitChunk chunk;
+    chunk.canNewFile = canNewFile;
+    chunk.alreadyEndFunc = alreadyEndFunc;
+    if (nextFuncDef != nullptr) {
+      chunk.hasNextFuncDef = true;
+      chunk.nextFuncDef = nextFuncDef;
+    }
+    if (indent > 0) chunk.text.append((size_t)indent * 2, ' ');
+    va_list args;
+    va_start(args, fmt);
+    appendVFormat(chunk.text, fmt, args);
+    va_end(args);
+    chunk.countedBytes = chunk.text.size() - (size_t)indent * 2;
+    assert(chunk.countedBytes > 0);
+    emitCaptureTarget->chunks.push_back(std::move(chunk));
+    return false;
+  }
   bool newFile = false;
   if (srcFp == NULL || (srcFileBytes > (globalConfig.cppMaxSizeKB * 1024) && canNewFile)) {
-    if (srcFp != NULL) {
-      if (!alreadyEndFunc) fprintf(srcFp, "}"); // the end of the current function
-      fclose(srcFp);
-      commitStableOutputFile(srcTmpFilePath, srcFilePath);
-    }
-    srcFilePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), srcFileIdx);
-    srcTmpFilePath = globalConfig.MtStableOutput ? srcFilePath + ".tmp" : "";
-    const std::string openPath = globalConfig.MtStableOutput ? srcTmpFilePath : srcFilePath;
-    srcFp = std::fopen(openPath.c_str(), "w");
-    srcFileIdx ++;
-    assert(srcFp != NULL);
-    // 4 MiB stdio buffer: generated text is ~12 GB streamed line-by-line;
-    // the default 4-8 KB buffer turns into millions of write syscalls.
-    setvbuf(srcFp, NULL, _IOFBF, 4 * 1024 * 1024);
-    srcFileBytes = fprintf(srcFp, "#include \"%s.h\"\n", name.c_str());
-    if (nextFuncDef != NULL) {
-      srcFileBytes += fprintf(srcFp, "%s {\n", nextFuncDef);
-    }
+    rotateSrcFile(alreadyEndFunc, nextFuncDef);
     newFile = true;
   }
   for (int i = 0; i < indent; i ++) fprintf(srcFp, "  ");
@@ -15018,6 +15139,79 @@ bool graph::__emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const ch
   va_end(args);
   srcFileBytes += bytes;
   return newFile;
+}
+
+// Replays captured units in order; rotation decisions depend only on the
+// cumulative byte count, which equals the sequential stream's at every chunk
+// boundary, so files and rotation points come out identical.
+void graph::flushEmitBufs(std::vector<EmitBuf>& bufs) {
+  for (EmitBuf& buf : bufs) {
+    for (EmitChunk& chunk : buf.chunks) {
+      if (srcFp == NULL || (srcFileBytes > (globalConfig.cppMaxSizeKB * 1024) && chunk.canNewFile)) {
+        rotateSrcFile(chunk.alreadyEndFunc, chunk.hasNextFuncDef ? chunk.nextFuncDef.c_str() : nullptr);
+      }
+      fwrite(chunk.text.data(), 1, chunk.text.size(), srcFp);
+      srcFileBytes += (int)chunk.countedBytes;
+    }
+    std::vector<EmitChunk>().swap(buf.chunks);
+  }
+}
+
+struct EmitCtxSnapshot {
+  bool sparseGateAtomic;
+  bool activeWorklistEmit;
+  bool traceSuppressed;
+  int traceSourceCppId;
+};
+
+static int emitParallelThreadCount() {
+  const char* env = std::getenv("GSIM_EMIT_THREADS");
+  int n = 0;
+  if (env != nullptr && env[0] != '\0') n = std::atoi(env);
+  if (n <= 0) n = std::min(16, (int)std::thread::hardware_concurrency());
+  return std::max(1, n);
+}
+
+// Renders `unitCount` independent emission units on a worker pool, then
+// assembles them sequentially in unit order. Determinism does not depend on
+// scheduling: buffers are indexed by unit, never by worker.
+void graph::emitUnitsParallel(size_t unitCount, const std::function<void(size_t)>& renderUnit) {
+  if (unitCount == 0) return;
+  std::vector<EmitBuf> bufs(unitCount);
+  const size_t nWorkers = std::min((size_t)emitParallelThreadCount(), unitCount);
+  if (nWorkers <= 1) {
+    for (size_t u = 0; u < unitCount; u ++) {
+      emitCaptureTarget = &bufs[u];
+      renderUnit(u);
+      emitCaptureTarget = nullptr;
+    }
+    flushEmitBufs(bufs);
+    return;
+  }
+  EmitCtxSnapshot ctx;
+  ctx.sparseGateAtomic = mtDenseSparseGateAtomicEmit;
+  ctx.activeWorklistEmit = mtDenseActiveWorklistEmit;
+  ctx.traceSuppressed = mtActivationEventTraceSuppressed;
+  ctx.traceSourceCppId = mtActivationEventTraceSourceCppId;
+  std::atomic<size_t> nextUnit(0);
+  std::vector<std::thread> pool;
+  pool.reserve(nWorkers);
+  for (size_t w = 0; w < nWorkers; w ++) {
+    pool.emplace_back([&, ctx]() {
+      mtDenseSparseGateAtomicEmit = ctx.sparseGateAtomic;
+      mtDenseActiveWorklistEmit = ctx.activeWorklistEmit;
+      mtActivationEventTraceSuppressed = ctx.traceSuppressed;
+      mtActivationEventTraceSourceCppId = ctx.traceSourceCppId;
+      size_t u;
+      while ((u = nextUnit.fetch_add(1, std::memory_order_relaxed)) < unitCount) {
+        emitCaptureTarget = &bufs[u];
+        renderUnit(u);
+        emitCaptureTarget = nullptr;
+      }
+    });
+  }
+  for (std::thread& t : pool) t.join();
+  flushEmitBufs(bufs);
 }
 
 void graph::emitPrintf() {
@@ -15129,6 +15323,7 @@ void graph::cppEmitter() {
   bool useDenseExecutorCodegen = mtUseDenseExecutorCodegen();
   bool activationEventTraceCodegen = mtUseActivationEventTraceCodegen();
   MtDenseSchedule mtDenseSchedule;
+  EmitPhaseTimer scheduleTimer("Final.scheduleBuild");
   if (useMtHelpers) {
     mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
     markMtRepCutLiteRuntimeApplied(mtRepCutHeaderTasks);
@@ -16811,10 +17006,11 @@ void graph::cppEmitter() {
 
   printf("[cppEmitter] define %ld nodes %d superNodes\n", definedNode.size(), superId);
   if (mtOldValueHistogramEnabled()) {
+    uint64_t histTotal = mtOldSnapWithConsumers.load(std::memory_order_relaxed) + mtOldSnapNoConsumers.load(std::memory_order_relaxed);
     fprintf(stderr, "[mt-oldvalue-histogram] with_activation_consumers=%llu no_consumers=%llu (no-consumer share %.2f%%)\n",
-            (unsigned long long)mtOldSnapWithConsumers, (unsigned long long)mtOldSnapNoConsumers,
-            (mtOldSnapWithConsumers + mtOldSnapNoConsumers) ?
-              100.0 * (double)mtOldSnapNoConsumers / (double)(mtOldSnapWithConsumers + mtOldSnapNoConsumers) : 0.0);
+            (unsigned long long)mtOldSnapWithConsumers.load(std::memory_order_relaxed),
+            (unsigned long long)mtOldSnapNoConsumers.load(std::memory_order_relaxed),
+            histTotal ? 100.0 * (double)mtOldSnapNoConsumers.load(std::memory_order_relaxed) / (double)histTotal : 0.0);
   }
   std::cout << "[cppEmitter] finish writing " << srcFileIdx << " cpp files to " + globalConfig.OutputDir + "/" << std::endl;
 }
