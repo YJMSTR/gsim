@@ -6097,13 +6097,7 @@ static void applyRepCutLiteSelection(std::map<int, MtTaskInfo>& tasks) {
       remainingBudget -= task.repcutCopyCost;
     }
   }
-}
 
-static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelection() {
-  std::map<int, MtTaskInfo> tasks;
-  { EmitPhaseTimer selectTimer("Final.infoMap.repcutSelect"); tasks = buildMtTaskInfoMapWithRepCut(); }
-  applyRepCutLiteSelection(tasks);
-  return tasks;
 }
 
 struct MtContextCacheState {
@@ -6133,8 +6127,16 @@ static void resetMtContextCache() {
   mtDenseScheduleCacheValid = false;
 }
 
+// The task-info map is a pure function of the frozen graph + config within one
+// generation, but the Final phases rebuild it from scratch at every call site
+// (7 full rebuilds + 6 repcut selections per T16 champion generation, ~48 s).
+// Memoize unconditionally - same provenance as the mtDenseScheduleCache hand-off
+// in d69757c - and hand every caller its own copy (return by value), so
+// post-return mutations (markMtRepCutLiteRuntimeApplied on caller copies)
+// never touch the cached map. resetMtContextCache() invalidates per generation.
+// The plan/trace caches below stay gated on --mt-context-cache because they are
+// keyed by their caller's (possibly marked) task map, not just global state.
 static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutForInvocation() {
-  if (!globalConfig.MtContextCache) return buildMtTaskInfoMapWithRepCut();
   if (!mtContextCache.hasRepCutTasks) {
     mtContextCache.repCutTasks = buildMtTaskInfoMapWithRepCut();
     mtContextCache.hasRepCutTasks = true;
@@ -6143,10 +6145,11 @@ static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutForInvocation() {
 }
 
 static std::map<int, MtTaskInfo> buildMtTaskInfoMapWithRepCutSelectionForInvocation() {
-  if (!globalConfig.MtContextCache) return buildMtTaskInfoMapWithRepCutSelection();
   if (!mtContextCache.hasRepCutSelectedTasks) {
-    std::map<int, MtTaskInfo> tasks = buildMtTaskInfoMapWithRepCutForInvocation();
-    applyRepCutLiteSelection(tasks);
+    std::map<int, MtTaskInfo> tasks;
+    { EmitPhaseTimer selectTimer("Final.infoMap.repcutSelect");
+      tasks = buildMtTaskInfoMapWithRepCutForInvocation();
+      applyRepCutLiteSelection(tasks); }
     mtContextCache.repCutSelectedTasks = std::move(tasks);
     mtContextCache.hasRepCutSelectedTasks = true;
   }
@@ -12071,8 +12074,11 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
         }
       });
     }
-    genMtTaskRunner(semanticPlan);
-    if (globalConfig.MtBatchFormationMode == "coarse") genMtCoarseRegionRunner(semanticPlan, coarsePlan);
+    { EmitPhaseTimer runnersTimer("Final.mtTaskRunners"); genMtTaskRunner(semanticPlan); }
+    if (globalConfig.MtBatchFormationMode == "coarse") {
+      EmitPhaseTimer coarseRunnerTimer("Final.mtCoarseRegionRunner");
+      genMtCoarseRegionRunner(semanticPlan, coarsePlan);
+    }
 
     EmitPhaseTimer subStepTimer("Final.subSteps");
     emitFuncDecl(0, "void S%s::subStep0() {\n", name.c_str());
@@ -12796,14 +12802,20 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     Assert(transitiveReduceEdges,
            "GSIM_MT_DENSE_OWNER_READY_FLAGS experiment requires GSIM_MT_DENSE_TRANSITIVE_REDUCE_EDGES=1");
   }
-  std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(
-      denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, xthreadDepsOnly);
-  int transitiveElidedEdges = transitiveReduceEdges
-      ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, denseSchedule.mtaskThreadAssign) : 0;
+  const std::chrono::steady_clock::time_point densePrologueBegin = std::chrono::steady_clock::now();
+  std::vector<std::vector<int>> denseRuntimeSuccs;
+  int transitiveElidedEdges = 0;
   MtDenseOwnerReadyLayout ownerReadyLayout;
-  if (ownerReadyFlags) {
-    ownerReadyLayout = mtBuildDenseOwnerReadyLayout(
-        denseRuntimeSuccs, denseSchedule.mtaskThreadAssign, threadCount);
+  {
+    EmitPhaseTimer proSuccTimer("Final.densePrologue.runtimeSuccs");
+    denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(
+        denseSchedule.mtasks, denseSchedule.mtaskThreadAssign, xthreadDepsOnly);
+    transitiveElidedEdges = transitiveReduceEdges
+        ? mtReduceDenseRuntimeSuccsTransitive(denseRuntimeSuccs, denseSchedule.mtaskThreadAssign) : 0;
+    if (ownerReadyFlags) {
+      ownerReadyLayout = mtBuildDenseOwnerReadyLayout(
+          denseRuntimeSuccs, denseSchedule.mtaskThreadAssign, threadCount);
+    }
   }
   const int denseLookaheadWindow = mtDenseLookaheadWindow();
   const bool denseLookahead = denseLookaheadWindow > 0;
@@ -13307,6 +13319,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   std::vector<uint32_t> denseDispatchWaitBegin, denseDispatchWaitEnd;
   std::vector<uint32_t> denseDispatchStoreBegin, denseDispatchStoreEnd;
   uint32_t denseDispatchWaitTotal = 0;
+  const std::chrono::steady_clock::time_point denseProFieldSetsBegin = std::chrono::steady_clock::now();
   if (tableDispatch && !denseLookahead) {
     denseDispatchWorkerCounts.assign((size_t)threadCount, 0);
     denseDispatchWaitBegin.assign((size_t)nMTasks, 0);
@@ -13331,6 +13344,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(stderr, "[mt-dense-table-dispatch] mtasks=%d wait_slots=%u threads=%d\n",
             nMTasks, denseDispatchWaitTotal, threadCount);
   }
+  if (emitPhaseTimingEnabled()) {
+    fprintf(stderr, "[emit-phase] Final.densePrologue.fieldSets = %ld ms\n",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - denseProFieldSetsBegin).count());
+  }
   MtDenseBreakdownWindowWaitLayout denseBreakdownWindowWaitLayout;
   if (denseBreakdownWindowCodegen) {
     denseBreakdownWindowWaitLayout = mtBuildDenseBreakdownWindowWaitLayout(
@@ -13348,6 +13366,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
            "dense breakdown all-owner physical record count %d is invalid for %d MTasks",
            denseBreakdownWindowAllOwnerLayout.recordCount, nMTasks);
   }
+  const std::chrono::steady_clock::time_point denseProDepsBegin = std::chrono::steady_clock::now();
   std::vector<uint32_t> denseRuntimeDepCounts((size_t)nMTasks, 0);
   int totalSuccs = 0;
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
@@ -13368,6 +13387,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             nMTasks, denseMTaskPhysicalSlotCount, denseMTaskPhysicalSlotCount - nMTasks,
             threadCount, ownerBankCountersDiag ? 1 : 0);
   }
+  if (emitPhaseTimingEnabled()) {
+    fprintf(stderr, "[emit-phase] Final.densePrologue.depCounts = %ld ms\n",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - denseProDepsBegin).count());
+  }
   std::vector<uint32_t> denseLookaheadLocalBegin, denseLookaheadLocalEnd,
       denseLookaheadLocalPrereqs;
   std::vector<uint8_t> denseLookaheadLocalPrereqKinds;
@@ -13377,6 +13401,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   int denseLookaheadSameWorkerPredCount = 0;
   int denseLookaheadPublisherConstrainedEntryCount = 0;
   int denseLookaheadPublisherSiblingPositionCount = 0;
+  const std::chrono::steady_clock::time_point denseProLookaheadBegin = std::chrono::steady_clock::now();
   if (denseLookahead) {
     // The B1 token layout reduces the complete MTask DAG without the synthetic
     // fixed-worker chains used by the strict Step-A token layout.
@@ -13485,6 +13510,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       }
     }
   }
+  if (emitPhaseTimingEnabled()) {
+    fprintf(stderr, "[emit-phase] Final.densePrologue.lookahead = %ld ms\n",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - denseProLookaheadBegin).count());
+  }
   if (ownerReadyFlags) {
     fprintf(stderr,
             "[mt-dense-owner-ready] mtasks=%d edges=%d tokens=%d slots=%d padding=%d banks=%d threads=%d\n",
@@ -13542,6 +13572,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "};\n");
   };
 
+  const std::chrono::steady_clock::time_point denseProHeaderTablesBegin = std::chrono::steady_clock::now();
   fprintf(header, "static constexpr bool kDenseXThreadDepsOnly = %s;\n", xthreadDepsOnly ? "true" : "false");
   fprintf(header, "static constexpr bool kDenseTransitiveReduceEdges = %s;\n", transitiveReduceEdges ? "true" : "false");
   fprintf(header, "static constexpr int kDenseTransitiveElidedEdgeCount = %d;\n", transitiveElidedEdges);
@@ -13965,6 +13996,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   } else {
     for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++)
       denseMTaskEmissionOrder.push_back(mtaskId);
+  }
+  if (emitPhaseTimingEnabled()) {
+    fprintf(stderr, "[emit-phase] Final.densePrologue.headerTables = %ld ms\n",
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - denseProHeaderTablesBegin).count());
+  }
+  if (emitPhaseTimingEnabled()) {
+    long prologueMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - densePrologueBegin).count();
+    fprintf(stderr, "[emit-phase] Final.densePrologue.total = %ld ms\n", prologueMs);
   }
   {
   EmitPhaseTimer denseBodyTimer("Final.denseMTaskBodies");
@@ -15423,11 +15464,16 @@ void graph::cppEmitter() {
     }
   }
   resetMtContextCache();
-  if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson();
-  if (globalConfig.DumpMtRepCutLiteReport || globalConfig.MtRepCutLiteMode == "on") dumpMtRepCutLiteReport();
-  if (globalConfig.DumpMtCoarseRegionReport || globalConfig.MtBatchFormationMode == "coarse") dumpMtCoarseRegionReport();
-  if (mtUseReadyBatchReport() || mtUseEnvelopeLocalEval() || mtUseEnvelopeLocalEvalDiagnostics()) dumpMtReadyBatchReport();
-  if (mtUseDenseExecutorCodegen()) dumpMtDenseScheduleJson();
+  { EmitPhaseTimer t("Final.dumpMtScheduleJson");
+    if (globalConfig.DumpMtScheduleJson) dumpMtScheduleJson(); }
+  { EmitPhaseTimer t("Final.dumpMtRepCutLiteReport");
+    if (globalConfig.DumpMtRepCutLiteReport || globalConfig.MtRepCutLiteMode == "on") dumpMtRepCutLiteReport(); }
+  { EmitPhaseTimer t("Final.dumpMtCoarseRegionReport");
+    if (globalConfig.DumpMtCoarseRegionReport || globalConfig.MtBatchFormationMode == "coarse") dumpMtCoarseRegionReport(); }
+  { EmitPhaseTimer t("Final.dumpMtReadyBatchReport");
+    if (mtUseReadyBatchReport() || mtUseEnvelopeLocalEval() || mtUseEnvelopeLocalEvalDiagnostics()) dumpMtReadyBatchReport(); }
+  { EmitPhaseTimer t("Final.dumpMtDenseScheduleJson");
+    if (mtUseDenseExecutorCodegen()) dumpMtDenseScheduleJson(); }
   if (globalConfig.MtReportOnly) {
     printf("[cppEmitter] mt-report-only: skipped generated C++ emission after reports\n");
     return;
