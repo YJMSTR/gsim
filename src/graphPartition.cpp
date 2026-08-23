@@ -6,6 +6,7 @@
 #include <queue>
 #include <stack>
 #include <map>
+#include <thread>
 #include <tuple>
 
 // #define SUPER_BOUND 35
@@ -182,12 +183,36 @@ uint64_t graph::canonInputHash() {
     for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
     return h;
   };
-  std::vector<std::string> records;
-  records.reserve(sortedSuper.size());
-  for (SuperNode* super : sortedSuper) {
-    if (super->superType != SUPER_VALID) continue;
-    records.push_back(keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext));
+  // Parallel record construction: per-super records are independent (sortedSuper
+  // and Node::name are read-only here); the final std::sort makes construction
+  // order irrelevant, so the hash value is identical to the sequential version.
+  // Each worker pre-computes keyOf() once per super and reuses it for that
+  // super's endpoint references only within its chunk; endpoint keys are still
+  // computed on demand (their supers may live outside the chunk).
+  const int nWorkers = std::min(16, (int)std::thread::hardware_concurrency());
+  std::vector<SuperNode*> valid;
+  valid.reserve(sortedSuper.size());
+  for (SuperNode* super : sortedSuper) if (super->superType == SUPER_VALID) valid.push_back(super);
+  std::vector<std::vector<std::string>> chunks((size_t)nWorkers);
+  std::vector<std::thread> pool;
+  size_t total = valid.size();
+  for (int w = 0; w < nWorkers; w ++) {
+    size_t lo = total * (size_t)w / (size_t)nWorkers;
+    size_t hi = total * (size_t)(w + 1) / (size_t)nWorkers;
+    pool.emplace_back([&, w, lo, hi]() {
+      std::vector<std::string> local;
+      local.reserve(hi - lo);
+      for (size_t i = lo; i < hi; i ++) {
+        SuperNode* super = valid[i];
+        local.push_back(keyOf(super) + "|" + sortedEnds(super->prev) + "|" + sortedEnds(super->next) + "|" + sortedEnds(super->depPrev) + "|" + sortedEnds(super->depNext));
+      }
+      chunks[(size_t)w] = std::move(local);
+    });
   }
+  for (std::thread& t : pool) t.join();
+  std::vector<std::string> records;
+  records.reserve(total);
+  for (auto& c : chunks) for (auto& r : c) records.push_back(std::move(r));
   std::sort(records.begin(), records.end());
   uint64_t recHash = 1469598103934665603ULL;
   for (const std::string& r : records) recHash = mixStr(recHash, r);

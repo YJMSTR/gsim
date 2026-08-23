@@ -9075,6 +9075,7 @@ FILE* graph::genHeaderStart() {
   const std::string openPath = globalConfig.MtStableOutput ? headerTmpFilePath : headerFilePath;
   FILE* header = std::fopen(openPath.c_str(), "w");
   assert(header != NULL);
+  setvbuf(header, NULL, _IOFBF, 4 * 1024 * 1024);
   fprintf(header, "#ifndef %s_H\n#define %s_H\n", name.c_str(), name.c_str());
   fprintf(header, "#ifndef _GNU_SOURCE\n#define _GNU_SOURCE\n#endif\n");
   fprintf(header, "#ifdef __linux\n");
@@ -15000,6 +15001,9 @@ bool graph::__emitSrc(int indent, bool canNewFile, bool alreadyEndFunc, const ch
     srcFp = std::fopen(openPath.c_str(), "w");
     srcFileIdx ++;
     assert(srcFp != NULL);
+    // 4 MiB stdio buffer: generated text is ~12 GB streamed line-by-line;
+    // the default 4-8 KB buffer turns into millions of write syscalls.
+    setvbuf(srcFp, NULL, _IOFBF, 4 * 1024 * 1024);
     srcFileBytes = fprintf(srcFp, "#include \"%s.h\"\n", name.c_str());
     if (nextFuncDef != NULL) {
       srcFileBytes += fprintf(srcFp, "%s {\n", nextFuncDef);
