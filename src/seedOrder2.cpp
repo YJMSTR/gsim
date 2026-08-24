@@ -672,7 +672,129 @@ void mtSeed2Load() {
           generator.c_str(), r.points.size(), r.keys.size(), whenGroupCount, payloadInfo, sec);
 }
 
+
 }  // namespace
+
+// ---------------- standalone transcode (format conversion, no generation) ----------------
+// GSIM_SEED2_TRANSCODE=in[:out] turns a v1 seed into a v2 codec-framed seed (and can
+// re-frame a v2 seed at another codec/level) WITHOUT running any graph pass: it pipes
+// the source payload byte-for-byte through Seed2Input -> Seed2Output. The payload is
+// never re-serialized from parsed structures, so intern ids, rank order, point tags,
+// canon hashes, whenMap order and the input hash are identical by construction - a
+// transcoded seed replays exactly like its source. Output codec/level come from
+// GSIM_SEED2_CODEC (zlib|none; v1 is meaningless here) / GSIM_SEED2_LEVEL. Exits 0.
+int mtSeed2TranscodeMain() {
+  const char* spec = std::getenv("GSIM_SEED2_TRANSCODE");
+  Assert(spec != nullptr && spec[0] != '\0', "GSIM_SEED2_TRANSCODE must be in[:out]");
+  Assert(!mtSeed2WriteActive() && !mtSeed2ReplayActive(),
+         "GSIM_SEED2_TRANSCODE is a standalone mode; unset GSIM_SCHEDULE_SEED2(_WRITE)");
+  std::string in = spec, out;
+  size_t colon = in.find(':');
+  if (colon != std::string::npos) {
+    out = in.substr(colon + 1);
+    in.resize(colon);
+  } else {
+    out = in + ".v2";
+  }
+  Assert(!in.empty() && !out.empty(), "GSIM_SEED2_TRANSCODE paths must be non-empty");
+  uint32_t codec = SEED2_CODEC_ZLIB;
+  if (const char* c = std::getenv("GSIM_SEED2_CODEC")) {
+    if (std::strcmp(c, "zlib") == 0) codec = SEED2_CODEC_ZLIB;
+    else if (std::strcmp(c, "none") == 0) codec = SEED2_CODEC_NONE;
+    else Assert(false, "seed2 transcode: GSIM_SEED2_CODEC '%s' unsupported here (want zlib|none)", c);
+  }
+  int level = 6;
+  if (const char* l = std::getenv("GSIM_SEED2_LEVEL")) {
+    level = std::atoi(l);
+    Assert(level >= 1 && level <= 9, "seed2: GSIM_SEED2_LEVEL %d out of range 1..9", level);
+  }
+  const double t0 = seed2NowSec();
+  FILE* fin = std::fopen(in.c_str(), "rb");
+  Assert(fin != nullptr, "seed2 transcode: cannot open input %s", in.c_str());
+  Assert(std::fseek(fin, 0, SEEK_END) == 0, "seed2 transcode: cannot seek %s", in.c_str());
+  const long inBytes = std::ftell(fin);
+  Assert(std::fseek(fin, 0, SEEK_SET) == 0, "seed2 transcode: cannot seek %s", in.c_str());
+  char magic[4];
+  Assert(std::fread(magic, 1, 4, fin) == 4 && std::memcmp(magic, SEED2_MAGIC, 4) == 0,
+         "seed2: bad magic in %s (not a GS2 file)", in.c_str());
+  uint32_t inVersion = seed2ReadU32(fin, in.c_str());
+  Assert(inVersion == SEED2_VERSION || inVersion == SEED2_VERSION2,
+         "seed2 transcode: unsupported version %u in %s", inVersion, in.c_str());
+  uint64_t inputHash = seed2ReadU64(fin, in.c_str());
+  std::string generator = seed2ReadStr(fin, in.c_str(), inBytes);
+  uint32_t pointCount = seed2ReadU32(fin, in.c_str());
+  uint32_t nameCount = seed2ReadU32(fin, in.c_str());
+  uint32_t whenGroupCount = seed2ReadU32(fin, in.c_str());
+  uint32_t inCodec = SEED2_CODEC_NONE;
+  uint64_t rawPayload = 0, compPayload = 0;
+  uint32_t wantCrc = 0;
+  if (inVersion == SEED2_VERSION2) {
+    inCodec = seed2ReadU32(fin, in.c_str());
+    seed2ReadU32(fin, in.c_str());  // input level (informational)
+    rawPayload = seed2ReadU64(fin, in.c_str());
+    wantCrc = seed2ReadU32(fin, in.c_str());
+    compPayload = seed2ReadU64(fin, in.c_str());
+    Assert(inCodec == SEED2_CODEC_NONE || inCodec == SEED2_CODEC_ZLIB,
+           "seed2 transcode: unsupported codec %u in %s", inCodec, in.c_str());
+    long tail = inBytes - std::ftell(fin);
+    Assert(tail >= 0 && (uint64_t)tail == compPayload,
+           "seed2 transcode: payload size mismatch in %s (truncated or corrupt)", in.c_str());
+  } else {
+    compPayload = (uint64_t)(inBytes - std::ftell(fin));
+    rawPayload = compPayload;
+  }
+  const uint64_t maxEntries = rawPayload / 4;
+  Assert((uint64_t)nameCount <= maxEntries && (uint64_t)pointCount <= maxEntries &&
+         (uint64_t)whenGroupCount <= maxEntries,
+         "seed2 transcode: implausible counts (points=%u names=%u groups=%u) for %llu-byte payload in %s",
+         pointCount, nameCount, whenGroupCount, (unsigned long long)rawPayload, in.c_str());
+  FILE* fout = std::fopen(out.c_str(), "wb");
+  Assert(fout != nullptr, "seed2 transcode: cannot open output %s", out.c_str());
+  Assert(std::fwrite(SEED2_MAGIC, 1, 4, fout) == 4, "seed2 transcode: write failed on %s", out.c_str());
+  seed2WriteU32(fout, SEED2_VERSION2);
+  seed2WriteU64(fout, inputHash);
+  seed2WriteStr(fout, generator);
+  seed2WriteU32(fout, pointCount);
+  seed2WriteU32(fout, nameCount);
+  seed2WriteU32(fout, whenGroupCount);
+  seed2WriteU32(fout, codec);
+  seed2WriteU32(fout, (uint32_t)level);
+  const long metaOff = std::ftell(fout);
+  unsigned char zero[20] = {0};
+  Assert(std::fwrite(zero, 1, 20, fout) == 20, "seed2 transcode: write failed on %s", out.c_str());
+  Seed2Input src;
+  src.open(fin, in.c_str(), inCodec, rawPayload, compPayload, wantCrc, inVersion == SEED2_VERSION2);
+  Seed2Output dst;
+  dst.open(fout, out.c_str(), codec, level);
+  std::vector<unsigned char> buf(1 << 20);
+  while (src.remaining() > 0) {
+    size_t k = src.remaining() < buf.size() ? (size_t)src.remaining() : buf.size();
+    src.readExact(buf.data(), k);
+    dst.write(buf.data(), k);
+  }
+  dst.finish();
+  src.finishPayload();  // input trailing-byte + CRC verification (v2 sources)
+  if (inVersion == SEED2_VERSION)
+    Assert(std::fgetc(fin) == EOF, "seed2 transcode: unparsed bytes at end of %s (corrupt seed)", in.c_str());
+  Assert(dst.rawBytes == rawPayload,
+         "seed2 transcode: copied %llu payload bytes but header promised %llu (internal error)",
+         (unsigned long long)dst.rawBytes, (unsigned long long)rawPayload);
+  unsigned char meta[20];
+  seed2StoreU64(meta + 0, dst.rawBytes);
+  seed2StoreU32(meta + 8, dst.crc);
+  seed2StoreU64(meta + 12, dst.compBytes);
+  Assert(std::fseek(fout, metaOff, SEEK_SET) == 0, "seed2 transcode: cannot rewind header of %s", out.c_str());
+  Assert(std::fwrite(meta, 1, 20, fout) == 20, "seed2 transcode: write failed on %s", out.c_str());
+  Assert(std::fflush(fout) == 0 && std::fclose(fout) == 0, "seed2 transcode: close failed on %s", out.c_str());
+  std::fclose(fin);
+  fprintf(stderr,
+          "[schedule-seed2] transcoded %s(v=%u) -> %s(v=2 codec=%s level=%d): points=%u names=%u "
+          "whenGroups=%u payload=%.1fMB->%.1fMB (%.2fx) in %.2fs\n",
+          in.c_str(), inVersion, out.c_str(), codec == SEED2_CODEC_ZLIB ? "zlib" : "none", level,
+          pointCount, nameCount, whenGroupCount, dst.rawBytes / 1048576.0, dst.compBytes / 1048576.0,
+          dst.compBytes ? (double)dst.rawBytes / (double)dst.compBytes : 0.0, seed2NowSec() - t0);
+  return 0;
+}
 
 void mtSeed2VerifyInputHash(uint64_t computedInputHash) {
   mtSeed2Load();

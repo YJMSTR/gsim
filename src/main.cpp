@@ -502,6 +502,10 @@ int main(int argc, char** argv) {
   static int dumpIdx = 0;
   const char *InputFileName = parseCommandLine(argc, argv);
 
+  // Standalone seed2 format transcode (GSIM_SEED2_TRANSCODE=in[:out]): convert a seed
+  // to the v2 codec frame without any parsing/generation, then exit.
+  if (std::getenv("GSIM_SEED2_TRANSCODE") != nullptr) return mtSeed2TranscodeMain();
+
 
   // 28c Phase 1A: mt-level-dispatch implies coarse formation + static profitability.
   // Promote only when user has not explicitly chosen otherwise (defaults from

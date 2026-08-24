@@ -513,4 +513,8 @@ size_t mtSeed2WhenGroupCount();
 std::string mtSeed2WhenGroupCondKey(size_t i);
 std::vector<std::string> mtSeed2WhenGroupSourceKeys(size_t i);
 
+// Standalone format transcode (GSIM_SEED2_TRANSCODE=in[:out]): copy a seed payload
+// byte-for-byte into a v2 codec frame without running a generation; returns exit code.
+int mtSeed2TranscodeMain();
+
 #endif
