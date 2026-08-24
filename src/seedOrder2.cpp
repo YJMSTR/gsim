@@ -57,6 +57,7 @@
 #include <deque>
 #include <vector>
 #include "common.h"
+#include "phaseTimer.h"
 
 #include <zlib.h>
 
@@ -827,8 +828,11 @@ void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, ui
   // identical full records are interchangeable, so queue order within a key is free.
   // Memory: one inline pointer per unique key; only the (tiny) duplicate-key set gets
   // deque storage. A deque per key over 7.2M keys was an OOM-prone allocation storm.
+  auto tKeys = phasetimer::now();
   std::unordered_map<std::string, int> dupCounts;
   seed2CountKeys(sortedSuper, dupCounts);
+  phasetimer::mark("apply.countKeys", tKeys);
+  auto tIdx = phasetimer::now();
   std::unordered_map<std::string, SuperNode*> firstByKey;
   std::unordered_map<std::string, std::deque<SuperNode*>> extraByKey;
   firstByKey.reserve(sortedSuper.size() * 2);
@@ -837,6 +841,8 @@ void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, ui
     auto [it, inserted] = firstByKey.emplace(std::move(k), super);
     if (!inserted) extraByKey[it->first].push_back(super);
   }
+  phasetimer::mark("apply.firstByKey", tIdx);
+  auto tForced = phasetimer::now();
   std::vector<SuperNode*> forced;
   forced.reserve(sortedSuper.size());
   for (uint32_t id : p.nameIds) {
@@ -857,6 +863,7 @@ void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, ui
     forced.push_back(eit->second.front());
     eit->second.pop_front();
   }
+  phasetimer::mark("apply.forced", tForced);
   sortedSuper = std::move(forced);
   r.cursor++;
   fprintf(stderr, "[schedule-seed2] applied  %-24s nodes=%zu canon=%016zx (%zu/%zu)\n",

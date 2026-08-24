@@ -6,6 +6,7 @@
 #include <set>
 #include <unordered_map>
 #include "common.h"
+#include "phaseTimer.h"
 #define MAX_NODES_PER_SUPER 7000
 #define MAX_SUBLINGS 30
 
@@ -113,25 +114,30 @@ void graph::mergeWhenNodes() {
   if (seed2Replay) {
     // S3 exact replay: the frontier traversal below only exists to DECIDE the merge
     // groups; replay applies the recorded groups verbatim against the pre-merge graph.
-    std::unordered_map<std::string, SuperNode*> byKey;
-    for (SuperNode* super : sortedSuper)
-      if (super->superType == SUPER_VALID) byKey.emplace(mtSeed2FullKeyOf(super), super);
-    const size_t groupCount = mtSeed2WhenGroupCount();
-    for (size_t gi = 0; gi < groupCount; gi++) {
-      std::vector<std::string> srcKeys = mtSeed2WhenGroupSourceKeys(gi);
-      Assert(!srcKeys.empty(), "seed2 replay: empty when group %zu", gi);
-      auto tit = byKey.find(srcKeys[0]);
-      Assert(tit != byKey.end(), "seed2 replay: when target key missing for group %zu (pre-merge graph mismatch)", gi);
-      SuperNode* target = tit->second;
-      for (size_t i = 1; i < srcKeys.size(); i++) {
-        auto sit = byKey.find(srcKeys[i]);
-        Assert(sit != byKey.end(), "seed2 replay: when source key missing for group %zu (pre-merge graph mismatch)", gi);
-        SuperNode* src = sit->second;
-        for (Node* member : src->member) {
-          target->add_member(member);
-          member->super = target;
+    PhaseTimer whenTotal("when.total");
+    {
+      PhaseTimer t("when.replay.byKey");
+      std::unordered_map<std::string, SuperNode*> byKey;
+      for (SuperNode* super : sortedSuper)
+        if (super->superType == SUPER_VALID) byKey.emplace(mtSeed2FullKeyOf(super), super);
+      const size_t groupCount = mtSeed2WhenGroupCount();
+      PhaseTimer tg("when.replay.groups");
+      for (size_t gi = 0; gi < groupCount; gi ++) {
+        std::vector<std::string> srcKeys = mtSeed2WhenGroupSourceKeys(gi);
+        Assert(!srcKeys.empty(), "seed2 replay: empty when group %zu", gi);
+        auto tit = byKey.find(srcKeys[0]);
+        Assert(tit != byKey.end(), "seed2 replay: when target key missing for group %zu (pre-merge graph mismatch)", gi);
+        SuperNode* target = tit->second;
+        for (size_t i = 1; i < srcKeys.size(); i ++) {
+          auto sit = byKey.find(srcKeys[i]);
+          Assert(sit != byKey.end(), "seed2 replay: when source key missing for group %zu (pre-merge graph mismatch)", gi);
+          SuperNode* src = sit->second;
+          for (Node* member : src->member) {
+            target->add_member(member);
+            member->super = target;
+          }
+          src->member.clear();
         }
-        src->member.clear();
       }
     }
   } else {
@@ -267,12 +273,18 @@ void graph::mergeWhenNodes() {
   else if (stableOrder) applyWhenMap(whenMapStable);
   else applyWhenMap(whenMapOrig);
   }  // end else (seed2Replay verbatim application above)
-  size_t prevSuper = sortedSuper.size();
-  removeEmptySuper();
-  reconnectSuper();
-  detectSortedSuperLoop();
-  printf("[mergeNodes-when] remove %ld superNodes (%ld -> %ld)\n", prevSuper - sortedSuper.size(), prevSuper, sortedSuper.size());
-  when2mux();
+  {
+    PhaseTimer t("when.cleanup");
+    size_t prevSuper = sortedSuper.size();
+    removeEmptySuper();
+    reconnectSuper();
+    detectSortedSuperLoop();
+    printf("[mergeNodes-when] remove %ld superNodes (%ld -> %ld)\n", prevSuper - sortedSuper.size(), prevSuper, sortedSuper.size());
+  }
+  {
+    PhaseTimer t("when.when2mux");
+    when2mux();
+  }
 }
 #endif
 
@@ -378,6 +390,7 @@ void graph::mergeResetAll() {
   merge nodes with out-degree=1 to their successors
 */
 void graph::mergeOut1() {
+  PhaseTimer out1Total("out1.total");
   for (int i = sortedSuper.size() - 1; i >= 0; i --) {
     SuperNode* super = sortedSuper[i];
     /* do not merge superNodes that contains reg src */
@@ -423,13 +436,16 @@ void graph::mergeOut1() {
       super->clear_relation();
     }
   }
-  removeEmptySuper();
+  {
+    PhaseTimer t("out1.removeEmpty");
+    removeEmptySuper();
+  }
 }
-
 /*
   merge nodes with in-degree=1 to their preceding nodes
 */
 void graph::mergeIn1() {
+  PhaseTimer in1Total("in1.total");
   for (size_t i = 0; i < sortedSuper.size(); i ++) {
     SuperNode* super = sortedSuper[i];
     if (super->superType != SUPER_VALID) continue;
@@ -471,7 +487,10 @@ void graph::mergeIn1() {
     }
   }
 
-  removeEmptySuper();
+  {
+    PhaseTimer t("in1.removeEmpty");
+    removeEmptySuper();
+  }
   // reconnectSuper();
 }
 
@@ -488,6 +507,8 @@ bool prevEq(SuperNode* super1, SuperNode* super2) {
 }
 
 void graph::mergeSublings() {
+  PhaseTimer subTotal("sublings.total");
+  auto tMap = phasetimer::now();
   std::map<uint64_t, std::vector<SuperNode*>> prevSuper;
   for (SuperNode* super : sortedSuper) {
     if (super->prev.size() == 0) continue;
@@ -496,7 +517,8 @@ void graph::mergeSublings() {
     if (prevSuper.find(id) == prevSuper.end()) prevSuper[id] = std::vector<SuperNode*>();
     prevSuper[id].push_back(super);
   }
-
+  phasetimer::mark("sublings.map", tMap);
+  auto tMerge = phasetimer::now();
   for (auto iter : prevSuper) {
     std::set<SuperNode*> uniquePrev;
     for (SuperNode* super : iter.second) {
@@ -518,6 +540,9 @@ void graph::mergeSublings() {
       if (!find) uniquePrev.insert(super);
     }
   }
+  phasetimer::mark("sublings.merge", tMerge);
+  auto tCleanup = phasetimer::now();
   removeEmptySuper();
   reconnectSuper();
+  phasetimer::mark("sublings.cleanup", tCleanup);
 }
