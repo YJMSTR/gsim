@@ -2214,6 +2214,38 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   std::unordered_map<uint64_t, bool> pathMemo;
   uint64_t pathMemoHits = 0, pathCapHits = 0;
   std::vector<int> pathSt; pathSt.reserve(4096); // reusable DFS stack: no per-query heap traffic
+  // DFS-local, epoch-normalized successor cache: gSN[x] holds x's CURRENT-ROOT successors,
+  // rebuilt from the raw gS[x] on the first DFS visit of each merge epoch (pathEpoch bumps on
+  // every applied merge; the edge branch's transient erase/restore additionally invalidates
+  // the one affected list). The merge protocol itself (relContains adjacency checks, candidate
+  // scoring/flow, merge fixups) keeps reading the RAW gS lists, so every protocol decision --
+  // and therefore the merge sequence and the emitted model -- is untouched.
+  // pathExists answers are identical by construction: resolving gS entries with find() at push
+  // time (legacy) walks exactly the same quotient graph as reading the pre-resolved gSN
+  // entries; the neighbor ORDER differs, but reachability booleans are order-independent and
+  // the 500k-visit cap is unreachable here (visits <= live roots <= n < cap), so no answer can
+  // diverge. This removes the per-successor find() and the pop-time find() from the DFS hot
+  // loop and dedups the stale entries every merge leaves behind (each merge inserts the fresh
+  // root but leaves the absorbed group's old ids in neighboring lists).
+  // Differential proof: difftest3 harness (/tmp/pathopt/difftest3.cpp, extends the
+  // /tmp/schedopt/difftest2 precedent), 33/33 graph-shape x seed x protocol configs
+  // (24 mixed edge+sibling + 9 edge-only, up to 20k nodes / 120k edges / 250k queries),
+  // zero answer mismatches, zero state divergence.
+  std::vector<std::vector<int>> gSN((size_t)n);
+  std::vector<uint64_t> gsnEpoch((size_t)n, 0);
+  uint64_t pathEpoch = 1;
+  auto gsn = [&](int x) -> const std::vector<int>& {
+    if (gsnEpoch[(size_t)x] != pathEpoch) {
+      std::vector<int>& L = gSN[(size_t)x];
+      L = gS[(size_t)x];
+      for (int& e : L) e = find(e);
+      std::sort(L.begin(), L.end());
+      L.erase(std::unique(L.begin(), L.end()), L.end());
+      L.erase(std::remove(L.begin(), L.end(), x), L.end());
+      gsnEpoch[(size_t)x] = pathEpoch;
+    }
+    return gSN[(size_t)x];
+  };
   std::function<bool(int,int)> pathExists = [&](int frm, int to) -> bool {
     EmitPhaseAccumScope vcScope(vcAccPath, vcPhaseTiming);
     const int src = find(frm), dst = find(to);
@@ -2231,7 +2263,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     long long visits = 0; const long long visitCap = 500000; // overflow -> assume reachable (reject merge, safe)
     bool reachable = false;
     while (!pathSt.empty()) {
-      int x = find(pathSt.back()); pathSt.pop_back();
+      const int x = pathSt.back(); pathSt.pop_back(); // stack entries are current roots: no pop-time find
       if (x == to) { reachable = true; break; }
       if (gen[(size_t)x] == curGen) continue;
       gen[(size_t)x] = curGen;
@@ -2243,7 +2275,15 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
       // plain gen-tagged DFS for cycle-safety; propagated CP is used ONLY in edgeScore (merge
       // ORDER, a heuristic that is safe for any CP value). This still captures Verilator's
       // exact-merge-order fidelity win without the unsound prune.
-      for (int s2 : gS[(size_t)x]) { int rs = find(s2); if (rs != x) pathSt.push_back(rs); }
+      for (int s2 : gsn(x)) {
+        // s2 is a current root. A successor equal to the target proves reachability right now:
+        // the legacy DFS proves the same fact when it pops this entry, so the boolean is
+        // identical -- this only skips the push/pop round trip (and the subtree exploration
+        // that would precede the target's pop).
+        if (s2 == to) { reachable = true; break; }
+        pathSt.push_back(s2);
+      }
+      if (reachable) break;
     }
     pathMemo.emplace(memoKey, reachable);
     return reachable;
@@ -2403,9 +2443,9 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     } else {
       if (!relContains(gS[(size_t)a], b)) continue;
       // Cycle-safe iff no ALTERNATE path a~>b once the direct edge is excluded.
-      relErase(gS[(size_t)a], b); relErase(gP[(size_t)b], a);
+      relErase(gS[(size_t)a], b); relErase(gP[(size_t)b], a); gsnEpoch[(size_t)a] = 0; // cached gSN[a] would still contain the erased edge
       cyc = pathExists(a, b);
-      if (cyc) { relInsert(gS[(size_t)a], b); relInsert(gP[(size_t)b], a); cycRej ++; continue; }
+      if (cyc) { relInsert(gS[(size_t)a], b); relInsert(gP[(size_t)b], a); gsnEpoch[(size_t)a] = 0; cycRej ++; continue; } // restored list differs from any cached copy too
     }
     // merge b into a
     {
@@ -2419,6 +2459,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     relErase(gS[(size_t)a], a); relErase(gP[(size_t)a], a); relErase(gS[(size_t)a], b); relErase(gP[(size_t)a], b);
     live --; merges ++; ++scoreCacheGeneration; if (c.sibling) sibMerges ++;
     pathMemo.clear(); // quotient graph changed: reachability answers are stale
+    pathEpoch ++;     // ... and every gSN snapshot is stale
     }
     if (propagateCp && (merges % (uint64_t)recomputeEvery) == 0) { recomputeCP(); ++scoreCacheGeneration; rebuildPQ(); }
     {
