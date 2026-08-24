@@ -5,12 +5,21 @@
 //
 // Binary format (little-endian), file extension convention *.gsimseed2:
 //   char  magic[4]   = "GS2\0"
-//   u32   version    = 1
+//   u32   version    = 1 (legacy, all existing champion seeds) or 2 (codec-framed)
 //   u64   input_hash                 (graph::canonInputHash() at topoSort entry)
 //   u32   generator_len, bytes       (generator tag)
 //   u32   point_count
 //   u32   name_count
 //   u32   whenmap_group_count
+//   -- version 1 ends here; the payload follows stored uncompressed --
+//   -- version 2 codec header (quick-parse prefix above stays at v1 offsets) --
+//   u32   codec                      (0 = none, 1 = zlib)
+//   u32   codec_level                (informational: zlib deflate level)
+//   u64   raw_payload_bytes          (uncompressed payload size)
+//   u32   payload_crc32              (CRC-32 of the uncompressed payload bytes)
+//   u64   comp_payload_bytes         (on-disk payload size; must match file tail)
+//   [payload = string table + points + whenmap, byte-identical to the v1 body,
+//    stored as one codec frame]
 //   [string table] name_count x { u32 len, bytes }      (SuperNode keys, see keyOf)
 //   [points] point_count x {
 //     u32 tag_len, bytes
@@ -24,6 +33,14 @@
 //     u32 sources[source_count]      (string-table ids; index 0 is the recorded target)
 //   }
 //
+// v2 payloads are produced and consumed through bounded chunk buffers (Seed2Output /
+// Seed2Input): the writer streams its in-memory state straight into z_stream as it
+// serializes and the reader inflates on demand as the parsers consume, so neither side
+// ever stages a second full-size copy. Compressing the payload changes nothing about
+// intern ids, point tags, rank order or whenMap order; replay semantics, canon checks
+// and generated models are byte-identical to a v1 write+replay of the same run.
+// The reader auto-detects v1/v2 by the version field; v1 champion seeds keep replaying.
+//
 // A SuperNode key is the ';'-joined member-name list (same construction as
 // graph::canonInputHash's keyOf) - member names are unique, so the list keys the node.
 //
@@ -33,17 +50,29 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <deque>
 #include <vector>
 #include "common.h"
 
+#include <zlib.h>
+
 #define SEED2_MAGIC "GS2\0"
-#define SEED2_VERSION 1u
+#define SEED2_VERSION 1u   // legacy layout: payload stored uncompressed after the counts
+#define SEED2_VERSION2 2u  // codec-framed payload (see header comment)
+#define SEED2_CODEC_NONE 0u
+#define SEED2_CODEC_ZLIB 1u
 
 bool mtSeed2WriteActive() { return std::getenv("GSIM_SCHEDULE_SEED2_WRITE") != nullptr; }
 bool mtSeed2ReplayActive() { return std::getenv("GSIM_SCHEDULE_SEED2") != nullptr; }
+
+// Write-side knobs (read side auto-detects everything from the header):
+//   GSIM_SEED2_CODEC = zlib (default) | none | v1 (write the legacy layout, for
+//                      byte-for-byte comparison against existing champion seeds)
+//   GSIM_SEED2_LEVEL = zlib deflate level 1..9 (default 6)
 
 void mtSeed2AssertCompatible() {
   Assert(!(mtSeed2WriteActive() && mtSeed2ReplayActive()),
@@ -135,12 +164,115 @@ static void seed2CountKeys(const std::vector<SuperNode*>& supers, std::unordered
   for (const SuperNode* super : supers) out[seed2KeyOf(super)]++;
 }
 
+static double seed2NowSec() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// zlib's crc32/crc32 take a uInt (32-bit) length: feed in <=1GiB chunks so arbitrarily
+// large rank arrays stay on the defined path.
+static void seed2CrcUpdate(uint32_t& crc, const void* p, size_t n) {
+  const unsigned char* b = static_cast<const unsigned char*>(p);
+  while (n) {
+    size_t chunk = n > ((size_t)1 << 30) ? ((size_t)1 << 30) : n;
+    crc = (uint32_t)crc32(crc, b, (uInt)chunk);
+    b += chunk;
+    n -= chunk;
+  }
+}
+
+// Header helpers (the quick-parse prefix is always stored uncompressed).
 void seed2WriteU32(FILE* fp, uint32_t v) { std::fwrite(&v, 4, 1, fp); }
 void seed2WriteU64(FILE* fp, uint64_t v) { std::fwrite(&v, 8, 1, fp); }
 void seed2WriteStr(FILE* fp, const std::string& s) {
   seed2WriteU32(fp, (uint32_t)s.size());
   if (!s.empty()) Assert(std::fwrite(s.data(), 1, s.size(), fp) == s.size(), "seed2: write failed (disk full?)");
 }
+static void seed2StoreU64(unsigned char* p, uint64_t v) {
+  for (int i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+static void seed2StoreU32(unsigned char* p, uint32_t v) {
+  for (int i = 0; i < 4; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+// Streaming payload sink: routes the exact v1 byte order either straight to the file
+// (none / v1 layout) or through a zlib deflate stream, flushing bounded output chunks as
+// they fill. The compressed image is never staged whole - peak extra memory is the one
+// 256KiB output buffer.
+struct Seed2Output {
+  static constexpr size_t BUF = 256 * 1024;
+  FILE* fp = nullptr;
+  const char* path = nullptr;
+  uint32_t codec = SEED2_CODEC_NONE;
+  z_stream zs = {};
+  bool zsActive = false;
+  std::unique_ptr<unsigned char[]> outBuf;
+  uint64_t rawBytes = 0;   // uncompressed payload bytes fed through write()
+  uint64_t compBytes = 0;  // payload bytes flushed to the file
+  uint32_t crc = 0;
+
+  void open(FILE* f, const char* p, uint32_t codec_, int level) {
+    fp = f;
+    path = p;
+    codec = codec_;
+    crc = (uint32_t)crc32(0L, Z_NULL, 0);
+    outBuf.reset(new unsigned char[BUF]);
+    if (codec == SEED2_CODEC_ZLIB) {
+      Assert(deflateInit(&zs, level) == Z_OK, "seed2: deflateInit failed on %s", path);
+      zsActive = true;
+    }
+  }
+  void putOut(size_t n) {
+    if (!n) return;
+    Assert(std::fwrite(outBuf.get(), 1, n, fp) == n, "seed2: write failed on %s (disk full?)", path);
+    compBytes += n;
+  }
+  void write(const void* p, size_t n) {
+    seed2CrcUpdate(crc, p, n);
+    rawBytes += n;
+    if (codec != SEED2_CODEC_ZLIB) {
+      if (n) Assert(std::fwrite(p, 1, n, fp) == n, "seed2: write failed on %s (disk full?)", path);
+      compBytes += n;
+      return;
+    }
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    while (n) {
+      size_t feed = n > BUF ? BUF : n;
+      zs.next_in = const_cast<Bytef*>(b);
+      zs.avail_in = (uInt)feed;
+      while (zs.avail_in > 0) {
+        zs.next_out = outBuf.get();
+        zs.avail_out = (uInt)BUF;
+        int ret = deflate(&zs, Z_NO_FLUSH);
+        Assert(ret == Z_OK, "seed2: deflate failed on %s (%s)", path, zs.msg ? zs.msg : "zlib error");
+        putOut(BUF - zs.avail_out);
+      }
+      b += feed;
+      n -= feed;
+    }
+  }
+  void u32(uint32_t v) { write(&v, 4); }
+  void u64(uint64_t v) { write(&v, 8); }
+  void str(const std::string& s) {
+    u32((uint32_t)s.size());
+    if (!s.empty()) write(s.data(), s.size());
+  }
+  void finish() {
+    if (!zsActive) return;
+    int ret = Z_OK;
+    do {
+      zs.next_out = outBuf.get();
+      zs.avail_out = (uInt)BUF;
+      ret = deflate(&zs, Z_FINISH);
+      Assert(ret == Z_OK || ret == Z_STREAM_END || ret == Z_BUF_ERROR,
+             "seed2: deflate finish failed on %s (%s)", path, zs.msg ? zs.msg : "zlib error");
+      putOut(BUF - zs.avail_out);
+    } while (ret != Z_STREAM_END);
+    deflateEnd(&zs);
+    zsActive = false;
+  }
+};
 
 void mtSeed2Finalize() {
   Seed2Writer& w = seed2Writer();
@@ -148,30 +280,59 @@ void mtSeed2Finalize() {
   const char* path = std::getenv("GSIM_SCHEDULE_SEED2_WRITE");
   Assert(path != nullptr, "mtSeed2Finalize without GSIM_SCHEDULE_SEED2_WRITE");
   Assert(w.inputHashSet, "seed2: input hash was never set (topoSort record missing)");
+  uint32_t codec = SEED2_CODEC_ZLIB;
+  bool legacy = false;
+  if (const char* c = std::getenv("GSIM_SEED2_CODEC")) {
+    if (std::strcmp(c, "zlib") == 0) codec = SEED2_CODEC_ZLIB;
+    else if (std::strcmp(c, "none") == 0) codec = SEED2_CODEC_NONE;
+    else if (std::strcmp(c, "v1") == 0) { legacy = true; codec = SEED2_CODEC_NONE; }
+    else Assert(false, "seed2: unknown GSIM_SEED2_CODEC '%s' (want zlib|none|v1)", c);
+  }
+  int level = 6;
+  if (const char* l = std::getenv("GSIM_SEED2_LEVEL")) {
+    level = std::atoi(l);
+    Assert(level >= 1 && level <= 9, "seed2: GSIM_SEED2_LEVEL %d out of range 1..9", level);
+  }
+  const double t0 = seed2NowSec();
   FILE* fp = std::fopen(path, "wb");
   Assert(fp != nullptr, "cannot open seed2 output %s", path);
   Assert(std::fwrite(SEED2_MAGIC, 1, 4, fp) == 4, "seed2: write failed on %s", path);
-  seed2WriteU32(fp, SEED2_VERSION);
+  seed2WriteU32(fp, legacy ? SEED2_VERSION : SEED2_VERSION2);
   seed2WriteU64(fp, w.inputHash);
   seed2WriteStr(fp, "wip/dense-b1-lookahead");
   seed2WriteU32(fp, (uint32_t)w.points.size());
   seed2WriteU32(fp, (uint32_t)w.keys.size());
   seed2WriteU32(fp, (uint32_t)w.whenGroups.size());
-  for (const std::string& k : w.keys) seed2WriteStr(fp, k);
+  long metaOff = -1;
+  if (!legacy) {
+    seed2WriteU32(fp, codec);
+    seed2WriteU32(fp, (uint32_t)level);
+    metaOff = std::ftell(fp);
+    unsigned char zero[20] = {0};  // raw_payload_bytes, payload_crc32, comp_payload_bytes; patched below
+    Assert(std::fwrite(zero, 1, 20, fp) == 20, "seed2: write failed on %s", path);
+  }
+  Seed2Output out;
+  out.open(fp, path, codec, level);
+  for (const std::string& k : w.keys) out.str(k);
   for (const Seed2Point& p : w.points) {
-    seed2WriteStr(fp, p.tag);
-    seed2WriteU64(fp, p.canonHash);
-    seed2WriteU32(fp, (uint32_t)p.nameIds.size());
-    if (!p.nameIds.empty())
-      Assert(std::fwrite(p.nameIds.data(), 4, p.nameIds.size(), fp) == p.nameIds.size(),
-             "seed2: write failed on %s (disk full?)", path);
+    out.str(p.tag);
+    out.u64(p.canonHash);
+    out.u32((uint32_t)p.nameIds.size());
+    if (!p.nameIds.empty()) out.write(p.nameIds.data(), p.nameIds.size() * 4);
   }
   for (const Seed2WhenGroup& g : w.whenGroups) {
-    seed2WriteU32(fp, g.condKey);
-    seed2WriteU32(fp, (uint32_t)g.sources.size());
-    if (!g.sources.empty())
-      Assert(std::fwrite(g.sources.data(), 4, g.sources.size(), fp) == g.sources.size(),
-             "seed2: write failed on %s (disk full?)", path);
+    out.u32(g.condKey);
+    out.u32((uint32_t)g.sources.size());
+    if (!g.sources.empty()) out.write(g.sources.data(), g.sources.size() * 4);
+  }
+  out.finish();
+  if (!legacy) {
+    unsigned char meta[20];
+    seed2StoreU64(meta + 0, out.rawBytes);
+    seed2StoreU32(meta + 8, out.crc);
+    seed2StoreU64(meta + 12, out.compBytes);
+    Assert(std::fseek(fp, metaOff, SEEK_SET) == 0, "seed2: cannot rewind header of %s", path);
+    Assert(std::fwrite(meta, 1, 20, fp) == 20, "seed2: write failed on %s", path);
   }
   // Verify flush/close BEFORE declaring success: a delayed write error (full disk) must
   // never leave a silently truncated seed behind (observed in the campaign).
@@ -180,8 +341,14 @@ void mtSeed2Finalize() {
   w.finalized = true;
   size_t bytes = 0;
   for (const std::string& k : w.keys) bytes += 4 + k.size();
-  fprintf(stderr, "[schedule-seed2] wrote %s: points=%zu names=%zu whenGroups=%zu table=%.1fMB\n",
-          path, w.points.size(), w.keys.size(), w.whenGroups.size(), bytes / 1048576.0);
+  const double sec = seed2NowSec() - t0;
+  fprintf(stderr,
+          "[schedule-seed2] wrote %s: v=%u codec=%s level=%d points=%zu names=%zu whenGroups=%zu "
+          "table=%.1fMB payload=%.1fMB->%.1fMB (%.2fx) in %.2fs\n",
+          path, legacy ? 1u : 2u, legacy ? "v1" : (codec == SEED2_CODEC_ZLIB ? "zlib" : "none"), level,
+          w.points.size(), w.keys.size(), w.whenGroups.size(), bytes / 1048576.0,
+          out.rawBytes / 1048576.0, out.compBytes / 1048576.0,
+          out.compBytes ? (double)out.rawBytes / (double)out.compBytes : 0.0, sec);
 }
 
 }  // namespace
@@ -241,6 +408,7 @@ Seed2Reader& seed2Reader() {
   return r;
 }
 
+// Header helpers (the quick-parse prefix is always stored uncompressed).
 uint32_t seed2ReadU32(FILE* fp, const char* path) {
   uint32_t v;
   Assert(std::fread(&v, 4, 1, fp) == 1, "seed2: truncated file %s", path);
@@ -263,12 +431,144 @@ std::string seed2ReadStr(FILE* fp, const char* path, long fileBytes) {
   return s;
 }
 
+// Streaming payload source: parses the exact v1 byte order from either the plain file
+// (v1 / none) or an on-demand inflate stream. The uncompressed image is never staged
+// whole - peak extra memory is two 256KiB chunk buffers. All length bounds use the
+// remaining *uncompressed* payload bytes, which is the correct budget for every codec.
+struct Seed2Input {
+  static constexpr size_t BUF = 256 * 1024;
+  FILE* fp = nullptr;
+  const char* path = nullptr;
+  uint32_t codec = SEED2_CODEC_NONE;
+  z_stream zs = {};
+  bool zsActive = false;
+  bool inflateDone = false;
+  std::unique_ptr<unsigned char[]> compBuf;  // file -> inflate input chunks
+  std::unique_ptr<unsigned char[]> rawBuf;   // inflate (or fread) -> parser chunks
+  size_t rawLen = 0, rawPos = 0;
+  uint64_t rawRemaining = 0;   // unconsumed uncompressed payload bytes (buffered + future)
+  uint64_t compRemaining = 0;  // unread payload bytes left in the file
+  uint32_t crc = 0;
+  uint32_t wantCrc = 0;
+  bool verify = false;         // v2 only: strict trailing-byte + CRC checks
+
+  void open(FILE* f, const char* p, uint32_t codec_, uint64_t rawPayload, uint64_t compPayload,
+            uint32_t crcExpect, bool verify_) {
+    fp = f;
+    path = p;
+    codec = codec_;
+    rawRemaining = rawPayload;
+    compRemaining = compPayload;
+    crc = (uint32_t)crc32(0L, Z_NULL, 0);
+    wantCrc = crcExpect;
+    verify = verify_;
+    compBuf.reset(new unsigned char[BUF]);
+    rawBuf.reset(new unsigned char[BUF]);
+    if (codec == SEED2_CODEC_ZLIB) {
+      Assert(inflateInit(&zs) == Z_OK, "seed2: inflateInit failed on %s", path);
+      zsActive = true;
+    }
+  }
+  uint64_t remaining() const { return rawRemaining; }
+
+  // Pull one chunk of uncompressed payload bytes (plain fread or one inflate call).
+  void fill() {
+    Assert(!inflateDone, "seed2: payload truncated in %s (structures exceed recorded payload)", path);
+    if (codec != SEED2_CODEC_ZLIB) {
+      Assert(compRemaining > 0, "seed2: payload truncated in %s", path);
+      size_t k = compRemaining < BUF ? (size_t)compRemaining : BUF;
+      Assert(std::fread(rawBuf.get(), 1, k, fp) == k, "seed2: truncated file %s", path);
+      compRemaining -= k;
+      rawLen = k;
+      rawPos = 0;
+      return;
+    }
+    if (zs.avail_in == 0 && compRemaining > 0) {
+      size_t k = compRemaining < BUF ? (size_t)compRemaining : BUF;
+      Assert(std::fread(compBuf.get(), 1, k, fp) == k, "seed2: truncated file %s", path);
+      compRemaining -= k;
+      zs.next_in = compBuf.get();
+      zs.avail_in = (uInt)k;
+    }
+    zs.next_out = rawBuf.get();
+    zs.avail_out = (uInt)BUF;
+    int ret = inflate(&zs, Z_NO_FLUSH);
+    Assert(ret == Z_OK || ret == Z_STREAM_END || ret == Z_BUF_ERROR,
+           "seed2: corrupt zlib payload in %s (%s)", path, zs.msg ? zs.msg : "zlib error");
+    rawLen = BUF - zs.avail_out;
+    rawPos = 0;
+    if (ret == Z_STREAM_END) {
+      inflateDone = true;
+      Assert(compRemaining == 0 && zs.avail_in == 0,
+             "seed2: trailing compressed bytes after zlib stream end in %s (corrupt seed)", path);
+    } else if (rawLen == 0 && zs.avail_in == 0 && compRemaining == 0) {
+      // No progress possible and no input left: the stream cannot deliver the payload it promised.
+      Assert(false, "seed2: compressed payload truncated in %s", path);
+    }
+  }
+
+  void readExact(void* dst, size_t n) {
+    unsigned char* d = static_cast<unsigned char*>(dst);
+    while (n) {
+      if (rawPos == rawLen) fill();
+      size_t k = rawLen - rawPos;
+      if (k > n) k = n;
+      seed2CrcUpdate(crc, rawBuf.get() + rawPos, k);
+      std::memcpy(d, rawBuf.get() + rawPos, k);
+      rawPos += k;
+      d += k;
+      n -= k;
+      rawRemaining -= k;
+    }
+  }
+  uint32_t u32() {
+    uint32_t v;
+    readExact(&v, 4);
+    return v;
+  }
+  uint64_t u64() {
+    uint64_t v;
+    readExact(&v, 8);
+    return v;
+  }
+  std::string str() {
+    uint32_t n = u32();
+    Assert((uint64_t)n <= remaining(),
+           "seed2: string length %u exceeds remaining payload size in %s (corrupt seed)", n, path);
+    std::string s(n, '\0');
+    if (n) readExact(s.data(), n);
+    return s;
+  }
+
+  void finishPayload() {
+    if (!zsActive) {
+      if (verify) {
+        Assert(rawRemaining == 0, "seed2: %llu unparsed payload bytes in %s (corrupt seed)",
+               (unsigned long long)rawRemaining, path);
+        Assert(compRemaining == 0, "seed2: %llu unread payload bytes in %s (corrupt seed)",
+               (unsigned long long)compRemaining, path);
+        Assert(crc == wantCrc, "seed2: payload checksum mismatch in %s (corrupt seed): have %08x want %08x",
+               path, crc, wantCrc);
+      }
+      return;
+    }
+    while (!inflateDone) fill();
+    Assert(rawRemaining == 0, "seed2: %llu unparsed payload bytes in %s (corrupt seed)",
+           (unsigned long long)rawRemaining, path);
+    inflateEnd(&zs);
+    zsActive = false;
+    Assert(crc == wantCrc, "seed2: payload checksum mismatch in %s (corrupt seed): have %08x want %08x",
+           path, crc, wantCrc);
+  }
+};
+
 void mtSeed2Load() {
   Seed2Reader& r = seed2Reader();
   if (r.loaded) return;
   mtSeed2AssertCompatible();
   const char* path = std::getenv("GSIM_SCHEDULE_SEED2");
   Assert(path != nullptr, "mtSeed2Load without GSIM_SCHEDULE_SEED2");
+  const double t0 = seed2NowSec();
   FILE* fp = std::fopen(path, "rb");
   Assert(fp != nullptr, "cannot open schedule seed2 %s", path);
   Assert(std::fseek(fp, 0, SEEK_END) == 0, "seed2: cannot seek %s", path);
@@ -278,48 +578,71 @@ void mtSeed2Load() {
   Assert(std::fread(magic, 1, 4, fp) == 4 && std::memcmp(magic, SEED2_MAGIC, 4) == 0,
          "seed2: bad magic in %s (not a GS2 file)", path);
   uint32_t version = seed2ReadU32(fp, path);
-  Assert(version == SEED2_VERSION, "seed2: unsupported version %u in %s", version, path);
+  Assert(version == SEED2_VERSION || version == SEED2_VERSION2,
+         "seed2: unsupported version %u in %s", version, path);
   r.inputHash = seed2ReadU64(fp, path);
   std::string generator = seed2ReadStr(fp, path, fileBytes);
   uint32_t pointCount = seed2ReadU32(fp, path);
   uint32_t nameCount = seed2ReadU32(fp, path);
   uint32_t whenGroupCount = seed2ReadU32(fp, path);
-  // Bound every count by the file size before reserving: each entry costs >= 4 bytes on
-  // disk (a name needs >= 4 for its length; a rank id 4), so counts beyond fileBytes/4
-  // are impossible and indicate a corrupt seed.
-  const uint64_t maxEntries = fileBytes > 0 ? (uint64_t)fileBytes / 4 : 0;
+  uint32_t codec = SEED2_CODEC_NONE;
+  uint32_t level = 0;
+  uint64_t rawPayload = 0, compPayload = 0;
+  uint32_t wantCrc = 0;
+  if (version == SEED2_VERSION2) {
+    codec = seed2ReadU32(fp, path);
+    level = seed2ReadU32(fp, path);
+    rawPayload = seed2ReadU64(fp, path);
+    wantCrc = seed2ReadU32(fp, path);
+    compPayload = seed2ReadU64(fp, path);
+    Assert(codec == SEED2_CODEC_NONE || codec == SEED2_CODEC_ZLIB,
+           "seed2: unsupported codec %u in %s (this build reads none/zlib)", codec, path);
+    long payloadOnDisk = fileBytes - std::ftell(fp);
+    Assert(payloadOnDisk >= 0 && (uint64_t)payloadOnDisk == compPayload,
+           "seed2: payload size mismatch in %s: header says %llu bytes, file has %ld (truncated or corrupt)",
+           path, (unsigned long long)compPayload, payloadOnDisk);
+  } else {
+    compPayload = (uint64_t)(fileBytes - std::ftell(fp));
+  }
+  // Bound every count before reserving: each entry costs >= 4 payload bytes (a name
+  // needs >= 4 for its length; a rank id 4), so counts beyond payload/4 are impossible
+  // and indicate a corrupt seed. v1 bounds by the file size (payload == file tail).
+  const uint64_t boundBytes = version == SEED2_VERSION2 ? rawPayload : compPayload;
+  const uint64_t maxEntries = boundBytes / 4;
   Assert((uint64_t)nameCount <= maxEntries && (uint64_t)pointCount <= maxEntries &&
          (uint64_t)whenGroupCount <= maxEntries,
-         "seed2: implausible counts (points=%u names=%u groups=%u) for %ld-byte file %s",
-         pointCount, nameCount, whenGroupCount, fileBytes, path);
+         "seed2: implausible counts (points=%u names=%u groups=%u) for %llu-byte payload in %s",
+         pointCount, nameCount, whenGroupCount, (unsigned long long)boundBytes, path);
+  Seed2Input in;
+  in.open(fp, path, codec, version == SEED2_VERSION2 ? rawPayload : compPayload, compPayload,
+          wantCrc, version == SEED2_VERSION2);
   r.keys.reserve(nameCount);
-  for (uint32_t i = 0; i < nameCount; i++) r.keys.push_back(seed2ReadStr(fp, path, fileBytes));
+  for (uint32_t i = 0; i < nameCount; i++) r.keys.push_back(in.str());
   r.points.reserve(pointCount);
   for (uint32_t i = 0; i < pointCount; i++) {
     Seed2Point p;
-    p.tag = seed2ReadStr(fp, path, fileBytes);
-    p.canonHash = seed2ReadU64(fp, path);
-    uint32_t n = seed2ReadU32(fp, path);
-    long remaining = fileBytes - std::ftell(fp);
-    Assert((uint64_t)n * 4 <= (uint64_t)std::max(0L, remaining),
-           "seed2: rank count %u exceeds remaining file size in %s (corrupt seed)", n, path);
+    p.tag = in.str();
+    p.canonHash = in.u64();
+    uint32_t n = in.u32();
+    Assert((uint64_t)n * 4 <= in.remaining(),
+           "seed2: rank count %u exceeds remaining payload size in %s (corrupt seed)", n, path);
     p.nameIds.resize(n);
-    if (n) Assert(std::fread(p.nameIds.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
+    if (n) in.readExact(p.nameIds.data(), (size_t)n * 4);
     r.points.push_back(std::move(p));
   }
   // whenMap section (S3): recorded merge groups in application order.
   r.whenGroups.reserve(whenGroupCount);
   for (uint32_t i = 0; i < whenGroupCount; i++) {
     Seed2WhenGroup g;
-    g.condKey = seed2ReadU32(fp, path);
-    uint32_t n = seed2ReadU32(fp, path);
-    long remaining = fileBytes - std::ftell(fp);
-    Assert((uint64_t)n * 4 <= (uint64_t)std::max(0L, remaining),
-           "seed2: when-group size %u exceeds remaining file size in %s (corrupt seed)", n, path);
+    g.condKey = in.u32();
+    uint32_t n = in.u32();
+    Assert((uint64_t)n * 4 <= in.remaining(),
+           "seed2: when-group size %u exceeds remaining payload size in %s (corrupt seed)", n, path);
     g.sources.resize(n);
-    if (n) Assert(std::fread(g.sources.data(), 4, n, fp) == n, "seed2: truncated file %s", path);
+    if (n) in.readExact(g.sources.data(), (size_t)n * 4);
     r.whenGroups.push_back(std::move(g));
   }
+  in.finishPayload();
   std::fclose(fp);
   // Validate every table ID before any indexing: an out-of-range id would otherwise be
   // an out-of-bounds vector access (UB) instead of a clean compatibility error.
@@ -333,8 +656,20 @@ void mtSeed2Load() {
       Assert(id < nameTotal, "seed2: when-group source id %u out of range (%u names) in %s", id, nameTotal, path);
   }
   r.loaded = true;
-  fprintf(stderr, "[schedule-seed2] loaded %s: generator=%s points=%zu names=%zu whenGroups=%u\n",
-          path, generator.c_str(), r.points.size(), r.keys.size(), whenGroupCount);
+  const double sec = seed2NowSec() - t0;
+  char payloadInfo[64];
+  if (version == SEED2_VERSION2 && codec == SEED2_CODEC_ZLIB)
+    snprintf(payloadInfo, sizeof payloadInfo, "%.1fMB->%.1fMB on disk", rawPayload / 1048576.0,
+             compPayload / 1048576.0);
+  else
+    snprintf(payloadInfo, sizeof payloadInfo, "%.1fMB",
+             (version == SEED2_VERSION2 ? rawPayload : compPayload) / 1048576.0);
+  fprintf(stderr,
+          "[schedule-seed2] loaded %s: v=%u codec=%s level=%u generator=%s points=%zu names=%zu "
+          "whenGroups=%u payload=%s in %.2fs\n",
+          path, version,
+          version == SEED2_VERSION2 ? (codec == SEED2_CODEC_ZLIB ? "zlib" : "none") : "legacy", level,
+          generator.c_str(), r.points.size(), r.keys.size(), whenGroupCount, payloadInfo, sec);
 }
 
 }  // namespace

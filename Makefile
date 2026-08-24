@@ -180,7 +180,8 @@ $(foreach x, $(PARSER_GEN_SRCS), $(eval \
 $(foreach x, $(GSIM_SRCS), $(eval \
 	$(call CXX_TEMPLATE, $(GSIM_BUILD_DIR)/$(basename $(x)).o, $(x), $(CXXFLAGS), GSIM_OBJS, $(PARSER_GEN_HEADER))))
 
-$(eval $(call LD_TEMPLATE, $(GSIM_BIN), $(GSIM_OBJS), $(CXXFLAGS) -lgmp))
+# -lz: schedule-seed2 v2 payload compression (zlib; see src/seedOrder2.cpp)
+$(eval $(call LD_TEMPLATE, $(GSIM_BIN), $(GSIM_OBJS), $(CXXFLAGS) -lgmp -lz))
 
 build-gsim: $(GSIM_BIN)
 
