@@ -2011,6 +2011,7 @@ static void mtDenseAddEdge(MtDenseSchedule& schedule,
   schedule.edges.push_back(edge);
   if (kind == "dependency") schedule.dependencyEdgeCount ++;
   else if (kind == "active") schedule.activeEdgeCount ++;
+  else if (kind == "active_back") schedule.activeEdgeCount ++;
   else if (kind == "need_activate") schedule.needActivateEdgeCount ++;
   if (succSets[(size_t)fromCppId].insert(toCppId).second) {
     predSets[(size_t)toCppId].insert(fromCppId);
@@ -9717,7 +9718,13 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   if (node->isAsyncReset()) {
     Assert(!opt, "invalid opt");
     if (activeBufferName.empty()) {
+      // Sparse-gate dense bodies run concurrently with other workers' atomic gate-clear /
+      // activation RMWs on activeFlags. activateAll() is a plain memset and "%s = -1" a plain
+      // byte store: both silently erase concurrently-produced bits (lost activations freeze
+      // the core). Route both through atomic full-word ORs (same resulting bits, race-free).
+      bool denseAtomic = mtDenseSparseGateAtomicEmit;
       if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) emitBodyLock(indent, "activateAll(%d);\n", mtActivationEventTraceSourceCppId);
+      else if (denseAtomic) emitBodyLock(indent, "activateAllAtomicDense();\n");
       else emitBodyLock(indent, "activateAll();\n");
     } else {
       emitBodyLock(indent, "%s.activateAll();\n", activeBufferName.c_str());
@@ -9725,7 +9732,11 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
         emitBodyLock(indent, "recordMtActivationEvent(%d, 0, UINT64_MAX, MT_ACTIVATION_EVENT_ACTIVATE_ALL);\n", mtActivationEventTraceSourceCppId);
       }
     }
-    emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
+    if (mtDenseSparseGateAtomicEmit && flagName.rfind("activeFlags[", 0) == 0) {
+      emitBodyLock(indent, "__atomic_fetch_or(&%s, (uint%d_t)-1, __ATOMIC_RELAXED);\n", flagName.c_str(), ACTIVE_WIDTH);
+    } else {
+      emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
+    }
     if (mtDenseActiveWorklistEmit && activeBufferName.empty()) emitBodyLock(indent, "markDenseActiveWorklistAll();\n");
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
@@ -9789,7 +9800,16 @@ void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inSte
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
   if (ACTIVE_MASK(curMask) != 0) {
     std::string orFlag = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
-    emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+    // In the sparse-gate dense body flagName is "activeFlags[w]" (shared uint8_t word): the
+    // unconditional same-word activation must be an atomic RMW or a concurrent gate-clear /
+    // activation on another worker (word split across MTasks) loses this bit entirely.
+    bool atomicWord = mtDenseSparseGateAtomicEmit && orFlag.rfind("activeFlags[", 0) == 0;
+    if (atomicWord) {
+      emitBodyLock(indent, "__atomic_fetch_or(&%s, (uint%d_t)0x%lx, __ATOMIC_RELAXED); // %s\n",
+                   orFlag.c_str(), ACTIVE_WIDTH, ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+    } else {
+      emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+    }
     if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
       emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%d, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_UNCONDITIONAL);\n",
                    mtActivationEventTraceSourceCppId, node->super->cppId / ACTIVE_WIDTH, ACTIVE_MASK(curMask));
@@ -10031,7 +10051,11 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     emitBodyLock(indent, "#endif\n");
   }
   if (useAccum) {
-    emitBodyLock(indent, "%s |= %s;\n", flagName.c_str(), accumVar.c_str());
+    if (mtDenseSparseGateAtomicEmit && flagName.rfind("activeFlags[", 0) == 0) {
+      emitBodyLock(indent, "__atomic_fetch_or(&%s, (uint%d_t)%s, __ATOMIC_RELAXED);\n", flagName.c_str(), ACTIVE_WIDTH, accumVar.c_str());
+    } else {
+      emitBodyLock(indent, "%s |= %s;\n", flagName.c_str(), accumVar.c_str());
+    }
     if (mtDenseActiveWorklistEmit) emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", super->cppId / ACTIVE_WIDTH);
   }
   mtActivationEventTraceSourceCppId = savedTraceSourceCppId;
@@ -12713,6 +12737,8 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
         }
       } else if (mtUseActivationEventTraceCodegen()) {
         emitBodyLock(indent, "activateAll(traceSourceCppId);\n");
+      } else if (mtDenseSparseGateAtomicEmit) {
+        emitBodyLock(indent, "activateAllAtomicDense();\n");
       } else {
         emitBodyLock(indent, "activateAll();\n");
       }
@@ -12775,7 +12801,13 @@ void graph::genResetAll() {
     bool isUIntReset = super->superType == SUPER_UINT_RESET;
     if (isUIntReset) super2ResetId[super->resetNode].first = resetId;
     else super2ResetId[super->resetNode].second = resetId;
+    // Sparse-gate dense bodies call subResetN() concurrently with other workers' atomic
+    // activeFlags RMWs, so the unbuffered subReset bodies must emit atomic activation writes
+    // too (same bits, race-free). Default builds keep the plain form.
+    bool savedSparseGateAtomic = mtDenseSparseGateAtomicEmit;
+    mtDenseSparseGateAtomicEmit = mtDenseSparseGateAtomicEmit || mtUseDenseSparseGate();
     genResetDef(super, isUIntReset, false, resetId, 0);
+    mtDenseSparseGateAtomicEmit = savedSparseGateAtomic;
     if (globalConfig.MtHelperMode == "buffered-seq" ||
         globalConfig.MtHelperMode == "mt" ||
         globalConfig.MtHelperMode == "mt-level-dispatch") {
@@ -12885,6 +12917,123 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       ownerReadyLayout = mtBuildDenseOwnerReadyLayout(
           denseRuntimeSuccs, denseSchedule.mtaskThreadAssign, threadCount);
     }
+  }
+  // Sparse-gate ordering audit (runs whenever GSIM_MT_DENSE_SPARSE_GATE is on): the gate is
+  // only exact when the runtime schedule orders every cross-MTask activation pair the way the
+  // ascending-cppId sparse-ST scan does — producer before consumer for cppId-forward pairs
+  // (same-cycle consumption), consumer before producer for cppId-backward pairs (bit must
+  // survive to the next cycle). The enforced order is: token/counter edges in
+  // denseRuntimeSuccs PLUS per-worker program order (ascending MTask id within a worker).
+  // Compute the transitive closure of that order and check every member-level activation
+  // edge (nextActiveId/nextNeedActivate) against it. Also asserts dependency edges ascend in
+  // cppId (the precondition that keeps the cppId-classified edge set acyclic).
+  if (mtUseDenseSparseGate()) {
+    const int nAuditMT = nMTasks;
+    std::vector<int> mtaskOfCpp((size_t)superId, -1);
+    for (int m = 0; m < nAuditMT; m++) {
+      for (int sccId : denseSchedule.mtasks[(size_t)m].sccIds) {
+        if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+        for (int c : denseSchedule.sccs[(size_t)sccId].cppIds) {
+          if (c >= 0 && c < superId) mtaskOfCpp[(size_t)c] = m;
+        }
+      }
+    }
+    std::vector<std::vector<int>> orderSuccs = denseRuntimeSuccs;
+    {
+      // Per-worker program order: a worker executes its MTasks in ascending id, so chain each
+      // worker's MTasks prev->cur (ids interleave across workers; adjacency is not required).
+      int maxWorker = -1;
+      for (int m = 0; m < nAuditMT; m++) {
+        int w = denseSchedule.mtaskThreadAssign[(size_t)m];
+        if (w > maxWorker) maxWorker = w;
+      }
+      std::vector<int> prevOnWorker((size_t)maxWorker + 1, -1);
+      for (int m = 0; m < nAuditMT; m++) {
+        int w = denseSchedule.mtaskThreadAssign[(size_t)m];
+        if (w < 0 || w > maxWorker) continue;
+        int prev = prevOnWorker[(size_t)w];
+        if (prev >= 0) orderSuccs[(size_t)prev].push_back(m);
+        prevOnWorker[(size_t)w] = m;
+      }
+    }
+    bool orderEdgesAscending = true;
+    for (int m = 0; m < nAuditMT; m++) {
+      for (int s : orderSuccs[(size_t)m]) {
+        if (s <= m || s >= nAuditMT) orderEdgesAscending = false;
+      }
+    }
+    const int auditWordCount = (nAuditMT + 63) / 64;
+    std::vector<std::vector<uint64_t>> reach((size_t)nAuditMT,
+                                             std::vector<uint64_t>((size_t)std::max(1, auditWordCount), 0));
+    auto reachTest = [&](int from, int to) -> bool {
+      if (from == to) return true;
+      if (from < 0 || to < 0 || from >= nAuditMT || to >= nAuditMT) return false;
+      return (reach[(size_t)from][(size_t)to >> 6] & (uint64_t{1} << (to & 63))) != 0;
+    };
+    if (orderEdgesAscending) {
+      for (int from = nAuditMT - 1; from >= 0; from--) {
+        for (int succ : orderSuccs[(size_t)from]) {
+          if (succ <= from || succ >= nAuditMT) continue;
+          reach[(size_t)from][(size_t)succ >> 6] |= (uint64_t{1} << (succ & 63));
+          for (int w = 0; w < auditWordCount; w++) {
+            reach[(size_t)from][(size_t)w] |= reach[(size_t)succ][(size_t)w];
+          }
+        }
+      }
+    }
+    uint64_t pairForward = 0, pairBackward = 0, badForward = 0, badBackward = 0, badSameMTaskBackward = 0;
+    uint64_t depEdges = 0, depNonAscending = 0;
+    for (const MtDenseEdge& edge : denseSchedule.edges) {
+      if (edge.kind != "dependency") continue;
+      depEdges++;
+      if (edge.fromCppId >= edge.toCppId) depNonAscending++;
+    }
+    const int sampleLimit = 12;
+    auto reportBad = [&](const char* cls, int fromCppId, int toCppId, int fromMT, int toMT) {
+      if (badForward + badBackward >= (uint64_t)sampleLimit) return;
+      (void)cls;
+      fprintf(stderr,
+              "[sparse-gate-order-audit] %s violation: activation cpp %d -> cpp %d (mtasks %d -> %d, "
+              "workers %d -> %d, required order %s)\n",
+              cls, fromCppId, toCppId, fromMT, toMT,
+              fromMT >= 0 && fromMT < nAuditMT ? denseSchedule.mtaskThreadAssign[(size_t)fromMT] : -1,
+              toMT >= 0 && toMT < nAuditMT ? denseSchedule.mtaskThreadAssign[(size_t)toMT] : -1,
+              fromCppId < toCppId ? "producer-before-consumer" : "consumer-before-producer");
+    };
+    for (int cppId = 0; cppId < superId; cppId++) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || !superIter->second) continue;
+      SuperNode* super = superIter->second;
+      int fromMT = mtaskOfCpp[(size_t)cppId];
+      for (Node* member : super->member) {
+        if (!member) continue;
+        for (int listIdx = 0; listIdx < 2; listIdx++) {
+          const std::set<int>& targets = listIdx == 0 ? member->nextActiveId : member->nextNeedActivate;
+          for (int toCppId : targets) {
+            if (toCppId < 0 || toCppId >= superId || toCppId == cppId) continue;
+            int toMT = mtaskOfCpp[(size_t)toCppId];
+            if (fromMT < 0 || toMT < 0) continue;
+            if (fromMT == toMT) {
+              // Same MTask: ascending-cppId member emission enforces both directions.
+              if (cppId > toCppId && listIdx == 0) badSameMTaskBackward++;  // counted, never a violation
+              continue;
+            }
+            bool ok;
+            if (cppId < toCppId) { pairForward++; ok = reachTest(fromMT, toMT); if (!ok) { badForward++; reportBad("forward", cppId, toCppId, fromMT, toMT); } }
+            else { pairBackward++; ok = reachTest(toMT, fromMT); if (!ok) { badBackward++; reportBad("backward", cppId, toCppId, fromMT, toMT); } }
+          }
+        }
+      }
+    }
+    fprintf(stderr,
+            "[sparse-gate-order-audit] mtasks=%d order_edges_ascending=%d dep_edges=%llu dep_non_ascending=%llu "
+            "pairs: forward=%llu bad_forward=%llu backward=%llu bad_backward=%llu same_mtask_backward=%llu%s\n",
+            nAuditMT, orderEdgesAscending ? 1 : 0, (unsigned long long)depEdges,
+            (unsigned long long)depNonAscending, (unsigned long long)pairForward,
+            (unsigned long long)badForward, (unsigned long long)pairBackward,
+            (unsigned long long)badBackward, (unsigned long long)badSameMTaskBackward,
+            (!orderEdgesAscending || depNonAscending || badForward || badBackward)
+                ? "  RESULT: ORDER VIOLATIONS PRESENT" : "  RESULT: order OK");
   }
   const int denseLookaheadWindow = mtDenseLookaheadWindow();
   const bool denseLookahead = denseLookaheadWindow > 0;
@@ -17130,6 +17279,17 @@ void graph::cppEmitter() {
     emitFuncDecl(0, "void S%s::activateAll() {\n"
                  "  memset(activeFlags, 0xff, sizeof(activeFlags));\n"
                  "}\n", name.c_str());
+  }
+
+  // Sparse-gate dense executor: concurrent-safe activate-all. activateAll()'s plain memset
+  // erases bits concurrently produced by other workers' atomic gate-clear/activation RMWs
+  // (lost activations freeze the core); this variant sets the same bits with per-byte atomic
+  // ORs. Only emitted when the sparse gate is enabled; unused otherwise.
+  if (mtUseDenseSparseGate()) {
+    fprintf(header, "void activateAllAtomicDense();\n");
+    emitFuncDecl(0, "void S%s::activateAllAtomicDense() {\n"
+                 "  for (int i = 0; i < %d; i ++) __atomic_fetch_or(&activeFlags[i], (uint%d_t)-1, __ATOMIC_RELAXED);\n"
+                 "}\n", name.c_str(), activeFlagNum, ACTIVE_WIDTH);
   }
 
    /* input/output interface */
