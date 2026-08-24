@@ -1,4 +1,6 @@
 #include "common.h"
+#include <algorithm>
+#include <atomic>
 #include "phaseTimer.h"
 #include <climits>
 #include <cstddef>
@@ -209,9 +211,10 @@ struct CanonArena {
 struct CanonStreamCache {
   bool valid = false;
   uint64_t hash = 0;
+  int algo = 0;                                  // canon algorithm that produced `hash` (1|2)
   std::vector<CanonArena> arenas;                // record byte storage
   std::vector<std::string_view> sorted;          // sorted views into arenas
-  void reset() { valid = false; hash = 0; std::vector<CanonArena>().swap(arenas); std::vector<std::string_view>().swap(sorted); }
+  void reset() { valid = false; hash = 0; algo = 0; std::vector<CanonArena>().swap(arenas); std::vector<std::string_view>().swap(sorted); }
 };
 CanonStreamCache& canonStreamCache() { static CanonStreamCache c; return c; }
 
@@ -222,8 +225,81 @@ bool canonViewEq(std::string_view a, std::string_view b) {
   return a.size() == b.size() && (a.size() == 0 || std::memcmp(a.data(), b.data(), a.size()) == 0);
 }
 }  // namespace
+
+// ---- exact canon mixes (verification-only values; never touch model bytes) ----
+// Both are pure functions of the sorted record view list.
+namespace {
+// The v1 basis/prime are frozen: every champion seed's recorded canon values were
+// produced by these constants, so they must never change.
+constexpr uint64_t CANON_FNV_BASIS = 1469598103934665603ULL;
+constexpr uint64_t CANON_FNV_PRIME = 1099511628211ULL;
+constexpr char CANON_V2_DOMAIN[] = "GSIM-CANON-V2";  // no NUL: 13 explicit bytes
+
+inline void canonFnvBytes(uint64_t& h, const unsigned char* p, size_t n) {
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= CANON_FNV_PRIME; }
+}
+inline void canonFnvU64(uint64_t& h, uint64_t v) {
+  for (int b = 0; b < 8; b++) { h ^= (unsigned char)(v >> (8 * b)); h *= CANON_FNV_PRIME; }
+}
+}  // namespace
+
+// v1: serial FNV-1a over the whole sorted stream (verbatim legacy mix, ~0.8GB/s).
+uint64_t graph::canonMixV1(const std::vector<std::string_view>& views) {
+  uint64_t h = CANON_FNV_BASIS;
+  for (std::string_view r : views) canonFnvBytes(h, (const unsigned char*)r.data(), r.size());
+  return h;
+}
+
+// v2: parallel segmented hash (GSIM_SEED2_CANON=v2). Deterministic construction -
+// the value depends only on the record bytes, never on the thread count:
+//   S      = n == 0 ? 1 : min(4096, ceil(n / 256))   (segment count, from n alone)
+//   seg_j  = views[n*j/S .. n*(j+1)/S)
+//   h_j    = FNV-1a over LE64(segBytes_j) || LE64(segCount_j) || seg_j bytes
+//   final  = FNV-1a over "GSIM-CANON-V2" || LE64(n) || LE64(S) || LE64(h_0) .. LE64(h_{S-1})
+// (LE = fixed little-endian byte order; the domain tag keeps v2 values distinct
+// from v1 values.) Each segment is hashed independently, so segments spread over
+// workers; the combine is a fixed-order serial fold of the h_j sequence.
+uint64_t graph::canonMixV2(const std::vector<std::string_view>& views) {
+  const size_t n = views.size();
+  const size_t S = n == 0 ? 1 : std::min<size_t>(4096, (n + 255) / 256);
+  std::vector<uint64_t> seg(S, 0);
+  auto hashSegment = [&](size_t j) {
+    size_t lo = n * j / S, hi = n * (j + 1) / S;
+    uint64_t bytes = 0;
+    for (size_t i = lo; i < hi; i++) bytes += views[i].size();
+    uint64_t h = CANON_FNV_BASIS;
+    canonFnvU64(h, bytes);
+    canonFnvU64(h, (uint64_t)(hi - lo));
+    for (size_t i = lo; i < hi; i++)
+      canonFnvBytes(h, (const unsigned char*)views[i].data(), views[i].size());
+    seg[j] = h;
+  };
+  const int nWorkers = std::max(1, std::min<int>(std::min((int)S, 16),
+                                                  (int)std::thread::hardware_concurrency()));
+  std::atomic<size_t> next(0);
+  auto workerLoop = [&]() {
+    size_t j;
+    while ((j = next.fetch_add(1)) < S) hashSegment(j);
+  };
+  std::vector<std::thread> pool;
+  for (int w = 1; w < nWorkers; w++) pool.emplace_back(workerLoop);
+  workerLoop();  // worker 0 runs inline
+  for (std::thread& t : pool) t.join();
+  uint64_t h = CANON_FNV_BASIS;
+  canonFnvBytes(h, (const unsigned char*)CANON_V2_DOMAIN, sizeof(CANON_V2_DOMAIN) - 1);
+  canonFnvU64(h, (uint64_t)n);
+  canonFnvU64(h, (uint64_t)S);
+  for (uint64_t v : seg) canonFnvU64(h, v);
+  return h;
+}
+
 uint64_t graph::canonInputHash() {
   PhaseTimer hashTotal("canonInputHash.total");
+  // Which exact mix to run: v1 (frozen serial FNV-1a, the only value every
+  // existing champion seed ever recorded) or v2 (parallel segmented, opt-in via
+  // GSIM_SEED2_CANON=v2 on writes; on replay the next point's recorded tag
+  // decides, so v1 seeds keep computing v1 and mixed seeds replay correctly).
+  const int canonAlgo = mtSeed2CanonAlgo();
   auto tBuild = phasetimer::now();
   // Record byte image (unchanged from the original construction): member names in
   // order + '|' + sorted prev/next/depPrev/depNext endpoint keys, ',' after each key.
@@ -307,11 +383,11 @@ uint64_t graph::canonInputHash() {
   std::sort(views.begin(), views.end(), canonViewLess);
   phasetimer::mark("canonInputHash.sort", tSort);
   // Exact stream cache: if the sorted view list is byte-for-byte equal to the
-  // previous computation's, the FNV-1a value is identical by construction, so the
-  // cached hash is returned without re-running the (serial, ~0.8GB/s) mix. The
-  // equality check is a full compare - this is exactly as strong as rehashing.
+  // previous computation's AND was hashed with the same algorithm, the value is
+  // identical by construction, so the cached hash is returned without re-running
+  // the mix. The equality check is a full compare - exactly as strong as rehashing.
   CanonStreamCache& cache = canonStreamCache();
-  if (cache.valid && cache.sorted.size() == views.size()) {
+  if (cache.valid && cache.algo == canonAlgo && cache.sorted.size() == views.size()) {
     bool equal = true;
     size_t n = views.size();
     int cmpWorkers = nWorkers;
@@ -338,19 +414,15 @@ uint64_t graph::canonInputHash() {
     }
   }
   auto tMix = phasetimer::now();
-  uint64_t recHash = 1469598103934665603ULL;
   size_t mixBytes = 0;
-  for (std::string_view r : views) {
-    const unsigned char* p = (const unsigned char*)r.data();
-    size_t n = r.size();
-    mixBytes += n;
-    for (size_t i = 0; i < n; i ++) { recHash ^= p[i]; recHash *= 1099511628211ULL; }
-  }
+  for (std::string_view r : views) mixBytes += r.size();
+  uint64_t recHash = canonAlgo == 2 ? canonMixV2(views) : canonMixV1(views);
   phasetimer::mark("canonInputHash.mix", tMix);
-  if (phasetimer::enabled()) fprintf(stderr, "[gpart-phase] canonInputHash.bytes = %zu (%.2f GB, %zu records)\n", mixBytes, (double)mixBytes / 1e9, views.size());
+  if (phasetimer::enabled()) fprintf(stderr, "[gpart-phase] canonInputHash.bytes = %zu (%.2f GB, %zu records) algo=%d\n", mixBytes, (double)mixBytes / 1e9, views.size(), canonAlgo);
   auto tDtor = phasetimer::now();
   cache.reset();
   cache.valid = true;
+  cache.algo = canonAlgo;
   cache.hash = recHash;
   cache.arenas = std::move(arenas);
   cache.sorted = std::move(views);

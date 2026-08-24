@@ -5,14 +5,15 @@
 //
 // Binary format (little-endian), file extension convention *.gsimseed2:
 //   char  magic[4]   = "GS2\0"
-//   u32   version    = 1 (legacy, all existing champion seeds) or 2 (codec-framed)
+//   u32   version    = 1 (legacy, all existing champion seeds), 2 (codec-framed)
+//                     or 3 (codec-framed + per-point canon algorithm tag)
 //   u64   input_hash                 (graph::canonInputHash() at topoSort entry)
 //   u32   generator_len, bytes       (generator tag)
 //   u32   point_count
 //   u32   name_count
 //   u32   whenmap_group_count
 //   -- version 1 ends here; the payload follows stored uncompressed --
-//   -- version 2 codec header (quick-parse prefix above stays at v1 offsets) --
+//   -- version 2/3 codec header (quick-parse prefix above stays at v1 offsets) --
 //   u32   codec                      (0 = none, 1 = zlib)
 //   u32   codec_level                (informational: zlib deflate level)
 //   u64   raw_payload_bytes          (uncompressed payload size)
@@ -23,6 +24,7 @@
 //   [string table] name_count x { u32 len, bytes }      (SuperNode keys, see keyOf)
 //   [points] point_count x {
 //     u32 tag_len, bytes
+//     [version 3 only] u8 canon_algo  (1 = serial FNV-1a v1, 2 = segmented v2)
 //     u64 canon_hash                 (order-free content hash at this point)
 //     u32 node_count
 //     u32 ranks[node_count]          (string-table ids, in recorded sortedSuper order)
@@ -32,6 +34,16 @@
 //     u32 source_count
 //     u32 sources[source_count]      (string-table ids; index 0 is the recorded target)
 //   }
+//
+// The canon hash is VERIFICATION-ONLY: mtSeed2RecordPoint stores it next to the
+// rank permutation, mtSeed2ApplyPoint compares it (Assert abort on mismatch) and
+// forces sortedSuper strictly from the recorded ranks - the hash never reaches
+// the emitted model. GSIM_SEED2_CANON=v2 (default off) opts new writes into the
+// parallel segmented mix (graph::canonMixV2): such seeds are written as version 3
+// with a per-point canon_algo tag, replay computes exactly the tagged algorithm
+// per point, and untagged v1/v2 seeds keep computing the frozen v1 mix - so all
+// existing champion seeds replay byte-identically and mixed v1/v2 point streams
+// inside one version-3 file also replay correctly.
 //
 // v2 payloads are produced and consumed through bounded chunk buffers (Seed2Output /
 // Seed2Input): the writer streams its in-memory state straight into z_stream as it
@@ -57,15 +69,18 @@
 #include <deque>
 #include <vector>
 #include "common.h"
+#include "graph.h"
 #include "phaseTimer.h"
-
 #include <zlib.h>
 
 #define SEED2_MAGIC "GS2\0"
 #define SEED2_VERSION 1u   // legacy layout: payload stored uncompressed after the counts
 #define SEED2_VERSION2 2u  // codec-framed payload (see header comment)
+#define SEED2_VERSION3 3u  // codec-framed payload + per-point canon algorithm tag
 #define SEED2_CODEC_NONE 0u
 #define SEED2_CODEC_ZLIB 1u
+#define SEED2_CANON_ALGO_V1 1  // frozen serial FNV-1a (all champion seeds)
+#define SEED2_CANON_ALGO_V2 2  // parallel segmented mix (GSIM_SEED2_CANON=v2)
 
 bool mtSeed2WriteActive() { return std::getenv("GSIM_SCHEDULE_SEED2_WRITE") != nullptr; }
 bool mtSeed2ReplayActive() { return std::getenv("GSIM_SCHEDULE_SEED2") != nullptr; }
@@ -74,6 +89,23 @@ bool mtSeed2ReplayActive() { return std::getenv("GSIM_SCHEDULE_SEED2") != nullpt
 //   GSIM_SEED2_CODEC = zlib (default) | none | v1 (write the legacy layout, for
 //                      byte-for-byte comparison against existing champion seeds)
 //   GSIM_SEED2_LEVEL = zlib deflate level 1..9 (default 6)
+//   GSIM_SEED2_CANON = v1 (default) | v2. v2 records per-point canon_algo=2 tags
+//                      (file version 3) and hashes each point with the parallel
+//                      segmented mix; v1 keeps the frozen serial FNV-1a values.
+//                      Incompatible with GSIM_SEED2_CODEC=v1 (the legacy layout
+//                      cannot carry per-point tags).
+
+// GSIM_SEED2_CANON for the write side: SEED2_CANON_ALGO_V1 (default) or V2.
+// Anything but "" / "v1" / "v2" fails fast instead of silently hashing v1.
+static int seed2CanonEnvAlgo() {
+  const char* c = std::getenv("GSIM_SEED2_CANON");
+  if (c == nullptr || c[0] == '\0' || std::strcmp(c, "v1") == 0) return SEED2_CANON_ALGO_V1;
+  Assert(std::strcmp(c, "v2") == 0, "seed2: unknown GSIM_SEED2_CANON '%s' (want v1|v2)", c);
+  if (std::strcmp(std::getenv("GSIM_SEED2_CODEC") ? std::getenv("GSIM_SEED2_CODEC") : "", "v1") == 0)
+    Assert(false, "seed2: GSIM_SEED2_CANON=v2 cannot be combined with GSIM_SEED2_CODEC=v1 "
+                  "(the legacy layout has no per-point canon tag; drop the codec override)");
+  return SEED2_CANON_ALGO_V2;
+}
 
 void mtSeed2AssertCompatible() {
   Assert(!(mtSeed2WriteActive() && mtSeed2ReplayActive()),
@@ -82,6 +114,8 @@ void mtSeed2AssertCompatible() {
          "GSIM_SCHEDULE_SEED2_WRITE and GSIM_SCHEDULE_SEED(_WRITE) are mutually exclusive (use one seed format at a time)");
   Assert(!(mtSeed2ReplayActive() && (mtSeedReplayActive() || mtSeedWriteActive())),
          "GSIM_SCHEDULE_SEED2 and GSIM_SCHEDULE_SEED(_WRITE) are mutually exclusive");
+  // Fail fast on GSIM_SEED2_CANON=v2 + GSIM_SEED2_CODEC=v1 (layout cannot carry tags).
+  if (mtSeed2WriteActive()) seed2CanonEnvAlgo();
   // GSIM_STABLE_ORDER + SEED2_WRITE is allowed (records a stable-order run).
   // GSIM_STABLE_ORDER + SEED2 replay is pointless (two fixed orders) but harmless;
   // replay wins because it forces verbatim order after each point.
@@ -93,6 +127,7 @@ namespace {
 
 struct Seed2Point {
   std::string tag;
+  int canonAlgo = SEED2_CANON_ALGO_V1;  // algorithm that produced canonHash (v3 tag)
   uint64_t canonHash = 0;
   std::vector<uint32_t> nameIds;  // string-table ids in recorded sortedSuper order
 };
@@ -255,6 +290,7 @@ struct Seed2Output {
   }
   void u32(uint32_t v) { write(&v, 4); }
   void u64(uint64_t v) { write(&v, 8); }
+  void u8(uint8_t v) { write(&v, 1); }
   void str(const std::string& s) {
     u32((uint32_t)s.size());
     if (!s.empty()) write(s.data(), s.size());
@@ -297,8 +333,12 @@ void mtSeed2Finalize() {
   const double t0 = seed2NowSec();
   FILE* fp = std::fopen(path, "wb");
   Assert(fp != nullptr, "cannot open seed2 output %s", path);
-  Assert(std::fwrite(SEED2_MAGIC, 1, 4, fp) == 4, "seed2: write failed on %s", path);
-  seed2WriteU32(fp, legacy ? SEED2_VERSION : SEED2_VERSION2);
+  Assert(std::fwrite(SEED2_MAGIC, 1, 4, fp) == 4, "seed2: write failed on %s (disk full?)", path);
+  // 3 = codec-framed + per-point canon tags (any v2-canon point forces 3).
+  bool anyCanonV2 = false;
+  for (const Seed2Point& p : w.points) anyCanonV2 = anyCanonV2 || p.canonAlgo == SEED2_CANON_ALGO_V2;
+  const uint32_t outVersion = legacy ? SEED2_VERSION : (anyCanonV2 ? SEED2_VERSION3 : SEED2_VERSION2);
+  seed2WriteU32(fp, outVersion);
   seed2WriteU64(fp, w.inputHash);
   seed2WriteStr(fp, "wip/dense-b1-lookahead");
   seed2WriteU32(fp, (uint32_t)w.points.size());
@@ -317,6 +357,7 @@ void mtSeed2Finalize() {
   for (const std::string& k : w.keys) out.str(k);
   for (const Seed2Point& p : w.points) {
     out.str(p.tag);
+    if (outVersion == SEED2_VERSION3) out.u8((uint8_t)p.canonAlgo);
     out.u64(p.canonHash);
     out.u32((uint32_t)p.nameIds.size());
     if (!p.nameIds.empty()) out.write(p.nameIds.data(), p.nameIds.size() * 4);
@@ -344,9 +385,10 @@ void mtSeed2Finalize() {
   for (const std::string& k : w.keys) bytes += 4 + k.size();
   const double sec = seed2NowSec() - t0;
   fprintf(stderr,
-          "[schedule-seed2] wrote %s: v=%u codec=%s level=%d points=%zu names=%zu whenGroups=%zu "
+          "[schedule-seed2] wrote %s: v=%u codec=%s level=%d canon=%s points=%zu names=%zu whenGroups=%zu "
           "table=%.1fMB payload=%.1fMB->%.1fMB (%.2fx) in %.2fs\n",
-          path, legacy ? 1u : 2u, legacy ? "v1" : (codec == SEED2_CODEC_ZLIB ? "zlib" : "none"), level,
+          path, outVersion, legacy ? "v1" : (codec == SEED2_CODEC_ZLIB ? "zlib" : "none"), level,
+          anyCanonV2 ? "v2" : "v1",
           w.points.size(), w.keys.size(), w.whenGroups.size(), bytes / 1048576.0,
           out.rawBytes / 1048576.0, out.compBytes / 1048576.0,
           out.compBytes ? (double)out.rawBytes / (double)out.compBytes : 0.0, sec);
@@ -367,6 +409,7 @@ void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSu
   if (w.points.empty()) std::atexit(mtSeed2Finalize);
   Seed2Point p;
   p.tag = tag;
+  p.canonAlgo = seed2CanonEnvAlgo();  // tag = the algorithm canonInputHash() used
   p.canonHash = canonHash;
   p.nameIds.reserve(sortedSuper.size());
   std::unordered_map<std::string, int> dupCounts;
@@ -579,7 +622,7 @@ void mtSeed2Load() {
   Assert(std::fread(magic, 1, 4, fp) == 4 && std::memcmp(magic, SEED2_MAGIC, 4) == 0,
          "seed2: bad magic in %s (not a GS2 file)", path);
   uint32_t version = seed2ReadU32(fp, path);
-  Assert(version == SEED2_VERSION || version == SEED2_VERSION2,
+  Assert(version == SEED2_VERSION || version == SEED2_VERSION2 || version == SEED2_VERSION3,
          "seed2: unsupported version %u in %s", version, path);
   r.inputHash = seed2ReadU64(fp, path);
   std::string generator = seed2ReadStr(fp, path, fileBytes);
@@ -590,7 +633,7 @@ void mtSeed2Load() {
   uint32_t level = 0;
   uint64_t rawPayload = 0, compPayload = 0;
   uint32_t wantCrc = 0;
-  if (version == SEED2_VERSION2) {
+  if (version >= SEED2_VERSION2) {
     codec = seed2ReadU32(fp, path);
     level = seed2ReadU32(fp, path);
     rawPayload = seed2ReadU64(fp, path);
@@ -608,21 +651,28 @@ void mtSeed2Load() {
   // Bound every count before reserving: each entry costs >= 4 payload bytes (a name
   // needs >= 4 for its length; a rank id 4), so counts beyond payload/4 are impossible
   // and indicate a corrupt seed. v1 bounds by the file size (payload == file tail).
-  const uint64_t boundBytes = version == SEED2_VERSION2 ? rawPayload : compPayload;
+  const uint64_t boundBytes = version >= SEED2_VERSION2 ? rawPayload : compPayload;
   const uint64_t maxEntries = boundBytes / 4;
   Assert((uint64_t)nameCount <= maxEntries && (uint64_t)pointCount <= maxEntries &&
          (uint64_t)whenGroupCount <= maxEntries,
          "seed2: implausible counts (points=%u names=%u groups=%u) for %llu-byte payload in %s",
          pointCount, nameCount, whenGroupCount, (unsigned long long)boundBytes, path);
   Seed2Input in;
-  in.open(fp, path, codec, version == SEED2_VERSION2 ? rawPayload : compPayload, compPayload,
-          wantCrc, version == SEED2_VERSION2);
+  in.open(fp, path, codec, version >= SEED2_VERSION2 ? rawPayload : compPayload, compPayload,
+          wantCrc, version >= SEED2_VERSION2);
   r.keys.reserve(nameCount);
   for (uint32_t i = 0; i < nameCount; i++) r.keys.push_back(in.str());
   r.points.reserve(pointCount);
   for (uint32_t i = 0; i < pointCount; i++) {
     Seed2Point p;
     p.tag = in.str();
+    if (version == SEED2_VERSION3) {
+      uint8_t algo;
+      in.readExact(&algo, 1);
+      Assert(algo == SEED2_CANON_ALGO_V1 || algo == SEED2_CANON_ALGO_V2,
+             "seed2: unknown canon algorithm tag %u at point %u in %s (corrupt seed)", algo, i, path);
+      p.canonAlgo = algo;
+    }
     p.canonHash = in.u64();
     uint32_t n = in.u32();
     Assert((uint64_t)n * 4 <= in.remaining(),
@@ -659,17 +709,17 @@ void mtSeed2Load() {
   r.loaded = true;
   const double sec = seed2NowSec() - t0;
   char payloadInfo[64];
-  if (version == SEED2_VERSION2 && codec == SEED2_CODEC_ZLIB)
+  if (version >= SEED2_VERSION2 && codec == SEED2_CODEC_ZLIB)
     snprintf(payloadInfo, sizeof payloadInfo, "%.1fMB->%.1fMB on disk", rawPayload / 1048576.0,
              compPayload / 1048576.0);
   else
     snprintf(payloadInfo, sizeof payloadInfo, "%.1fMB",
-             (version == SEED2_VERSION2 ? rawPayload : compPayload) / 1048576.0);
+             (version >= SEED2_VERSION2 ? rawPayload : compPayload) / 1048576.0);
   fprintf(stderr,
           "[schedule-seed2] loaded %s: v=%u codec=%s level=%u generator=%s points=%zu names=%zu "
           "whenGroups=%u payload=%s in %.2fs\n",
           path, version,
-          version == SEED2_VERSION2 ? (codec == SEED2_CODEC_ZLIB ? "zlib" : "none") : "legacy", level,
+          version >= SEED2_VERSION2 ? (codec == SEED2_CODEC_ZLIB ? "zlib" : "none") : "legacy", level,
           generator.c_str(), r.points.size(), r.keys.size(), whenGroupCount, payloadInfo, sec);
 }
 
@@ -719,7 +769,7 @@ int mtSeed2TranscodeMain() {
   Assert(std::fread(magic, 1, 4, fin) == 4 && std::memcmp(magic, SEED2_MAGIC, 4) == 0,
          "seed2: bad magic in %s (not a GS2 file)", in.c_str());
   uint32_t inVersion = seed2ReadU32(fin, in.c_str());
-  Assert(inVersion == SEED2_VERSION || inVersion == SEED2_VERSION2,
+  Assert(inVersion == SEED2_VERSION || inVersion == SEED2_VERSION2 || inVersion == SEED2_VERSION3,
          "seed2 transcode: unsupported version %u in %s", inVersion, in.c_str());
   uint64_t inputHash = seed2ReadU64(fin, in.c_str());
   std::string generator = seed2ReadStr(fin, in.c_str(), inBytes);
@@ -729,7 +779,7 @@ int mtSeed2TranscodeMain() {
   uint32_t inCodec = SEED2_CODEC_NONE;
   uint64_t rawPayload = 0, compPayload = 0;
   uint32_t wantCrc = 0;
-  if (inVersion == SEED2_VERSION2) {
+  if (inVersion >= SEED2_VERSION2) {
     inCodec = seed2ReadU32(fin, in.c_str());
     seed2ReadU32(fin, in.c_str());  // input level (informational)
     rawPayload = seed2ReadU64(fin, in.c_str());
@@ -752,7 +802,9 @@ int mtSeed2TranscodeMain() {
   FILE* fout = std::fopen(out.c_str(), "wb");
   Assert(fout != nullptr, "seed2 transcode: cannot open output %s", out.c_str());
   Assert(std::fwrite(SEED2_MAGIC, 1, 4, fout) == 4, "seed2 transcode: write failed on %s", out.c_str());
-  seed2WriteU32(fout, SEED2_VERSION2);
+  // v3 inputs keep version 3 (the payload carries per-point canon tags byte-for-byte);
+  // v1/v2 inputs have no tags, so the output is v2.
+  seed2WriteU32(fout, inVersion >= SEED2_VERSION3 ? SEED2_VERSION3 : SEED2_VERSION2);
   seed2WriteU64(fout, inputHash);
   seed2WriteStr(fout, generator);
   seed2WriteU32(fout, pointCount);
@@ -761,10 +813,10 @@ int mtSeed2TranscodeMain() {
   seed2WriteU32(fout, codec);
   seed2WriteU32(fout, (uint32_t)level);
   const long metaOff = std::ftell(fout);
-  unsigned char zero[20] = {0};
+  unsigned char zero[20] = {0};  // raw_payload_bytes, payload_crc32, comp_payload_bytes; patched below
   Assert(std::fwrite(zero, 1, 20, fout) == 20, "seed2 transcode: write failed on %s", out.c_str());
   Seed2Input src;
-  src.open(fin, in.c_str(), inCodec, rawPayload, compPayload, wantCrc, inVersion == SEED2_VERSION2);
+  src.open(fin, in.c_str(), inCodec, rawPayload, compPayload, wantCrc, inVersion >= SEED2_VERSION2);
   Seed2Output dst;
   dst.open(fout, out.c_str(), codec, level);
   std::vector<unsigned char> buf(1 << 20);
@@ -789,9 +841,10 @@ int mtSeed2TranscodeMain() {
   Assert(std::fflush(fout) == 0 && std::fclose(fout) == 0, "seed2 transcode: close failed on %s", out.c_str());
   std::fclose(fin);
   fprintf(stderr,
-          "[schedule-seed2] transcoded %s(v=%u) -> %s(v=2 codec=%s level=%d): points=%u names=%u "
+          "[schedule-seed2] transcoded %s(v=%u) -> %s(v=%u codec=%s level=%d): points=%u names=%u "
           "whenGroups=%u payload=%.1fMB->%.1fMB (%.2fx) in %.2fs\n",
-          in.c_str(), inVersion, out.c_str(), codec == SEED2_CODEC_ZLIB ? "zlib" : "none", level,
+          in.c_str(), inVersion, out.c_str(), inVersion >= SEED2_VERSION3 ? 3u : 2u,
+          codec == SEED2_CODEC_ZLIB ? "zlib" : "none", level,
           pointCount, nameCount, whenGroupCount, dst.rawBytes / 1048576.0, dst.compBytes / 1048576.0,
           dst.compBytes ? (double)dst.rawBytes / (double)dst.compBytes : 0.0, seed2NowSec() - t0);
   return 0;
@@ -803,6 +856,23 @@ void mtSeed2VerifyInputHash(uint64_t computedInputHash) {
   Assert(r.inputHash == computedInputHash,
          "seed2 input mismatch: seed has %016zx, this run computes %016zx (different RTL/front-end state)",
          (size_t)r.inputHash, (size_t)computedInputHash);
+}
+
+// Canon algorithm for the point about to be hashed. Write mode: env (uniform per
+// run). Replay mode: the NEXT point's recorded tag - points are consumed strictly
+// in order, and canonInputHash() runs before mtSeed2ApplyPoint advances the
+// cursor, so the peek always names the point being verified. Untagged v1/v2
+// seeds and any non-seed2 context are v1, which is why every existing champion
+// seed keeps hashing exactly as before. Exhausted replay (cursor at end) has no
+// point left to verify; v1 is the harmless default there.
+int mtSeed2CanonAlgo() {
+  if (mtSeed2WriteActive()) return seed2CanonEnvAlgo();
+  if (mtSeed2ReplayActive()) {
+    mtSeed2Load();
+    Seed2Reader& r = seed2Reader();
+    if (r.cursor < r.points.size()) return r.points[r.cursor].canonAlgo;
+  }
+  return SEED2_CANON_ALGO_V1;
 }
 
 // Force sortedSuper to the recorded permutation of the NEXT expected point.
@@ -899,4 +969,116 @@ std::vector<std::string> mtSeed2WhenGroupSourceKeys(size_t i) {
   out.reserve(r.whenGroups[i].sources.size());
   for (uint32_t id : r.whenGroups[i].sources) out.push_back(r.keys[id]);
   return out;
+}
+
+// ---------------- standalone canon fuzz (GSIM_SEED2_CANON_FUZZ=<iters>) ----------
+// Divergence-detection harness on synthetic record streams: v1 and v2 must BOTH
+// change whenever the stream changes by one record (byte flip, insert, delete,
+// duplicate). Also pins v2 determinism (same stream -> same value, independent
+// of thread scheduling) and the exact segment-count construction. Exits 0 on
+// PASS, nonzero on the first violation. No generation runs.
+int mtSeed2CanonFuzzMain() {
+  const char* spec = std::getenv("GSIM_SEED2_CANON_FUZZ");
+  long iters = spec ? std::atol(spec) : 100;
+  if (iters < 1) iters = 1;
+  Assert(!mtSeed2WriteActive() && !mtSeed2ReplayActive(),
+         "GSIM_SEED2_CANON_FUZZ is a standalone mode; unset GSIM_SCHEDULE_SEED2(_WRITE)");
+  // Deterministic splitmix64 stream: fixed seed, so a failure reproduces exactly.
+  uint64_t rngState = 0x9E3779B97F4A7C15ULL;
+  auto nextRand = [&]() {
+    uint64_t z = (rngState += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+  };
+  auto makeViews = [&](size_t n, std::vector<std::string>& storage) {
+    storage.clear();
+    storage.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+      // Lengths 0..63 hit empty records and segment-boundary straddling alike;
+      // biased alphabet keeps accidental coincidences meaningful, not certain.
+      size_t len = (size_t)(nextRand() % 64);
+      std::string s(len, '\0');
+      for (char& c : s) c = (char)('a' + (int)(nextRand() % 8));
+      storage.push_back(std::move(s));
+    }
+  };
+  auto toViewList = [](const std::vector<std::string>& storage) {
+    std::vector<std::string_view> views;
+    views.reserve(storage.size());
+    for (const std::string& s : storage) views.emplace_back(s.data(), s.size());
+    return views;
+  };
+  long flips = 0, inserts = 0, deletes = 0, dups = 0, sizes = 0;
+  std::vector<std::string> storage;
+  for (long it = 0; it < iters; it++) {
+    // Sizes sweep the segment-count function: 0, 1, small, k*256-1, k*256, k*256+1.
+    static const size_t fixedSizes[] = {0, 1, 2, 255, 256, 257, 511, 512, 65535, 65536, 65537, 1048577};
+    size_t n = (it % 12 == 0) ? fixedSizes[(it / 12) % 12]
+                              : (size_t)(nextRand() % 900);
+    makeViews(n, storage);
+    auto views = toViewList(storage);
+    uint64_t h1 = graph::canonMixV1(views);
+    uint64_t h2 = graph::canonMixV2(views);
+    // Determinism: recompute both; v2 spawns threads whose count/interleaving
+    // must not leak into the value.
+    Assert(graph::canonMixV1(views) == h1, "canon fuzz iter %ld: v1 not deterministic", it);
+    Assert(graph::canonMixV2(views) == h2, "canon fuzz iter %ld: v2 not deterministic", it);
+    if (n == 0) continue;
+    int mode = (int)(nextRand() % 4);
+    // streamVisible = the concatenated byte stream v1 hashes actually changed.
+    // v1 frames nothing per record, so inserting/deleting an EMPTY record is
+    // invisible to it (frozen construction; empty-member shells hash to "").
+    // v2 frames every segment with byte+record counts and folds n, so it must
+    // catch structural changes even when zero bytes move.
+    bool streamVisible = true;
+    if (mode == 0) {
+      // Flip one byte in one record (falls through to duplicate when the picked
+      // record is empty - there is no byte to flip).
+      size_t ri = nextRand() % n;
+      if (!storage[ri].empty()) {
+        size_t bi = nextRand() % storage[ri].size();
+        storage[ri][bi] = (char)('a' + ((storage[ri][bi] - 'a' + 1 + (int)(nextRand() % 7)) % 8));
+        flips++;
+      } else {
+        const std::string& rec = storage[nextRand() % n];
+        streamVisible = !rec.empty();
+        storage.push_back(rec);
+        dups++;
+      }
+    } else if (mode == 1) {
+      std::string rec((size_t)(nextRand() % 9), 'x');
+      streamVisible = !rec.empty();
+      storage.insert(storage.begin() + (long)(nextRand() % n), std::move(rec));
+      inserts++;
+    } else if (mode == 2 && n > 1) {
+      size_t ri = nextRand() % n;
+      streamVisible = !storage[ri].empty();
+      storage.erase(storage.begin() + (long)ri);
+      deletes++;
+    } else {
+      const std::string& rec = storage[nextRand() % n];
+      streamVisible = !rec.empty();
+      storage.push_back(rec);
+      dups++;
+    }
+    auto mutViews = toViewList(storage);
+    uint64_t m1 = graph::canonMixV1(mutViews);
+    uint64_t m2 = graph::canonMixV2(mutViews);
+    if (streamVisible) {
+      Assert(m1 != h1,
+             "canon fuzz iter %ld: v1 MISSED a stream-visible mutation (n=%zu mode=%d h=%016zx)", it, n, mode, (size_t)h1);
+    } else {
+      Assert(m1 == h1,
+             "canon fuzz iter %ld: v1 changed on an empty-record mutation (n=%zu mode=%d)", it, n, mode);
+    }
+    Assert(m2 != h2,
+           "canon fuzz iter %ld: v2 MISSED the mutation (n=%zu mode=%d h=%016zx)", it, n, mode, (size_t)h2);
+    sizes += (long)n;
+  }
+  fprintf(stderr, "[canon-fuzz] PASS: %ld iters (%ld flips, %ld inserts, %ld deletes, %ld dups, "
+          "%ld total records): every stream-visible mutation changed v1; EVERY mutation "
+          "(including empty-record structural changes v1 cannot see) changed v2\n",
+          iters, flips, inserts, deletes, dups, sizes);
+  return 0;
 }

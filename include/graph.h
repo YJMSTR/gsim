@@ -7,7 +7,7 @@
 
 #include <functional>
 #include <vector>
-
+#include <string_view>
 
 struct MtRepCutClone;
 struct MtRepCutSemanticPlan;
@@ -20,7 +20,13 @@ public:
   void canonDumpTag(const char* tag);
   // Canonical order-free content hash of the current graph (seed input identity).
   uint64_t canonInputHash();
-  // Pre-topoSort variant over supersrc (GSIM_DEBUG_PRE_CANON bisect).
+  // Exact FNV-1a mixes over the sorted record stream (verification-only values;
+  // see seedOrder2.cpp). V1 = frozen serial whole-stream mix (champion seeds).
+  // V2 = parallel segmented construction (GSIM_SEED2_CANON=v2); pure function of
+  // the view list, deterministic across thread counts and machines, so the fuzz
+  // harness can exercise it on synthetic streams.
+  static uint64_t canonMixV1(const std::vector<std::string_view>& views);
+  static uint64_t canonMixV2(const std::vector<std::string_view>& views);
   uint64_t canonRawHash();
   // Renumber all emittable nodes by name (content-stable ids for emission).
   void renumberNodesContentStable();

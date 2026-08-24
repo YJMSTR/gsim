@@ -505,6 +505,9 @@ int main(int argc, char** argv) {
   // Standalone seed2 format transcode (GSIM_SEED2_TRANSCODE=in[:out]): convert a seed
   // to the v2 codec frame without any parsing/generation, then exit.
   if (std::getenv("GSIM_SEED2_TRANSCODE") != nullptr) return mtSeed2TranscodeMain();
+  // Standalone canon v1/v2 divergence-detection fuzz (GSIM_SEED2_CANON_FUZZ=<iters>).
+  if (std::getenv("GSIM_SEED2_CANON_FUZZ") != nullptr) return mtSeed2CanonFuzzMain();
+
 
 
   // 28c Phase 1A: mt-level-dispatch implies coarse formation + static profitability.

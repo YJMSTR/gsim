@@ -514,6 +514,15 @@ void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSu
 void mtSeed2VerifyInputHash(uint64_t computedInputHash);
 void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, uint64_t currentCanonHash);
 bool mtSeed2ReplayPointPending(const char* tag);
+// Canon algorithm selector for the CURRENT graph point: 1 = legacy serial FNV-1a
+// (v1, all existing champion seeds), 2 = parallel segmented mix (GSIM_SEED2_CANON=v2).
+// Write mode follows the env; replay mode peeks the next recorded point's tag
+// (mixed v1/v2 seeds replay correctly); every other path is v1.
+int mtSeed2CanonAlgo();
+// Standalone divergence-detection fuzz (GSIM_SEED2_CANON_FUZZ=<iters>): synthetic
+// record streams, flip/insert/delete one record -> BOTH v1 and v2 hashes must
+// change. Returns exit code.
+int mtSeed2CanonFuzzMain();
 std::string mtSeed2KeyOf(const SuperNode* super);
 std::string mtSeed2FullKeyOf(const SuperNode* super);
 void mtSeed2RecordWhenGroup(const SuperNode* cond, const std::vector<SuperNode*>& sources);
