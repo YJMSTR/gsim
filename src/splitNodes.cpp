@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 #include "common.h"
+#include "phaseTimer.h"
 #include "splitNode.h"
 
 #define NODE_REF first
@@ -753,10 +754,15 @@ void getCut(Node* node, std::set<int>& cuts, Segments* seg1, Segments* seg2) {
 void graph::splitNodes() {
   int num = 0;
   /* initialize nodeSegments */
-  for (SuperNode* super : sortedSuper) {
-    for (Node* node : super->member) nodeSegments[node] = std::make_pair(new Segments(node->width), new Segments(node->width));
+  {
+    PhaseTimer t("splitNodes.segInit");
+    for (SuperNode* super : sortedSuper) {
+      for (Node* node : super->member) nodeSegments[node] = std::make_pair(new Segments(node->width), new Segments(node->width));
+    }
   }
 /* update nodeComponent & nodeSegments */
+  {
+    PhaseTimer t("splitNodes.inferComponent");
   for (SuperNode* super : sortedSuper) {
     for (Node* node : super->member) {
       NodeComponent* comp;
@@ -769,8 +775,11 @@ void graph::splitNodes() {
       Assert(node->width == componentMap[node]->countWidth(), "%s width not match %d != %d", node->name.c_str(), node->width, comp->width);
     }
   }
-  /* update refer & update segments for each node */
+  }
   std::set<Node*> validNodes;
+  {
+    PhaseTimer t("splitNodes.genReferSegment");
+  /* update refer & update segments for each node */
   for (int i = sortedSuper.size() - 1; i >= 0; i --) {
     for (int j = sortedSuper[i]->member.size() - 1; j >= 0; j --) {
       Node* node = sortedSuper[i]->member[j];
@@ -779,6 +788,9 @@ void graph::splitNodes() {
       genReferSegment(node, comp);
     }
   }
+  }
+  {
+    PhaseTimer t("splitNodes.splitLoop");
 
   std::set<Node*> checkNodes(validNodes);
   std::set<Node*> arrayMember;
@@ -841,6 +853,9 @@ void graph::splitNodes() {
     checkNodes.clear();
     reInferAll(true, checkNodes);
   }
+  }
+  {
+    PhaseTimer t("splitNodes.updateTrees");
 
   /* update assignTree*/
   for (SuperNode* super : sortedSuper) {
@@ -854,6 +869,9 @@ void graph::splitNodes() {
     for (ExpTree* tree : node->assignTree) tree->updateWithSplittedNode();
     if (node->resetTree) node->resetTree->updateWithSplittedNode();
   }
+  }
+  {
+    PhaseTimer t("splitNodes.updateSupers");
 
 /* update superNodes, replace reg by splitted regs */
   for (size_t i = 0; i < sortedSuper.size(); i ++) {
@@ -881,19 +899,23 @@ void graph::splitNodes() {
       }
     }
   }
-  regsrc.erase(
-    std::remove_if(regsrc.begin(), regsrc.end(), [](const Node* n){ return n->status == SPLITTED_NODE; }),
-        regsrc.end()
-  );
-  removeNodesNoConnect(SPLITTED_NODE);
-/* update connection */
-  for (SuperNode* super : sortedSuper) {
-    for (Node* member : super->member) {
-      member->clear_relation();
-    }
   }
+  {
+    PhaseTimer t("splitNodes.reconnect");
+    regsrc.erase(
+      std::remove_if(regsrc.begin(), regsrc.end(), [](const Node* n){ return n->status == SPLITTED_NODE; }),
+          regsrc.end()
+    );
+    removeNodesNoConnect(SPLITTED_NODE);
+  /* update connection */
+    for (SuperNode* super : sortedSuper) {
+      for (Node* member : super->member) {
+        member->clear_relation();
+      }
+    }
 
-  reconnectAll();
+    reconnectAll();
+  }
 
   printf("[splitNode] update %d nodes (total %ld)\n", num, countNodes());
   printf("[splitNode] split %ld nodes (total %ld)\n", splittedNodesSeg.size(), countNodes());

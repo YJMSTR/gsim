@@ -2,7 +2,9 @@
   Remove deadNodes. A node is a deadNode if it has no successor or all successors are also deadNodes.
   must be called after topo-sort
 */
+
 #include "common.h"
+#include "phaseTimer.h"
 #include <stack>
 
 static std::set<Node*> nodesInUpdateTree;
@@ -44,12 +46,21 @@ void graph::removeDeadNodes() {
   if (globalConfig.LogLevel > 1) {
     fprintf(stderr, "[RemoveDeadNodes] pass %d start\n", curPass);
   }
-  std::set<Node*> visited;
-  std::stack<Node*> s;
-  auto add = [&visited, &s](Node* node) {
-    if (visited.find(node) == visited.end()) {
-      s.push(node);
-      visited.insert(node);
+  /* Reachability marking uses a per-call epoch stamped into Node::reachEpoch
+   * instead of a std::set<Node*>: same claim-once semantics, O(1) cache-friendly
+   * membership. The visited *set* is the only output of the traversal (the mark
+   * loop below reads membership, never order), so the traversal order change
+   * from stack->vector is unobservable. */
+  static uint32_t reachEpochCounter = 0;
+  const uint32_t epoch = ++ reachEpochCounter;
+  size_t totalNodes = 0, totalSuper = 0;
+  {
+    PhaseTimer tReach("RemoveDeadNodes.reach");
+  std::vector<Node*> s;
+  auto add = [&s, epoch](Node* node) {
+    if (node->reachEpoch != epoch) {
+      s.push_back(node);
+      node->reachEpoch = epoch;
     }
   };
   for (Node* outNode : output) add(outNode);
@@ -59,9 +70,8 @@ void graph::removeDeadNodes() {
       if (member->type == NODE_EXT || member->type == NODE_EXT_IN || member->type == NODE_EXT_OUT) add(member);
     }
   }
-  while (!s.empty()) {
-    Node* top = s.top();
-    s.pop();
+  for (size_t si = 0; si < s.size(); si ++) {
+    Node* top = s[si];
     for (Node* prev : top->prev) {
       add(prev);
     }
@@ -81,11 +91,13 @@ void graph::removeDeadNodes() {
       for (Node* member : ext->member) add(member);
     }
   }
-
-  for (SuperNode* super : sortedSuper) {
+  }
+  {
+    PhaseTimer tMark("RemoveDeadNodes.markDead");
+    for (SuperNode* super : sortedSuper) {
     for (Node* node : super->member) {
       if (node->type == NODE_INP || node->type == NODE_OUT) continue;
-      if (visited.find(node) == visited.end()) {
+      if (node->reachEpoch != epoch) {
         if (globalConfig.LogLevel > 1) {
           fprintf(stderr, "[RemoveDeadNodes] pass %d mark dead: %s type=%d super=%d line=%d\n",
                   curPass, node->name.c_str(), node->type, super->id, __LINE__);
@@ -94,10 +106,12 @@ void graph::removeDeadNodes() {
       }
     }
   }
-
+  }
+  {
+    PhaseTimer tCleanup("RemoveDeadNodes.cleanup");
   /* counters */
-  size_t totalNodes = countNodes();
-  size_t totalSuper = sortedSuper.size();
+  totalNodes = countNodes();
+  totalSuper = sortedSuper.size();
 
   removeNodes(DEAD_NODE);
   regsrc.erase(
@@ -117,8 +131,11 @@ void graph::removeDeadNodes() {
       i --;
     }
   }
-  reconnectAll();
-
+  }
+  {
+    PhaseTimer tReconnect("RemoveDeadNodes.reconnectAll");
+    reconnectAll();
+  }
   size_t optimizedNodes = countNodes();
   size_t optimizedSuper = sortedSuper.size();
 

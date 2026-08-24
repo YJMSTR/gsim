@@ -1,20 +1,23 @@
 #include "common.h"
 #include <cstdint>
 #include <stack>
-
+#include "phaseTimer.h"
 #define MAX_COMMON_NEXT 5
 
 static std::map<uint64_t, std::vector<Node*>> exprId;
 
-static std::map<Node*, uint64_t> nodeId;
-static std::map<Node*, Node*> realValueMap;
+/* nodeId / realValueMap moved into Node scratch fields (exprKeyCache /
+ * realValue) - same values, no red-black tree lookups on the hot paths.
+ * exprKeyCache==0 encodes "not in map" (ids start at 1), realValue==nullptr
+ * likewise, so the field semantics are exactly the old find()-based ones. */
 static std::map<Node*, Node*> aliasMap;
 
 
 uint64_t ENode::keyHash() {
-  if (nodePtr) return nodeId.find(nodePtr) != nodeId.end() ? nodeId[nodePtr] : nodePtr->id;
+  if (nodePtr) return nodePtr->exprKeyCache ? nodePtr->exprKeyCache : (uint64_t)nodePtr->id;
   else return opType * width;
 }
+
 
 uint64_t ExpTree::keyHash() {
   std::stack<ENode*> s;
@@ -46,7 +49,9 @@ bool checkENodeEq(ENode* enode1, ENode* enode2) {
   if (enode1->opType == OP_INT && enode1->strVal != enode2->strVal) return false;
   if (enode1->values.size() != enode2->values.size()) return false;
   if ((!enode1->getNode() && enode2->getNode()) || (enode1->getNode() && !enode2->getNode())) return false;
-  bool realEq = realValueMap.find(enode1->getNode()) != realValueMap.end() && realValueMap.find(enode2->getNode()) != realValueMap.end() && realValueMap[enode1->getNode()] == realValueMap[enode2->getNode()];
+  Node* rv1 = enode1->getNode() ? enode1->getNode()->realValue : nullptr;
+  Node* rv2 = enode2->getNode() ? enode2->getNode()->realValue : nullptr;
+  bool realEq = rv1 && rv2 && rv1 == rv2;
   if (enode1->getNode() && enode2->getNode() && enode1->getNode() != enode2->getNode() && !realEq) return false;
   for (size_t i = 0; i < enode1->values.size(); i ++) {
     if (enode1->values[i] != enode2->values[i]) return false;
@@ -97,50 +102,53 @@ void ExpTree::replace(std::map<Node*, Node*>& aliasMap) {
 
 /* TODO: check common regs */
 void graph::commonExpr() {
+  {
+    PhaseTimer t("CommonExpr.keyHash");
   for (SuperNode* super : sortedSuper) {
     if (super->superType != SUPER_VALID) {
-      for (Node* node : super->member) nodeId[node] = node->id;
+      for (Node* node : super->member) node->exprKeyCache = node->id;
       continue;
     }
     for (Node* node : super->member) {
       if(node->status != VALID_NODE) continue;
-      nodeId[node] = node->id;
+      node->exprKeyCache = node->id;
       if (node->type != NODE_OTHERS || node->isArray()) continue;
       if (node->prev.size() == 0) continue;
       // if (node->next.size() == 1) continue;
       uint64_t key = node->keyHash();
-      if (exprId.find(key) == exprId.end()) {
-        exprId[key] = std::vector<Node*>();
-      }
       exprId[key].push_back(node);
-      nodeId[node] = key;
+      node->exprKeyCache = key;
     }
   }
-
+  }
   std::map<Node*, std::vector<Node*>> uniqueNodes;
+  {
+    PhaseTimer t("CommonExpr.match");
   std::map<uint64_t, std::vector<Node*>> key2UniqueNodes;
   for (SuperNode* super : sortedSuper) {
     for (Node* node : super->member) {
-      uint64_t key = nodeId[node];
+      uint64_t key = node->exprKeyCache;
       if (exprId[key].size() <= 1) { // slot with only one member
-        realValueMap[node] = node;
+        node->realValue = node;
         uniqueNodes[node] = std::vector<Node*>(1, node);
         continue;
       }
       for (Node* unique : key2UniqueNodes[key]) {
         if (uniqueNodes.find(unique) != uniqueNodes.end() && checkNodeEq(node, unique)) {
           uniqueNodes[unique].push_back(node);
-          realValueMap[node] = unique;
+          node->realValue = unique;
         }
       }
-      if (realValueMap.find(node) == realValueMap.end()) {
-        realValueMap[node] = node;
+      if (node->realValue == nullptr) {
+        node->realValue = node;
         uniqueNodes[node] = std::vector<Node*>(1, node);
         key2UniqueNodes[key].push_back(node);
       }
     }
   }
-
+  }
+  {
+    PhaseTimer t("CommonExpr.decideMerge");
   for (auto iter : uniqueNodes) {
     bool mergeCond = iter.second.size() >= MAX_COMMON_NEXT || iter.second[0]->width > BASIC_WIDTH;
     if (!mergeCond) {
@@ -157,7 +165,9 @@ void graph::commonExpr() {
       }
     }
   }
-
+  }
+  {
+    PhaseTimer t("CommonExpr.replaceTrees");
 /* update assignTrees */
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
@@ -166,10 +176,13 @@ void graph::commonExpr() {
       if (member->resetTree) member->resetTree->replace(aliasMap);
     }
   }
-
+  }
+  {
+    PhaseTimer t("CommonExpr.removeReconnect");
 /* update connection */
   removeNodesNoConnect(DEAD_NODE);
   reconnectAll();
+  }
 
   printf("[commonExpr] remove %ld nodes (-> %ld)\n", aliasMap.size(), countNodes());
 

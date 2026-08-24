@@ -1,4 +1,5 @@
 #include "common.h"
+#include "phaseTimer.h"
 #include <cstdio>
 #include <queue>
 #include <stack>
@@ -390,9 +391,12 @@ void graph::splitArrayNode(Node* node) {
 }
 
 void graph::splitArray() {
+  {
+    PhaseTimer t("splitArray.splitLoop");
   std::map<Node*, int> times;
   std::stack<Node*> s;
   int num = 0;
+
 
   for (SuperNode* super : supersrc) {
     for (Node* node : super->member) {
@@ -450,7 +454,11 @@ void graph::splitArray() {
   }
   Assert(partialVisited.size() == 0, "partial is not empty!");
   printf("[splitArray] split %d arrays\n", num);
-  splitOptionalArray();
+  }
+  {
+    PhaseTimer t("splitArray.optional");
+    splitOptionalArray();
+  }
 
   supersrc.erase(
     std::remove_if(supersrc.begin(), supersrc.end(), [](const SuperNode* n) {return n->member[0]->status == DEAD_NODE; }),

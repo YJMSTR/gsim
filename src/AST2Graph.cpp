@@ -4,6 +4,7 @@
 
 
 #include "common.h"
+#include "phaseTimer.h"
 #include <stack>
 #include <map>
 #include <utility>
@@ -1560,10 +1561,15 @@ graph* AST2Graph(PNode* root) {
     moduleMap[module->name] = module;
   }
   Assert(topModule, "Top module can not be NULL\n");
-  visitTopModule(g, topModule);
+  {
+    PhaseTimer t("Init.visitTopModule");
+    visitTopModule(g, topModule);
+  }
 
 /* infer memory port (NODE_INFER) */
-  for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
+  {
+    PhaseTimer t("Init.memPortInfer");
+    for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
     Node* node = it->second;
     if (node->type == NODE_INFER || node->type == NODE_READER) {
       if (node->parent->rlatency == 1) {
@@ -1621,67 +1627,93 @@ graph* AST2Graph(PNode* root) {
 #endif
     }
   }
-  removeDummyDim(g);
-
-  for (Node* reg : g->regsrc) {
-    /* set lvalue to regDst */
-    for (ExpTree* tree : reg->assignTree) {
-      if (tree->getlval()) {
-        Assert(tree->getlval()->nodePtr, "lvalue in %s is not node", reg->name.c_str());
-        tree->getlval()->nodePtr = reg->getDst();
-      }
-    }
-    reg->getDst()->assignTree.insert(reg->getDst()->assignTree.end(), reg->assignTree.begin(), reg->assignTree.end());
-    reg->assignTree.clear();
-
-    reg->addReset();
-    reg->addUpdateTree();
   }
-  g->clockOptimize(allSignals);
+  {
+    PhaseTimer t("Init.removeDummyDim");
+    removeDummyDim(g);
+  }
+  {
+    PhaseTimer t("Init.regFinalize");
+    for (Node* reg : g->regsrc) {
+      /* set lvalue to regDst */
+      for (ExpTree* tree : reg->assignTree) {
+        if (tree->getlval()) {
+          Assert(tree->getlval()->nodePtr, "lvalue in %s is not node", reg->name.c_str());
+          tree->getlval()->nodePtr = reg->getDst();
+        }
+      }
+      reg->getDst()->assignTree.insert(reg->getDst()->assignTree.end(), reg->assignTree.begin(), reg->assignTree.end());
+      reg->assignTree.clear();
 
-  for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
-    it->second->invalidArrayOptimize();
+      reg->addReset();
+      reg->addUpdateTree();
+    }
+  }
+  {
+    PhaseTimer t("Init.clockOptimize");
+    g->clockOptimize(allSignals);
+  }
+  {
+    PhaseTimer t("Init.invalidArrayOptimize");
+    for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
+      it->second->invalidArrayOptimize();
+    }
   }
   // two passes, not an interleave (same bug class as splitArrayNode).
   // updateDep(R) reads R->next; that set is only complete after every consumer's
   // updateConnect ran. Name order happens to place $NEXT nodes before their regs,
   // but any consumer sorting after its reg was silently missed by the propagation.
-  for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
-    updatePrevNext(it->second);
+  {
+    PhaseTimer t("Init.updatePrevNext");
+    for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
+      updatePrevNext(it->second);
+    }
   }
-  for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
-    if (it->second->type == NODE_REG_SRC) it->second->updateDep();
+  {
+    PhaseTimer t("Init.updateDep");
+    for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
+      if (it->second->type == NODE_REG_SRC) it->second->updateDep();
+    }
   }
 
-  for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
-    it->second->constructSuperNode();
+  {
+    PhaseTimer t("Init.constructSuperNode");
+    for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
+      it->second->constructSuperNode();
+    }
   }
   /* must be called after constructSuperNode all finished */
-  for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
-    it->second->constructSuperConnect();
+  {
+    PhaseTimer t("Init.constructSuperConnect");
+    for (auto it = allSignals.begin(); it != allSignals.end(); it ++) {
+      it->second->constructSuperConnect();
+    }
   }
   /* find all sources: regsrc, memory rdata, input, constant node */
-  for (Node* reg : g->regsrc) {
-    if (reg->prev.size() == 0)
-      g->supersrc.push_back(reg->super);
-    if (reg->getDst()->prev.size() == 0)
-      g->supersrc.push_back(reg->getDst()->super);
-  }
-
-  for (Node* input : g->input) {
-    g->supersrc.push_back(input->super);
-    for (ExpTree* tree : input->assignTree) Assert(tree->isInvalid(), "input %s not invalid", input->name.c_str());
-    input->assignTree.clear();
-  }
-  for (auto it : allSignals) {
-    if ((it.second->type == NODE_OTHERS || it.second->type == NODE_READER || it.second->type == NODE_WRITER || it.second->type == NODE_READWRITER ||
-        it.second->type == NODE_SPECIAL || it.second->type == NODE_EXT || it.second->type == NODE_EXT_IN || it.second->type == NODE_OUT)
-        && it.second->super->prev.size() == 0) {
-      g->supersrc.push_back(it.second->super);
+  {
+    PhaseTimer t("Init.collectSupersrc");
+    for (Node* reg : g->regsrc) {
+      if (reg->prev.size() == 0)
+        g->supersrc.push_back(reg->super);
+      if (reg->getDst()->prev.size() == 0)
+        g->supersrc.push_back(reg->getDst()->super);
     }
-    if (it.second->isArray()) {
-      for (ExpTree* tree : it.second->assignTree) {
-        if(tree->isConstant()) g->halfConstantArray.insert(it.second);
+
+    for (Node* input : g->input) {
+      g->supersrc.push_back(input->super);
+      for (ExpTree* tree : input->assignTree) Assert(tree->isInvalid(), "input %s not invalid", input->name.c_str());
+      input->assignTree.clear();
+    }
+    for (auto it : allSignals) {
+      if ((it.second->type == NODE_OTHERS || it.second->type == NODE_READER || it.second->type == NODE_WRITER || it.second->type == NODE_READWRITER ||
+          it.second->type == NODE_SPECIAL || it.second->type == NODE_EXT || it.second->type == NODE_EXT_IN || it.second->type == NODE_OUT)
+          && it.second->super->prev.size() == 0) {
+        g->supersrc.push_back(it.second->super);
+      }
+      if (it.second->isArray()) {
+        for (ExpTree* tree : it.second->assignTree) {
+          if(tree->isConstant()) g->halfConstantArray.insert(it.second);
+        }
       }
     }
   }

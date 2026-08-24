@@ -115,6 +115,12 @@ class Node {
   int order = -1;
   int orderInSuper = -1;
   int lineno = -1;
+  /* pass scratch (never dumped, never emitted): epoch marks and cached keys.
+   * Semantics: 0 = unset; callers pair them with their own per-call epoch. */
+  uint32_t reachEpoch = 0;      /* removeDeadNodes: last reach pass that claimed this node */
+  uint32_t topoEpoch = 0;       /* topoSort/visited: last dfs pass that visited this node */
+  uint64_t exprKeyCache = 0;    /* commonExpr: node->key hash (0 -> fall back to id) */
+  Node* realValue = nullptr;    /* commonExpr: realValueMap value (nullptr = not present) */
   /* adjacent */
   std::set<Node*> next;
   std::set<Node*> prev;
@@ -389,10 +395,12 @@ public:
   std::set<SuperNode*> depNext;
   std::vector<Node*> member; // The order of member is neccessary
   std::vector<InstInfo> insts;
-  StmtTree* stmtTree = nullptr;
-  int id;
-  int order;
   int cppId = -1;
+  /* topoSort scratch: (epoch<<32)|count packed; count==0 means visited-only */
+  uint64_t topoMark = 0;
+  int id;
+  StmtTree* stmtTree = nullptr;
+  int order;
   SuperType superType = SUPER_VALID;
   Node* resetNode = nullptr;
   SuperNode() {

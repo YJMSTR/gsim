@@ -3,6 +3,7 @@
   merge constantNode into here
 */
 
+#include "phaseTimer.h"
 #include <map>
 #include <gmp.h>
 #include <queue>
@@ -1848,21 +1849,28 @@ std::string computeExtMod(SuperNode* super) {
 }
 
 void graph::instsGenerator() {
+
   maxConcatNum = 0;
   std::set<Node*> s;
   std::set<Node*> s_array;
-  for (SuperNode* super : sortedSuper) {
-    for (Node* n : super->member) n->updateIsRoot();
-  }
-  for (SuperNode* super : sortedSuper) {
-    if (super->superType == SUPER_EXTMOD) {
-      extDecl.push_back(computeExtMod(super));
-    } else {
-      super->stmtTree->compute(super->insts);
+  {
+    PhaseTimer t("instsGen.updateIsRoot");
+    for (SuperNode* super : sortedSuper) {
+      for (Node* n : super->member) n->updateIsRoot();
     }
   }
-  for (SuperNode* super : allReset) {
-    super->stmtTree->compute(super->insts);
+  {
+    PhaseTimer t("instsGen.compute");
+    for (SuperNode* super : sortedSuper) {
+      if (super->superType == SUPER_EXTMOD) {
+        extDecl.push_back(computeExtMod(super));
+      } else {
+        super->stmtTree->compute(super->insts);
+      }
+    }
+    for (SuperNode* super : allReset) {
+      super->stmtTree->compute(super->insts);
+    }
   }
 
   /* remove constant nodes */

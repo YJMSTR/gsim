@@ -5,8 +5,8 @@
 
 #include <cstdio>
 #include <map>
-#include <gmp.h>
 #include <queue>
+#include "phaseTimer.h"
 #include <stack>
 #include <tuple>
 #include <utility>
@@ -1262,14 +1262,23 @@ void ExpTree::removeConstant(const char* ownerName) {
 }
 
 void graph::constantAnalysis() {
-  for (SuperNode* super : sortedSuper) {
-    for (Node* n : super->member) {
-      consMap[n] = new valInfo(n->width, n->sign);
-      addRecompute(n);
+  {
+    PhaseTimer t("ConstantAnalysis.initCons");
+    for (SuperNode* super : sortedSuper) {
+      for (Node* n : super->member) {
+        consMap[n] = new valInfo(n->width, n->sign);
+        addRecompute(n);
+      }
     }
   }
-  recomputeAllNodes();
-  constantMemory();
+  {
+    PhaseTimer t("ConstantAnalysis.recompute");
+    recomputeAllNodes();
+  }
+  {
+    PhaseTimer t("ConstantAnalysis.constantMemory");
+    constantMemory();
+  }
   /* remove constant nodes */
   int consNum = 0;
   for (SuperNode* super : sortedSuper) {
@@ -1282,6 +1291,8 @@ void graph::constantAnalysis() {
     }
   }
 
+  {
+    PhaseTimer t("ConstantAnalysis.fold");
   /* update assignTree */
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
@@ -1349,7 +1360,9 @@ void graph::constantAnalysis() {
       }
     }
   }
-
+  }
+  {
+    PhaseTimer t("ConstantAnalysis.removeReconnect");
   if (globalConfig.DumpConstStatus) {
     std::string path = globalConfig.OutputDir + "/" + name + "_ConstStatus.json";
     std::ofstream ofs(path);
@@ -1375,6 +1388,8 @@ void graph::constantAnalysis() {
   );
 
   reconnectAll();
+
+  }
 
   size_t optimizeNodes = countNodes();
   printf("[constantNode] find %d constantNodes (total %ld)\n", consNum, optimizeNodes);
