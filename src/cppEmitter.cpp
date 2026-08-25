@@ -1375,6 +1375,20 @@ static bool mtUseDenseExecutorCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// GSIM_MT_DENSE_ONLY_CODEGEN (default off): emit only the dense executor and
+// the lean serial-fast fallback. The sparse-dispatch runtime text is dropped:
+// the buffered mtTaskN(flag, ActivationDelta&) helpers, the plain serial
+// subStepN() scan (with its coarse-region dispatch and pure-batch calls), the
+// pure-batch shard switch tables, and the whole coarse runner. The worker
+// pool itself stays (the dense executor posts jobKind 6/7 jobs to it); its
+// sparse job kinds are not emitted. step() aborts with a clear message when
+// the configured runtime would need the sparse path. Default off keeps the
+// generated model byte-identical.
+static bool mtUseDenseOnlyCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_ONLY_CODEGEN");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 static bool mtUseDenseXThreadDepsOnly() {
   const char* env = std::getenv("GSIM_MT_DENSE_XTHREAD_DEPS_ONLY");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -10191,7 +10205,12 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   int shardCount = mtPureBatchShardCount();
   bool useCoarse = globalConfig.MtBatchFormationMode == "coarse";
   bool waitProbeCodegen = mtUseWaitProbeCodegen();
-  auto emitPureTaskSwitchCases = [&](int shardBegin, int shardEnd, bool workerMode) {
+  // Dense-only: pure-batch shard switch tables and mtRunPureBatchWorkerRange
+  // are sparse-dispatch text (they call the dropped buffered mtTaskN /
+  // mtRepCutLiteTaskN helpers); the worker pool core below stays because the
+  // dense executor posts jobKind 6/7 jobs to it.
+  const bool denseOnlyCodegen = mtUseDenseOnlyCodegen();
+  [[maybe_unused]] auto emitPureTaskSwitchCases = [&](int shardBegin, int shardEnd, bool workerMode) {
     for (int cppId = shardBegin; cppId < shardEnd; cppId ++) {
       if (mtTasks[cppId].taskKind != "pure_compute") continue;
       emitBodyLock(4, "case %d:\n", cppId);
@@ -10243,6 +10262,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
       emitBodyLock(5, "break;\n");
     }
   };
+  if (!denseOnlyCodegen) {
   for (int shard = 0; shard < shardCount; shard ++) {
     int shardBegin = shard * MT_PURE_BATCH_SHARD_SIZE;
     int shardEnd = std::min(superId, shardBegin + MT_PURE_BATCH_SHARD_SIZE);
@@ -10290,6 +10310,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
+  }
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolPause() {\n", name.c_str());
   emitBodyLock(1, "#if defined(__x86_64__) || defined(__i386__)\n");
@@ -10410,7 +10431,16 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(2, "const int chunkBegin = mtWorkerPoolChunks[(size_t)worker].begin;\n");
   emitBodyLock(2, "const int chunkEnd = mtWorkerPoolChunks[(size_t)worker].end;\n");
   emitBodyLock(2, "const int jobKind = mtWorkerPoolJobKind;\n");
-  if (useCoarse) {
+  if (denseOnlyCodegen) {
+    // Dense-only: the pool only ever serves dense jobs (kind 6 dense layer,
+    // kind 7 dense thread worker). The pure-batch (0) and coarse (1/2/3/5)
+    // sparse job kinds have no emitted handlers.
+    emitBodyLock(2, "if (jobKind == 6) {\n");
+    emitBodyLock(3, "(this->*mtWorkerPoolDenseLayerFn)(worker, chunkBegin, chunkEnd);\n");
+    emitBodyLock(2, "} else if (jobKind == 7) {\n");
+    emitBodyLock(3, "stepDenseThreadWorker(worker);\n");
+    emitBodyLock(2, "}\n");
+  } else if (useCoarse) {
     emitBodyLock(2, "const int coarseRegionIndex = mtWorkerPoolCoarseRegionIndex;\n");
     emitBodyLock(2, "const int coarseLayerIndex = mtWorkerPoolCoarseLayerIndex;\n");
     emitBodyLock(2, "if (jobKind == 1) {\n");
@@ -10578,6 +10608,9 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "mtWorkerPoolThreads.clear();\n");
   emitBodyLock(0, "}\n");
 
+  // Dense-only: mtRunPureBatch is the sparse pure-batch dispatcher; its only
+  // callers are the plain subStepN() scan, which is not emitted.
+  if (!denseOnlyCodegen) {
   emitFuncDecl(0, "void S%s::mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord) {\n", name.c_str(), ACTIVE_WIDTH);
   emitBodyLock(1, "int taskCount = endCppId - beginCppId;\n");
   emitBodyLock(1, "if (taskCount <= 0) return;\n");
@@ -10798,6 +10831,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileBatchWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(1, "if (mtProfileEnabled) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(0, "}\n");
+  }
 }
 
 void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan) {
@@ -12193,23 +12227,36 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
       // frozen state (cppId2Super, super2ResetId, semanticPlan clones) plus the
       // per-thread emission context. Render in parallel, assemble in cppId
       // order - byte-identical to sequential emission.
-      emitUnitsParallel((size_t)superId, [this](size_t unit) {
+      const bool denseOnlyCodegen = mtUseDenseOnlyCodegen();
+      emitUnitsParallel((size_t)superId, [this, denseOnlyCodegen](size_t unit) {
         int idx = (int)unit;
-        genMtTaskHelper(cppId2Super[idx], true, "ActivationDelta");
+        // Dense-only: the buffered mtTaskN(flag, ActivationDelta&) variant is
+        // referenced only by the sparse coarse/pure-batch dispatch, which is
+        // not emitted. Keep the unbuffered mtTaskN(flag) bodies.
+        if (!denseOnlyCodegen) genMtTaskHelper(cppId2Super[idx], true, "ActivationDelta");
         genMtTaskHelper(cppId2Super[idx], false, "ActivationDelta");
       });
-      emitUnitsParallel((size_t)superId, [this, &mtTasks, &semanticPlan](size_t unit) {
-        int idx = (int)unit;
-        auto taskIter = mtTasks.find(idx);
-        if (taskIter != mtTasks.end() && taskIter->second.repcutRuntimeApplied) {
-          genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx), "ActivationDelta");
-        }
-      });
+      if (!denseOnlyCodegen) {
+        emitUnitsParallel((size_t)superId, [this, &mtTasks, &semanticPlan](size_t unit) {
+          int idx = (int)unit;
+          auto taskIter = mtTasks.find(idx);
+          if (taskIter != mtTasks.end() && taskIter->second.repcutRuntimeApplied) {
+            genMtRepCutLiteTaskHelper(cppId2Super[idx], mtRepCutClonesForSink(semanticPlan, idx), "ActivationDelta");
+          }
+        });
+      }
     }
     { EmitPhaseTimer runnersTimer("Final.mtTaskRunners"); genMtTaskRunner(semanticPlan); }
-    if (globalConfig.MtBatchFormationMode == "coarse") {
+    if (globalConfig.MtBatchFormationMode == "coarse" && !mtUseDenseOnlyCodegen()) {
       EmitPhaseTimer coarseRunnerTimer("Final.mtCoarseRegionRunner");
       genMtCoarseRegionRunner(semanticPlan, coarsePlan);
+    }
+    if (mtUseDenseOnlyCodegen()) {
+      // Dense-only model: the plain serial subStepN() scan is sparse-dispatch
+      // fallback text (coarse-region dispatch, pure-batch calls, scalar task
+      // dispatch). step() aborts instead of falling through to it, so no
+      // subStepN() bodies or declarations are emitted at all.
+      return -1;
     }
 
     EmitPhaseTimer subStepTimer("Final.subSteps");
@@ -15460,28 +15507,36 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
     emitBodyLock(2, "return;\n");
     emitBodyLock(1, "}\n");
   }
-  bool stepActiveWordGuard = mtUseStepActiveWordGuard();
-  for (int i = 0; i <= subStepIdxMax; i ++) {
-    bool guardedSubStep = stepActiveWordGuard && i < (int)mtStepActiveWordGuards.size() &&
-                          i < (int)mtStepActiveWordGuardable.size() &&
-                          mtStepActiveWordGuardable[(size_t)i] &&
-                          !mtStepActiveWordGuards[(size_t)i].empty();
-    if (guardedSubStep) {
-      const std::vector<int>& guards = mtStepActiveWordGuards[(size_t)i];
-      std::string guardExpr;
-      for (int activeWord : guards) {
-        if (!guardExpr.empty()) guardExpr += " | ";
-        guardExpr += format("activeFlags[%d]", activeWord);
+  if (mtUseDenseOnlyCodegen()) {
+    // Dense-only model: the sparse serial scan is not compiled in. The only
+    // live paths are the dense executor (returned earlier) and the serial-fast
+    // block above; anything reaching here has no runtime to run on.
+    emitBodyLock(1, "fprintf(stderr, \"[gsim] dense-only model: this worker configuration requires the sparse runtime (rebuild without GSIM_MT_DENSE_ONLY_CODEGEN)\\n\");\n");
+    emitBodyLock(1, "abort();\n");
+  } else {
+    bool stepActiveWordGuard = mtUseStepActiveWordGuard();
+    for (int i = 0; i <= subStepIdxMax; i ++) {
+      bool guardedSubStep = stepActiveWordGuard && i < (int)mtStepActiveWordGuards.size() &&
+                            i < (int)mtStepActiveWordGuardable.size() &&
+                            mtStepActiveWordGuardable[(size_t)i] &&
+                            !mtStepActiveWordGuards[(size_t)i].empty();
+      if (guardedSubStep) {
+        const std::vector<int>& guards = mtStepActiveWordGuards[(size_t)i];
+        std::string guardExpr;
+        for (int activeWord : guards) {
+          if (!guardExpr.empty()) guardExpr += " | ";
+          guardExpr += format("activeFlags[%d]", activeWord);
+        }
+        emitBodyLock(1, "if (unlikely((%s) != 0)) subStep%d();\n", guardExpr.c_str(), i);
+      } else {
+        emitBodyLock(1, "subStep%d();\n", i);
       }
-      emitBodyLock(1, "if (unlikely((%s) != 0)) subStep%d();\n", guardExpr.c_str(), i);
-    } else {
-      emitBodyLock(1, "subStep%d();\n", i);
     }
-  }
 
-  // Dump before cycles++ so the trace line names the cycle whose substeps just ran.
-  emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
-  if (mtUseActivationEventTraceCodegen()) emitBodyLock(1, "flushMtActivationEventTraceCycle();\n");
+    // Dump before cycles++ so the trace line names the cycle whose substeps just ran.
+    emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
+    if (mtUseActivationEventTraceCodegen()) emitBodyLock(1, "flushMtActivationEventTraceCycle();\n");
+  }
   emitBodyLock(1, "cycles ++;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileTotalStepNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileStepBegin).count();\n");
   emitBodyLock(0, "}\n");
@@ -17366,6 +17421,9 @@ void graph::cppEmitter() {
   int subStepIdxMax = 0;
   int serialFastSubStepMax = -1;
   std::string serialFastSuffix;
+  Assert(!mtUseDenseOnlyCodegen() || (useMtHelpers && denseExecutorValid),
+         "GSIM_MT_DENSE_ONLY_CODEGEN requires --mt-helper-mode=mt-level-dispatch and the dense executor (GSIM_MT_DENSE_EXECUTOR_CODEGEN)");
+  const bool denseOnlyCodegen = mtUseDenseOnlyCodegen();
   if (useMtHelpers) {
     serialFastSuffix = "SerialFast";
     { EmitPhaseTimer genActivateTimer("Final.genActivate"); serialFastSubStepMax = genActivate(serialFastSuffix); }
@@ -17386,10 +17444,10 @@ void graph::cppEmitter() {
   if (useHelperTasks) {
     for (int i = 0; i < superId; i ++) {
       if (globalConfig.MtHelperMode == "buffered-seq") fprintf(header, "void mtTask%d(uint%d_t &flag, ActiveBuffer &nextActive);\n", i, ACTIVE_WIDTH);
-      if (useMtHelpers) fprintf(header, "void mtTask%d(uint%d_t &flag, ActivationDelta &nextActive);\n", i, ACTIVE_WIDTH);
+      if (useMtHelpers && !denseOnlyCodegen) fprintf(header, "void mtTask%d(uint%d_t &flag, ActivationDelta &nextActive);\n", i, ACTIVE_WIDTH);
       if (!useBufferedHelpers || useMtHelpers) fprintf(header, "void mtTask%d(uint%d_t &flag);\n", i, ACTIVE_WIDTH);
     }
-    if (useMtHelpers) {
+    if (useMtHelpers && !denseOnlyCodegen) {
       for (int i = 0; i < superId; i ++) {
         if (mtRepCutHeaderTasks[i].repcutRuntimeApplied) {
           fprintf(header, "void mtRepCutLiteTask%d(uint%d_t &flag, ActivationDelta &nextActive);\n", i, ACTIVE_WIDTH);
@@ -17397,20 +17455,24 @@ void graph::cppEmitter() {
       }
     }
     if (useMtHelpers) {
-      int shardCount = mtPureBatchShardCount();
-      for (int shard = 0; shard < shardCount; shard ++) {
-        fprintf(header, "void mtRunPureBatchDirectShard%d(int chunkBegin, int chunkEnd, uint%d_t &activeWord);\n", shard, ACTIVE_WIDTH);
-        fprintf(header, "void mtRunPureBatchWorkerShard%d(int worker, int chunkBegin, int chunkEnd, std::vector<std::vector<int>> &mtProfileLocalTaskIds, std::vector<uint64_t> &mtProfileLocalWorkerTaskCount);\n", shard);
+      // Dense-only: shard/pure-batch dispatchers are not emitted; the worker
+      // pool core stays (dense executor jobKind 6/7 posts).
+      if (!denseOnlyCodegen) {
+        int shardCount = mtPureBatchShardCount();
+        for (int shard = 0; shard < shardCount; shard ++) {
+          fprintf(header, "void mtRunPureBatchDirectShard%d(int chunkBegin, int chunkEnd, uint%d_t &activeWord);\n", shard, ACTIVE_WIDTH);
+          fprintf(header, "void mtRunPureBatchWorkerShard%d(int worker, int chunkBegin, int chunkEnd, std::vector<std::vector<int>> &mtProfileLocalTaskIds, std::vector<uint64_t> &mtProfileLocalWorkerTaskCount);\n", shard);
+        }
+        fprintf(header, "void mtRunPureBatchWorkerRange(int worker, int chunkBegin, int chunkEnd);\n");
       }
-      fprintf(header, "void mtRunPureBatchWorkerRange(int worker, int chunkBegin, int chunkEnd);\n");
       fprintf(header, "void mtWorkerPoolPause();\n");
       fprintf(header, "void mtWorkerPoolPost();\n");
       fprintf(header, "void mtWorkerPoolWaitForDone(int expectedDoneCount);\n");
       fprintf(header, "void mtWorkerPoolLoop(int worker);\n");
       fprintf(header, "void startMtWorkerPool();\n");
       fprintf(header, "void stopMtWorkerPool();\n");
-      fprintf(header, "void mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord);\n", ACTIVE_WIDTH);
-      if (useCoarseMt) {
+      if (!denseOnlyCodegen) fprintf(header, "void mtRunPureBatch(int beginCppId, int endCppId, uint%d_t &activeWord);\n", ACTIVE_WIDTH);
+      if (useCoarseMt && !denseOnlyCodegen) {
         fprintf(header, "void mtRunCoarseLayerWorkerRange(int worker, int regionIndex, int layerIndex, int chunkBegin, int chunkEnd);\n");
         fprintf(header, "void mtMergeLocalCoarseDelta(int worker, int regionBeginActiveWord, int regionActiveWordSpan);\n");
         fprintf(header, "void mtRunCoarseMTaskWorkerList(int worker, int regionIndex, const int *mtaskIndices, int mtaskCount);\n");
