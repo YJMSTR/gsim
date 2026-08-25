@@ -55,6 +55,23 @@ Build flags: plain `-O3 -march=znver4`. PGO was measured and is **not** used —
 
 All `GSIM_MT_DENSE_*` knobs are default-off; with none of them set, generation output is byte-identical to upstream.
 
+### Toolchain pipeline cost (generation + build)
+
+Same machine (EPYC 9654, `-j48` builds), same input (XiangShan Default-config `SimTop`, 886 MB FIR / 2,089 Verilog files), clang 23 for the gsim model builds. Note the outputs differ: Verilator emits a 16-thread model, upstream gsim a serial model, gsim-mt the 16-thread dense model — this table compares pipeline cost, not simulation speed (that is the table above).
+
+| Toolchain | Model generation | Model build (-O3 -march=znver4) | Total | Model size |
+|---|---:|---:|---:|---:|
+| Verilator 5.034 | 29m40s (verilate, single-threaded) | 3m22s (864 TUs) | **33m02s** | 2.0 GB |
+| upstream gsim (serial) | 10m15s | 4m00s (257 TUs) | **14m14s** | 2.5 GB |
+| gsim-mt, fresh generation | 10m39s | ~24m53s (fresh model is same shape, 1,214 TUs) | **~35m32s** | 12 GB |
+| gsim-mt, champion seed replay | 20m36s (reproduces the registered T16 model byte-identically) | 24m53s (same model) | **45m29s** | 12 GB |
+
+Notes:
+
+- gsim-mt fresh generation costs about the same as upstream's serial generation (10m39s vs 10m15s): the vcontract MTask-contraction search (mergeLoop 32s) fits inside the savings from the parallel/canon emission work. Seed replay adds ~10 minutes of deterministic schedule search and buys exact regeneration of the registered model (9/9 canon checks, 1,213/1,213 files sha256-identical).
+- The gsim-mt model build is the bottleneck: its dense executor emits per-worker major-text bodies plus the owner-ready synchronization machinery (12 GB of C++ vs upstream's 2.5 GB), and the build is -O3-optimizer-bound on large translation units (header parsing is ~1% — precompiled headers were measured and rejected). Peak generation memory: 81 GB (fresh) / 104 GB (Verilator verilate) / 76 GB (upstream).
+- The runtime payoff for this pipeline cost is in the benchmark table above (6.43s vs Verilator 11.15s at 16 threads).
+
 ### Quick start (XiangShan SimTop netlist, 32 threads)
 
 Generate the model with the champion recipe:
