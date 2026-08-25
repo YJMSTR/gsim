@@ -434,7 +434,7 @@ uint64_t graph::canonInputHash() {
 }
 
 void graph::canonSeed2Record(const char* tag) { mtSeed2RecordPoint(tag, sortedSuper, canonInputHash()); }
-void graph::canonSeed2Apply(const char* tag) { mtSeed2ApplyPoint(tag, sortedSuper, canonInputHash()); orderAllNodes(); }
+void graph::canonSeed2Apply(const char* tag) { mtSeed2ApplyPoint(tag, sortedSuper, mtSeed2CanonVerifyEnabled() ? canonInputHash() : 0); orderAllNodes(); }
 
 // Pre-topoSort variant over supersrc (sortedSuper is empty before topoSort).
 // Same record construction so hashes are comparable with canonInputHash.
@@ -496,7 +496,7 @@ void graph::graphCoarsen() {
     PhaseName pn("pin", tag);
     PhaseTimer t(pn.c_str());
     if (seed2Write) mtSeed2RecordPoint(tag, sortedSuper, canonInputHash());
-    if (seed2Replay) { mtSeed2ApplyPoint(tag, sortedSuper, canonInputHash()); orderAllNodes(); }
+    if (seed2Replay) { mtSeed2ApplyPoint(tag, sortedSuper, mtSeed2CanonVerifyEnabled() ? canonInputHash() : 0); orderAllNodes(); }
   };
 
   {
@@ -848,7 +848,7 @@ void graph::graphPartition() {
   {
     PhaseTimer t("pin.partition.init");
     if (mtSeed2WriteActive()) mtSeed2RecordPoint("partition.init", sortedSuper, canonInputHash());
-    if (mtSeed2ReplayActive()) { mtSeed2ApplyPoint("partition.init", sortedSuper, canonInputHash()); orderAllNodes(); }
+    if (mtSeed2ReplayActive()) { mtSeed2ApplyPoint("partition.init", sortedSuper, mtSeed2CanonVerifyEnabled() ? canonInputHash() : 0); orderAllNodes(); }
   }
   canonDumpTag("partition.init");
   {
