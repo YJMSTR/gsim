@@ -12988,6 +12988,21 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
     return nextSubStepIdx - 1;
 }
 
+// GSIM_EMIT_RESET_CHUNK=<n>: subResetN bodies carry millions of scalar
+// assignments in ONE function; the C++ frontend is superlinear on that shape
+// (measured 1366s for one 5MB body vs 2.8s stubbed). Splitting the body into
+// chain-called chunks of <n> statements (split only at top-level depth, so the
+// IF/ELSE nesting is never cut) restores linear frontend cost. Default off.
+static long mtResetChunkSize() {
+  const char* e = std::getenv("GSIM_EMIT_RESET_CHUNK");
+  if (e == nullptr || e[0] == '\0') return 0;
+  long v = std::atol(e);
+  return v >= 256 ? v : 0;
+}
+static std::vector<std::string>& mtResetChunkDecls() {
+  static std::vector<std::string> decls;
+  return decls;
+}
 void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int resetId, int indent, const std::string& nameSuffix, bool emitActivation) {
   std::string activeSinkType = (globalConfig.MtHelperMode == "mt" ||
                                 globalConfig.MtHelperMode == "mt-level-dispatch")
@@ -13043,26 +13058,72 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
     }
     emitBodyLock(-- indent, "}\n");
   }
+  // Chunked emission (GSIM_EMIT_RESET_CHUNK=<n>): the reset body's statement
+  // stream is split into chain-called member helpers at top-level depth (the
+  // IF/ELSE nesting is never cut). The parent keeps the reset guard and
+  // activation logic; each chunk ends with a call to the next, so a chunk
+  // executes under exactly the same conditions as the unsplit body. The C++
+  // frontend is superlinear on million-statement functions (measured 1366s
+  // for one 5MB subReset body, 2.8s stubbed); chunking restores linear cost.
+  const long chunkSize = mtResetChunkSize();
+  const char* chunkCallArgs = traceSourceParam ? "(nextActive, traceSourceCppId)" : (buffered ? "(nextActive)" : "()");
+  const std::string chunkParamList = traceSourceParam
+    ? (std::string("(") + (buffered ? "ActivationDelta &nextActive, " : "") + "int32_t traceSourceCppId)")
+    : (buffered ? "(ActivationDelta &nextActive)" : "()");
+  // The statement stream typically nests entirely inside `if (reset) { ... }`
+  // (depth 1 throughout), so a depth-0-only split would never fire. Instead we
+  // track the open IF stack; on a split we close the open braces, chain into
+  // the next chunk function, and re-open the identical IF conditions inside
+  // it. Reset conditions are pure member loads, so re-evaluating them is
+  // side-effect-free and yields the same guard context for every statement.
+  std::vector<std::string> openIfs;
+  long emittedInChunk = 0;
+  int chunkIdx = 0;
   for (InstInfo inst : super->insts) {
+    if (chunkSize > 0 && emittedInChunk >= chunkSize &&
+        inst.infoType != SUPER_INFO_IF && inst.infoType != SUPER_INFO_ELSE &&
+        inst.infoType != SUPER_INFO_DEDENT) {
+      // close the open if-chain, chain into the next chunk, reopen it there
+      for (size_t d = 0; d < openIfs.size(); d ++) emitBodyLock(-- indent, "}\n");
+      emitBodyLock(indent, "%s_c%d%s;\n", resetFuncName.c_str(), chunkIdx + 1, chunkCallArgs);
+      if (chunkIdx == 0) {
+        if (!emitActivation) emitBodyLock(-- indent, "}\n");  // reset guard
+        emitBodyLock(-- indent, "}\n");                        // parent function
+      } else {
+        emitBodyLock(indent, "}\n");
+      }
+      chunkIdx ++;
+      emitFuncDecl(indent, "void S%s::%s_c%d%s {\n", name.c_str(), resetFuncName.c_str(), chunkIdx, chunkParamList.c_str());
+      mtResetChunkDecls().push_back(format("  void %s_c%d%s;\n", resetFuncName.c_str(), chunkIdx, chunkParamList.c_str()));
+      for (const std::string& ifInst : openIfs) emitBodyLock(indent ++, "%s\n", ifInst.c_str());
+      emittedInChunk = 0;
+    }
     switch (inst.infoType) {
       case SUPER_INFO_IF:
         emitBodyLock(indent ++, "%s\n", inst.inst.c_str());
+        openIfs.push_back(inst.inst);
+        emittedInChunk ++;
         break;
       case SUPER_INFO_DEDENT:
         emitBodyLock(--indent, "%s\n", inst.inst.c_str());
+        if (!openIfs.empty()) openIfs.pop_back();
         break;
       case SUPER_INFO_ELSE:
       case SUPER_INFO_STR:
         emitBodyLock(indent, "%s\n", inst.inst.c_str());
+        emittedInChunk ++;
         break;
       default:
         break;
     }
   }
-  if (!emitActivation) {
+  if (chunkIdx > 0) {
+    for (size_t d = 0; d < openIfs.size(); d ++) emitBodyLock(-- indent, "}\n");
+    emitBodyLock(indent, "}\n");  // close the final chunk
+  } else {
+    if (!emitActivation) emitBodyLock(-- indent, "}\n");
     emitBodyLock(-- indent, "}\n");
   }
-  emitBodyLock(-- indent, "}\n");
 }
 
 void graph::genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId) {
@@ -17631,6 +17692,7 @@ void graph::cppEmitter() {
       else fprintf(header, "void subReset%d(ActivationDelta &nextActive);\n", i);
     }
   }
+  for (const std::string& decl : mtResetChunkDecls()) fprintf(header, "%s", decl.c_str());
 
   /* main evaluation loop (step) */
   int subStepIdxMax = 0;
