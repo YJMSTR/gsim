@@ -1383,10 +1383,28 @@ static bool mtUseDenseExecutorCodegen() {
 // pool itself stays (the dense executor posts jobKind 6/7 jobs to it); its
 // sparse job kinds are not emitted. step() aborts with a clear message when
 // the configured runtime would need the sparse path. Default off keeps the
-// generated model byte-identical.
-static bool mtUseDenseOnlyCodegen() {
+// generated model byte-identical. See mtDenseOnlyCodegenLevel() for =2.
+static int mtDenseOnlyCodegenLevel() {
   const char* env = std::getenv("GSIM_MT_DENSE_ONLY_CODEGEN");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
+  if (env == nullptr || env[0] == '\0' || env[0] == '0') return 0;
+  int level = std::atoi(env);
+  if (level < 1) level = 1;   // any truthy non-numeric value behaves as level 1
+  if (level > 2) level = 2;
+  return level;
+}
+
+static bool mtUseDenseOnlyCodegen() {
+  return mtDenseOnlyCodegenLevel() >= 1;
+}
+
+// GSIM_MT_DENSE_ONLY_CODEGEN=2 ("level 2") additionally drops the SerialFast
+// subSteps (subStepNSerialFast) and step()'s serial-fast dispatch branch: the
+// T<=mtSparseSerialFastMaxWorkers fallback is a different deployment target
+// than a dense-only model. step() keeps only the dense executor path and an
+// abort for everything else. Level 1 behavior is unchanged; default off keeps
+// the generated model byte-identical.
+static bool mtUseDenseOnlyCodegenLevel2() {
+  return mtDenseOnlyCodegenLevel() >= 2;
 }
 
 static bool mtUseDenseXThreadDepsOnly() {
@@ -15487,6 +15505,15 @@ void graph::genStep(int subStepIdxMax, int serialFastSubStepMax, const std::stri
   emitFuncDecl(0, "void S%s::step() {\n", name.c_str());
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   if (denseExecutorValid) emitBodyLock(1, "if (unlikely(mtUseDenseExecutor)) { stepDense(); return; }\n");
+  if (mtUseDenseOnlyCodegenLevel2()) {
+    // Level 2: the SerialFast subSteps and the sparse serial scan are not
+    // compiled in, so the dense executor early-return above is the only live
+    // path; everything after it would be dead text before an abort.
+    emitBodyLock(1, "fprintf(stderr, \"[gsim] dense-only level-2 model: step() requires the dense executor (run with GSIM_MT_EXECUTOR=dense, or rebuild without GSIM_MT_DENSE_ONLY_CODEGEN=2)\\n\");\n");
+    emitBodyLock(1, "abort();\n");
+    emitBodyLock(0, "}\n");
+    return;
+  }
   if (mtUseActivationEventTraceCodegen()) emitBodyLock(1, "beginMtActivationEventTraceCycle();\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(1, "resetAll();\n");
@@ -17426,7 +17453,9 @@ void graph::cppEmitter() {
   const bool denseOnlyCodegen = mtUseDenseOnlyCodegen();
   if (useMtHelpers) {
     serialFastSuffix = "SerialFast";
-    { EmitPhaseTimer genActivateTimer("Final.genActivate"); serialFastSubStepMax = genActivate(serialFastSuffix); }
+    if (!mtUseDenseOnlyCodegenLevel2()) {
+      { EmitPhaseTimer genActivateTimer("Final.genActivate"); serialFastSubStepMax = genActivate(serialFastSuffix); }
+    }
     subStepIdxMax = genActivateMtHelpers(serialFastSubStepMax, serialFastSuffix);
   } else if (useSeqHelpers) {
     subStepIdxMax = genActivateSeqHelpers(useBufferedHelpers);
