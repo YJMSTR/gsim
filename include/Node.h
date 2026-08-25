@@ -513,6 +513,11 @@ void mtSeed2SetInputHash(uint64_t h);
 void mtSeed2RecordPoint(const char* tag, const std::vector<SuperNode*>& sortedSuper, uint64_t canonHash);
 void mtSeed2VerifyInputHash(uint64_t computedInputHash);
 void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, uint64_t currentCanonHash);
+// GSIM_SEED2_VERIFY_CANON=0 skips the replay canon-hash verification (the hash is the
+// integrity check, not an input to the applied order); pin application and the input-hash
+// gate still run. Default on. Skipping saves the serial canon mix on v1 seeds (~400s on
+// the T16 champion replay); a wrong-seed mistake still surfaces at the schedule-facts line.
+bool mtSeed2CanonVerifyEnabled();
 bool mtSeed2ReplayPointPending(const char* tag);
 // Canon algorithm selector for the CURRENT graph point: 1 = legacy serial FNV-1a
 // (v1, all existing champion seeds), 2 = parallel segmented mix (GSIM_SEED2_CANON=v2).

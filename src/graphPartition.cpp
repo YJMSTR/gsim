@@ -26,7 +26,10 @@ void graph::resort(const char* seed2Tag) {
     auto t0 = phasetimer::now();
     if (seed2Write && seed2Tag) mtSeed2RecordPoint(seed2Tag, sortedSuper, canonInputHash());
     if (seed2Replay && seed2Tag) {
-      mtSeed2ApplyPoint(seed2Tag, sortedSuper, canonInputHash());
+      // Canon verification is the replay integrity check; with GSIM_SEED2_VERIFY_CANON=0
+      // skip the (serial, ~minutes on v1 seeds) hash entirely - the applied order comes
+      // from the pin payload either way.
+      mtSeed2ApplyPoint(seed2Tag, sortedSuper, mtSeed2CanonVerifyEnabled() ? canonInputHash() : 0);
       orderAllNodes();
     }
     phasetimer::mark("resort.recordSeed2", t0);

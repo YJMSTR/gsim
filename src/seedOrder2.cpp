@@ -84,6 +84,13 @@
 
 bool mtSeed2WriteActive() { return std::getenv("GSIM_SCHEDULE_SEED2_WRITE") != nullptr; }
 bool mtSeed2ReplayActive() { return std::getenv("GSIM_SCHEDULE_SEED2") != nullptr; }
+bool mtSeed2CanonVerifyEnabled() {
+  static const bool enabled = [](){
+    const char* e = std::getenv("GSIM_SEED2_VERIFY_CANON");
+    return !(e != nullptr && e[0] == '0');
+  }();
+  return enabled;
+}
 
 // Write-side knobs (read side auto-detects everything from the header):
 //   GSIM_SEED2_CODEC = zlib (default) | none | v1 (write the legacy layout, for
@@ -887,7 +894,7 @@ void mtSeed2ApplyPoint(const char* tag, std::vector<SuperNode*>& sortedSuper, ui
   Assert(p.tag == tag,
          "seed2 replay divergence: run reached point %s but the seed expects %s (pass-flow mismatch)",
          p.tag.c_str(), tag);
-  Assert(p.canonHash == currentCanonHash,
+  Assert(!mtSeed2CanonVerifyEnabled() || p.canonHash == currentCanonHash,
          "seed2 replay divergence at %s: seed canon %016zx vs run %016zx (an upstream order-consuming point was not pinned)",
          tag, (size_t)p.canonHash, (size_t)currentCanonHash);
   Assert(p.nameIds.size() == sortedSuper.size(),
