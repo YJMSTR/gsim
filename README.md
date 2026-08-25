@@ -145,6 +145,7 @@ The seed records nine pin points (topoSort, all coarsen merges, partition, repli
 + `GSIM_DEBUG_CANON_HASH=1` prints per-pass content hashes; `GSIM_DEBUG_CANON_DUMP=<dir>` dumps canonical records for diffing.
 + `GSIM_MT_DENSE_PEG_DUMP=<prefix>` dumps the precedence event graph (dependency edges dist=0, register wrap edges dist=1, per-MTask cost) for recurrence (max-cycle-ratio) analysis.
 + `GSIM_MT_PROFILE=1 GSIM_MT_PROFILE_TASKS=1` at runtime prints per-task wall-time accounting.
++ Generator-side instrumentation knobs (all default-off, all report-only — they never change emitted logic): `GSIM_EMIT_PHASE_TIMING=1` prints per-phase generation walls; `GSIM_MT_DENSE_OLDVALUE_HISTOGRAM=1` reports how many `$old$` snapshots have downstream consumers; `GSIM_MT_ASSERTS=0` (at generation time) omits the runtime assertions from the emitted model. Model-build macro: compiling the model with `-DGSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE=1` adds lookahead tail-scan counters (calls/scanned/found/fullmiss) to the model's profile dump.
 
 
 ## Debug logs & dumps
