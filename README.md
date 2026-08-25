@@ -140,6 +140,8 @@ GSIM_SCHEDULE_SEED2=champion.gsimseed2       build/gsim/gsim ...   # replay it b
 
 The seed records nine pin points (topoSort, all coarsen merges, partition, replication, pre-emit) plus the when-merge table; replay forces each recorded outcome and verifies a content hash at every point, so the same recipe on any allocator reproduces the same model byte-for-byte. Seeds are tied to the generator build — re-record after any content-affecting change.
 
+`GSIM_SEED2_VERIFY_CANON=0` skips the per-point content-hash verification (the integrity check, not an input to the applied order): T16 champion replay 19m30s → 8m39s with byte-identical output. The input-hash gate, pass-flow tags, and pin-count checks still run; a wrong-seed mistake still surfaces in the schedule-facts line. Verification stays the default.
+
 ### Diagnostics
 
 + `GSIM_DEBUG_CANON_HASH=1` prints per-pass content hashes; `GSIM_DEBUG_CANON_DUMP=<dir>` dumps canonical records for diffing.
