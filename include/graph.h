@@ -144,6 +144,7 @@ private:
   void detectLoop();
   void topoSort();
   void instsGenerator();
+  void mtInternNodeNames();
   void cppEmitter();
   void dumpMtScheduleJson();
   void dumpMtRepCutLiteReport();

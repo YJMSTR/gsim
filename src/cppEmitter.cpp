@@ -5849,6 +5849,185 @@ static std::string mtRepCutReplaceNodeNames(const std::string& text, const std::
   return result;
 }
 
+static int emitParallelThreadCount();
+
+// ---- GSIM_SHORT_NAMES: emission-time node-name interning (default off) ----
+// Long node names (>= 8 bytes) are renamed to _v<idx> right before body
+// emission. Full names stay for input/output nodes (the set_/get_ accessor
+// spellings are an external contract) and for names that are already short.
+// The mapping is kept in mtShortNameOrig and re-emitted as `// orig=<name>`
+// comments at the genNodeDef declaration site so models stay debuggable.
+static std::map<Node*, std::string> mtShortNameOrig;
+static std::unordered_map<std::string, std::string> mtShortNameLookup;
+static size_t mtShortNameMinFromLen = 0;
+
+static bool mtUseShortNames() {
+  const char* env = std::getenv("GSIM_SHORT_NAMES");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+static const std::string* mtShortNameOrigOf(Node* node) {
+  if (mtShortNameOrig.empty()) return nullptr;
+  auto iter = mtShortNameOrig.find(node);
+  return iter == mtShortNameOrig.end() ? nullptr : &iter->second;
+}
+
+// Sibling of mtRepCutReplaceNodeNames above for string-keyed replacement maps,
+// used to rewrite the InstInfo::inst snippets baked by instsGenerator. Same
+// token-boundary semantics (mtRepCutNameChar), but implemented as one
+// left-to-right pass: names are unique whole tokens and replacement outputs
+// (_v<idx>, shorter than every from-name) are never themselves in the from-set,
+// so per-token lookup is equivalent to the reference's sequential
+// longest-replacement-first scan while staying linear in the text size.
+// Tokens that start with a digit are skipped: names never do, and this keeps
+// numeric literals (incl. long hex constants) out of the hash path.
+static void mtRewriteInstNodeNames(std::string& text) {
+  if (mtShortNameLookup.empty()) return;
+  std::string out;
+  out.reserve(text.size());
+  size_t i = 0;
+  const size_t size = text.size();
+  while (i < size) {
+    char ch = text[i];
+    if (mtRepCutNameChar(ch) && !(ch >= '0' && ch <= '9')) {
+      size_t j = i + 1;
+      while (j < size && mtRepCutNameChar(text[j])) j ++;
+      if (j - i >= mtShortNameMinFromLen) {
+        auto iter = mtShortNameLookup.find(text.substr(i, j - i));
+        if (iter != mtShortNameLookup.end()) {
+          out.append(iter->second);
+          i = j;
+          continue;
+        }
+      }
+      out.append(text, i, j - i);
+      i = j;
+    } else {
+      out.push_back(ch);
+      i ++;
+    }
+  }
+  text.swap(out);
+}
+
+void graph::mtInternNodeNames() {
+  // Collect every node the emitter can reach. graph::allNodes is never
+  // populated; the live universe is the super containers' members plus the
+  // standalone node vectors from include/graph.h.
+  std::set<Node*> nodes;
+  auto collectSuper = [&](SuperNode* super) {
+    if (!super) return;
+    for (Node* member : super->member) {
+      if (member) nodes.insert(member);
+    }
+  };
+  for (SuperNode* super : sortedSuper) collectSuper(super);
+  for (SuperNode* super : supersrc) collectSuper(super);
+  for (SuperNode* super : allReset) collectSuper(super);
+  for (Node* node : memory) if (node) nodes.insert(node);
+  for (Node* node : specialNodes) if (node) nodes.insert(node);
+  for (Node* node : external) if (node) nodes.insert(node);
+  for (Node* node : regsrc) if (node) nodes.insert(node);
+
+  // Interning is NAME-keyed, not node-keyed: REG_DST/REG_RESET twins share
+  // their REG_SRC's name, so two Node objects can carry one spelling. Every
+  // node holding a name must flip together with the InstInfo token rewrite,
+  // or bodies reference an undeclared member.
+  std::set<Node*> keepFull;
+  for (Node* node : input) if (node) keepFull.insert(node);
+  for (Node* node : output) if (node) keepFull.insert(node);
+  std::set<std::string> keptNames;
+  std::set<std::string> internableNames;
+  for (Node* node : nodes) {
+    if (!node || node->name.empty()) continue;
+    // Extmodule blackbox calls declare and call free functions named after
+    // the EXT node (instsGenerator's computeExtMod); those spellings are baked
+    // outside the InstInfo token rewrite, so their names must stay full.
+    if (node->type == NODE_EXT) { keptNames.insert(node->name); continue; }
+    if (keepFull.count(node) || node->name.size() < 8) {
+      keptNames.insert(node->name);
+    } else {
+      internableNames.insert(node->name);
+    }
+  }
+  // Deterministic assignment: names in sorted order; a generated _v<idx> that
+  // would repeat a kept name is skipped so the generated pool stays disjoint.
+  std::map<std::string, std::string> nameMap;
+  size_t nextIdx = 0;
+  for (const std::string& name : internableNames) {
+    std::string shortName;
+    do {
+      shortName = format("_v%zu", nextIdx ++);
+    } while (keptNames.count(shortName) != 0);
+    if (shortName.size() >= name.size()) continue;  // never lengthen
+    nameMap[name] = shortName;
+  }
+  if (nameMap.empty()) return;
+
+  mtShortNameOrig.clear();
+  mtShortNameLookup.clear();
+  mtShortNameMinFromLen = SIZE_MAX;
+  for (const auto& mapping : nameMap) {
+    mtShortNameLookup[mapping.first] = mapping.second;
+    mtShortNameMinFromLen = std::min(mtShortNameMinFromLen, mapping.first.size());
+  }
+  for (Node* node : nodes) {
+    if (!node) continue;
+    if (nameMap.count(node->name) != 0) mtShortNameOrig[node] = node->name;
+  }
+
+  // Rewrite the baked InstInfo::inst snippets before mutating Node::name:
+  // the from-keys are the original names. Supers can appear in more than one
+  // container (sortedSuper vs supersrc); dedupe by pointer so each inst string
+  // is rewritten exactly once. Independent per-super work, no shared state
+  // besides the read-only lookup - render on a worker pool.
+  std::vector<SuperNode*> supers;
+  {
+    std::set<SuperNode*> seen;
+    auto pushSuper = [&](SuperNode* super) {
+      if (super && seen.insert(super).second) supers.push_back(super);
+    };
+    for (SuperNode* super : sortedSuper) pushSuper(super);
+    for (SuperNode* super : supersrc) pushSuper(super);
+    for (SuperNode* super : allReset) pushSuper(super);
+  }
+  {
+    std::atomic<size_t> next(0);
+    const size_t nWorkers = std::min((size_t)emitParallelThreadCount(), supers.size());
+    std::vector<std::thread> pool;
+    pool.reserve(nWorkers);
+    for (size_t w = 0; w < nWorkers; w ++) {
+      pool.emplace_back([&]() {
+        size_t u;
+        while ((u = next.fetch_add(1, std::memory_order_relaxed)) < supers.size()) {
+          SuperNode* super = supers[u];
+          for (InstInfo& inst : super->insts) {
+            if (!inst.inst.empty()) mtRewriteInstNodeNames(inst.inst);
+          }
+        }
+      });
+    }
+    for (std::thread& thread : pool) thread.join();
+  }
+  // Mutate Node::name last: from here on every emission site (member
+  // declarations, $old$/$RESET/cond_ temporaries, activateNext commits,
+  // accessor member reads) derives from the short name. All twins of a
+  // shared name flip together.
+  size_t internedNodeCount = 0;
+  for (Node* node : nodes) {
+    auto mapping = nameMap.find(node->name);
+    if (mapping == nameMap.end()) continue;
+    node->name = mapping->second;
+    internedNodeCount ++;
+  }
+  uint64_t instBytesRewritten = 0;
+  for (SuperNode* super : supers) {
+    for (const InstInfo& inst : super->insts) instBytesRewritten += inst.inst.size();
+  }
+  fprintf(stderr, "[gsim-short-names] interned %zu names across %zu nodes (%.1f MB inst text rewritten)\n",
+          nameMap.size(), internedNodeCount, (double)instBytesRewritten / (1024.0 * 1024.0));
+}
+
 static uint64_t mtRepCutForcedSinkMaskForBatch(const MtRepCutSemanticPlan& semanticPlan, int beginCppId) {
   for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
     if (batch.beginCppId == beginCppId && batch.parallelSafe) return batch.forcedSinkMask;
@@ -9723,7 +9902,11 @@ void graph::genNodeDef(FILE* fp, Node* node) {
   fprintf(fp, "%s %s", widthUType(node->width).c_str(), node->name.c_str());
   if (node->type == NODE_MEMORY) fprintf(fp, "[%d]", upperPower2(node->depth));
   for (int dim : node->dimension) fprintf(fp, "[%d]", upperPower2(dim));
-  fprintf(fp, "; // width = %d, lineno = %d\n", node->width, node->lineno);
+  if (const std::string* orig = mtShortNameOrigOf(node)) {
+    fprintf(fp, "; // width = %d, lineno = %d, orig=%s\n", node->width, node->lineno, orig->c_str());
+  } else {
+    fprintf(fp, "; // width = %d, lineno = %d\n", node->width, node->lineno);
+  }
   int w = node->width;
   bool needInitMask = (node->type != NODE_MEMORY && node->type != NODE_WRITER) &&
     (((w < 64) && (w != 8 && w != 16 && w != 32 && w != 64)) || ((w > 64) && (w % 32 != 0)));
@@ -15813,6 +15996,11 @@ void graph::cppEmitter() {
     if (mtUseReadyBatchReport() || mtUseEnvelopeLocalEval() || mtUseEnvelopeLocalEvalDiagnostics()) dumpMtReadyBatchReport(); }
   { EmitPhaseTimer t("Final.dumpMtDenseScheduleJson");
     if (mtUseDenseExecutorCodegen()) dumpMtDenseScheduleJson(); }
+  // Intern node names only after every report/dump above (mt schedule JSON,
+  // repcut/coarse/ready-batch reports, dense schedule JSON): they name nodes
+  // by their original full names, and mtDenseObservabilityDroppableSet's
+  // classifier (still on call) must keep seeing the original hierarchy.
+  if (mtUseShortNames()) { EmitPhaseTimer t("Final.shortNames"); mtInternNodeNames(); }
   if (globalConfig.MtReportOnly) {
     printf("[cppEmitter] mt-report-only: skipped generated C++ emission after reports\n");
     return;
