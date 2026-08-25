@@ -2129,6 +2129,16 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     auto it = std::lower_bound(v.begin(), v.end(), x);
     if (it != v.end() && *it == x) v.erase(it);
   };
+  // Sorted-union of two sorted unique spans via a reusable out-buffer + O(1) swap (the
+  // out-buffer's allocation recycles across merges; no per-merge allocation, no
+  // in-place-merge overlap hazards). Result equals the former relInsert-per-edge sequence.
+  std::vector<int> relUnionOut;
+  const auto relUnionInto = [](std::vector<int>& dst, const std::vector<int>& sortedUniqueSrc, std::vector<int>& out) {
+    out.clear();
+    out.reserve(dst.size() + sortedUniqueSrc.size());
+    std::set_union(dst.begin(), dst.end(), sortedUniqueSrc.begin(), sortedUniqueSrc.end(), std::back_inserter(out));
+    dst.swap(out);
+  };
   std::vector<bool> gw0((size_t)n);
   for (int scc = 0; scc < realN; ++scc) { int node = denseNode(scc); gcost[(size_t)node] = sc(scc); gw0[(size_t)node] = schedule.sccs[(size_t)scc].workerZeroOnly; }
   for (int u = 0; u < realN; ++u) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < realN) { int from = denseNode(u), to = denseNode(v); gS[(size_t)from].push_back(to); gP[(size_t)to].push_back(from); }
@@ -2172,31 +2182,40 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // quotient hazard where CP both rises (cost growth) and falls (a->b edge internalizes) per merge.
   int recomputeEvery = 256;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP_EVERY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) recomputeEvery = v; } }
+  // Scratch buffers reused across recomputeCP calls (cleared per call): 143 calls each
+  // allocating ~n vectors of vectors was most of recomputeCP's wall. clear()/assign() reuse
+  // the existing allocations; the traversal and arithmetic below are byte-for-byte the
+  // former fresh-vector version, so gF/gR come out identical.
+  std::vector<int> cpRoots; cpRoots.reserve((size_t)n);
+  std::vector<std::vector<int>> cpSucc((size_t)n), cpPred((size_t)n);
+  std::vector<int> cpIndeg((size_t)n, 0);
+  std::vector<int> cpSs; cpSs.reserve(1024);
+  std::vector<int> cpTopo; cpTopo.reserve((size_t)n);
+  std::vector<int> cpQ; cpQ.reserve((size_t)n);
   auto recomputeCP = [&]() {
     EmitPhaseAccumScope vcScope(vcAccRecompute, vcPhaseTiming);
     // Live roots and their find()-normalized, deduped succ/pred sets.
-    std::vector<int> roots; roots.reserve((size_t)n);
-    for (int i = 0; i < n; i ++) if (find(i) == i) roots.push_back(i);
-    std::vector<std::vector<int>> succ((size_t)n), pred((size_t)n);
-    std::vector<int> indeg((size_t)n, 0);
-    for (int r : roots) {
-      std::vector<int> ss; ss.reserve(gS[(size_t)r].size());
-      for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r) ss.push_back(rs); }
-      std::sort(ss.begin(), ss.end());
-      ss.erase(std::unique(ss.begin(), ss.end()), ss.end());
-      succ[(size_t)r].assign(ss.begin(), ss.end());
-      for (int rs : succ[(size_t)r]) { pred[(size_t)rs].push_back(r); }
+    cpRoots.clear();
+    for (int i = 0; i < n; i ++) if (find(i) == i) cpRoots.push_back(i);
+    for (int r : cpRoots) cpPred[(size_t)r].clear();
+    for (int r : cpRoots) {
+      cpSs.clear();
+      for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r) cpSs.push_back(rs); }
+      std::sort(cpSs.begin(), cpSs.end());
+      cpSs.erase(std::unique(cpSs.begin(), cpSs.end()), cpSs.end());
+      cpSucc[(size_t)r].assign(cpSs.begin(), cpSs.end());
+      for (int rs : cpSucc[(size_t)r]) { cpPred[(size_t)rs].push_back(r); }
     }
-    for (int r : roots) indeg[(size_t)r] = (int)pred[(size_t)r].size();
+    for (int r : cpRoots) cpIndeg[(size_t)r] = (int)cpPred[(size_t)r].size();
     // Kahn topo order of live roots.
-    std::vector<int> topo; topo.reserve(roots.size());
-    std::vector<int> q; for (int r : roots) if (indeg[(size_t)r] == 0) q.push_back(r);
+    cpTopo.clear();
+    cpQ.clear(); for (int r : cpRoots) if (cpIndeg[(size_t)r] == 0) cpQ.push_back(r);
     size_t qh = 0;
-    while (qh < q.size()) { int u = q[qh ++]; topo.push_back(u); for (int v : succ[(size_t)u]) if (-- indeg[(size_t)v] == 0) q.push_back(v); }
+    while (qh < cpQ.size()) { int u = cpQ[qh ++]; cpTopo.push_back(u); for (int v : cpSucc[(size_t)u]) if (-- cpIndeg[(size_t)v] == 0) cpQ.push_back(v); }
     // gF (cost-to-sink): reverse topo. gR (cost-from-source): forward topo.
-    for (int r : roots) { gF[(size_t)r] = 0; gR[(size_t)r] = 0; }
-    for (size_t k = topo.size(); k-- > 0; ) { int u = topo[k]; uint64_t b = 0; for (int v : succ[(size_t)u]) b = std::max(b, gF[(size_t)v] + stepCost(gcost[(size_t)v])); gF[(size_t)u] = b; }
-    for (int u : topo) { uint64_t b = 0; for (int p : pred[(size_t)u]) b = std::max(b, gR[(size_t)p] + stepCost(gcost[(size_t)p])); gR[(size_t)u] = b; }
+    for (int r : cpRoots) { gF[(size_t)r] = 0; gR[(size_t)r] = 0; }
+    for (size_t k = cpTopo.size(); k-- > 0; ) { int u = cpTopo[k]; uint64_t b = 0; for (int v : cpSucc[(size_t)u]) b = std::max(b, gF[(size_t)v] + stepCost(gcost[(size_t)v])); gF[(size_t)u] = b; }
+    for (int u : cpTopo) { uint64_t b = 0; for (int p : cpPred[(size_t)u]) b = std::max(b, gR[(size_t)p] + stepCost(gcost[(size_t)p])); gR[(size_t)u] = b; }
   };
   // CP-bound-pruned, generation-tagged DFS: does a path root(frm)~>root(to) exist (excluding the
   // direct frm->to edge, which the caller removes temporarily)?
@@ -2214,6 +2233,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // Cleared after each applied merge; duplicate PQ entries make repeat queries common.
   std::unordered_map<uint64_t, bool> pathMemo;
   uint64_t pathMemoHits = 0, pathCapHits = 0;
+  std::vector<int> mergeFixScratch; mergeFixScratch.reserve(1024); // per-merge union scratch: reused, no per-merge alloc
   std::vector<int> pathSt; pathSt.reserve(4096); // reusable DFS stack: no per-query heap traffic
   // DFS-local, epoch-normalized successor cache: gSN[x] holds x's CURRENT-ROOT successors,
   // rebuilt from the raw gS[x] on the first DFS visit of each merge epoch (pathEpoch bumps on
@@ -2242,7 +2262,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
       for (int& e : L) e = find(e);
       std::sort(L.begin(), L.end());
       L.erase(std::unique(L.begin(), L.end()), L.end());
-      L.erase(std::remove(L.begin(), L.end(), x), L.end());
+      if (std::binary_search(L.begin(), L.end(), x)) L.erase(std::remove(L.begin(), L.end(), x), L.end());
       gsnEpoch[(size_t)x] = pathEpoch;
     }
     return gSN[(size_t)x];
@@ -2455,8 +2475,27 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     gF[(size_t)a] = std::max(gF[(size_t)a], gF[(size_t)b]); gR[(size_t)a] = std::max(gR[(size_t)a], gR[(size_t)b]);
     gRmin[(size_t)a] = std::min(gRmin[(size_t)a], gRmin[(size_t)b]); gRmax[(size_t)a] = std::max(gRmax[(size_t)a], gRmax[(size_t)b]);
     gFmin[(size_t)a] = std::min(gFmin[(size_t)a], gFmin[(size_t)b]); gFmax[(size_t)a] = std::max(gFmax[(size_t)a], gFmax[(size_t)b]);
-    for (int s2 : gS[(size_t)b]) { int rs = find(s2); if (rs != a) { relInsert(gS[(size_t)a], rs); relInsert(gP[(size_t)rs], a); } }
-    for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) { relInsert(gP[(size_t)a], rp); relInsert(gS[(size_t)rp], a); } }
+    // Batch-union fixup: collect b's live root-neighbor set once (sorted+deduped), dedup-
+    // insert the survivor into each surviving neighbor's mirror list, then rebuild the
+    // survivor's own two lists with one sorted union each (relUnionInto). Content-identical
+    // to the former incremental insert-per-edge sequence: both end at (old set union added
+    // roots) as sorted unique vectors, and no reader observes the intermediate states (the
+    // only lists read between the writes are b's own two lists plus lists the incremental
+    // version had not reached either; find() sees uf[b]=a in both). The O(len) memmove-per-
+    // edge of relInsert collapses to one linear pass on the survivor side; perMTaskCap
+    // bounds group size, so the unioned spans stay small.
+    mergeFixScratch.clear();
+    for (int s2 : gS[(size_t)b]) { int rs = find(s2); if (rs != a) mergeFixScratch.push_back(rs); }
+    std::sort(mergeFixScratch.begin(), mergeFixScratch.end());
+    mergeFixScratch.erase(std::unique(mergeFixScratch.begin(), mergeFixScratch.end()), mergeFixScratch.end());
+    for (int rs : mergeFixScratch) relInsert(gP[(size_t)rs], a);
+    relUnionInto(gS[(size_t)a], mergeFixScratch, relUnionOut);
+    mergeFixScratch.clear();
+    for (int p : gP[(size_t)b]) { int rp = find(p); if (rp != a) mergeFixScratch.push_back(rp); }
+    std::sort(mergeFixScratch.begin(), mergeFixScratch.end());
+    mergeFixScratch.erase(std::unique(mergeFixScratch.begin(), mergeFixScratch.end()), mergeFixScratch.end());
+    for (int rp : mergeFixScratch) relInsert(gS[(size_t)rp], a);
+    relUnionInto(gP[(size_t)a], mergeFixScratch, relUnionOut);
     relErase(gS[(size_t)a], a); relErase(gP[(size_t)a], a); relErase(gS[(size_t)a], b); relErase(gP[(size_t)a], b);
     live --; merges ++; ++scoreCacheGeneration; if (c.sibling) sibMerges ++;
     pathMemo.clear(); // quotient graph changed: reachability answers are stale
