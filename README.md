@@ -79,9 +79,21 @@ Notes:
 - The runtime payoff for this pipeline cost is in the benchmark table above (6.43s vs Verilator 11.15s at 16 threads).
 - `GSIM_MT_DENSE_ONLY_CODEGEN=1` (generation-time, default-off, byte-identical when off) drops the sparse-dispatch runtime's text from the model: the buffered `mtTaskN(flag, ActivationDelta&)` helpers, the plain serial `subStepN()` scan, and the coarse-region/pure-batch runners — three of the four evaluation-body copies the default emission ships, which serve runtimes the dense executor never executes. The dense-only model keeps the dense path and the serial-fast fallback (workers ≤ `GSIM_MT_SPARSE_SERIAL_FAST_MAX_WORKERS`, no profile) bit-exact; any other configuration aborts with a clear message. Measured: model 12.4→7.1 GB (-42%), emu 215→110 MB, build 24m53s→23m08s, C50000 perf neutral (-1.19%, 5-pair), NEMU bit-exact (C5000 528/4941/0x800027ba, C50000 46540/50000). The build wall shrinks less than the text because it is -O3-optimizer-bound on the hot TUs, which are unchanged; the dropped cold code was cheap to compile.
 
+### Full chain from XiangShan source (end-to-end, T32, measured 2026-08-26)
+
+The quick start below assumes `SimTop.fir` already exists. The complete chain from XiangShan source, with per-stage walls on the reference machine (EPYC 9654, `-j48`):
+
+| Stage | Command (essence) | Wall | Output |
+|---|---|---:|---|
+| 1. XiangShan elaboration | `make sim-verilog CONFIG=DefaultConfig` (mill; needs `NOOP_HOME` set) | ~15–20 min | 2,089 `.sv` / `SimTop.fir` (886 MB) |
+| 2. gsim generation | champion recipe below (T32: `MAXMT=2400`), optionally `GSIM_SCHEDULE_SEED2=<seed>` + `GSIM_SEED2_VERIFY_CANON=0` | 8m46s (champion seed replay) / 7m38s fresh | model (1,218 TUs, 12 GB) + schedule JSON |
+| 3. model build | difftest `gsim-build-emu` (`EMU_THREADS=32`, `-O3 -march=znver4 -j48`) | 23m46s | `emu` (see the pipeline table above: the opt-in knobs take this to 1m42s) |
+| 4. simulation | `GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense GSIM_MT_CPU_AFFINITY=auto ./emu -i <workload> [-C N]` | Linux `linux.bin` 100K cycles ≈ **10.9 s** (1M ≈ 105 s); CoreMark C50000 ≈ 5.5 s | cycle/instruction counters |
+
+Reproducibility: with the champion seed, stage 2 replays the registered schedule exactly (facts line verbatim, 9/9 canon pins) and stages 3–4 land on the registered performance (Linux 100K 10.6–11.3 s vs registered mean 10.8 s; 1M 105.3 s vs 107.4 s). Note `emu` requires `NEMU_HOME` pointing at a tree containing `build/riscv64-nemu-interpreter-so` even for non-difftest runs (the difftest library is always linked).
+
 ### Quick start (XiangShan SimTop netlist, 32 threads)
 
-Generate the model with the champion recipe:
 
 ```bash
 export GSIM_THREADS=32
@@ -107,7 +119,7 @@ export GSIM_MT_DENSE_LOOKAHEAD=128          # bounded lookahead window (0/unset 
 
 build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
   --sep-mod=__DOT__ --sep-aggr=__DOT__ --mt-helper-mode=mt-level-dispatch \
-  --dir <OUT_DIR> SimTop.fir                 # <OUT_DIR> must exist; ~33 min for XiangShan
+  --dir <OUT_DIR> SimTop.fir                 # <OUT_DIR> must exist; ~8-9 min for XiangShan (see pipeline table)
 ```
 
 Then build and run the emitted model with your MT harness (a difftest-based flow is one option), with `GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense GSIM_MT_CPU_AFFINITY=auto` at runtime.
