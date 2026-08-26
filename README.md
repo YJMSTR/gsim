@@ -61,7 +61,7 @@ Same machine (EPYC 9654, `-j48` builds), same input (XiangShan Default-config `S
 
 | Toolchain | Model generation | Model build (-O3 -march=znver4) | Total | Model size |
 |---|---:|---:|---:|---:|
-| Verilator 5.034 | 29m40s (verilate, single-threaded) | 3m22s (864 TUs; emu 95 MB) | **33m02s** | 2.0 GB |
+| Verilator 5.034 | 29m40s verilate single-threaded; **23m29s with `-j 32`** (measured: Amdahl-bound, ~157% avg CPU) | 3m22s (864 TUs; emu 95 MB) | 33m02s / 26m51s parallel | 2.0 GB |
 | upstream gsim (serial) | 10m15s | 4m00s (257 TUs) | **14m14s** | 2.5 GB |
 | gsim-mt, fresh generation | 7m38s (jemalloc-linked generator; 10m39s with the system allocator) | ~24m53s (fresh model is same shape, 1,214 TUs) | **~32m31s** | 12 GB |
 | gsim-mt, champion seed replay | 19m30s (default, canon-verified; 8m39s with `GSIM_SEED2_VERIFY_CANON=0` — byte-identical output) | 24m53s (champion model) | **44m23s** | 12 GB |
