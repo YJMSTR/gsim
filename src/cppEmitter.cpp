@@ -1386,7 +1386,15 @@ static bool mtUseDenseExecutorCodegen() {
 // generated model byte-identical. See mtDenseOnlyCodegenLevel() for =2.
 static int mtDenseOnlyCodegenLevel() {
   const char* env = std::getenv("GSIM_MT_DENSE_ONLY_CODEGEN");
-  if (env == nullptr || env[0] == '\0' || env[0] == '0') return 0;
+  // Default ON (level 2) under the dense recipe (--mt-helper-mode=mt-level-dispatch
+  // plus GSIM_MT_DENSE_EXECUTOR_CODEGEN=1): the dense executor is the shipped
+  // runtime and the dropped text (sparse-dispatch runtime, SerialFast) is dead
+  // weight for it. Outside the dense recipe the default stays OFF so upstream-
+  // style generation keeps its legacy output. Set =0 (or none) to opt back into
+  // the legacy full emission under the dense recipe too.
+  const bool denseRecipe = globalConfig.MtHelperMode == "mt-level-dispatch" && mtUseDenseExecutorCodegen();
+  if (env == nullptr || env[0] == '\0') return denseRecipe ? 2 : 0;
+  if (env[0] == '0' || strncmp(env, "none", 4) == 0) return 0;
   int level = std::atoi(env);
   if (level < 1) level = 1;   // any truthy non-numeric value behaves as level 1
   if (level > 2) level = 2;
@@ -5863,7 +5871,10 @@ static size_t mtShortNameMinFromLen = 0;
 
 static bool mtUseShortNames() {
   const char* env = std::getenv("GSIM_SHORT_NAMES");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
+  // Default ON: interning is NEMU-verified and shrinks the model ~4x. Set =0
+  // to keep full hierarchical names in the emitted text.
+  if (env == nullptr || env[0] == '\0') return true;
+  return env[0] != '0';
 }
 
 static const std::string* mtShortNameOrigOf(Node* node) {
@@ -12995,9 +13006,13 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
 // IF/ELSE nesting is never cut) restores linear frontend cost. Default off.
 static long mtResetChunkSize() {
   const char* e = std::getenv("GSIM_EMIT_RESET_CHUNK");
-  if (e == nullptr || e[0] == '\0') return 0;
+  // Default 4096: chunking is semantics-preserving (chain-called helpers under
+  // identical re-opened guards) and removes a ~500x clang frontend blowup on
+  // giant reset bodies. Set =0 to emit the legacy monolithic bodies.
+  if (e == nullptr || e[0] == '\0') return 4096;
   long v = std::atol(e);
-  return v >= 256 ? v : 0;
+  if (v == 0) return 0;
+  return v >= 256 ? v : 4096;
 }
 static std::vector<std::string>& mtResetChunkDecls() {
   static std::vector<std::string> decls;
