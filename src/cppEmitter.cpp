@@ -5871,9 +5871,12 @@ static size_t mtShortNameMinFromLen = 0;
 
 static bool mtUseShortNames() {
   const char* env = std::getenv("GSIM_SHORT_NAMES");
-  // Default ON: interning is NEMU-verified and shrinks the model ~4x. Set =0
-  // to keep full hierarchical names in the emitted text.
-  if (env == nullptr || env[0] == '\0') return true;
+  // Default OFF: interning is NEMU-exact but NOT perf-neutral - a T32 C50000
+  // 5-pair measured +4.5% (champ 5.338s vs interned 5.578s, non-overlapping;
+  // T16 showed the same direction at +1.4%). Shorter identifiers shift znver4
+  // codegen alignment in the hot bodies. Opt in only for size/disk-constrained
+  // builds (4.8GB -> 1.1GB model).
+  if (env == nullptr || env[0] == '\0') return false;
   return env[0] != '0';
 }
 
