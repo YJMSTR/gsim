@@ -2238,6 +2238,26 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     cpRoots.clear();
     for (int i = 0; i < n; i ++) if (find(i) == i) cpRoots.push_back(i);
     for (int r : cpRoots) cpPred[(size_t)r].clear();
+    // Dead-entry compaction (GSIM_MT_DENSE_VCONTRACT_COMPACT=1, default OFF):
+    // NOT neutral - absorbed groups' stale entries act as live-edge DUPLICATES after
+    // find()-normalization; the candidate-time temporary erase removes one occurrence,
+    // so a dead duplicate keeps the direct edge visible to pathExists and the merge is
+    // spuriously cycle-rejected (measured 16x: cycRej 3.29M -> 0.20M, mtasks 12275 ->
+    // 8253 on the T32 champion graph). Default off preserves the registered champion
+    // schedules; opt-in produces coarser schedules for perf experimentation.
+    static const bool vcCompact = [](){
+      const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_COMPACT");
+      return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    if (vcCompact) for (int r : cpRoots) {
+      auto compact = [&](std::vector<int>& v) {
+        size_t w = 0;
+        for (size_t i2 = 0; i2 < v.size(); i2 ++) if (find(v[i2]) == v[i2]) v[w ++] = v[i2];
+        v.resize(w);
+      };
+      compact(gS[(size_t)r]);
+      compact(gP[(size_t)r]);
+    }
     for (int r : cpRoots) {
       cpSs.clear();
       for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r) cpSs.push_back(rs); }
