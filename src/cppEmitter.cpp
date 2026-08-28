@@ -2091,6 +2091,24 @@ static uint64_t mtDenseStepCostV3(uint64_t cost) {
   logCost = std::ceil(logCost * 20.0) / 20.0;
   return static_cast<uint64_t>(std::exp(logCost));
 }
+static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount, std::vector<int>& assign, std::vector<int>& order);
+// ---- VCONTRACT_POLICY=auto pass control (file scope; recomputeCP's compaction
+// gate and the two-pass driver in mtaskBuild coordinate through these) ----
+static int gVcAutoPass = 0;          // 0 = plain pass, 1 = compact pass
+static void vcAutoPassReset() { gVcAutoPass = 0; }
+static void vcAutoPassAdvance() { gVcAutoPass = 1; }
+static void vcAutoPassFinish(bool pickCompact) { gVcAutoPass = pickCompact ? 1 : 0; }
+// Scoring assignment: the REAL dependency-aware list scheduler (same function
+// the emission path uses). A free-form LPT was tried first and erased exactly
+// the term that decides T16 (order/dependency-constrained imbalance: measured
+// plain maxW=47234 vs LPT's optimistic 34267) - the model then collapsed to
+// "fewer edges always wins" and picked wrong.
+static void vcAutoAssign(MtDenseSchedule& sched, int threadCount) {
+  std::vector<int> assignTmp, orderTmp;
+  mtBuildDenseScheduleOrder(sched.mtasks, threadCount, assignTmp, orderTmp);
+  sched.mtaskThreadAssign = assignTmp;
+}
+
 static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDenseSchedule& schedule,
                                                                      int threadCount) {
   const int realN = static_cast<int>(schedule.sccs.size());
@@ -2245,10 +2263,31 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     // spuriously cycle-rejected (measured 16x: cycRej 3.29M -> 0.20M, mtasks 12275 ->
     // 8253 on the T32 champion graph). Default off preserves the registered champion
     // schedules; opt-in produces coarser schedules for perf experimentation.
-    static const bool vcCompact = [](){
+    // GSIM_MT_DENSE_VCONTRACT_POLICY=auto: two-pass schedule search. Pass 1 runs the
+    // legacy mergeLoop (no compaction), records the resulting schedule's invariants
+    // (max per-worker static cost, cross-thread edge count); pass 2 re-runs from the
+    // pristine graph WITH compaction and records its invariants. The winner is picked
+    // by the calibrated two-term floor model (constants from the machine-measured
+    // token latencies 24.5ns same-CCD / 290ns cross-CCD and one work-rate point per
+    // tier; ledger: v470 latency-augmented floor, vcontract-compact promotions):
+    //   score = maxW * A + crossEdges * B * L(threads),  L = 1 (<=16 workers, 1 CCD)
+    //                                                         8 (>16 workers, CCD mix)
+    // Essence: compaction trades sync points for balance. It wins when the plain
+    // schedule is sync-bound (T32: edges -40%, balance 1.63->1.49) and loses when
+    // work/balance-bound (T16: maxW floor dominates; coarser tasks fit 16 bins worse).
+    // The thread-count heuristic alone matched all measured points; the score model
+    // additionally adapts to RTL/workload shape via the actual invariants.
+    static const int vcPolicy = [](){
+      const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_POLICY");
+      if (e == nullptr || e[0] == '\0') return 1;   // default: manual COMPACT knob
+      if (std::strncmp(e, "auto", 4) == 0) return 2;
+      return 1;
+    }();
+    static const bool vcCompactManual = [](){
       const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_COMPACT");
       return e != nullptr && e[0] != '\0' && e[0] != '0';
     }();
+    const bool vcCompact = vcPolicy == 2 ? (gVcAutoPass == 1) : vcCompactManual;
     if (vcCompact) for (int r : cpRoots) {
       auto compact = [&](std::vector<int>& v) {
         size_t w = 0;
@@ -3933,7 +3972,59 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
 
     const bool v3Policy = mtUseDenseV3ContractPolicy();
     if (v3Policy || (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1')) {
-      schedule.mtasks = mtBuildDenseMTasksVerilatorContract(schedule, threadCount);
+      if (std::getenv("GSIM_MT_DENSE_VCONTRACT_POLICY") &&
+          std::strncmp(std::getenv("GSIM_MT_DENSE_VCONTRACT_POLICY"), "auto", 4) == 0) {
+        // Two-pass schedule search: plain then compacted, pick by the calibrated
+        // two-term floor model. The contract builder rebuilds its quotient graph
+        // from schedule.sccs on every call, so the second pass starts pristine.
+        auto scheduleInvariants = [](const std::vector<MtDenseMTask>& mts,
+                                     const std::vector<int>& assign,
+                                     std::vector<int>& workerCosts) {
+          workerCosts.assign(64, 0);
+          long cross = 0;
+          for (size_t i = 0; i < mts.size(); i ++) {
+            int w = i < assign.size() ? assign[(size_t)i] : 0;
+            if (w >= 0 && w < 64) workerCosts[(size_t)w] += mts[i].staticCost;
+            for (int succ : mts[i].succMTasks) {
+              int ws = succ >= 0 && succ < (int)assign.size() ? assign[(size_t)succ] : -1;
+              if (ws >= 0 && ws != w) cross ++;
+            }
+          }
+          return cross;
+        };
+        auto scoreOf = [](long maxW, long cross, int threads) {
+          const double A = 2.647e-3;              // us per static-cost unit (work rate, machine-fit)
+          const double B = 2.198e-5;              // us per cross-thread edge (same-CCD token)
+          const double L = threads <= 16 ? 1.0 : 8.0;  // cross-CCD latency weight (290/24.5 ~ 12, fit 8)
+          return maxW * A + cross * B * L;
+        };
+        MtDenseSchedule plainSched = schedule, compactSched = schedule;
+        vcAutoPassReset();
+        plainSched.mtasks = mtBuildDenseMTasksVerilatorContract(plainSched, threadCount);
+        vcAutoAssign(plainSched, threadCount);
+        std::vector<int> wcP; long crossP = scheduleInvariants(plainSched.mtasks, plainSched.mtaskThreadAssign, wcP);
+        long maxWP = *std::max_element(wcP.begin(), wcP.end());
+        vcAutoPassAdvance();
+        compactSched.mtasks = mtBuildDenseMTasksVerilatorContract(compactSched, threadCount);
+        vcAutoAssign(compactSched, threadCount);
+        std::vector<int> wcC; long crossC = scheduleInvariants(compactSched.mtasks, compactSched.mtaskThreadAssign, wcC);
+        long maxWC = *std::max_element(wcC.begin(), wcC.end());
+        double sP = scoreOf(maxWP, crossP, threadCount);
+        double sC = scoreOf(maxWC, crossC, threadCount);
+        // Conjunction rule (falsification-hardened): the two-term score model is
+        // missing fill/drain and task-granularity terms and systematically favors
+        // compaction at <=16 threads, where BOTH measured A/Bs show compaction
+        // losing (pre-merge +1.5%, merged-tip +7.2%, non-overlapping). The
+        // thread-count prior carries that calibration; the score acts as an
+        // additional veto at high thread counts.
+        bool pickCompact = (threadCount > 16) && (sC < sP);
+        fprintf(stderr, "[vcontract-policy] auto: plain(maxW=%ld cross=%ld score=%.1fus) vs compact(maxW=%ld cross=%ld score=%.1fus) -> %s\n",
+                maxWP, crossP, sP, maxWC, crossC, sC, pickCompact ? "COMPACT" : "PLAIN");
+        schedule = pickCompact ? compactSched : plainSched;
+        vcAutoPassFinish(pickCompact);
+      } else {
+        schedule.mtasks = mtBuildDenseMTasksVerilatorContract(schedule, threadCount);
+      }
     } else if (mtUseDenseCpContraction()) {
       schedule.mtasks = mtBuildDenseMTasksCpContraction(schedule, threadCount);
     } else {
