@@ -2,7 +2,9 @@ name: build-and-release
 
 on:
   push:
-    branches: ["**"]
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
 
 permissions:
   contents: write
@@ -10,60 +12,64 @@ permissions:
 jobs:
   build:
     name: Build gsim
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        llvm-version:
+          - 21.1.8
+          - 19.1.7
+        os:
+          - ubuntu-latest
+          - ubuntu-26.04-arm
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: false
 
-      - name: Install base dependencies
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          # flex provides the scanner; libfl-dev provides FlexLexer.h and libfl
-          sudo apt-get install -y make flex bison g++ libfl-dev libgmp-dev libc6-dev file
+          sudo ENABLE_STATIC=true ./scripts/install-dependencies.sh
 
-      - name: Install LLVM toolchain (>=19)
+      - name: Install LLVM toolchain
         uses: KyleMayes/install-llvm-action@v2
         with:
-          version: "20.1.4"
+          version: ${{ matrix.llvm-version }}
 
-      - name: Build gsim (static)
+      - name: Build gsim & verify
         run: |
+          # Build
           make -j"$(nproc)" STATIC=1 build-gsim
-
-      - name: Verify fully static binary
-        run: |
-          file build/gsim/gsim
-          # ldd prints "not a dynamic executable" for static binaries
-          ldd build/gsim/gsim 2>&1 | tee /dev/stderr | grep -q "not a dynamic executable"
-
-      - name: Smoke test help
-        run: |
-          ./build/gsim/gsim -h >/dev/null
+          # Rename to include compiler / arch info
+          GSIM_BIN=./build/gsim/gsim-clang${{ matrix.llvm-version }}-${{ runner.arch }}
+          mv ./build/gsim/gsim $GSIM_BIN
+          echo "GSIM_BIN=$GSIM_BIN" > $GITHUB_ENV
+          # Verify fully static binary: ldd prints "not a dynamic executable" for static binaries
+          ldd $GSIM_BIN 2>&1 | tee /dev/stderr | grep -q "not a dynamic executable"
+          # Verify gsim runs and prints help message
+          $GSIM_BIN -h >/dev/null
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: gsim-${{ runner.os }}-${{ github.sha }}
-          path: build/gsim/gsim
+          name: gsim-clang${{ matrix.llvm-version }}-${{ runner.arch }}
+          path: ${{ env.GSIM_BIN }}
 
   release:
     name: Release on master
     needs: build
-    if: github.ref == 'refs/heads/master'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Download built artifact
+        uses: actions/download-artifact@v8
         with:
-          submodules: false
-
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: gsim-${{ runner.os }}-${{ github.sha }}
-          path: dist
+          pattern: gsim-*
+          merge-multiple: true
 
       - name: Set release info
         id: release_info
@@ -72,12 +78,11 @@ jobs:
           echo "sha=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: master-${{ github.sha }}
+          target_commitish: ${{ github.sha }}
+          tag_name: master-${{ steps.release_info.outputs.date }}-${{ steps.release_info.outputs.sha }}
           name: gsim ${{ steps.release_info.outputs.date }} ${{ steps.release_info.outputs.sha }}
           body: ${{ github.event.head_commit.message }}
           files: |
-            dist/gsim
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            gsim*

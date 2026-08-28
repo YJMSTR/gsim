@@ -1,20 +1,28 @@
 name: ci
-on: [push, pull_request]
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+
+env:
+  CLANG_VERSION: 21.1.8
+
 jobs:
   fir-regression:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y make g++ flex bison libfl-dev libgmp-dev
-      - name: Install LLVM and Clang
+          sudo ./scripts/install-dependencies.sh
+      - name: Install LLVM toolchain
         uses: KyleMayes/install-llvm-action@v2
         with:
-            version: "20.1.4"
+          version: ${{ env.CLANG_VERSION }}
       - name: Build gsim
         run: |
           make -j "$(nproc)" build-gsim
@@ -31,25 +39,24 @@ jobs:
       matrix:
         dutName: [ysyx3, rocket, small-boom, large-boom, minimal-xiangshan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: 3.x
       - name: Install dependencies
         run: |
-          sudo apt install -y flex bison libfl-dev
-      # Since ubuntu 2404 doesn't comes with llvm >= 19
-      - name: Install LLVM and Clang
+          sudo ./scripts/install-dependencies.sh
+      - name: Install LLVM toolchain
         uses: KyleMayes/install-llvm-action@v2
         with:
-            version: "20.1.4"
+          version: ${{ env.CLANG_VERSION }}
       - name: Install verilator
-        uses: YosysHQ/setup-oss-cad-suite@v3
+        uses: YosysHQ/setup-oss-cad-suite@v4
         with:
-            version: "2025-04-24"
-            github-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "2025-04-24"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Enlarge swap
         if: matrix.dutName == 'minimal-xiangshan'
         run: |
@@ -74,25 +81,24 @@ jobs:
   bolt-ysyx3:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
             submodules: true
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: 3.x
       - name: Install dependencies
         run: |
-          sudo apt install -y flex bison libfl-dev
-      # Since ubuntu 2404 doesn't comes with llvm >= 19
-      - name: Install LLVM and Clang
+          sudo ./scripts/install-dependencies.sh
+      - name: Install LLVM toolchain
         uses: KyleMayes/install-llvm-action@v2
         with:
-            version: "20.1.4"
+          version: ${{ env.CLANG_VERSION }}
       - name: Install verilator
-        uses: YosysHQ/setup-oss-cad-suite@v3
+        uses: YosysHQ/setup-oss-cad-suite@v4
         with:
-            version: "2025-04-24"
-            github-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "2025-04-24"
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Check resources
         run: |
           echo "nproc = `nproc`"

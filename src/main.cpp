@@ -12,7 +12,9 @@
 #include <string>
 #include <cerrno>
 #include <cstdint>
+#include <thread>
 #include <getopt.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -34,6 +36,27 @@ PNode* parseFIR(char *strbuf);
 void preorder_traversal(PNode* root);
 graph* AST2Graph(PNode* root);
 void inferAllWidth();
+
+/* The CPUs this process may actually run on. The affinity mask is what a
+   shared or batch scheduled host grants, which can be far less than the
+   machine holds; hardware_concurrency() covers the case where the mask cannot
+   be read, and zero means the limit is unknown. */
+static int availableThreads() {
+  cpu_set_t affinity;
+  if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
+    int usable = CPU_COUNT(&affinity);
+    if (usable > 0) return usable;
+  }
+  return (int)std::thread::hardware_concurrency();
+}
+
+/* Workers past that limit only contend for the same cores, so the requested
+   count is held down to it whenever the limit is known. */
+static int capThreads(int requested) {
+  int limit = availableThreads();
+  if (limit > 0 && requested > limit) return limit;
+  return requested;
+}
 
 Config::Config() {
   EnableDumpGraph = false;
@@ -67,6 +90,7 @@ Config::Config() {
   MergeWhenSize = 5;
   When2muxBound = 2;
   LogLevel = 0;
+  NumThreads = capThreads(10);
 }
 Config globalConfig;
 
@@ -150,6 +174,8 @@ static void printUsage(const char* ProgName) {
             << "      --when-size=[num]            Bound for merging nested when blocks (default: 5).\n"
             << "      --when2mux-bound=[num]       Bound for converting when to mux (default: 2).\n"
             << "      --log-level=[0|1|2]          Verbosity for additional logs.\n"
+            << "      --threads=[num]              Number of worker threads used to parse the input\n"
+            << "                                   (default: 10, held down to the available CPUs).\n"
             << "      --dump-json                  Dump graphs in JSON (disable dot unless --dump-dot is also set).\n"
             << "      --dump-dot                   Dump graphs in DOT (disable json unless --dump-json is also set).\n"
             << "      --dump-stages=a,b,c          Dump only the listed stages (e.g., Init,TopoSort,AliasAnalysis).\n"
@@ -207,6 +233,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_WHEN_SIZE,
     OPT_WHEN2MUX,
     OPT_LOG_LEVEL,
+    OPT_THREADS,
     OPT_DUMP_JSON,
     OPT_DUMP_DOT,
     OPT_DUMP_STAGES,
@@ -243,6 +270,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"when-size", required_argument, nullptr, 0},
       {"when2mux-bound", required_argument, nullptr, 0},
       {"log-level", required_argument, nullptr, 0},
+      {"threads", required_argument, nullptr, 0},
       {"dump-json", no_argument, nullptr, 0},
       {"dump-dot", no_argument, nullptr, 0},
       {"dump-stages", required_argument, nullptr, 0},
@@ -289,6 +317,23 @@ static char* parseCommandLine(int argc, char** argv) {
                 case OPT_WHEN_SIZE: sscanf(optarg, "%d", &globalConfig.MergeWhenSize); break;
                 case OPT_WHEN2MUX: sscanf(optarg, "%d", &globalConfig.When2muxBound); break;
                 case OPT_LOG_LEVEL: sscanf(optarg, "%d", &globalConfig.LogLevel); break;
+                case OPT_THREADS: {
+                  int requested = 0;
+                  /* Fewer than one worker leaves the parser tasks unclaimed. */
+                  if (sscanf(optarg, "%d", &requested) != 1 || requested < 1) {
+                    fprintf(stderr, "Error: --threads expects a positive number, got '%s'.\n", optarg);
+                    printUsage(argv[0]);
+                    std::cout.flush();
+                    fflush(nullptr);
+                    _exit(EXIT_FAILURE);
+                  }
+                  globalConfig.NumThreads = capThreads(requested);
+                  if (globalConfig.NumThreads != requested) {
+                    fprintf(stderr, "Warning: --threads=%d exceeds the %d CPUs available here, using %d.\n",
+                        requested, globalConfig.NumThreads, globalConfig.NumThreads);
+                  }
+                  break;
+                }
                 case OPT_DUMP_JSON:
                   if (explicitDot) {
                     fprintf(stderr, "Error: --dump-json and --dump-dot cannot be used together.\n");

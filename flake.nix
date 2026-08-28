@@ -2,7 +2,7 @@
   description = "GSIM: A Fast RTL Simulator for Large-Scale Designs";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   };
 
   outputs = { self, nixpkgs, ... }:
@@ -12,7 +12,7 @@
       perSystem = nixpkgs.lib.genAttrs systems (system:
         let
           pkgs = import nixpkgs { inherit system; };
-          llvm = pkgs.llvmPackages_19;
+          llvm = pkgs.llvmPackages;
           gsim = llvm.stdenv.mkDerivation {
             pname = "gsim";
             version = version;
@@ -29,6 +29,7 @@
             buildInputs = [
               pkgs.flex
               pkgs.gmp
+              pkgs.jemalloc
             ];
 
             makeFlags = [
@@ -56,6 +57,17 @@
         {
           packages = {
             gsim = gsim;
+            gsim-static = (gsim.overrideAttrs (prev: {
+              pname = "${prev.pname}-static";
+              buildInputs = prev.buildInputs ++ [
+                pkgs.pkgsStatic.gmp
+                pkgs.pkgsStatic.jemalloc
+                llvm.stdenv.cc.libc.static
+              ];
+              makeFlags = prev.makeFlags ++ [
+                "STATIC=1"
+              ];
+            }));
             default = gsim;
           };
         }

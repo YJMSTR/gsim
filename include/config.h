@@ -33,6 +33,7 @@ struct Config {
   int MergeWhenSize;
   int When2muxBound;
   int LogLevel;
+  int NumThreads;
   std::set<std::string> DumpStages;
   Config();
 };

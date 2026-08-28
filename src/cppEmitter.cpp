@@ -10250,6 +10250,15 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     emitBodyLock(indent, "uint%d_t %s = 0;\n", ACTIVE_WIDTH, accumVar.c_str());
   }
   if (super->superType == SUPER_EXTMOD) { // TODO: normalize
+    auto emitExtAsyncReset = [&](Node* extOut) {
+      if (!extOut->isAsyncReset()) return;
+      auto resetId = super2ResetId.find(extOut);
+      Assert(resetId != super2ResetId.end() && resetId->second.second >= 0, "missing async reset id for %s", extOut->name.c_str());
+      emitBodyLock(indent, "subReset%d();\n", resetId->second.second);
+    };
+    for (size_t i = 1; i < super->member.size(); i ++) {
+      emitExtAsyncReset(super->member[i]);
+    }
     /* save old EXT_OUT*/
     for (size_t i = 1; i < super->member.size(); i ++) {
       if (!super->member[i]->needActivate()) continue;
@@ -10258,6 +10267,9 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     }
     for (InstInfo inst : super->insts) {
       indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+    }
+    for (size_t i = 1; i < super->member.size(); i ++) {
+      emitExtAsyncReset(super->member[i]);
     }
     for (size_t i = 1; i < super->member.size(); i ++) {
       if (!super->member[i]->needActivate()) continue;
