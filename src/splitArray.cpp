@@ -98,9 +98,13 @@ Node* getSplitArray(graph* g) {
     if (node->isArray() && point2self(node)) return node;
   }
 
-  for (Node* node : g->halfConstantArray) {
-    if (fullyVisited.find(node) != fullyVisited.end() || splitArrayMap.find(node) != splitArrayMap.end()) continue;
-    if (point2self(node)) return node;
+  {
+    std::vector<Node*> hca(g->halfConstantArray.begin(), g->halfConstantArray.end());
+    std::sort(hca.begin(), hca.end(), [](const Node* a, const Node* b){ return a->name < b->name; });
+    for (Node* node : hca) {
+      if (fullyVisited.find(node) != fullyVisited.end() || splitArrayMap.find(node) != splitArrayMap.end()) continue;
+      if (point2self(node)) return node;
+    }
   }
   for (Node* node : partialVisited) {
     int time = 0;
@@ -349,21 +353,29 @@ void graph::splitArrayNode(Node* node) {
     }
   }
 
-  std::set<Node*> checkNodes;
+  // Determinism fix (2026-08-28, residual): a pointer-ordered std::set here made the
+  // updateConnect/updateDep/updateWithSplittedArray iteration order allocation-
+  // dependent -> super construction order -> SuperNode id assignment -> DFS seed
+  // stack order (406/6.94M local swaps measured via GSIM_DEBUG_TOPO_IDS). The
+  // earlier two-pass fix stabilized edge CONTENT; this fixes iteration ORDER.
+  // Collect into the pointer set (cheap dedup) but iterate in NAME order.
+  std::set<Node*> checkNodesSet;
   /* construct connections */
   if ((node->type == NODE_REG_SRC || node->type == NODE_REG_DST) && splitArrayMap.find(node->getBindReg()) != splitArrayMap.end()) {
     Node* regBind = node->getBindReg();
     for (Node* member : splitArrayMap[regBind]) {
-      checkNodes.insert(member);
+      checkNodesSet.insert(member);
     }
   }
   for (Node* member : arrayMember) {
-    checkNodes.insert(member);
+    checkNodesSet.insert(member);
   }
   for (Node* next : node->depNext) {
-    checkNodes.insert(next);
+    checkNodesSet.insert(next);
     if (next != node) next->erasePrev(node);
   }
+  std::vector<Node*> checkNodes(checkNodesSet.begin(), checkNodesSet.end());
+  std::sort(checkNodes.begin(), checkNodes.end(), [](const Node* a, const Node* b){ return a->name < b->name; });
   for (Node* n : checkNodes) {
     for (ExpTree* tree : n->assignTree) tree->updateWithSplittedArray(n, node, arrayMember);
     if (n->resetTree) n->resetTree->updateWithSplittedArray(n, node, arrayMember);
@@ -559,8 +571,17 @@ void graph::checkNodeSplit(Node* node) {
 /* splitted separately assigned, no variable index acceesing arrays */
 void graph::splitOptionalArray() {
   int num = 0;
-  for (Node* node : fullyVisited) {
-    checkNodeSplit(node);
+  // Determinism: checkNodeSplit marks arraySplitMap entries while iterating
+  // fullyVisited (pointer-ordered std::set) - the MARK ORDER is allocation-
+  // dependent even though the final marked SET is not. The subsequent
+  // splitArrayNode loop (ORDERED_TOPO_SORT branch) is id-sorted, but the ids
+  // themselves derive from construction order upstream. Iterate in name order.
+  {
+    std::vector<Node*> fv(fullyVisited.begin(), fullyVisited.end());
+    std::sort(fv.begin(), fv.end(), [](const Node* a, const Node* b){ return a->name < b->name; });
+    for (Node* node : fv) {
+      checkNodeSplit(node);
+    }
   }
   regsrc.erase(
     std::remove_if(regsrc.begin(), regsrc.end(), [](const Node* n){ return n->status == DEAD_NODE; }),
