@@ -41,7 +41,7 @@ This branch adds a multithreaded dense execution engine: the design is condensed
 | 6 | 12.5 s (dense) | — | — |
 | 8 | 8.9–9.2 s (dense, pinned²) | 14.18 s | ~1.6× |
 | 16 | **6.39 s** (`COMPACT=1`, registered xiangshan-t16-compact-v1 on determinism-fixed tip 2026-08-29; tuned predecessor 6.30 s on pre-fix graph; clean A/B confirmed compaction wins on T16 too) | 11.15 s | 1.75× |
-| 32 | **5.40 s** (`COMPACT=1 MAXMT=1800`, registered xiangshan-t32-compact-v3 on determinism-fixed tip 2026-08-29; tuned predecessor 4.83 s on pre-fix graph; MAXMT optimum shifted 2400→1800 after determinism fixes) | 9.73–9.84 s | ~1.81× |
+| 32 | **4.83 s** (`COMPACT=1`, registered xiangshan-t32-compact-v3 on determinism-fixed tip 2026-08-29 — compact-v2 seed replays byte-identically through the determinism fixes; seed pins start at pass.topoSort, after the fixed graph-construction passes) | 9.73–9.84 s | ~2.03× |
 | 48 | 5.75 s (dense, pinned) | — | — |
 | 64 | 5.89 s (dense, pinned) | — | — |
 
