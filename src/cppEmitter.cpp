@@ -4011,13 +4011,15 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
         long maxWC = *std::max_element(wcC.begin(), wcC.end());
         double sP = scoreOf(maxWP, crossP, threadCount);
         double sC = scoreOf(maxWC, crossC, threadCount);
-        // Conjunction rule (falsification-hardened): the two-term score model is
-        // missing fill/drain and task-granularity terms and systematically favors
-        // compaction at <=16 threads, where BOTH measured A/Bs show compaction
-        // losing (pre-merge +1.5%, merged-tip +7.2%, non-overlapping). The
-        // thread-count prior carries that calibration; the score acts as an
-        // additional veto at high thread counts.
-        bool pickCompact = (threadCount > 16) && (sC < sP);
+        // Score rule (recalibrated 2026-08-29): the earlier conjunction with a
+        // threads>16 prior was calibrated on two cross-graph contaminated T16
+        // A/Bs; the CLEAN same-graph A/B (determinism-fixed binary, identical
+        // graph verified) FLIPPED the T16 verdict to compact -8.4% (5-pair
+        // non-overlapping). The pure score model had picked COMPACT on T16 all
+        // along - the model was right, the falsifying data was wrong. The score
+        // stands alone; the physical invariants (maxW, crossEdges) carry the
+        // input-adaptivity.
+        bool pickCompact = sC < sP;
         fprintf(stderr, "[vcontract-policy] auto: plain(maxW=%ld cross=%ld score=%.1fus) vs compact(maxW=%ld cross=%ld score=%.1fus) -> %s\n",
                 maxWP, crossP, sP, maxWC, crossC, sC, pickCompact ? "COMPACT" : "PLAIN");
         schedule = pickCompact ? compactSched : plainSched;
