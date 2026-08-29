@@ -40,8 +40,8 @@ This branch adds a multithreaded dense execution engine: the design is condensed
 | 4 | 17.8 s (serial-fast fallback¹) | — | — |
 | 6 | 12.5 s (dense) | — | — |
 | 8 | 8.9–9.2 s (dense, pinned²) | 14.18 s | ~1.6× |
-| 16 | 6.43 s (dense, registered; 6.08–6.26 s pinned today; compaction measured +1.5% here — T32-recipe-only) | 11.15 s | 1.73× |
-| 32 | **5.01 s** (`GSIM_MT_DENSE_VCONTRACT_COMPACT=1`, registered xiangshan-t32-compact-v1; 5.33–5.37 s legacy champion pinned today) | 9.73–9.84 s | ~1.95× |
+| 16 | 6.43 s (dense, registered v457; 6.08–6.26 s pinned at registration+0 on 2026-08-24; compaction measured +1.5% on this tier — T32-recipe-only) | 11.15 s | 1.73× |
+| 32 | **4.83 s** (`GSIM_MT_DENSE_VCONTRACT_COMPACT=1`, registered xiangshan-t32-compact-v2, 2026-08-27 clean 5-run; legacy champion 5.33–5.37 s on the same date) | 9.73–9.84 s | ~2.03× |
 | 48 | 5.75 s (dense, pinned) | — | — |
 | 64 | 5.89 s (dense, pinned) | — | — |
 
