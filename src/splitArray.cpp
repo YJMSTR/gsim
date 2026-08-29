@@ -89,22 +89,13 @@ bool point2self(Node* node) {
 }
 
 Node* getSplitArray(graph* g) {
-  // Determinism fix (2026-08-28): partialVisited is a pointer-ordered std::set, so
-  // the CHOICE among tied candidates depended on allocation addresses - fresh
-  // (seedless) generation landed on different graphs under jemalloc vs glibc
-  // (sccs 45161 vs 45162 on XiangShan SimTop), and cross-allocator seed replay
-  // broke after the upstream merge. Iterate candidates in NAME order instead:
-  // names are unique, so the selection is now a pure function of the graph.
-  {
-    std::vector<Node*> candidates;
-    for (Node* node : partialVisited) if (node->isArray()) candidates.push_back(node);
-    std::sort(candidates.begin(), candidates.end(), [](const Node* a, const Node* b){ return a->name < b->name; });
-    for (Node* node : candidates) {
-      if (node->next.find(node) != node->next.end()) return node; // point to self directly
-    }
-    for (Node* node : candidates) {
-      if (point2self(node)) return node;
-    }
+  /* array points to itself */
+  for (Node* node : partialVisited) {
+    if (node->isArray() && node->next.find(node) != node->next.end()) return node; // point to self directly
+  }
+
+  for (Node* node : partialVisited) {
+    if (node->isArray() && point2self(node)) return node;
   }
 
   for (Node* node : g->halfConstantArray) {
