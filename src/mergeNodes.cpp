@@ -152,6 +152,16 @@ void graph::mergeWhenNodes() {
   std::map<SuperNode*, std::vector<SuperNode*>, SeedRankLess> whenMapSeed;
   std::set<SuperNode*> condWaitOrig;
   std::map<SuperNode*, std::vector<SuperNode*>> whenMapOrig;
+  // Determinism (2026-08-28, residual round 3): the default path's depNext
+  // iteration, condWaitTop() tie-break, and whenMap apply order were all
+  // pointer-ordered -> mergeNodes-when removed 32333 (jemalloc) vs 32331
+  // (glibc) supers. The supers entering this pass are identical with identical
+  // ids (topo sequence now byte-identical), so id-ordering is deterministic.
+  const auto idOrdered = [](const std::set<SuperNode*>& in) {
+    std::vector<SuperNode*> v(in.begin(), in.end());
+    std::sort(v.begin(), v.end(), [](const SuperNode* a, const SuperNode* b){ return a->id < b->id; });
+    return v;
+  };
   /* generator all cond nodes */
   for (SuperNode* super : sortedSuper) {
     times[super] = 0;
@@ -215,7 +225,7 @@ void graph::mergeWhenNodes() {
   while (!s.empty()) {
     SuperNode* top = s.front();
     s.pop();
-    for (SuperNode* next : (seedReplay ? seedRankOrdered(top->depNext) : (stableOrder ? stableOrdered(top->depNext) : std::vector<SuperNode*>(top->depNext.begin(), top->depNext.end())))) {
+    for (SuperNode* next : (seedReplay ? seedRankOrdered(top->depNext) : (stableOrder ? stableOrdered(top->depNext) : idOrdered(top->depNext)))) {
       times[next] ++;
       if (times[next] + 1 == (int)next->depPrev.size()) {
         if (node2Cond.find(next) != node2Cond.end()) {
@@ -229,12 +239,18 @@ void graph::mergeWhenNodes() {
     }
     while (s.empty() && (!cond.empty() || !condWaitEmpty())) {
       if (cond.empty()) {
-        cond2Queue(condWaitTop());
+        SuperNode* pick = condWaitTop();
+        if (!seedReplay && !stableOrder && !condWaitOrig.empty()) {
+          // id-min over the pointer set (begin() is pointer-min)
+          pick = *std::min_element(condWaitOrig.begin(), condWaitOrig.end(),
+                                   [](const SuperNode* a, const SuperNode* b){ return a->id < b->id; });
+        }
+        cond2Queue(pick);
       }
       SuperNode* mergeCond = cond.front();
       cond.pop();
       std::vector<SuperNode*> mergeSuper;
-      for (SuperNode* next : (seedReplay ? seedRankOrdered(mergeCond->depNext) : (stableOrder ? stableOrdered(mergeCond->depNext) : std::vector<SuperNode*>(mergeCond->depNext.begin(), mergeCond->depNext.end())))) {
+      for (SuperNode* next : (seedReplay ? seedRankOrdered(mergeCond->depNext) : (stableOrder ? stableOrdered(mergeCond->depNext) : idOrdered(mergeCond->depNext)))) {
         times[next] ++;
         if (times[next] == (int)next->depPrev.size()) {
           if (allCond[mergeCond].find(next) != allCond[mergeCond].end()) mergeSuper.push_back(next);
@@ -271,7 +287,22 @@ void graph::mergeWhenNodes() {
   }
   if (seedReplay) applyWhenMap(whenMapSeed);
   else if (stableOrder) applyWhenMap(whenMapStable);
-  else applyWhenMap(whenMapOrig);
+  else {
+    // pointer-keyed map iterates in address order; apply in id order
+    std::vector<std::pair<SuperNode*, std::vector<SuperNode*>>> byId(whenMapOrig.begin(), whenMapOrig.end());
+    std::sort(byId.begin(), byId.end(), [](const auto& a, const auto& b){ return a.first->id < b.first->id; });
+    for (auto& kv : byId) {
+      std::vector<SuperNode*> allSuper = kv.second;
+      SuperNode* mergeSuper = allSuper[0];
+      for (size_t i = 1; i < allSuper.size(); i ++) {
+        for (Node* member : allSuper[i]->member) {
+          mergeSuper->add_member(member);
+          member->super = mergeSuper;
+        }
+        allSuper[i]->member.clear();
+      }
+    }
+  }
   }  // end else (seed2Replay verbatim application above)
   {
     PhaseTimer t("when.cleanup");
