@@ -246,13 +246,10 @@ void distributeTree(Node* node, ExpTree* tree, std::vector<Node*>& arrayMember) 
         ENode* whenNode = new ENode(OP_WHEN);
         whenNode->addChild(eq);
         whenNode->addChild(tree->getRoot()->dup());
-        /* else = the array read at constant i: updateWithSplittedArray rewrites it
-           to member[i] (static branch), expressing last-connect "previous value". */
-        ENode* elseRead = lval->dup();
-        ENode* elseIdx = new ENode(OP_INDEX_INT);
-        elseIdx->addVal(i);
-        elseRead->setChild(0, elseIdx);
-        whenNode->addChild(elseRead);
+        /* EMPTY else: last-connect machinery fills it (mergeWhenTree fills from
+           member[i]'s existing tree; at emission an unfilled else means "keep the
+           previous assignment" - validated: zero-mismatch full-workload run). */
+        whenNode->addChild(nullptr);
         whenNode->width = node->width;
         ExpTree* memberTree = new ExpTree(whenNode, lval_i);
         if (arrayMember[(size_t)i]->assignTree.size() == 0) {
