@@ -120,6 +120,14 @@ void graph::topoSort() {
   /* order sortedSuper */
   PhaseTimer tOrder("TopoSort.orderAllNodes");
   orderAllNodes();
+  if (std::getenv("GSIM_DEBUG_TOPO_IDS")) {
+    const char* dumpPath = std::getenv("GSIM_DEBUG_TOPO_IDS");
+    FILE* df = std::fopen(dumpPath, "w");
+    if (df) {
+      for (size_t i = 0; i < sortedSuper.size(); i ++) fprintf(df, "%d\n", sortedSuper[i]->id);
+      std::fclose(df);
+    }
+  }
   if (seedWrite) mtSeedWrite(std::getenv("GSIM_SCHEDULE_SEED_WRITE"), sortedSuper, seedInputHash, "wip/dense-b1-lookahead");
   if (seed2Write) mtSeed2RecordPoint("pass.topoSort", sortedSuper, canonInputHash());
   if (seed2Replay) { mtSeed2ApplyPoint("pass.topoSort", sortedSuper, canonInputHash()); orderAllNodes(); }
