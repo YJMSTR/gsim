@@ -55,6 +55,22 @@ Build flags: plain `-O3 -march=znver4`. PGO was measured and is **not** used —
 
 All `GSIM_MT_DENSE_*` knobs are default-off; with none of them set, generation output is byte-identical to upstream.
 
+### Benchmarks — new RTL (XiangShan kunminghu-v3), Linux boot 30K cycles
+
+The kunminghu-v3 netlist (253 commits after the v86 above; 1.46 GB FIR, 65,965 SCCs) requires the dynamic-index array-write fix (commit `e710a43`; see `docs/upstream-gap-dynamic-array-index.md` — the construct triggers an upstream gsim assertion). Workload: `linux.bin` booted 30,000 cycles, no-diff, 3 runs each, thread-width matched (see below). All four simulators below commit an identical, deterministic 86,469 instructions in the window (cross-simulator functional agreement).
+
+| Threads | gsim (best config) | Verilator (same machine/RTL) | gsim speedup |
+|---|---:|---:|---:|
+| 1 | **37.7 s** (plain serial model, 367 cpp) | 267–270 s | **7.1×** |
+| 16 | **8.21 s** (`COMPACT=1 MAXMT=800`, registered newrtl-t16-compact-v1, seed verified) | 15.4–15.9 s | **1.9×** |
+| 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified) | (verilation >60 min; vs V-T16) | **2.2×** |
+
+Notes:
+- **Thread-width match rule**: runtime `GSIM_THREADS` must equal generation-time width; a mismatch costs 14–16× (idle workers actively spin on owner-ready flags). Cross-tier rows above each use their own width-matched generation.
+- **Cross-RTL instruction counts are not same-work**: the same 30K-cycle window commits 40,134 instr on v86 vs 86,469 on kunminghu-v3. Decomposition: v86 boots through a flash→RAM copy path (t0=0x80000000 signature, ~2.1 IPC steady, its emu/NEMU pairing cannot difftest this image past instr 2) while kunminghu-v3 boots the reference flow (NEMU difftest clean, ~9K silent cycles then kernel init at ~5.0 IPC). Instruction-budget-symmetric run: both reach 40,134 instr at 30,000 (v86) vs 20,820 (kunminghu-v3) cycles.
+- Correctness gates on this RTL: CoreMark 2-iteration full-run difftest HIT GOOD TRAP (pc `0x80001ca0`, 663,758 instr / 304,246 cycles, zero mismatch) for serial, T16-compact, and T32-compact builds.
+- FIR lineage: `rtl-kunminghu-v3-frozen/SimTop.fir` (sha `4a0f4533b6b7f947`). Chisel elaboration is not byte-reproducible (paired-constant swaps between runs); every FIR is frozen immediately and treated as a distinct lineage.
+
 ### Toolchain pipeline cost (generation + build)
 
 Same machine (EPYC 9654, `-j48` builds), same input (XiangShan Default-config `SimTop`, 886 MB FIR / 2,089 Verilog files), clang 23 for the gsim model builds. Note the outputs differ: Verilator emits a 16-thread model, upstream gsim a serial model, gsim-mt the 16-thread dense model — this table compares pipeline cost, not simulation speed (that is the table above).
