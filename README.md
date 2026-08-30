@@ -62,7 +62,7 @@ The kunminghu-v3 netlist (253 commits after the v86 above; 1.46 GB FIR, 65,965 S
 | Threads | gsim (best config) | Verilator (same machine/RTL) | gsim speedup |
 |---|---:|---:|---:|
 | 1 | **37.7 s** (plain serial model, 367 cpp) | 267–270 s | **7.1×** |
-| 16 | **8.21 s** (`COMPACT=1 MAXMT=800`, registered newrtl-t16-compact-v1, seed verified) | 15.4–15.9 s (V curve: T20 13.3 s, T24 12.9 s, T26 12.6 s — flattening) | **1.9×** |
+| 16 | **7.19 s** (`COMPACT=1 MAXMT=1700`, registered newrtl-t16-compact-v2 — MAXMT retuned for the 46%-larger graph; sweep 800→8.17 s, 1100→8.14, 1400→7.57, 1700→7.25, 2000→7.20 plateau, 2400→7.62; 5-pair faceoff 1700 vs 2000 tie) | 15.35 s best-of-5 (V curve: T20 13.3 s, T24 12.9 s, T26 12.6 s — flattened) | **2.13× same-thread** (conservative pairing 2.10×) |
 | 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified) | n/a — max partitionable is **T26** (binary-searched: 25✓ 26✓ 27✗ 28✗, UNOPTTHREADS is fatal-by-default); best Verilator T26 = 12.6–14.5 s | **1.8×** vs best Verilator |
 
 Notes:
