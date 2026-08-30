@@ -63,7 +63,7 @@ The kunminghu-v3 netlist (253 commits after the v86 above; 1.46 GB FIR, 65,965 S
 |---|---:|---:|---:|
 | 1 | **37.7 s** (plain serial model, 367 cpp) | 267–270 s | **7.1×** |
 | 16 | **8.21 s** (`COMPACT=1 MAXMT=800`, registered newrtl-t16-compact-v1, seed verified) | 15.4–15.9 s | **1.9×** |
-| 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified) | (verilation >60 min; vs V-T16) | **2.2×** |
+| 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified) | n/a — T32 verilation fails (UNOPTTHREADS: Verilator cannot partition this netlist for 32 threads; best Verilator is T16) | **2.2×** vs V-T16 |
 
 Notes:
 - **Thread-width match rule**: runtime `GSIM_THREADS` must equal generation-time width; a mismatch costs 14–16× (idle workers actively spin on owner-ready flags). Cross-tier rows above each use their own width-matched generation.
