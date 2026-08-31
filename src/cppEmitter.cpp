@@ -3972,6 +3972,92 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
 
     const bool v3Policy = mtUseDenseV3ContractPolicy();
     if (v3Policy || (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1')) {
+
+      // GSIM_MT_DENSE_VCONTRACT_MAXMT_AUTO=1: in-generation MAXMT search. The
+      // contract builder rebuilds its quotient graph from schedule.sccs on every
+      // call (same pristine-restart mechanism the two-pass POLICY=auto search
+      // relies on), so we can evaluate a ladder of MAXMT candidates on the same
+      // constructed graph and pick by the calibrated floor model
+      // score = maxW*A + cross*B*L(threads) - U-shaped in MAXMT: coarse schedules
+      // lose on balance (maxW), fine schedules lose on sync (crossEdges). The
+      // winner is exported via setenv so the single real contraction below (and,
+      // under POLICY=auto, both of its passes) runs with it. Default off; when
+      // off, byte-identical output is unaffected.
+      if (std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT_AUTO") &&
+          std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT_AUTO")[0] == '1') {
+        auto probeInvariants = [](const std::vector<MtDenseMTask>& mts,
+                                  const std::vector<int>& assign,
+                                  std::vector<int>& workerCosts) {
+          workerCosts.assign(64, 0);
+          long cross = 0;
+          for (size_t i = 0; i < mts.size(); i ++) {
+            int w = i < assign.size() ? assign[(size_t)i] : 0;
+            if (w >= 0 && w < 64) workerCosts[(size_t)w] += mts[i].staticCost;
+            for (int succ : mts[i].succMTasks) {
+              int ws = succ >= 0 && succ < (int)assign.size() ? assign[(size_t)succ] : -1;
+              if (ws >= 0 && ws != w) cross ++;
+            }
+          }
+          return cross;
+        };
+        // Level-synchronous critical invariant: the dense executor advances
+        // level by level, so a worker with no task at a level still waits for
+        // the level's straggler. The floor is sum over levels of the max
+        // per-worker work in that level - NOT the global per-worker max.
+        auto probeLevelSum = [](const std::vector<MtDenseMTask>& mts, const std::vector<int>& assign) {
+          const size_t n = mts.size();
+          std::vector<int> indeg(n, 0);
+          for (size_t i = 0; i < n; i ++) indeg[i] = (int)mts[i].predMTasks.size();
+          std::vector<int> q; for (size_t i = 0; i < n; i ++) if (indeg[i] == 0) q.push_back((int)i);
+          long levelSum = 0; size_t done = 0;
+          std::vector<int> lw(64, 0);
+          while (!q.empty()) {
+            for (int w = 0; w < 64; w ++) lw[(size_t)w] = 0;
+            long mx = 0;
+            for (int u : q) {
+              int w = u < (int)assign.size() ? assign[(size_t)u] : 0;
+              if (w >= 0 && w < 64) { lw[(size_t)w] += mts[(size_t)u].staticCost; if (lw[(size_t)w] > mx) mx = lw[(size_t)w]; }
+            }
+            levelSum += mx; done += q.size();
+            std::vector<int> nq;
+            for (int u : q) for (int v : mts[(size_t)u].succMTasks) if (-- indeg[(size_t)v] == 0) nq.push_back(v);
+            q.swap(nq);
+          }
+          return done == n ? levelSum : -1;  // -1: cycle guard (should not happen post-contraction)
+        };
+        // (the maxW+cross floor score was retired: it misranked both validated RTLs)
+        std::vector<int> probeCands;
+        { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT_LADDER");
+          if (e && e[0]) { char* dup = strdup(e); for (char* t = strtok(dup, ","); t; t = strtok(nullptr, ",")) { int v = atoi(t); if (v > threadCount) probeCands.push_back(v); } free(dup); } }
+        if (probeCands.empty()) { static const int probeMults[] = {25, 50, 75, 100, 150, 200, 300}; for (int m : probeMults) probeCands.push_back(m * threadCount); }
+        fprintf(stderr, "[maxmt-auto] searching MAXMT ladder for threads=%d\n", threadCount);
+        int bestVal = -1; double bestScore = 1e30; long bestMaxW = 0, bestCross = 0;
+        for (int cand : probeCands) {
+          char cbuf[32]; snprintf(cbuf, sizeof cbuf, "%d", cand);
+          setenv("GSIM_MT_DENSE_VCONTRACT_MAXMT", cbuf, 1);
+          MtDenseSchedule probeSched = schedule;   // pristine copy; builder rebuilds from .sccs
+          probeSched.mtasks = mtBuildDenseMTasksVerilatorContract(probeSched, threadCount);
+          vcAutoAssign(probeSched, threadCount);
+          std::vector<int> wc; long cross = probeInvariants(probeSched.mtasks, probeSched.mtaskThreadAssign, wc);
+          long maxW = *std::max_element(wc.begin(), wc.end());
+          long lvlSum = probeLevelSum(probeSched.mtasks, probeSched.mtaskThreadAssign);
+          // Pick rule (validated 2026-08-30 on two RTLs): the level-synchronous
+          // straggler sum is the primary physical invariant (v86-T16: argmin lvlSum
+          // = 1200 = measured optimum, zero-fitting). The old maxW+cross floor
+          // misranked both RTLs (picked 2400/1000 where 2000/1200 measured best).
+          // lvlSum can overestimate schedules that bounded lookahead rescues, so
+          // cross breaks near-ties and the recommended protocol prunes to the
+          // top-2 candidates and confirms by a real bench (see ledger).
+          double s = (double)lvlSum;
+          fprintf(stderr, "[maxmt-auto]   cand=%d mtasks=%zu maxW=%ld cross=%ld lvlSum=%ld score=%.1f\n",
+                  cand, probeSched.mtasks.size(), maxW, cross, lvlSum, s);
+          if (s < bestScore || (s == bestScore && cross < bestCross)) { bestScore = s; bestVal = cand; bestMaxW = maxW; bestCross = cross; }
+        }
+        char wbuf[32]; snprintf(wbuf, sizeof wbuf, "%d", bestVal);
+        setenv("GSIM_MT_DENSE_VCONTRACT_MAXMT", wbuf, 1);
+        fprintf(stderr, "[maxmt-auto] picked MAXMT=%d (maxW=%ld cross=%ld score=%.1f)\n",
+                bestVal, bestMaxW, bestCross, bestScore);
+      }
       if (std::getenv("GSIM_MT_DENSE_VCONTRACT_POLICY") &&
           std::strncmp(std::getenv("GSIM_MT_DENSE_VCONTRACT_POLICY"), "auto", 4) == 0) {
         // Two-pass schedule search: plain then compacted, pick by the calibrated
