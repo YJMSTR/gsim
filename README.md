@@ -65,6 +65,8 @@ The kunminghu-v3 netlist (253 commits after the v86 above; 1.46 GB FIR, 65,965 S
 | 8 | **58.0 s** (`COMPACT=1 MAXMT=1600 LA128 CCD=250` — MAXMT picked by the in-generation lvlSum probe, first field deployment) | 120.0–120.6 s | **2.07×** |
 
 Workload refresh 2026-09-01 (linux **100k** cycles, same-session interleaved): T16 gsim 24.78 s vs V-T16 53.9 s = **2.18×**; CoreMark C50000 on khv3: gsim 11.29 s vs V 25.65 s = **2.27×** (ic 67,944 identical).
+
+Session-final T16 stack (28 h campaign, linux-30k): champion v3 7.08 s → +state-owner layout (−1.28 %, recorded) → **6.90 s best observed = 2.38×** vs same-session V-T16 16.36 s. Every layout/protocol lever measured: SBO ✅, ready-pad ❌ (+1.3 %), THP null, KL ×2 ❌/tie, slack-weight ❌ — the residual 61.7 G-instruction dispatch excess is localized to the `$old$` copy wall + activation compares (`docs/deep-ccd-repartitioning-design.md` WP2′, fresh-session discipline).
 | 16 | **7.05 s** (`COMPACT=1 MAXMT=2000 LA512 CCD_AFFINITY=250`, registered newrtl-t16-compact-v3 — CCD-locality assignment: greedy penalty for producer→consumer pairs split across the 8-core L3 boundary; 5-pair vs v2: −4.76%, 5/5 negative, ranges disjoint; γ saturates at 250) | 15.35 s best-of-5 (V curve: T20 13.3 s, T24 12.9 s, T26 12.6 s — flattened) | **2.18× same-thread** |
 | 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified; B2 linux-100k sweep: probe-picked m4800+CCD ties m2400 within noise — tier at plateau, T32 24.2 s ≈ T16 24.8 s at 100k) | n/a — max partitionable is **T26** (binary-searched: 25✓ 26✓ 27✗ 28✗, UNOPTTHREADS is fatal-by-default); best Verilator T26 = 12.6–14.5 s | **1.8×** vs best Verilator |
 
