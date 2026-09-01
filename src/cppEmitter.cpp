@@ -3424,6 +3424,19 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
   // 2x32MB L3. Soft term only: busyUntil/balance still dominate ordering.
   int ccdExtra = 0;
   { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+  // GSIM_MT_DENSE_CCD_SLACK_WEIGHT=1 (default off): scale the cross-CCD penalty
+  // by the edge's TEMPORAL heat. The strict-KL tie proved static cut is not
+  // binding; the greedy win is temporal co-scheduling. Slack of edge (p->c) =
+  // start(c) - completion(p) as estimated by this list scheduler: short slack
+  // means the token fires inside the producer's L3 residency window (full
+  // penalty), long slack means the line will likely be evicted anyway
+  // (discounted). Penalty_e = ccdExtra * cost(p) * w(slack), w = 1/(1+slack/T)
+  // with T = GSIM_MT_DENSE_CCD_SLACK_TAU pct of cost(p).
+  bool ccdSlackW = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_CCD_SLACK_WEIGHT"); ccdSlackW = e && e[0] && e[0] != '0'; }
+  int ccdSlackTauPct = 50;
+  { const char* e = std::getenv("GSIM_MT_DENSE_CCD_SLACK_TAU"); if (e && e[0]) { int v = std::atoi(e); if (v > 0) ccdSlackTauPct = v; } }
+  (void)ccdSlackW; (void)ccdSlackTauPct; // the schedorder path carries its own reads
   const int ccdSize = 8;
   int scheduled = 0;
   while (!ready.empty()) {
@@ -3518,6 +3531,11 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   // uses (the PackThreads variant of the term sits in its own builder).
   int ccdExtra = 0;
   { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+
+  bool ccdSlackW2 = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_CCD_SLACK_WEIGHT"); ccdSlackW2 = e && e[0] && e[0] != '0'; }
+  int ccdSlackTau2 = 50;
+  { const char* e = std::getenv("GSIM_MT_DENSE_CCD_SLACK_TAU"); if (e && e[0]) { int v = std::atoi(e); if (v > 0) ccdSlackTau2 = v; } }
   const int ccdSize = 8;
   while (!ready.empty()) {
     int bestReadyIndex = -1, bestMTask = -1, bestWorker = 0;
@@ -3538,8 +3556,17 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           int predWorker = outAssign[(size_t)pred];
           if (predWorker >= 0 && predWorker != worker) {
             predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
-            if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
-              predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
+            if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize)) {
+              long long pen = (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
+              if (ccdSlackW2) {
+                // temporal heat: this candidate start vs producer completion
+                long long slack = timeBegin - completion[(size_t)pred];
+                if (slack < 0) slack = 0;
+                long long tau = std::max<long long>(1, (long long)(costOf(mtasks[(size_t)pred])) * ccdSlackTau2 / 100);
+                pen = pen * tau / (tau + slack); // 1/(1+slack/tau)
+              }
+              predEnd += pen;
+            }
             // V3 PackThreads bounds a cross-thread estimate by the end of the next task
             // already packed on the predecessor's worker, avoiding a priority inversion.
             int next = v3Policy ? nextOnWorker[(size_t)pred] : -1;
