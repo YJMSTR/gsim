@@ -40,7 +40,7 @@ This branch adds a multithreaded dense execution engine: the design is condensed
 | 4 | 17.8 s (serial-fast fallback¹) | — | — |
 | 6 | 12.5 s (dense) | — | — |
 | 8 | 8.9–9.2 s (dense, pinned²) | 14.18 s | ~1.6× |
-| 16 | **6.39 s** (`COMPACT=1`, registered xiangshan-t16-compact-v1 on determinism-fixed tip 2026-08-29; tuned predecessor 6.30 s on pre-fix graph; clean A/B confirmed compaction wins on T16 too) | 11.15 s | 1.75× |
+| 16 | **5.46 s** (`COMPACT=1 MAXMT=1200 LA128`, registered xiangshan-t16-compact-v2 — MAXMT retune -12.1% same-harness 5/5, both sides C50000-difftest gated bit-identical; v1 6.39 s superseded) | 11.15 s (pre-pull harness; see harness-generation rule below) | ~1.9× (needs same-harness V-T16 re-measure) |
 | 32 | **4.83 s** (`COMPACT=1`, registered xiangshan-t32-compact-v3 on determinism-fixed tip 2026-08-29 — compact-v2 seed replays byte-identically through the determinism fixes; seed pins start at pass.topoSort, after the fixed graph-construction passes) | 9.73–9.84 s | ~2.03× |
 | 48 | 5.75 s (dense, pinned) | — | — |
 | 64 | 5.89 s (dense, pinned) | — | — |
@@ -62,6 +62,9 @@ The kunminghu-v3 netlist (253 commits after the v86 above; 1.46 GB FIR, 65,965 S
 | Threads | gsim (best config) | Verilator (same machine/RTL) | gsim speedup |
 |---|---:|---:|---:|
 | 1 | **37.7 s** (plain serial model, 367 cpp) | 267–270 s | **7.1×** |
+| 8 | **58.0 s** (`COMPACT=1 MAXMT=1600 LA128 CCD=250` — MAXMT picked by the in-generation lvlSum probe, first field deployment) | 120.0–120.6 s | **2.07×** |
+
+Workload refresh 2026-09-01 (linux **100k** cycles, same-session interleaved): T16 gsim 24.78 s vs V-T16 53.9 s = **2.18×**; CoreMark C50000 on khv3: gsim 11.29 s vs V 25.65 s = **2.27×** (ic 67,944 identical).
 | 16 | **7.05 s** (`COMPACT=1 MAXMT=2000 LA512 CCD_AFFINITY=250`, registered newrtl-t16-compact-v3 — CCD-locality assignment: greedy penalty for producer→consumer pairs split across the 8-core L3 boundary; 5-pair vs v2: −4.76%, 5/5 negative, ranges disjoint; γ saturates at 250) | 15.35 s best-of-5 (V curve: T20 13.3 s, T24 12.9 s, T26 12.6 s — flattened) | **2.18× same-thread** |
 | 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified) | n/a — max partitionable is **T26** (binary-searched: 25✓ 26✓ 27✗ 28✗, UNOPTTHREADS is fatal-by-default); best Verilator T26 = 12.6–14.5 s | **1.8×** vs best Verilator |
 
