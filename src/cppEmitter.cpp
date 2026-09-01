@@ -4230,6 +4230,90 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
         Assert(s > mi, "dense MTask id order not topo-monotone: edge %d->%d", mi, s);
       }
     }
+    // GSIM_MT_DENSE_CCD_KL=1 (default off): Kernighan-Lin-style post-pass on
+    // the finished assignment. Incremental gain only: a swap of a (CCD_A) and
+    // b (CCD_B) changes only a's and b's incident edges, so the cut delta is
+    // computed from those edges alone (the a-b edge, if any, stays crossing
+    // and cancels). Candidate pairs capped to keep this O(n * cap * deg).
+    {
+      const char* e = std::getenv("GSIM_MT_DENSE_CCD_KL");
+      if (e && e[0] && e[0] != '0' && (int)schedule.mtaskThreadAssign.size() == nMTasks && threadCount > 1) {
+        const int ccdSizeKL = 8;
+        auto mtCostKL = [&](int i) -> long long { const MtDenseMTask& m = schedule.mtasks[(size_t)i]; return m.schedCost > 0 ? m.schedCost : m.staticCost; };
+        auto ccdOfKL = [&](int t) { return schedule.mtaskThreadAssign[(size_t)t] / ccdSizeKL; };
+        // combined adjacency (pred + succ) for local gain evaluation
+        std::vector<std::vector<std::pair<int,long long>>> adj((size_t)nMTasks);
+        for (int i = 0; i < nMTasks; i++) {
+          long long w = mtCostKL(i);
+          for (int succ : schedule.mtasks[(size_t)i].succMTasks) {
+            if (succ < 0 || succ >= nMTasks || succ == i) continue;
+            adj[(size_t)i].push_back({succ, w});
+            adj[(size_t)succ].push_back({i, w});
+          }
+        }
+        std::vector<long long> load((size_t)threadCount, 0);
+        for (int i = 0; i < nMTasks; i++) load[(size_t)schedule.mtaskThreadAssign[(size_t)i]] += mtCostKL(i);
+        long long totalCut = 0;
+        for (int i = 0; i < nMTasks; i++)
+          for (int succ : schedule.mtasks[(size_t)i].succMTasks) {
+            if (succ < 0 || succ >= nMTasks) continue;
+            if (ccdOfKL(i) != ccdOfKL(succ)) totalCut += mtCostKL(i);
+          }
+        const long long cut0 = totalCut;
+        // local cut delta for swapping a and b (a!=b, different CCDs)
+        auto swapDelta = [&](int a, int b) -> long long {
+          int ca_ = ccdOfKL(a), cb_ = ccdOfKL(b);
+          long long delta = 0;
+          for (auto [o, w] : adj[(size_t)a]) {
+            if (o == b) continue; // stays crossing; cancels from both sums
+            bool before = (ccdOfKL(o) != ca_);
+            bool after  = (ccdOfKL(o) != cb_);
+            delta += (long long)after * w - (long long)before * w;
+          }
+          for (auto [o, w] : adj[(size_t)b]) {
+            if (o == a) continue;
+            bool before = (ccdOfKL(o) != cb_);
+            bool after  = (ccdOfKL(o) != ca_);
+            delta += (long long)after * w - (long long)before * w;
+          }
+          return delta;
+        };
+        int swaps = 0;
+        const int candCap = 128;
+        for (int pass = 0; pass < 3; pass ++) {
+          bool improved = false;
+          for (int a = 0; a < nMTasks; a++) {
+            if (schedule.mtasks[(size_t)a].workerZeroOnly) continue;
+            int wa = schedule.mtaskThreadAssign[(size_t)a];
+            int tried = 0;
+            for (int b = a + 1; b < nMTasks && tried < candCap; b++) {
+              int wb = schedule.mtaskThreadAssign[(size_t)b];
+              if (wb == wa || schedule.mtasks[(size_t)b].workerZeroOnly) continue;
+              if ((wa / ccdSizeKL) == (wb / ccdSizeKL)) continue;
+              tried ++;
+              long long c_a = mtCostKL(a), c_b = mtCostKL(b);
+              // per-worker balance guard: swap shifts wa by (c_b-c_a); bound the shift
+              long long shift = c_b - c_a;
+              if (shift > 0 && load[(size_t)wa] + shift > 3 * std::max<long long>(1, load[(size_t)wb])) continue;
+              if (shift < 0 && load[(size_t)wb] - shift > 3 * std::max<long long>(1, load[(size_t)wa])) continue;
+              long long d = swapDelta(a, b);
+              if (d < 0) {
+                schedule.mtaskThreadAssign[(size_t)a] = wb;
+                schedule.mtaskThreadAssign[(size_t)b] = wa;
+                load[(size_t)wa] += -c_a + c_b;
+                load[(size_t)wb] += -c_b + c_a;
+                totalCut += d;
+                swaps ++; improved = true;
+                wa = wb; // a now lives on b's old CCD
+              }
+            }
+          }
+          if (!improved) break;
+        }
+        fprintf(stderr, "[ccd-kl] %d swaps, cross-CCD cut %lld -> %lld (%.1f%%)\n", swaps, cut0, totalCut,
+                cut0 > 0 ? 100.0 * (double)totalCut / (double)cut0 : 100.0);
+      }
+    }
   }
   }
 
