@@ -16990,7 +16990,54 @@ void graph::cppEmitter() {
 
   // header: node definition; src: node evaluation
   fprintf(header, "uint32_t _var_start;\n");
-  for (SuperNode* super : sortedSuper) {
+  // GSIM_EMIT_STATE_BY_OWNER=1 (default off, no effect when unset): reorder the
+  // STATE-member declaration order so members whose owning mtask is assigned to
+  // the same CCD are declared adjacently. C++ lays members out in declaration
+  // order, so this groups each 8-core L3 domain's written state into contiguous
+  // arenas, cutting cross-CCD line ownership transfer on written lines. Pure
+  // layout: evaluation order and semantics are unchanged (the emission loop
+  // below is the ONLY consumer of this order for declarations; evaluation code
+  // references nodes by name).
+  bool stateByOwner = false;
+  { const char* e = std::getenv("GSIM_EMIT_STATE_BY_OWNER"); stateByOwner = e && e[0] && e[0] != '0'; }
+  std::vector<SuperNode*> emitOrderSuper(sortedSuper.begin(), sortedSuper.end());
+  if (stateByOwner && mtDenseSchedule.mtaskThreadAssign.size() == mtDenseSchedule.mtasks.size()) {
+    // node -> ccd of the worker of the mtask containing it (first scc hit wins;
+    // mtasks reference sccs, sccs reference nodes via the schedule)
+    std::map<Node*, int> nodeCcd;
+    const int ccdSize = 8;
+    for (size_t mi = 0; mi < mtDenseSchedule.mtasks.size(); mi ++) {
+      int w = mtDenseSchedule.mtaskThreadAssign[mi];
+      if (w < 0) continue;
+      int ccd = w / ccdSize;
+      for (int scc : mtDenseSchedule.mtasks[mi].sccIds) {
+        if (scc < 0 || scc >= (int)mtDenseSchedule.sccs.size()) continue;
+        for (int cpp : mtDenseSchedule.sccs[(size_t)scc].cppIds) {
+          if (cpp < 0 || cpp >= (int)supersrc.size()) continue;
+          for (Node* n : supersrc[(size_t)cpp]->member) {
+            if (n && nodeCcd.find(n) == nodeCcd.end()) nodeCcd[n] = ccd;
+          }
+        }
+      }
+    }
+    std::vector<int> superCcd(emitOrderSuper.size(), 1 << 30);
+    for (size_t i = 0; i < emitOrderSuper.size(); i ++) {
+      for (Node* n : emitOrderSuper[i]->member) { auto it = nodeCcd.find(n); if (it != nodeCcd.end()) { superCcd[i] = it->second; break; } }
+    }
+    std::vector<size_t> orderIdx(emitOrderSuper.size());
+    for (size_t i = 0; i < orderIdx.size(); i ++) orderIdx[i] = i;
+    std::sort(orderIdx.begin(), orderIdx.end(), [&](size_t a, size_t b) {
+      if (superCcd[a] != superCcd[b]) return superCcd[a] < superCcd[b];
+      return a < b; // original-order tiebreak == stability
+    });
+    std::vector<SuperNode*> reordered(emitOrderSuper.size());
+    for (size_t i = 0; i < orderIdx.size(); i ++) reordered[i] = emitOrderSuper[orderIdx[i]];
+    emitOrderSuper.swap(reordered);
+    // (dead lambda removed; index sort above is the stable reorder)
+    fprintf(stderr, "[state-by-owner] member decl reordered by owner CCD (%zu supers, %zu attributed nodes)\n",
+            emitOrderSuper.size(), nodeCcd.size());
+  }
+  for (SuperNode* super : emitOrderSuper) {
     // std::string insts;
     if (super->superType == SUPER_VALID || super->superType == SUPER_ASYNC_RESET) {
       for (Node* n : super->member) genNodeDef(header, n);
