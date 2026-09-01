@@ -3415,6 +3415,16 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
   for (size_t i = 0; i < mtasks.size(); i ++) {
     if (remainingPreds[i] == 0) ready.push_back(static_cast<int>(i));
   }
+  // GSIM_MT_DENSE_PACK_CCD_AFFINITY=<pct> (default 0 = off, byte-identical):
+  // extra greedy penalty for producer->consumer mtask pairs the assignment
+  // splits across the CCD/L3 boundary. Ground truth (lscpu, this machine):
+  // 8 cores per L3 domain; a T16 run on cores 0-15 spans CCD0 (0-7) and
+  // CCD1 (8-15); measured token latency 24.5ns same-CCD vs 290-322ns
+  // cross-CCD, and the split doubles the state footprint pressure on the
+  // 2x32MB L3. Soft term only: busyUntil/balance still dominate ordering.
+  int ccdExtra = 0;
+  { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+  const int ccdSize = 8;
   int scheduled = 0;
   while (!ready.empty()) {
     int bestReadyIndex = -1;
@@ -3431,7 +3441,11 @@ static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const 
           if (pred < 0 || pred >= static_cast<int>(mtasks.size())) continue;
           int predEnd = completion[(size_t)pred];
           int predWorker = assignment[(size_t)pred];
-          if (predWorker >= 0 && predWorker != worker) predEnd += (costOf(mtasks[(size_t)pred]) * 30) / 100;
+          if (predWorker >= 0 && predWorker != worker) {
+            predEnd += (costOf(mtasks[(size_t)pred]) * 30) / 100;
+            if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
+              predEnd += (costOf(mtasks[(size_t)pred]) * ccdExtra) / 100;
+          }
           if (predEnd > timeBegin) timeBegin = predEnd;
         }
         if (timeBegin < bestTime ||
@@ -3495,6 +3509,16 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   }
   std::vector<int> ready;
   for (int i = 0; i < n; i ++) if (remainingPreds[(size_t)i] == 0) ready.push_back(i);
+  // GSIM_MT_DENSE_PACK_CCD_AFFINITY=<pct> (default 0 = off, byte-identical):
+  // extra greedy penalty when a producer->consumer mtask pair lands across a
+  // CCD/L3 boundary. Ground truth (lscpu): 8 cores per L3 domain; T16 on cores
+  // 0-15 spans CCD0(0-7)/CCD1(8-15); token latency 24.5ns same- vs 290-322ns
+  // cross-CCD, and the split doubles 81MB of state across the 2x32MB L3s.
+  // This is the SCHED_ORDER path - the assignment the dense recipe actually
+  // uses (the PackThreads variant of the term sits in its own builder).
+  int ccdExtra = 0;
+  { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+  const int ccdSize = 8;
   while (!ready.empty()) {
     int bestReadyIndex = -1, bestMTask = -1, bestWorker = 0;
     long long bestTime = std::numeric_limits<long long>::max();
@@ -3514,6 +3538,8 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           int predWorker = outAssign[(size_t)pred];
           if (predWorker >= 0 && predWorker != worker) {
             predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
+            if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
+              predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
             // V3 PackThreads bounds a cross-thread estimate by the end of the next task
             // already packed on the predecessor's worker, avoiding a priority inversion.
             int next = v3Policy ? nextOnWorker[(size_t)pred] : -1;
