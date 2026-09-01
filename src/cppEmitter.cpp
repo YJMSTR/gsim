@@ -4292,10 +4292,11 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
               if ((wa / ccdSizeKL) == (wb / ccdSizeKL)) continue;
               tried ++;
               long long c_a = mtCostKL(a), c_b = mtCostKL(b);
-              // per-worker balance guard: swap shifts wa by (c_b-c_a); bound the shift
-              long long shift = c_b - c_a;
-              if (shift > 0 && load[(size_t)wa] + shift > 3 * std::max<long long>(1, load[(size_t)wb])) continue;
-              if (shift < 0 && load[(size_t)wb] - shift > 3 * std::max<long long>(1, load[(size_t)wa])) continue;
+              // STRICT balance guard: only swap near-equal-cost pairs, so the
+              // per-worker load vector is preserved to within 25% of the pair
+              // cost (the loose 3x guard of v1 let 6706 swaps wreck balance).
+              long long hi = std::max(c_a, c_b), lo = std::max<long long>(1, std::min(c_a, c_b));
+              if (hi > lo + lo / 4) continue; // require ca,cb within 25% of each other
               long long d = swapDelta(a, b);
               if (d < 0) {
                 schedule.mtaskThreadAssign[(size_t)a] = wb;
