@@ -66,7 +66,7 @@ The kunminghu-v3 netlist (253 commits after the v86 above; 1.46 GB FIR, 65,965 S
 
 Workload refresh 2026-09-01 (linux **100k** cycles, same-session interleaved): T16 gsim 24.78 s vs V-T16 53.9 s = **2.18×**; CoreMark C50000 on khv3: gsim 11.29 s vs V 25.65 s = **2.27×** (ic 67,944 identical).
 | 16 | **7.05 s** (`COMPACT=1 MAXMT=2000 LA512 CCD_AFFINITY=250`, registered newrtl-t16-compact-v3 — CCD-locality assignment: greedy penalty for producer→consumer pairs split across the 8-core L3 boundary; 5-pair vs v2: −4.76%, 5/5 negative, ranges disjoint; γ saturates at 250) | 15.35 s best-of-5 (V curve: T20 13.3 s, T24 12.9 s, T26 12.6 s — flattened) | **2.18× same-thread** |
-| 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified) | n/a — max partitionable is **T26** (binary-searched: 25✓ 26✓ 27✗ 28✗, UNOPTTHREADS is fatal-by-default); best Verilator T26 = 12.6–14.5 s | **1.8×** vs best Verilator |
+| 32 | **7.01 s** (`COMPACT=1 MAXMT=2400`, registered newrtl-t32-compact-v1, seed verified; B2 linux-100k sweep: probe-picked m4800+CCD ties m2400 within noise — tier at plateau, T32 24.2 s ≈ T16 24.8 s at 100k) | n/a — max partitionable is **T26** (binary-searched: 25✓ 26✓ 27✗ 28✗, UNOPTTHREADS is fatal-by-default); best Verilator T26 = 12.6–14.5 s | **1.8×** vs best Verilator |
 
 Notes:
 - **Thread-width match rule**: runtime `GSIM_THREADS` must equal generation-time width; a mismatch costs 14–16× (idle workers actively spin on owner-ready flags). Cross-tier rows above each use their own width-matched generation.
