@@ -14571,6 +14571,18 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       fprintf(header, "};\n");
     }
     fprintf(header, "struct MtDenseOwnerReadyToken { std::atomic<uint8_t> ready{0}; };\n");
+    // GSIM_EMIT_READY_PAD=1 (default off, byte-identical when off): pad each
+    // owner-ready token to a full 64B line. Measured structure: 16512 one-byte
+    // tokens share lines 64-way; cross-worker store(acquire/release) pairs
+    // ping-pong line ownership (290ns cross-CCD vs 24.5ns) on every token
+    // handoff - the tail counters' 698M candidate checks all touch these
+    // lines. Layout-only change, zero protocol/semantic change.
+    bool emitReadyPad = false;
+    { const char* e = std::getenv("GSIM_EMIT_READY_PAD"); emitReadyPad = e && e[0] && e[0] != '0'; }
+    if (emitReadyPad) {
+      fprintf(header, "struct alignas(64) MtDenseOwnerReadyTokenPadded { std::atomic<uint8_t> ready{0}; char pad[63]; };\n");
+      fprintf(header, "#define MT_DENSE_OWNER_READY_TOKEN_T MtDenseOwnerReadyTokenPadded\n");
+    }
     if (denseDuty) {
       fprintf(header, "struct alignas(64) MtDenseDutyLane { uint64_t spinNs = 0, spanNs = 0, tailNs = 0, blockNs = 0, resetNs = 0, joinNs = 0, stepWallNs = 0, count = 0; };\n");
       fprintf(header, "MtDenseDutyLane mtDutyLanes[%d];\n", threadCount + 1);
@@ -14583,8 +14595,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"owner-ready atomic must be lock-free\");\n");
     fprintf(header, "static_assert(sizeof(MtDenseOwnerReadyToken) == 1, \"owner-ready slots must have one-byte extent\");\n");
     fprintf(header, "static_assert((kDenseOwnerReadyPhysicalSlotCount %% 64) == 0, \"owner-ready storage must end on a 64-byte boundary\");\n");
-    fprintf(header, "alignas(64) MtDenseOwnerReadyToken mtDenseOwnerReadyTokens[%d];\n",
-            ownerReadyLayout.physicalSlotCount);
+    if (emitReadyPad)
+      fprintf(header, "alignas(64) MT_DENSE_OWNER_READY_TOKEN_T mtDenseOwnerReadyTokens[%d];\n",
+              ownerReadyLayout.physicalSlotCount);
+    else
+      fprintf(header, "alignas(64) MtDenseOwnerReadyToken mtDenseOwnerReadyTokens[%d];\n",
+              ownerReadyLayout.physicalSlotCount);
     fprintf(header, "bool mtDenseOwnerReadyTokensPrimed = false;\n");
     if (tableDispatch || denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
