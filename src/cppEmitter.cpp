@@ -14606,10 +14606,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
               std::max(1, (int)denseDispatchWaitTotal));
       bool firstSlot = true;
+      // GSIM_EMIT_SORTED_WAITS=1 (default off): sort each mtask's wait-slot
+      // list by token index. Conjunction is commutative so readiness semantics
+      // are unchanged; grouping same-line tokens (64/line) converts scattered
+      // acquire loads into sequential same-line accesses that stay L1-resident.
+      // Attacks the 136G scan/dispatch pool (attribution-revision-analytical).
+      bool sortWaits = false;
+      { const char* e = std::getenv("GSIM_EMIT_SORTED_WAITS"); sortWaits = e && e[0] && e[0] != '0'; }
       for (int t = 0; t < threadCount; t++) {
         for (int m = 0; m < nMTasks; m++) {
           if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
-          for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)m]) {
+          std::vector<int> slots = ownerReadyLayout.waitSlotsByMTask[(size_t)m];
+          if (sortWaits && slots.size() > 1) std::sort(slots.begin(), slots.end());
+          for (int slot : slots) {
             if (!firstSlot) fprintf(header, ",");
             fprintf(header, "%d", slot);
             firstSlot = false;
