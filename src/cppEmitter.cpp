@@ -9874,6 +9874,16 @@ ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveTy
   return std::make_tuple(ret, comment, uniqueIdx);
 }
 
+// GSIM_EMIT_BATCH_ACTIVATE=1 (default off): batch per-node activation ORs into
+// register-local accumulators per (word,bit) and flush once at body end. The
+// champion census: 447K activeFlags OR sites collapse to 39K (11.5x) because
+// many conds in one body target the same (slot,bit); OR is associative so the
+// flushed bits are identical (bodies never read activeFlags - verified census).
+bool mtBatchActivateEmit = []{ const char* e = std::getenv("GSIM_EMIT_BATCH_ACTIVATE"); return e && e[0] && e[0] != '0'; }();
+struct MtBatchActiveAccum { std::string name; int word; int bit; };
+static thread_local std::vector<MtBatchActiveAccum> mtBatchActiveAccums;
+
+
 std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBufferName = "") {
   if (!activeBufferName.empty()) return format("%s.orWord(%d, 0x%lx);", activeBufferName.c_str(), idx, mask);
   if (mtDenseSparseGateAtomicEmit) {
@@ -10403,6 +10413,24 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
       }
     }
     for (auto iter : bitMapInfo) {
+      const int batchBit = ACTIVE_UNIQUE(iter.second);
+      if (mtBatchActivateEmit && opt && batchBit >= 0 && activeBufferName.empty()
+          && (int)mtBatchActiveAccums.size() < 256) {
+        // WP2' batched activation: accumulate this cond into a function-scope
+        // bacc[] slot (declared at genSuperEval entry, enclosing all guards);
+        // flush once at genSuperEval exit. OR is associative: identical bits.
+        int accIdx = -1;
+        for (size_t ai = 0; ai < mtBatchActiveAccums.size(); ai ++)
+          if (mtBatchActiveAccums[ai].word == (int)iter.first && mtBatchActiveAccums[ai].bit == batchBit) { accIdx = (int)ai; break; }
+        if (accIdx < 0) {
+          mtBatchActiveAccums.push_back({"", (int)iter.first, batchBit});
+          accIdx = (int)mtBatchActiveAccums.size() - 1;
+          emitBodyLock(indent, "bacc[%d] = (uint8_t)%s; // batch-active %d<<%d\n", accIdx, condName.c_str(), (int)iter.first, batchBit);
+        } else {
+          emitBodyLock(indent, "bacc[%d] |= (uint8_t)%s; // batch-active %d<<%d\n", accIdx, condName.c_str(), (int)iter.first, batchBit);
+        }
+        continue;
+      }
       auto str = opt ? updateActiveStr(iter.first, ACTIVE_MASK(iter.second), condName, ACTIVE_UNIQUE(iter.second), activeBufferName)
                      : updateActiveStr(iter.first, ACTIVE_MASK(iter.second), activeBufferName);
       emitBodyLock(indent, "%s // %s\n", str.c_str(), ACTIVE_COMMENT(iter.second).c_str());
@@ -10592,6 +10620,19 @@ static bool mtActAccEnabled() {
 }
 
 void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation) { // current indent = 2
+  const std::vector<MtBatchActiveAccum> mtBatchAccumsSaved = std::move(mtBatchActiveAccums);
+  mtBatchActiveAccums.clear();
+  const int mtBatchActiveBaseIndent = indent;
+  if (mtBatchActivateEmit) emitBodyLock(indent, "uint8_t bacc[256]; // batch-active accumulators\n");
+  auto mtBatchActiveFlush = [&]() {
+    if (!mtBatchActiveAccums.empty()) {
+      for (size_t ai = 0; ai < mtBatchActiveAccums.size(); ai ++) {
+        const auto& a = mtBatchActiveAccums[ai];
+        emitBodyLock(mtBatchActiveBaseIndent, "activeFlags[%d] |= (uint8_t)(bacc[%zu] << %d); // batch-active flush\n", a.word, ai, a.bit);
+      }
+    }
+    mtBatchActiveAccums = std::move(mtBatchAccumsSaved);
+  };
   int savedTraceSourceCppId = mtActivationEventTraceSourceCppId;
   if (emitActivation && !mtActivationEventTraceSuppressed) mtActivationEventTraceSourceCppId = super->cppId;
   bool useAccum = emitActivation && mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
@@ -10709,6 +10750,7 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     }
     if (mtDenseActiveWorklistEmit) emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", super->cppId / ACTIVE_WIDTH);
   }
+  mtBatchActiveFlush();
   mtActivationEventTraceSourceCppId = savedTraceSourceCppId;
 }
 
@@ -10766,6 +10808,7 @@ int graph::genActivate(const std::string& subStepSuffix) {
 void graph::genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType) {
   int savedTraceSourceCppId = mtActivationEventTraceSourceCppId;
   mtActivationEventTraceSourceCppId = super->cppId;
+
   if (buffered) {
     emitFuncDecl(0, "void S%s::mtTask%d(uint%d_t &flag, %s &nextActive) {\n", name.c_str(), super->cppId, ACTIVE_WIDTH, activeSinkType.c_str());
     genSuperEval(super, "flag", "nextActive", 1, true);
