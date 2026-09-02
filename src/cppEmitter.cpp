@@ -3081,9 +3081,25 @@ static MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
   auto alignCacheLine = [](int slot) { return (slot + 63) & ~63; };
   int nextSlot = 0;
   std::vector<std::tuple<int, int, int, int>> bankRanges;
-  for (const auto& bank : groupsByOwnerPair) {
-    const int producerOwner = bank.first.first;
-    const int consumerOwner = bank.first.second;
+  // GSIM_EMIT_CONSUMER_ARENAS=1 (default off): iterate banks by CONSUMER then
+  // producer (instead of by producer pair), so all tokens a consumer waits on
+  // land in contiguous slots - the layout precondition for batch scanning
+  // (measured: both batch variants tie at pair-bank layout because consumer
+  // waits span ~15 banks 64B apart).
+  bool consumerArenas = false;
+  { const char* e = std::getenv("GSIM_EMIT_CONSUMER_ARENAS"); consumerArenas = e && e[0] && e[0] != '0'; }
+  std::vector<std::pair<std::pair<int,int>, std::vector<int>*>> bankOrder;
+  for (auto& bank : groupsByOwnerPair) bankOrder.push_back({bank.first, &bank.second});
+  if (consumerArenas) {
+    std::sort(bankOrder.begin(), bankOrder.end(), [](const auto& a, const auto& b) {
+      if (a.first.second != b.first.second) return a.first.second < b.first.second;
+      return a.first.first < b.first.first;
+    });
+  }
+  for (size_t bankIdx = 0; bankIdx < bankOrder.size(); bankIdx ++) {
+    const int producerOwner = bankOrder[bankIdx].first.first;
+    const int consumerOwner = bankOrder[bankIdx].first.second;
+    std::vector<int>& bank = *bankOrder[bankIdx].second;
     Assert(producerOwner != consumerOwner,
            "dense owner-ready pair bank unexpectedly aliases owner %d", producerOwner);
     nextSlot = alignCacheLine(nextSlot);
@@ -3091,7 +3107,7 @@ static MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
     Assert((bankBegin & 63) == 0,
            "dense owner-ready pair bank %d -> %d does not start on 64-byte boundary",
            producerOwner, consumerOwner);
-    for (int groupId : bank.second) {
+    for (int groupId : bank) {
       Group& group = groups[(size_t)groupId];
       Assert(group.slot < 0, "dense owner-ready group %d received duplicate slots", groupId);
       Assert(group.producerOwner == producerOwner && group.consumerOwner == consumerOwner,
@@ -3103,7 +3119,7 @@ static MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
     Assert((bankEnd & 63) == 0 && bankEnd > bankBegin,
            "dense owner-ready pair bank %d -> %d has invalid aligned extent [%d,%d)",
            producerOwner, consumerOwner, bankBegin, bankEnd);
-    for (int groupId : bank.second) {
+    for (int groupId : bank) {
       const Group& group = groups[(size_t)groupId];
       Assert(group.slot >= bankBegin && group.slot + 1 <= bankEnd,
              "dense owner-ready one-byte slot %d escapes pair bank [%d,%d)",
