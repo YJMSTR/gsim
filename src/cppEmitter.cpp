@@ -9884,6 +9884,10 @@ bool mtBatchActivateEmit = []{ const char* e = std::getenv("GSIM_EMIT_BATCH_ACTI
 // activate successors UNCONDITIONALLY (full evaluation, Verilator semantics,
 // conservative & bit-identical). Measures (skip value - detection cost) net.
 bool mtStaticDenseProbeEmit = []{ const char* e = std::getenv("GSIM_EMIT_STATIC_DENSE_PROBE"); return e && e[0] && e[0] != '0'; }();
+// GSIM_EMIT_SCAN_PREFETCH=1 (default off): prefetch wait/store token slots in the
+// lookahead scan. The 16KB token array is MESI-churned by 16 writers; prefetches
+// overlap the coherence-miss latency (measured: L3-latency-bound, 12% cross-CCD).
+bool mtScanPrefetchEmit = []{ const char* e = std::getenv("GSIM_EMIT_SCAN_PREFETCH"); return e && e[0] && e[0] != '0'; }();
 struct MtBatchActiveAccum { std::string name; int word; int bit; };
 static thread_local std::vector<MtBatchActiveAccum> mtBatchActiveAccums;
 
@@ -15217,6 +15221,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
             if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] != t) continue;
             emitBodyLock(4, "{ bool mtDenseInlineReady = true;\n");
+            if (mtScanPrefetchEmit) {
+              for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId])
+                emitBodyLock(5, "__builtin_prefetch(&mtDenseOwnerReadyTokens[%d].ready, 0, 3);\n", slot);
+            }
             for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
               emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
             }
@@ -15228,6 +15236,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                            t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
             }
             emitBodyLock(5, "stepDenseMTask%d();\n", mtaskId);
+            if (mtScanPrefetchEmit) {
+              for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId])
+                emitBodyLock(5, "__builtin_prefetch(&mtDenseOwnerReadyTokens[%d].ready, 1, 3);\n", slot);
+            }
             for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
               emitBodyLock(5, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
             }
