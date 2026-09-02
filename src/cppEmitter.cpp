@@ -9880,6 +9880,10 @@ ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveTy
 // many conds in one body target the same (slot,bit); OR is associative so the
 // flushed bits are identical (bodies never read activeFlags - verified census).
 bool mtBatchActivateEmit = []{ const char* e = std::getenv("GSIM_EMIT_BATCH_ACTIVATE"); return e && e[0] && e[0] != '0'; }();
+// GSIM_EMIT_STATIC_DENSE_PROBE=1 (default off): drop change detection entirely -
+// activate successors UNCONDITIONALLY (full evaluation, Verilator semantics,
+// conservative & bit-identical). Measures (skip value - detection cost) net.
+bool mtStaticDenseProbeEmit = []{ const char* e = std::getenv("GSIM_EMIT_STATIC_DENSE_PROBE"); return e && e[0] && e[0] != '0'; }();
 struct MtBatchActiveAccum { std::string name; int word; int bit; };
 static thread_local std::vector<MtBatchActiveAccum> mtBatchActiveAccums;
 
@@ -10347,12 +10351,18 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
 
   std::map<uint64_t, ActiveType> bitMapInfo;
   ActiveType curMask;
+  bool guardEmitted = true;
   if (node->isAsyncReset()) {
     emitBodyLock(indent ++, "if (%s || (%s != %s)) {\n", oldName.c_str(), nodeName.c_str(), oldName.c_str());
   } else {
     curMask = activeSet2bitMap(nextNodeId, bitMapInfo, node->super->cppId);
     opt = ((ACTIVE_MASK(curMask) != 0) + bitMapInfo.size()) <= 3;
-    if (opt) {
+    if (mtStaticDenseProbeEmit) {
+      // static-dense probe: full evaluation - unconditional constant-mask ORs,
+      // no compare guard; dead $old$ decls get DCE'd (kill-test proven)
+      opt = false;
+      guardEmitted = false;
+    } else if (opt) {
       if (node->width == 1) emitBodyLock(indent, "bool %s = %s ^ %s;\n", condName.c_str(), nodeName.c_str(), oldName.c_str());
       else emitBodyLock(indent, "bool %s = %s != %s;\n", condName.c_str(), nodeName.c_str(), oldName.c_str());
     }
@@ -10457,7 +10467,7 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
     if (inStep && node->type != NODE_EXT_OUT) emitBodyLock(indent, "isActivateValid = true;\n");
   #endif
   }
-  if (!opt) emitBodyLock(-- indent, "}\n");
+  if (!opt && guardEmitted) emitBodyLock(-- indent, "}\n");
 }
 void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
                                std::string activeBufferName, int indent,
