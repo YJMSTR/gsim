@@ -15529,7 +15529,39 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "const MtDenseDispatchEntry* mtDenseDispatchEntry = mtDenseDispatchBegin + head;\n");
     emitBodyLock(2, "bool mtDenseEntryReady = true;\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
-    emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
+    // GSIM_EMIT_BATCH_SCAN=1 (default off): with sorted wait lists, consecutive
+    // tokens often share cache lines. Instead of loading each token individually
+    // through the atomic, load 8 consecutive sorted tokens as one uint64_t word
+    // (they are 1 byte each, naturally aligned within the token array) and compare
+    // against the repeated-target pattern. Falls back to individual checks on
+    // pattern mismatch. Only activated when the wait count allows grouping.
+    bool batchScan = false;
+    { const char* e = std::getenv("GSIM_EMIT_BATCH_SCAN"); batchScan = e && e[0] && e[0] != '0'; }
+    if (batchScan) {
+      emitBodyLock(3, "{\n");
+      emitBodyLock(4, "const uint32_t wB = mtDenseDispatchEntry->waitBegin, wE = mtDenseDispatchEntry->waitEnd;\n");
+      emitBodyLock(4, "const uint64_t tgt8 = 0x0101010101010101ULL * (uint64_t)target;\n");
+      emitBodyLock(4, "uint32_t w = wB;\n");
+      emitBodyLock(4, "for (; w + 8 <= wE; w += 8) {\n");
+      emitBodyLock(5, "const int i0 = kDenseOwnerReadyWaitList[w];\n");
+      emitBodyLock(5, "bool consecutive = true;\n");
+      emitBodyLock(5, "for (int k = 1; k < 8; k++) if (kDenseOwnerReadyWaitList[w+k] != i0 + k) { consecutive = false; break; }\n");
+      emitBodyLock(5, "if (consecutive && ((i0 & 7) == 0)) {\n");
+      emitBodyLock(6, "uint64_t word; memcpy(&word, &mtDenseOwnerReadyTokens[i0].ready, 8);\n");
+      emitBodyLock(6, "if (word != tgt8) { mtDenseEntryReady = false; break; }\n");
+      emitBodyLock(5, "} else {\n");
+      emitBodyLock(6, "for (int k = 0; k < 8; k++) mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[w+k]].ready.load(std::memory_order_acquire) == target);\n");
+      emitBodyLock(6, "if (!mtDenseEntryReady) break;\n");
+      emitBodyLock(5, "}\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(4, "for (; w < wE; ++w) {\n");
+      emitBodyLock(5, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[w]].ready.load(std::memory_order_acquire) == target);\n");
+      emitBodyLock(5, "if (!mtDenseEntryReady) break;\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(3, "}\n");
+    } else {
+      emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
+    }
     emitBodyLock(2, "}\n");
     // Tail-scan instrumentation (E3): zero-cost unless the stats compile macro is set.
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
