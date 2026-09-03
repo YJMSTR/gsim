@@ -110,6 +110,72 @@ The quick start below assumes `SimTop.fir` already exists. The complete chain fr
 
 Reproducibility: with the champion seed, stage 2 replays the registered schedule exactly (facts line verbatim, 9/9 canon pins) and stages 3–4 land on the registered performance (Linux 100K 10.6–11.3 s vs registered mean 10.8 s; 1M 105.3 s vs 107.4 s). Note `emu` requires `NEMU_HOME` pointing at a tree containing `build/riscv64-nemu-interpreter-so` even for non-difftest runs (the difftest library is always linked).
 
+### From a fresh clone (copy-paste; verified end-to-end 2026-09-03 on EPYC 9654)
+
+Assumed layout: `gsim` and `XiangShan` as **sibling directories**, commands run from
+the gsim repo root unless noted. Known-good pins: this branch @ `6134430`;
+XiangShan `96f3a4d4b` (submodules: difftest `45638f51`, ready-to-run `e8840417`).
+Other XiangShan HEADs generally work but the FIR content drifts — regenerate the
+model, and expect benchmark numbers to differ from the registered ones.
+
+```bash
+# 1. This repo + the generator (~25 s; links jemalloc when available)
+git clone git@github.com:YJMSTR/gsim.git && cd gsim
+git checkout deliver/gsim-mt-dense-v1
+make build-gsim -j$(nproc)
+
+# 2. XiangShan sibling + SimTop.fir (skip if you already have the FIR)
+git clone https://github.com/OpenXiangShan/XiangShan.git ../XiangShan
+cd ../XiangShan && git checkout 96f3a4d4b && make init     # submodules; needs JDK+mill env
+make sim-chirrtl CONFIG=DefaultConfig                       # ~15–20 min; JVM heap 40G (JVM_XMX)
+cd ../gsim        # FIR lands at ../XiangShan/build/rtl/SimTop.fir
+
+# 3. Generate the MT model: export the quick-start env block below, then
+mkdir -p ../mybuild/gsim-compile
+build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
+  --sep-mod=__DOT__ --sep-aggr=__DOT__ --mt-helper-mode=mt-level-dispatch \
+  --dir ../mybuild/gsim-compile/model ../XiangShan/build/rtl/SimTop.fir   # ~8 min
+
+# 4. Build the emu via the XiangShan difftest harness (~1.5 min, 559 TUs)
+cp -r ../XiangShan/difftest/build/generated-src ../mybuild/   # one-time prerequisite
+make -C ../XiangShan/difftest gsim-build-emu \
+  BUILD_DIR=$(realpath ../mybuild) \
+  RTL_DIR=$(realpath ../XiangShan/build/rtl) \
+  NOOP_HOME=$(realpath ../XiangShan) \
+  WITH_CHISELDB=0 WITH_CONSTANTIN=0 EMU_THREADS=32 \
+  EMU_OPTIMIZE="-O3 -march=znver4 -DCPU_XIANGSHAN -DGSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE=1" \
+  -j$(nproc)
+# → ../mybuild/gsim-compile/emu
+
+# 5. Run (CoreMark, ~7 s for 50K cycles)
+NEMU_HOME=../XiangShan/ready-to-run \
+GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense GSIM_MT_CPU_AFFINITY=auto \
+taskset -c 0-31 ../mybuild/gsim-compile/emu \
+  -i ../XiangShan/ready-to-run/coremark-2-iteration.bin -C 50000 --no-diff
+# → "Core-0 instrCnt = 46,562, cycleCnt = 50,000, IPC = 0.93"
+```
+
+Path rules that bite (all verified by failure before choosing this form):
+
+- `BUILD_DIR`/`RTL_DIR`/`NOOP_HOME` **must be absolute** — hence `$(realpath ...)`.
+  `make -C` chdirs into `difftest/` and resolves make-variable relative paths against
+  *that* directory (a relative `BUILD_DIR=../mybuild` silently builds into
+  `XiangShan/mybuild/` and dies with `difftest-state.h: file not found`).
+  `$(realpath ...)` also strips symlink components, which matter because clang/make
+  resolve absolute paths containing `symlink/..` physically.
+- `$(BUILD_DIR)/generated-src` (from `difftest/build/generated-src`, normally a
+  Chisel-elaboration product) is a hard prerequisite of the build parse.
+- Keep the model's mtimes newer than the FIR, or make refires the generation rule
+  (and then needs `GSIM_BIN` pointing at the generator).
+- Runtime `NEMU_HOME` may stay relative (resolved against your CWD); the
+  ready-to-run submodule ships `build/riscv64-nemu-interpreter-so`, so no separate
+  NEMU build is needed. `--no-diff` skips the NEMU comparison but `NEMU_HOME` is
+  still required (the library is always linked). For bit-exact difftest, the NEMU
+  vintage must match the RTL vintage — if in doubt, use `--no-diff`.
+- Thread-width discipline: the quick-start `GSIM_THREADS=32` (generation),
+  `EMU_THREADS=32` (build) and runtime `GSIM_THREADS=32` must agree; a mismatched
+  runtime width falls off a >10× performance cliff.
+
 ### Quick start (XiangShan SimTop netlist, 32 threads)
 
 
