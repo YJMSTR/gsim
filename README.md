@@ -140,13 +140,24 @@ build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
   --dir <OUT_DIR> SimTop.fir                 # <OUT_DIR> must exist; ~8-9 min for XiangShan (see pipeline table)
 ```
 
+> **Required pairing**: `GSIM_MT_DENSE_EXECUTOR_CODEGEN=1` (and likewise
+> `GSIM_MT_DENSE_ONLY_CODEGEN`) only work with exactly
+> `--mt-helper-mode=mt-level-dispatch` on the gsim command line — that mode is
+> what enables coarse batch formation (`MtBatchFormationMode=coarse`, promoted
+> automatically; no explicit `--mt-batch-formation` needed). Any of the
+> following aborts generation with
+> `GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation in v181`:
+> omitting `--mt-helper-mode`, using `--mt-helper-mode=mt` (the legacy upstream
+> mode), or explicitly overriding `--mt-batch-formation=legacy` /
+> `active-frequency`.
+
 Then build and run the emitted model with your MT harness (a difftest-based flow is one option), with `GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense GSIM_MT_CPU_AFFINITY=auto` at runtime.
 
 ### Knob overview
 
 | Knob | Default | Effect |
 |---|---|---|
-| `GSIM_MT_DENSE_EXECUTOR_CODEGEN` | off | Emit the dense executor + schedule JSON report |
+| `GSIM_MT_DENSE_EXECUTOR_CODEGEN` | off | Emit the dense executor + schedule JSON reportrequires `--mt-helper-mode=mt-level-dispatch` (see quick start) |
 | `GSIM_MT_DENSE_VCONTRACT` | off | Verilator-style SCC contraction into MTasks |
 | `GSIM_MT_DENSE_VCONTRACT_MAXMT` | 1600 | MTask count cap (granularity; T32 optimum 2400, T16 optimum 800 on XiangShan — the landscape is non-smooth, sweep per design) |
 | `GSIM_MT_DENSE_VCONTRACT_EDGE_CPWO` | off | Critical-path-weighted edge scoring (load-bearing) |
