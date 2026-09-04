@@ -296,21 +296,6 @@ void distributeTree(Node* node, ExpTree* tree, std::vector<Node*>& arrayMember) 
   }
 }
 
-void splitAssignMent(Node* node, ExpTree* tree, std::vector<ExpTree*>& newTrees) {
-  int range = 1;
-  for (int i = tree->getlval()->getChildNum(); i < (int)node->dimension.size(); i ++) range *= node->dimension[i];
-
-  for (int idx = 0; idx < range; idx ++) {
-    std::vector<int> subIdx(node->dimension.size() - tree->getlval()->getChildNum());
-    int tmp = idx;
-    for (size_t i = node->dimension.size() - 1; i >= tree->getlval()->getChildNum(); i --) {
-      subIdx[i - tree->getlval()->getChildNum()] = tmp % node->dimension[i];
-      tmp /= node->dimension[i];
-    }
-    ExpTree* dupTree = dupTreeWithIdx(tree, subIdx, node);
-    newTrees.push_back(dupTree);
-  }
-}
 
 void ExpTree::updateWithSplittedArray(Node* node, Node* array, std::vector<Node*>& arrayMember) {
   std::stack<std::tuple<ENode*, ENode*, int>> s;

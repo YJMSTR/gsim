@@ -160,7 +160,7 @@ static std::vector<char> mtStepActiveWordGuardable;
 // (ACTIVE_WIDTH==8 => each activeFlags[] is uint8_t, so byte atomics are aligned/UB-free) so
 // cross-thread same-word activations don't lose updates. Set only around the gated dense body.
 static thread_local bool mtDenseSparseGateAtomicEmit = false;
-// V340: emit push-driven active-MTask registration only while generating the
+// emit push-driven active-MTask registration only while generating the
 // single-thread sparse-dense executor body. Activation writes then mark the
 // static reverse-index candidates directly; no repeated active-word scans.
 static thread_local bool mtDenseActiveWorklistEmit = false;
@@ -1449,7 +1449,7 @@ static bool mtUseDenseOwnerReadyFlags() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// V335: default-off compile-exclusive per-worker completion join.
+// default-off compile-exclusive per-worker completion join.
 static bool mtUseWorkerPoolFlagJoinCodegen() {
   const char* env = std::getenv("GSIM_MT_WORKER_POOL_FLAG_JOIN");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -1459,7 +1459,7 @@ static bool mtUseWorkerPoolFlagJoinCodegen() {
 
 
 
-// V357: default-off compile-exclusive per-CCD wake-generation sharding. The
+// default-off compile-exclusive per-CCD wake-generation sharding. The
 // single shared mtWorkerPoolGeneration line is read-hammered by all N-1 workers
 // every post; at T32 those workers span 4 CCDs (4 L3 domains) so each post
 // broadcast-invalidates the line across CCDs. Sharding the wake signal into
@@ -1606,7 +1606,7 @@ static bool mtUseDenseSharedHelpers() {
 // activity local collector: register reads (REG_SRC) plus MEMORY/array reads. The shared
 // MtBoundaryInfo read set only records NODE_REG_SRC names; memory readers (NODE_READER /
 // READWRITER / WRITER / MEMORY) were missing from the activation fanout, leaving a wavefront
-// closure hole (L2/array-driven one-hot assertions fired on the first V384 build). The collector
+// closure hole (L2/array-driven one-hot assertions fired on the first build of this collector). The collector
 // must be COMPLETE: any missed read is a closure hole that lets a body compute from stale inputs
 // (the activity4 rab one-hot divergence: deqPtrOH stuck at 0). No truncation budget.
 // Speed (activity5 generation took 52min vs 27min baseline): memoize per-Node read sets —
@@ -1743,7 +1743,7 @@ static bool mtUseDenseSparseGate() {
   const char* env = std::getenv("GSIM_MT_DENSE_SPARSE_GATE");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
-// V340: push-driven T1 de-risk for sparse-dense. This is intentionally
+// push-driven T1 de-risk for sparse-dense. This is intentionally
 // default-off and requires atomic sparse-gate writes so every activation can
 // register its target active word with the generated worklist.
 static bool mtUseDenseActiveWorklistPush() {
@@ -2222,7 +2222,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
       : std::numeric_limits<uint64_t>::max();
   bool sibEnabled = true;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_SIBLING"); if (e && e[0] == '0') sibEnabled = false; }
-  // V331: use V3's critPathCostWithout edge score in the legacy contraction
+  // use V3's critPathCostWithout edge score in the legacy contraction
   // without coupling to V3's cost domain or its soft stop policy.
   const bool edgeCpWithout = [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_EDGE_CPWO"); return e && e[0] && e[0] != '0'; }();
   // Verilator PropagateCp port: keep fwd/rev critical paths ACCURATE through merges so
@@ -9770,13 +9770,6 @@ static void inline newLine(FILE* fp) {
   fprintf(fp, "\n");
 }
 
-std::string strReplace(std::string s, std::string oldStr, std::string newStr) {
-  size_t pos;
-  while ((pos = s.find(oldStr)) != std::string::npos) {
-    s.replace(pos, oldStr.length(), newStr);
-  }
-  return s;
-}
 
 FILE* graph::genHeaderStart() {
   headerFilePath = globalConfig.OutputDir + "/" + name + ".h";
@@ -14658,8 +14651,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         fprintf(header, "};\n");
       }
       // fix: shared noinline helpers keep the per-site fanout/succ stores as calls.
-      // The first V384 build inlined constant-bounded loops; clang -O3 unrolled ~400K of them
-      // and SimTop1217.cpp compiled for 90+ minutes before the build was killed.
+      // Inlining these constant-bounded loops made clang -O3 unroll ~400K of them
+      // and one TU compiled for 90+ minutes before the build was killed; keep the calls outlined.
       fprintf(header, "void mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd);\n");
       fprintf(header, "void mtDenseActivitySuccStore(int mtask);\n");
       fprintf(header, "void mtDenseActivitySuccLiteStore(int mtask);\n");
@@ -15313,7 +15306,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   if (activity) {
     // Activations produced during cycle N target cycle N+1: the counter is incremented after
     // the pool join, so stores must write counter+1 (the upcoming cycle's epoch). The first
-    // V384 build stored the current counter, leaving cycle 1+ with no active MTasks (frozen
+    // Storing the current counter here leaves cycle 1+ with no active MTasks (frozen
     // core, C5000 hang).
     emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd) {\n", name.c_str());
     emitBodyLock(1, "for (int j = fanoutBegin; j < fanoutEnd; j++)\n");

@@ -30,15 +30,6 @@ void ExpTree::getRelyNodes(std::set<Node*>& allNodes) {
   }
 }
 
-bool anyOuterEdge(Node* node) {
-  bool ret = false;
-  for (Node* next : node->next) {
-    if (next == node || (node->type == NODE_REG_SRC && next == node->getDst())
-      || next->status == DEAD_NODE /* point to dead registers */) continue;
-    ret = true;
-  }
-  return ret;
-}
 
 void graph::removeDeadNodes() {
   static int passId = 0;

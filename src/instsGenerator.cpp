@@ -218,17 +218,6 @@ static int countArrayIndex(std::string name) {
   return count;
 }
 
-bool resetConsEq(valInfo* dstInfo, Node* regsrc) {
-  if (!regsrc->resetTree) return true;
-  valInfo* info = regsrc->resetTree->getRoot()->compute(regsrc, regsrc->name.c_str(), true);
-  if (info->status == VAL_EMPTY) return true;
-  mpz_t consVal;
-  mpz_init(consVal);
-  mpz_set(consVal, dstInfo->status == VAL_CONSTANT ? dstInfo->consVal : dstInfo->assignmentCons);
-  if (info->status == VAL_CONSTANT && mpz_cmp(info->consVal, consVal) == 0) return true;
-  if (info->sameConstant && mpz_cmp(info->assignmentCons, consVal) == 0) return true;
-  return false;
-}
 
 static bool isSubArray(std::string name, Node* node) {
   size_t count = countArrayIndex(name);
@@ -308,12 +297,6 @@ std::string idx2Str(Node* node, int idx, int dim) {
   return ret;
 }
 
-std::string setCons(std::string lvalue, int width, valInfo* info) {
-  Assert(info->status == VAL_CONSTANT, "%s expect constant", lvalue.c_str());
-  std::string ret;
-  ret = format("%s = %s;\n", lvalue.c_str(), info->valStr.c_str());
-  return ret;
-}
 
 valInfo* ENode::instsWhen(Node* node, std::string lvalue, bool isRoot) {
   /* cond is constant */
