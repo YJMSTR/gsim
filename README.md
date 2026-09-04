@@ -182,7 +182,8 @@ cd ../XiangShan && make init && mkdir -p out && export NOOP_HOME=$(pwd)
 make sim-chirrtl GSIM=1 CONFIG=DefaultConfig      # vintage table above; old trees: sim-verilog
 cd ../gsim        # FIR lands at ../XiangShan/build/rtl/SimTop.fir
 
-# 3. Generate the MT model: export the quick-start env block below, then
+# 3. Generate the MT model: FIRST export the quick-start env block (below) —
+   the env shapes the emitted schedule; exporting after generation has no effect — then
 mkdir -p ../mybuild/gsim-compile
 build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
   --sep-mod=__DOT__ --sep-aggr=__DOT__ --mt-helper-mode=mt-level-dispatch \
@@ -232,9 +233,19 @@ Path rules that bite (all verified by failure before choosing this form):
   `--no-diff` skips the NEMU comparison but `NEMU_HOME` is still required (the
   library is always linked). For bit-exact difftest, the NEMU vintage must match
   the RTL vintage — if in doubt, use `--no-diff`.
-- Thread-width discipline: the quick-start `GSIM_THREADS=32` (generation),
-  `EMU_THREADS=32` (build) and runtime `GSIM_THREADS=32` must agree; a mismatched
-  runtime width falls off a >10× performance cliff.
+- Thread-width discipline — **export the quick-start env block BEFORE
+  generation** (step 3), and keep the same width N at all three touchpoints:
+  (1) generation `GSIM_THREADS=N` + the `GSIM_MT_DENSE_*` block decide the
+  schedule's worker count (baked into the model as `kDenseOwnerReadyWorkerCount`)
+  and what code is emitted — without `GSIM_MT_DENSE_EXECUTOR_CODEGEN=1` exported
+  at generation time, NO dense executor is emitted at all (exporting later does
+  not help); (2) build `EMU_THREADS=N` only compiles the harness thread-pool
+  width (`-DEMU_THREAD`); (3) runtime `GSIM_THREADS=N` is read by the model via
+  `getenv` at startup and **must equal the baked generation width** — a mismatch
+  falls off a >10× cliff (excess workers idle-spin on owner-ready flags).
+  Switching tiers (T32→T16) is NOT a runtime-env change: the dispatch tables are
+  baked, so regenerate with the `GSIM_THREADS=16` env block (`MAXMT=800`), then
+  build `EMU_THREADS=16`, then run `GSIM_THREADS=16 taskset -c 0-15`.
 - Flow 1 (`make gsim`) ignores the dense-executor env knobs by design — it drives
   the generator with repo-default `GSIM_FLAGS` from `difftest/gsim.mk`. Tuning
   lives in Flow 2's manual generation step.
