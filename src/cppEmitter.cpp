@@ -275,12 +275,6 @@ struct MtCoarseMTask {
   int staticCost = 0;
   int memberNodeCost = 0;
   int orderingEdgeCount = 0;
-  // per-mtask dependency graph for atomic-counter scheduling.
-  std::vector<int> predMTaskIndices;
-  std::vector<int> succMTaskIndices;
-  int upstreamDepCount = 0;
-  // serial/hazard singletons must stay on worker 0 for ordering correctness.
-  bool workerZeroOnly = false;
 };
 
 struct MtCoarseRegion {
@@ -314,12 +308,6 @@ struct MtCoarseRegion {
   std::vector<std::string> blockers;
   std::vector<MtCoarseLayer> layers;
   std::vector<MtCoarseMTask> mtasks;
-  std::vector<MtCoarseMTask> antichainProbeGroups;   // report-only inside-component antichain grouping
-  int antichainProbeMaxBlockWidth = 0;                  // max chain-cover width across non-serial blocks
-  int antichainProbeTotalGroups = 0;                    // total groups incl. serial singletons (may be large)
-  bool antichainProbeDagAcyclic = false;                // quotient DAG on antichainProbeGroups acyclic
-  bool useAntichainRuntime = false;                     // route this region through atomic-counter scheduler
-  std::string antichainSelectionReason;
 };
 
 struct MtCoarseRegionPlan {
@@ -2008,17 +1996,6 @@ static bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId) {
   bool value = mtTaskHasActiveEdgeToUncached(fromCppId, toCppId);
   mtActiveEdgeCache.emplace(key, value);
   return value;
-}
-// check whether fromCppId's SuperNode has a needActivate edge to toCppId.
-// Unlike nextActiveId (which includes always-active), nextNeedActivate tracks the
-// conditional activation edges gated by output change. Used by the Sarkar probe.
-static bool mtTaskHasNeedActivateEdgeTo(int fromCppId, int toCppId) {
-  auto iter = cppId2Super.find(fromCppId);
-  if (iter == cppId2Super.end() || !iter->second) return false;
-  for (Node* member : iter->second->member) {
-    if (member && member->nextNeedActivate.find(toCppId) != member->nextNeedActivate.end()) return true;
-  }
-  return false;
 }
 
 static bool mtTaskHasDependencyEdgeTo(int fromCppId, int toCppId) {
@@ -4268,341 +4245,6 @@ static void mtAddCoarseLayers(MtCoarseRegion& region) {
   region.estimatedLayerCount = static_cast<int>(region.layers.size());
 }
 
-// report-only inside-component antichain grouping.
-// Computes dependency-connected components, splits serial/hazard nodes into
-// singleton groups, and covers each contiguous non-serial block with a minimum
-// chain decomposition (Dilworth).  The resulting groups are stored only for
-// the coarse-region report; region.mtasks is left unchanged so the runtime
-// executor still sees the original ordering-edge components.
-// Forward declaration for DAG builder.
-static bool mtBuildAntichainMTaskDAG(MtCoarseRegion& region);
-
-static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
-  region.antichainProbeGroups.clear();
-  region.antichainProbeMaxBlockWidth = 0;
-  region.antichainProbeTotalGroups = 0;
-
-  int n = region.endCppId - region.beginCppId;
-  if (n <= 0) return;
-
-  // 1. Union-find on dependency edges only.
-  std::vector<int> parent(n);
-  for (int i = 0; i < n; i++) parent[i] = i;
-  std::function<int(int)> findRoot = [&](int value) -> int {
-    int root = value;
-    while (parent[root] != root) root = parent[root];
-    while (parent[value] != value) {
-      int next = parent[value];
-      parent[value] = root;
-      value = next;
-    }
-    return root;
-  };
-  auto unite = [&](int a, int b) {
-    int rootA = findRoot(a);
-    int rootB = findRoot(b);
-    if (rootA != rootB) parent[rootB] = rootA;
-  };
-
-  for (int from = region.beginCppId; from < region.endCppId; from++) {
-    for (int to = region.beginCppId; to < region.endCppId; to++) {
-      if (from == to) continue;
-      if (!mtTaskHasDependencyEdgeTo(from, to)) continue;
-      unite(from - region.beginCppId, to - region.beginCppId);
-    }
-  }
-
-  std::map<int, std::vector<int>> depComponentByRoot;
-  for (int cppId = region.beginCppId; cppId < region.endCppId; cppId++) {
-    int root = findRoot(cppId - region.beginCppId);
-    depComponentByRoot[root].push_back(cppId);
-  }
-
-  // Build local layer index map.
-  std::map<int, int> layerIndexByCppId;
-  for (size_t layerIdx = 0; layerIdx < region.layers.size(); layerIdx++) {
-    for (int cppId : region.layers[layerIdx].taskCppIds) {
-      layerIndexByCppId[cppId] = static_cast<int>(layerIdx);
-    }
-  }
-
-  auto addSingletonGroup = [&](int cppId, bool workerZeroOnly) {
-    MtCoarseMTask group;
-    auto layerIter = layerIndexByCppId.find(cppId);
-    if (layerIter != layerIndexByCppId.end()) {
-      while ((int)group.layerTaskCppIds.size() <= layerIter->second) {
-        group.layerTaskCppIds.push_back(std::vector<int>());
-      }
-      group.layerTaskCppIds[layerIter->second].push_back(cppId);
-    }
-    group.taskCount = 1;
-    group.staticCost = mtTaskEstimatedCost(tasks, cppId);
-    group.workerZeroOnly = workerZeroOnly;
-    auto superIter = cppId2Super.find(cppId);
-    if (superIter != cppId2Super.end() && superIter->second) {
-      group.memberNodeCost = static_cast<int>(superIter->second->member.size());
-    }
-    region.antichainProbeGroups.push_back(group);
-  };
-
-  // Minimum chain cover via Hopcroft-Karp on the transitive closure of a DAG.
-  auto chainCover = [&](const std::vector<int>& block) {
-    if (block.empty()) return;
-    if (block.size() == 1) {
-      addSingletonGroup(block[0], false);
-      return;
-    }
-    std::vector<int> verts = block;
-    std::sort(verts.begin(), verts.end());
-    std::map<int, int> idx;
-    for (size_t i = 0; i < verts.size(); i++) idx[verts[i]] = static_cast<int>(i);
-    int m = static_cast<int>(verts.size());
-
-    // Reachability bitset (forward edges only, by cppId order).
-    std::vector<uint64_t> reach(m * ((m + 63) / 64), 0);
-    int words = (m + 63) / 64;
-    auto setBit = [&](int r, int c) {
-      if (r == c) return;
-      if (idx[verts[r]] < idx[verts[c]]) {
-        reach[r * words + (c >> 6)] |= (1ULL << (c & 63));
-      }
-    };
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < m; j++) {
-        if (i == j) continue;
-        if (mtTaskHasDependencyEdgeTo(verts[i], verts[j]) ||
-            mtTaskHasActiveEdgeTo(verts[i], verts[j])) {
-          setBit(i, j);
-        }
-      }
-    }
-
-    // Transitive closure (Warshall via bitsets).
-    for (int k = 0; k < m; k++) {
-      for (int i = 0; i < m; i++) {
-        if (reach[i * words + (k >> 6)] & (1ULL << (k & 63))) {
-          for (int w = 0; w < words; w++) {
-            reach[i * words + w] |= reach[k * words + w];
-          }
-        }
-      }
-    }
-
-    // Build adjacency list from left U to right V.
-    std::vector<std::vector<int>> adj(m);
-    for (int i = 0; i < m; i++) {
-      for (int j = 0; j < m; j++) {
-        if (i == j) continue;
-        if (reach[i * words + (j >> 6)] & (1ULL << (j & 63))) {
-          adj[i].push_back(j);
-        }
-      }
-    }
-
-    // Hopcroft-Karp.
-    std::vector<int> pairU(m, -1), pairV(m, -1), dist(m);
-    std::function<bool()> bfs = [&]() -> bool {
-      std::deque<int> q;
-      for (int u = 0; u < m; u++) {
-        if (pairU[u] == -1) {
-          dist[u] = 0;
-          q.push_back(u);
-        } else {
-          dist[u] = -1;
-        }
-      }
-      bool found = false;
-      while (!q.empty()) {
-        int u = q.front(); q.pop_front();
-        for (int v : adj[u]) {
-          int pu = pairV[v];
-          if (pu != -1 && dist[pu] == -1) {
-            dist[pu] = dist[u] + 1;
-            q.push_back(pu);
-          } else if (pu == -1) {
-            found = true;
-          }
-        }
-      }
-      return found;
-    };
-    std::function<bool(int)> dfs = [&](int u) -> bool {
-      for (int v : adj[u]) {
-        int pu = pairV[v];
-        if (pu == -1 || (dist[pu] == dist[u] + 1 && dfs(pu))) {
-          pairU[u] = v;
-          pairV[v] = u;
-          return true;
-        }
-      }
-      dist[u] = -1;
-      return false;
-    };
-
-    int matching = 0;
-    while (bfs()) {
-      for (int u = 0; u < m; u++) {
-        if (pairU[u] == -1 && dfs(u)) matching++;
-      }
-    }
-    int width = m - matching;
-    if (width > region.antichainProbeMaxBlockWidth) region.antichainProbeMaxBlockWidth = width;
-
-    // Extract chains from matching: pairU[u] = v means u precedes v in a chain.
-    std::map<int, int> nxt;
-    std::set<int> hasPred;
-    for (int u = 0; u < m; u++) {
-      if (pairU[u] != -1) {
-        nxt[u] = pairU[u];
-        hasPred.insert(pairU[u]);
-      }
-    }
-    std::vector<std::vector<int>> chains;
-    for (int u = 0; u < m; u++) {
-      if (hasPred.find(u) == hasPred.end()) {
-        std::vector<int> chain;
-        int cur = u;
-        while (true) {
-          chain.push_back(cur);
-          auto it = nxt.find(cur);
-          if (it == nxt.end()) break;
-          cur = it->second;
-        }
-        chains.push_back(chain);
-      }
-    }
-    // Safety: any unmatched node not in a chain becomes its own chain.
-    std::set<int> covered;
-    for (auto& chain : chains) {
-      for (int x : chain) covered.insert(x);
-    }
-    for (int i = 0; i < m; i++) {
-      if (covered.find(i) == covered.end()) {
-        chains.push_back({i});
-      }
-    }
-
-    for (auto& chain : chains) {
-      MtCoarseMTask group;
-      for (int localIdx : chain) {
-        int cppId = verts[localIdx];
-        auto layerIter = layerIndexByCppId.find(cppId);
-        if (layerIter != layerIndexByCppId.end()) {
-          while ((int)group.layerTaskCppIds.size() <= layerIter->second) {
-            group.layerTaskCppIds.push_back(std::vector<int>());
-          }
-          group.layerTaskCppIds[layerIter->second].push_back(cppId);
-        }
-        group.taskCount++;
-        group.staticCost += mtTaskEstimatedCost(tasks, cppId);
-        auto superIter = cppId2Super.find(cppId);
-        if (superIter != cppId2Super.end() && superIter->second) {
-          group.memberNodeCost += static_cast<int>(superIter->second->member.size());
-        }
-      }
-      region.antichainProbeGroups.push_back(group);
-    }
-  };
-
-  for (auto& kv : depComponentByRoot) {
-    std::vector<int>& comp = kv.second;
-    std::sort(comp.begin(), comp.end());
-
-    std::vector<std::vector<int>> blocks;
-    std::vector<int> curBlock;
-    for (int cppId : comp) {
-      auto iter = tasks.find(cppId);
-      bool isSerial = iter == tasks.end() || iter->second.taskKind != "pure_compute" || !iter->second.serialReasons.empty();
-      if (isSerial) {
-        if (!curBlock.empty()) {
-          blocks.push_back(curBlock);
-          curBlock.clear();
-        }
-        blocks.push_back({cppId});
-      } else {
-        curBlock.push_back(cppId);
-      }
-    }
-    if (!curBlock.empty()) blocks.push_back(curBlock);
-
-    for (auto& block : blocks) {
-      if (block.size() == 1) {
-        auto iter = tasks.find(block[0]);
-        bool isSerial = iter == tasks.end() || iter->second.taskKind != "pure_compute" || !iter->second.serialReasons.empty();
-        addSingletonGroup(block[0], isSerial);
-      } else {
-        chainCover(block);
-      }
-    }
-  }
-  bool dagAcyclic = mtBuildAntichainMTaskDAG(region);
-  (void)dagAcyclic;  // Reported via JSON ; runtime not yet enabled.
-
-  region.antichainProbeTotalGroups = static_cast<int>(region.antichainProbeGroups.size());
-
-  // Gate: quotient DAG must be acyclic for antichain groups to be valid mtasks.
-  // If cyclic, report but do not enable runtime.
-  region.antichainProbeDagAcyclic = dagAcyclic;
-}
-
-
-
-// build the cross-mtask dependency DAG for antichainProbeGroups.
-// Uses all ordering edges (dependency + active) between different groups.
-// Returns true iff the quotient DAG is acyclic (required for these groups to be
-// schedulable as atomic mtasks).
-static bool mtBuildAntichainMTaskDAG(MtCoarseRegion& region) {
-  std::map<int, int> cppIdToGroup;
-  for (size_t g = 0; g < region.antichainProbeGroups.size(); g++) {
-    for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
-      for (int cppId : layer) cppIdToGroup[cppId] = static_cast<int>(g);
-    }
-  }
-
-  int groupCount = static_cast<int>(region.antichainProbeGroups.size());
-  std::set<std::pair<int, int>> seenEdges;
-  for (int from = region.beginCppId; from < region.endCppId; from++) {
-    for (int to = region.beginCppId; to < region.endCppId; to++) {
-      if (from == to) continue;
-      if (!mtTaskHasOrderingEdgeTo(from, to)) continue;
-      auto fromIter = cppIdToGroup.find(from);
-      auto toIter = cppIdToGroup.find(to);
-      if (fromIter == cppIdToGroup.end() || toIter == cppIdToGroup.end()) continue;
-      if (fromIter->second == toIter->second) continue;
-      int fromGroup = fromIter->second;
-      int toGroup = toIter->second;
-      if (!seenEdges.insert({fromGroup, toGroup}).second) continue;
-      region.antichainProbeGroups[fromGroup].succMTaskIndices.push_back(toGroup);
-      region.antichainProbeGroups[toGroup].predMTaskIndices.push_back(fromGroup);
-      region.antichainProbeGroups[toGroup].upstreamDepCount++;
-    }
-  }
-
-  // Topological sort / cycle detection on the quotient DAG.
-  std::vector<int> indegree(groupCount, 0);
-  for (int g = 0; g < groupCount; g++) {
-    for (int succ : region.antichainProbeGroups[g].succMTaskIndices) {
-      indegree[succ]++;
-    }
-  }
-  std::deque<int> q;
-  for (int g = 0; g < groupCount; g++) {
-    if (indegree[g] == 0) q.push_back(g);
-  }
-  int visited = 0;
-  while (!q.empty()) {
-    int u = q.front(); q.pop_front();
-    visited++;
-    for (int v : region.antichainProbeGroups[u].succMTaskIndices) {
-      if (--indegree[v] == 0) q.push_back(v);
-    }
-  }
-  return visited == groupCount;
-}
-
-
-
-
 static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
   region.mtasks.clear();
   int n = region.endCppId - region.beginCppId;
@@ -4670,332 +4312,6 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
       int groupIndex = groupIndexByRoot[fromRoot];
       region.mtasks[groupIndex].orderingEdgeCount ++;
     }
-  }
-  // report-only antichain probe.
-  // when GSIM_MT_ANTICHAIN_RUNTIME=1, compute antichain groups
-  // for selected runtime-eligible regions and use them as the real mtask set.
-  static bool antichainRuntimeEnabled = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_RUNTIME");
-    return env && env[0] == '1';
-  }();
-  static bool probeEnabled = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_PROBE");
-    return env && env[0] == '1';
-  }();
-  static bool sarkarProbe = []() {
-    const char* env = std::getenv("GSIM_MT_SARKAR_PROBE");
-    return env && env[0] == '1';
-  }();
-  static bool sarkarContract = []() {
-    const char* env = std::getenv("GSIM_MT_SARKAR_CONTRACT");
-    return env && env[0] == '1';
-  }();
-  static bool antichainAllRegions = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_ALL");
-    return env && env[0] == '1';
-  }();
-  static int antichainMinUseful = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_MIN_USEFUL");
-    return env && env[0] != '\0' ? std::atoi(env) : 0;
-  }();
-  static bool antichainRegionEnvSpecified = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_REGION");
-    return env && env[0] != '\0';
-  }();
-  static std::pair<int, int> antichainSelectedRange = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_REGION");
-    if (env == nullptr || env[0] == '\0') return std::make_pair(-1, -1);
-    char* end = nullptr;
-    long begin = std::strtol(env, &end, 10);
-    if (end == env || (*end != ':' && *end != '-')) return std::make_pair(-1, -1);
-    char* end2 = nullptr;
-    long finish = std::strtol(end + 1, &end2, 10);
-    if (end2 == end + 1 || *end2 != '\0') return std::make_pair(-1, -1);
-    return std::make_pair(static_cast<int>(begin), static_cast<int>(finish));
-  }();
-  static bool antichainLegacyOverride = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_LEGACY");
-    return env && env[0] == '1';
-  }();
-  static bool antichainLegacyDisabled = []() {
-    const char* env = std::getenv("GSIM_MT_ANTICHAIN_LEGACY");
-    return env && env[0] == '0';
-  }();
-  bool explicitRangeRegion = (antichainSelectedRange.first == region.beginCppId &&
-                              antichainSelectedRange.second == region.endCppId);
-  bool usefulRegion = antichainMinUseful > 0 && region.estimatedUsefulWork >= antichainMinUseful;
-  bool selectorSpecified = antichainRegionEnvSpecified || antichainMinUseful > 0 || antichainAllRegions;
-  bool legacyHotRegion = (region.beginCppId == 38872 && region.endCppId == 39056) &&
-                         !antichainLegacyDisabled &&
-                         (antichainLegacyOverride || !selectorSpecified);
-  bool antichainSelectedRegion = legacyHotRegion || explicitRangeRegion || usefulRegion || antichainAllRegions;
-  if (legacyHotRegion) region.antichainSelectionReason = "legacy_hot_region";
-  else if (explicitRangeRegion) region.antichainSelectionReason = "explicit_region";
-  else if (usefulRegion) region.antichainSelectionReason = "min_useful";
-  else if (antichainAllRegions) region.antichainSelectionReason = "all";
-  if (antichainSelectedRegion && (antichainRuntimeEnabled || probeEnabled || sarkarProbe || sarkarContract)) {
-    mtComputeAntichainGroups(region, tasks);
-  }
-  // cost-based Sarkar edge-contraction probe (report-only).
-  // Phase 1 (fix-hazards): contract need-only edges (no structural dep).
-  // Phase 2 (cost-based): contract any edge where min(staticCost_u, staticCost_v) < sync_cost.
-  // sync_cost from GSIM_MT_SARKAR_COST env (default 100).
-  // USAGE: GSIM_MT_SARKAR_COST=N GSIM_MT_SARKAR_PROBE=1 ./build/gsim/gsim ...
-  if (sarkarProbe && region.antichainProbeGroups.size() >= 2) {
-      int groupCount = static_cast<int>(region.antichainProbeGroups.size());
-      int syncCost = 100; { const char* s = getenv("GSIM_MT_SARKAR_COST"); if (s && s[0]) syncCost = atoi(s); }
-      // Group cppIds and costs.
-      std::map<int, int> cppIdToGroup;
-      std::vector<int> groupCosts(groupCount, 0);
-      for (int g = 0; g < groupCount; g++) {
-        groupCosts[g] = region.antichainProbeGroups[g].staticCost;
-        for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
-          for (int cppId : layer) cppIdToGroup[cppId] = g;
-        }
-      }
-      std::vector<std::vector<int>> groupCppIds(groupCount);
-      for (auto& kv : cppIdToGroup) groupCppIds[kv.second].push_back(kv.first);
-      // Precompute cross-group edge types and static costs.
-      // For each ordered pair (gi,gj): hasEdge, hasDep, hasNeed, minCost.
-      std::vector<std::vector<int>> hasEdge(groupCount, std::vector<int>(groupCount, 0));
-      std::vector<std::vector<int>> edgeClass(groupCount, std::vector<int>(groupCount, 0)); // 0=need,1=other,2=dep
-      for (int gi = 0; gi < groupCount; gi++) {
-        for (int gj = 0; gj < groupCount; gj++) {
-          if (gi == gj) continue;
-          bool anyDep = false, anyNeed = false, anyOther = false;
-          for (int from : groupCppIds[gi]) {
-            if (anyDep && anyNeed && anyOther) break;
-            for (int to : groupCppIds[gj]) {
-              if (!anyDep && mtTaskHasDependencyEdgeTo(from, to)) { anyDep = true; break; }
-            }
-          }
-          if (!anyDep) {
-            for (int from : groupCppIds[gi]) {
-              if (anyNeed && anyOther) break;
-              for (int to : groupCppIds[gj]) {
-                if (!anyNeed && mtTaskHasNeedActivateEdgeTo(from, to)) anyNeed = true;
-                if (!anyOther && mtTaskHasActiveEdgeTo(from, to) && !mtTaskHasNeedActivateEdgeTo(from, to)) anyOther = true;
-              }
-            }
-          }
-          if (anyNeed || anyOther || anyDep) {
-            hasEdge[gi][gj] = 1;
-            edgeClass[gi][gj] = anyDep ? 2 : (anyNeed ? 0 : 1);
-          }
-        }
-      }
-      // ---------- Phase 1: fix-hazards (need-only) ----------
-      std::vector<int> p1Parent(groupCount);
-      for (int g = 0; g < groupCount; g++) p1Parent[g] = g;
-      auto find = [&](auto& p, int x) -> int {
-        int r = x;
-        while (p[r] != r) r = p[r];
-        while (p[x] != x) { int n = p[x]; p[x] = r; x = n; }
-        return r;
-      };
-      auto unite = [&](auto& p, int a, int b) { p[find(p, b)] = find(p, a); };
-      int directedEdges = 0, depEdges = 0, needEdges = 0, otherEdges = 0;
-      for (int gi = 0; gi < groupCount; gi++) {
-        for (int gj = 0; gj < groupCount; gj++) {
-          if (!hasEdge[gi][gj]) continue;
-          directedEdges++;
-          if (edgeClass[gi][gj] == 2) { depEdges++; continue; }
-          if (edgeClass[gi][gj] == 0) { needEdges++; unite(p1Parent, gi, gj); continue; }
-          if (edgeClass[gi][gj] == 1) { otherEdges++; continue; }
-        }
-      }
-      std::set<int> p1Remaining;
-      for (int g = 0; g < groupCount; g++) p1Remaining.insert(find(p1Parent, g));
-      int p1Contracted = groupCount - static_cast<int>(p1Remaining.size());
-      // ---------- Phase 2: cost-based contraction ----------
-      int c2Edges = 0, c2BelowAll = 0;
-      // Pre-pass: count edges below threshold over p1 unions.
-      for (int gi = 0; gi < groupCount; gi++) {
-        for (int gj = 0; gj < groupCount; gj++) {
-          if (!hasEdge[gi][gj]) continue;
-          if (find(p1Parent, gi) == find(p1Parent, gj)) continue;
-          c2Edges++;
-          if (std::min(groupCosts[gi], groupCosts[gj]) < syncCost) c2BelowAll++;
-        }
-      }
-      int c2Contracted = 0;
-      std::vector<int> p2Parent = p1Parent;
-      for (int gi = 0; gi < groupCount; gi++) {
-        for (int gj = 0; gj < groupCount; gj++) {
-          if (!hasEdge[gi][gj]) continue;
-          if (find(p2Parent, gi) == find(p2Parent, gj)) continue;
-          if (std::min(groupCosts[gi], groupCosts[gj]) >= syncCost) continue;
-          c2Contracted++;
-          unite(p2Parent, gi, gj);
-        }
-      }
-      std::set<int> p2Remaining;
-      for (int g = 0; g < groupCount; g++) p2Remaining.insert(find(p2Parent, g));
-      int p2Contracted = groupCount - static_cast<int>(p2Remaining.size()) - p1Contracted;
-      // Report.
-      fprintf(stderr, "[sarkar-probe] region [%d,%d) groups=%d directed=%d dep=%d need=%d other=%d "
-              "fix-hazards_contracted=%d p1_remaining=%d "
-              "cost=%d above=%d below=%d union=%d total=%d final=%d",
-              region.beginCppId, region.endCppId,
-              groupCount, directedEdges, depEdges, needEdges, otherEdges,
-              p1Contracted, groupCount - p1Contracted,
-              syncCost, c2Edges - c2BelowAll, c2BelowAll, c2Contracted,
-              p1Contracted + p2Contracted, groupCount - p1Contracted - p2Contracted);
-      // Critical path estimate: longest chain in the surviving quotient DAG.
-      if (groupCount - p1Contracted - p2Contracted > 1) {
-        int c = 0;
-        for (int gi = 0; gi < groupCount; gi++) {
-          for (int gj = 0; gj < groupCount; gj++) {
-            if (!hasEdge[gi][gj]) continue;
-            if (find(p2Parent, gi) != find(p2Parent, gj)) c++;
-          }
-        }
-        fprintf(stderr, " remaining_edges=%d", c);
-      }
-      fprintf(stderr, "\n");
-    }
-  // actual Sarkar contraction (apply, not probe).
-  // Gated by GSIM_MT_SARKAR_CONTRACT=1; uses GSIM_MT_SARKAR_COST for threshold.
-  {
-    const char* contractEnv = std::getenv("GSIM_MT_SARKAR_CONTRACT");
-    bool doContract = contractEnv && contractEnv[0] == '1';
-    if (doContract && region.antichainProbeGroups.size() >= 2) {
-      int syncCost = 100;
-      { const char* e = std::getenv("GSIM_MT_SARKAR_COST"); if (e && e[0]) syncCost = atoi(e); }
-      if (syncCost <= 0) syncCost = 100;
-      int G = static_cast<int>(region.antichainProbeGroups.size());
-      // Build group cost vector.
-      std::vector<int> groupCosts(G, 0);
-      for (int g = 0; g < G; g++) groupCosts[g] = region.antichainProbeGroups[g].staticCost;
-      // Build cross-group edge matrix (same as probe Phase 2 pre-pass).
-      std::map<int, int> cppIdToGroup;
-      for (int g = 0; g < G; g++) {
-        for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
-          for (int cppId : layer) cppIdToGroup[cppId] = g;
-        }
-      }
-      std::vector<std::vector<int>> groupCppIds(G);
-      for (auto& kv : cppIdToGroup) groupCppIds[kv.second].push_back(kv.first);
-      // Union-find over cost-below-threshold edges.
-      std::vector<int> parent(G);
-      for (int g = 0; g < G; g++) parent[g] = g;
-      auto find = [&](auto& p, int x) -> int {
-        int r = x; while (p[r] != r) r = p[r];
-        while (p[x] != x) { int n = p[x]; p[x] = r; x = n; }
-        return r;
-      };
-      auto unite = [&](auto& p, int a, int b) { p[find(p, b)] = find(p, a); };
-      for (int gi = 0; gi < G; gi++) {
-        for (int gj = 0; gj < G; gj++) {
-          if (gi == gj) continue;
-          if (find(parent, gi) == find(parent, gj)) continue;
-          // Check if there's any ordering edge between the two groups.
-          bool hasEdge = false;
-          for (int from : groupCppIds[gi]) {
-            if (hasEdge) break;
-            for (int to : groupCppIds[gj]) {
-              if (mtTaskHasOrderingEdgeTo(from, to)) { hasEdge = true; break; }
-            }
-          }
-          if (!hasEdge) continue;
-          int benefit = std::min(groupCosts[gi], groupCosts[gj]);
-          if (benefit < syncCost) unite(parent, gi, gj);
-        }
-      }
-      // Build merged groups.
-      std::map<int, std::vector<int>> rootToGroups;
-      for (int g = 0; g < G; g++) rootToGroups[find(parent, g)].push_back(g);
-      if (static_cast<int>(rootToGroups.size()) == G) {
-        fprintf(stderr, "[sarkar-contract] region [%d,%d) no contraction candidates\n", region.beginCppId, region.endCppId);
-      } else {
-        std::vector<MtCoarseMTask> newGroups;
-        for (auto& kv : rootToGroups) {
-          MtCoarseMTask merged;
-          for (int g : kv.second) {
-            const auto& src = region.antichainProbeGroups[g];
-            merged.taskCount += src.taskCount;
-            merged.staticCost += src.staticCost;
-            merged.memberNodeCost += src.memberNodeCost;
-            merged.workerZeroOnly = merged.workerZeroOnly || src.workerZeroOnly;
-            for (const auto& layer : src.layerTaskCppIds) {
-              for (int cppId : layer) {
-                int layerIdx = -1;
-                for (size_t li = 0; li < region.layers.size(); li++) {
-                  for (int tc : region.layers[li].taskCppIds) {
-                    if (tc == cppId) { layerIdx = static_cast<int>(li); break; }
-                  }
-                  if (layerIdx >= 0) break;
-                }
-                if (layerIdx < 0) continue;
-                while (static_cast<int>(merged.layerTaskCppIds.size()) <= layerIdx) {
-                  merged.layerTaskCppIds.push_back(std::vector<int>());
-                }
-                merged.layerTaskCppIds[layerIdx].push_back(cppId);
-              }
-            }
-          }
-          newGroups.push_back(merged);
-        }
-        int oldCount = G;
-        region.antichainProbeGroups = std::move(newGroups);
-        int newCount = static_cast<int>(region.antichainProbeGroups.size());
-        region.antichainProbeTotalGroups = newCount;
-        // Rebuild quotient DAG for the merged groups.
-        region.antichainProbeDagAcyclic = false;
-        std::map<int, int> newCppIdToGroup;
-        for (int g = 0; g < newCount; g++) {
-          for (const auto& layer : region.antichainProbeGroups[g].layerTaskCppIds) {
-            for (int cppId : layer) newCppIdToGroup[cppId] = g;
-          }
-        }
-        std::vector<std::vector<int>> newGroupCppIds(newCount);
-        for (auto& kv : newCppIdToGroup) newGroupCppIds[kv.second].push_back(kv.first);
-        for (int g = 0; g < newCount; g++) {
-          region.antichainProbeGroups[g].succMTaskIndices.clear();
-          region.antichainProbeGroups[g].predMTaskIndices.clear();
-          region.antichainProbeGroups[g].upstreamDepCount = 0;
-        }
-        for (int gi = 0; gi < newCount; gi++) {
-          for (int gj = 0; gj < newCount; gj++) {
-            if (gi == gj) continue;
-            bool edge = false;
-            for (int from : newGroupCppIds[gi]) {
-              if (edge) break;
-              for (int to : newGroupCppIds[gj]) {
-                if (mtTaskHasOrderingEdgeTo(from, to)) { edge = true; break; }
-              }
-            }
-            if (edge) {
-              region.antichainProbeGroups[gi].succMTaskIndices.push_back(gj);
-              region.antichainProbeGroups[gj].predMTaskIndices.push_back(gi);
-              region.antichainProbeGroups[gj].upstreamDepCount++;
-            }
-          }
-        }
-        // Verify acyclicity via topological sort.
-        std::vector<int> indegree(newCount, 0);
-        for (int g = 0; g < newCount; g++) {
-          for (int s : region.antichainProbeGroups[g].succMTaskIndices) indegree[s]++;
-        }
-        std::deque<int> q;
-        for (int g = 0; g < newCount; g++) if (indegree[g] == 0) q.push_back(g);
-        int visited = 0;
-        while (!q.empty()) {
-          int u = q.front(); q.pop_front();
-          visited++;
-          for (int v : region.antichainProbeGroups[u].succMTaskIndices) {
-            if (--indegree[v] == 0) q.push_back(v);
-          }
-        }
-        region.antichainProbeDagAcyclic = (visited == newCount);
-        fprintf(stderr, "[sarkar-contract] region [%d,%d) groups %d->%d acyclic=%d\n",
-                region.beginCppId, region.endCppId, oldCount, newCount,
-                region.antichainProbeDagAcyclic ? 1 : 0);
-      }
-    }
-  }
-  if (antichainRuntimeEnabled && region.antichainProbeDagAcyclic && antichainSelectedRegion) {
-    region.useAntichainRuntime = true;
   }
 }
 
@@ -8381,16 +7697,9 @@ void graph::dumpMtCoarseRegionReport() {
     fprintf(fp, "      \"estimated_layer_count\": %d,\n", region.estimatedLayerCount);
     fprintf(fp, "      \"estimated_max_parallel_width\": %d,\n", region.estimatedMaxParallelWidth);
     fprintf(fp, "      \"mtask_count\": %zu,\n", region.mtasks.size());
-    fprintf(fp, "      \"antichain_probe_max_block_width\": %d,\n", region.antichainProbeMaxBlockWidth);
-    fprintf(fp, "      \"antichain_probe_total_groups\": %d,\n", region.antichainProbeTotalGroups);
     fprintf(fp, "      \"mtask_static_cost_min\": %d,\n", region.mtaskStaticCostMin);
     fprintf(fp, "      \"mtask_static_cost_max\": %d,\n", region.mtaskStaticCostMax);
     fprintf(fp, "      \"mtask_static_cost_total\": %d,\n", region.mtaskStaticCostTotal);
-    if (region.antichainProbeTotalGroups > 0) {
-      fprintf(fp, "      \"antichain_probe_dag_is_acyclic\": %s,\n", region.antichainProbeDagAcyclic ? "true" : "false");
-      fprintf(fp, "      \"use_antichain_runtime\": %s,\n", region.useAntichainRuntime ? "true" : "false");
-      fprintf(fp, "      \"antichain_selection_reason\": \"%s\",\n", jsonEscape(region.antichainSelectionReason).c_str());
-    }
     fprintf(fp, "      \"mtask_member_node_cost_max\": %d,\n", region.mtaskMemberNodeCostMax);
     fprintf(fp, "      \"mtask_member_node_cost_total\": %d,\n", region.mtaskMemberNodeCostTotal);
     fprintf(fp, "      \"estimated_copy_words_at_t4\": %d,\n", 4 * region.activeWordSpan);
@@ -8472,30 +7781,6 @@ void graph::dumpMtCoarseRegionReport() {
       }
       fprintf(fp, "]\n");
       fprintf(fp, "        }%s\n", mtaskIdx + 1 == region.mtasks.size() ? "" : ",");
-    }
-    fprintf(fp, "      ],\n");
-    fprintf(fp, "      \"antichain_probe_groups\": [\n");
-    for (size_t mtaskIdx = 0; mtaskIdx < region.antichainProbeGroups.size(); mtaskIdx++) {
-      const MtCoarseMTask& mtask = region.antichainProbeGroups[mtaskIdx];
-      fprintf(fp, "        {\n");
-      fprintf(fp, "          \"index\": %zu,\n", mtaskIdx);
-      fprintf(fp, "          \"task_count\": %d,\n", mtask.taskCount);
-      fprintf(fp, "          \"static_cost\": %d,\n", mtask.staticCost);
-      fprintf(fp, "          \"member_node_cost\": %d,\n", mtask.memberNodeCost);
-      fprintf(fp, "          \"upstream_dep_count\": %d,\n", mtask.upstreamDepCount);
-      fprintf(fp, "          \"pred_mtask_indices\": ");
-      dumpJsonIntArray(fp, mtask.predMTaskIndices);
-      fprintf(fp, ",\n");
-      fprintf(fp, "          \"succ_mtask_indices\": ");
-      dumpJsonIntArray(fp, mtask.succMTaskIndices);
-      fprintf(fp, ",\n");
-      fprintf(fp, "          \"layer_task_cpp_ids\": [");
-      for (size_t layerIdx = 0; layerIdx < mtask.layerTaskCppIds.size(); layerIdx++) {
-        if (layerIdx != 0) fprintf(fp, ", ");
-        dumpJsonIntArray(fp, mtask.layerTaskCppIds[layerIdx]);
-      }
-      fprintf(fp, "]\n");
-      fprintf(fp, "        }%s\n", mtaskIdx + 1 == region.antichainProbeGroups.size() ? "" : ",");
     }
     fprintf(fp, "      ]\n");
     fprintf(fp, "    }%s\n", i + 1 == coarsePlan.regions.size() ? "" : ",");
@@ -11406,42 +10691,6 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "break;\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
-  // shared emitter for antichain mtask body switch.
-  // Used by mtRunCoarseMTaskDynamic; walks region.antichainProbeGroups
-  // in the same topo/layer order as the old mtask switch.
-  auto emitAntichainMtaskInnerSwitch = [&](const MtCoarseRegion& region, int outerIndent) {
-    emitBodyLock(outerIndent, "switch (mtaskIndex) {\n");
-    for (size_t mtaskIdx = 0; mtaskIdx < region.antichainProbeGroups.size(); mtaskIdx ++) {
-      const MtCoarseMTask& mtask = region.antichainProbeGroups[mtaskIdx];
-      emitBodyLock(outerIndent + 1, "case %zu:\n", mtaskIdx);
-      for (size_t layerIdx = 0; layerIdx < mtask.layerTaskCppIds.size(); layerIdx ++) {
-        const std::vector<int>& taskCppIds = mtask.layerTaskCppIds[layerIdx];
-        if (taskCppIds.empty()) continue;
-        emitBodyLock(outerIndent + 2, "{\n");
-        for (int cppId : taskCppIds) {
-          int wordOffset = cppId / ACTIVE_WIDTH - region.beginActiveWord;
-          uint64_t mask = (uint64_t)1 << (cppId % ACTIVE_WIDTH);
-          emitBodyLock(outerIndent + 3, "if (mtWorkerCoarseFlags[worker][%d] & 0x%lx) {\n", wordOffset, mask);
-          if (mtTasks[cppId].repcutRuntimeApplied) {
-            emitBodyLock(outerIndent + 4, "mtRepCutLiteTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
-          } else {
-            emitBodyLock(outerIndent + 4, "mtTask%d(mtWorkerCoarseFlags[worker][%d], mtWorkerDeltas[worker]);\n", cppId, wordOffset);
-          }
-          emitBodyLock(outerIndent + 4, "if (mtProfileEnabled) {\n");
-          emitBodyLock(outerIndent + 5, "mtProfileLocalTaskIds[worker].push_back(%d);\n", cppId);
-          emitBodyLock(outerIndent + 5, "mtProfileLocalWorkerTaskCount[worker] ++;\n");
-          emitBodyLock(outerIndent + 4, "}\n");
-          emitBodyLock(outerIndent + 3, "}\n");
-        }
-        emitBodyLock(outerIndent + 3, "mtMergeLocalCoarseDelta(worker, %d, %d);\n", region.beginActiveWord, region.activeWordSpan);
-        emitBodyLock(outerIndent + 2, "}\n");
-      }
-      emitBodyLock(outerIndent + 2, "break;\n");
-    }
-    emitBodyLock(outerIndent + 1, "default:\n");
-    emitBodyLock(outerIndent + 2, "break;\n");
-    emitBodyLock(outerIndent, "}\n");
-  };
   // mutex-protected ready queue for antichain scheduler.
   // Push is called by any worker after a predecessor completes; pop prefers
   // worker0-only tasks on logical worker 0, then parallel tasks.
@@ -11464,116 +10713,6 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitFuncDecl(0, "void S%s::mtRunCoarseMTaskDynamic(int regionIndex, int worker) {\n", name.c_str());
   emitBodyLock(1, "if (mtCoarseSkeletalMode) return;\n");
   emitBodyLock(1, "switch (regionIndex) {\n");
-  {
-    int regionIndex = 0;
-    for (const MtCoarseRegion& region : coarsePlan.regions) {
-      if (!region.runtimeEligible) continue;
-      if (!region.useAntichainRuntime) {
-        regionIndex ++;
-        continue;
-      }
-      emitBodyLock(2, "case %d:\n", regionIndex);
-      int antichainMTaskCount = static_cast<int>(region.antichainProbeGroups.size());
-      emitBodyLock(3, "{\n");
-      emitBodyLock(3, "static const int kMTaskCount = %d;\n", antichainMTaskCount);
-      emitBodyLock(3, "static const int kBeginActiveWord = %d;\n", region.beginActiveWord);
-      emitBodyLock(3, "static const int kActiveWordSpan = %d;\n", region.activeWordSpan);
-      std::vector<int> upstreamCounts;
-      std::vector<int> succOffsets;
-      std::vector<int> succIndices;
-      std::vector<int> workerZeroOnlyFlags;
-      upstreamCounts.reserve(antichainMTaskCount);
-      workerZeroOnlyFlags.reserve(antichainMTaskCount);
-      succOffsets.push_back(0);
-      for (const MtCoarseMTask& mtask : region.antichainProbeGroups) {
-        upstreamCounts.push_back(mtask.upstreamDepCount);
-        workerZeroOnlyFlags.push_back(mtask.workerZeroOnly ? 1 : 0);
-        for (int succ : mtask.succMTaskIndices) succIndices.push_back(succ);
-        succOffsets.push_back(static_cast<int>(succIndices.size()));
-      }
-      emitBodyLock(3, "static const int kUpstream[%d] = {%s};\n", antichainMTaskCount, mtJoinIntList(upstreamCounts).c_str());
-      emitBodyLock(3, "static const int kSuccOffset[%d] = {%s};\n", antichainMTaskCount + 1, mtJoinIntList(succOffsets).c_str());
-      emitBodyLock(3, "static const int kSuccIndices[%zu] = {%s};\n", succIndices.size(), mtJoinIntList(succIndices).c_str());
-      emitBodyLock(3, "static const bool kWorkerZeroOnly[%d] = {%s};\n", antichainMTaskCount, mtJoinIntList(workerZeroOnlyFlags).c_str());
-      emitBodyLock(3, "uint64_t cycle = mtCoarseRegionCycle[regionIndex][0].load(std::memory_order_acquire);\n");
-      emitBodyLock(3, "bool evenCycle = (cycle % 2 == 0);\n");
-      emitBodyLock(3, "if (!mtCoarseUseAntichainQueue) {\n");
-      // Legacy scan-based dispatch: keep for bisection / NEMU mismatch debugging.
-      emitBodyLock(4, "while (mtCoarseMTaskRemaining.load(std::memory_order_acquire) > 0) {\n");
-      emitBodyLock(5, "int found = -1;\n");
-      emitBodyLock(5, "for (int m = 0; m < kMTaskCount; m ++) {\n");
-      emitBodyLock(6, "if (kWorkerZeroOnly[m] && worker != 0) continue;\n");
-      emitBodyLock(6, "uint64_t claimed = mtCoarseMTaskClaimGen[regionIndex][m].load(std::memory_order_relaxed);\n");
-      emitBodyLock(6, "if (claimed == cycle) continue;\n");
-      emitBodyLock(6, "int target = evenCycle ? 0 : kUpstream[m];\n");
-      emitBodyLock(6, "if (mtCoarseMTaskUpstream[regionIndex][m].load(std::memory_order_acquire) != target) continue;\n");
-      emitBodyLock(6, "if (mtCoarseMTaskClaimGen[regionIndex][m].compare_exchange_strong(claimed, cycle, std::memory_order_acquire)) { found = m; break; }\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "if (found < 0) {\n");
-      emitBodyLock(6, "if (mtCoarseMTaskRemaining.load(std::memory_order_acquire) == 0) break;\n");
-      emitBodyLock(6, "mtWorkerPoolPause();\n");
-      emitBodyLock(6, "continue;\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
-      emitBodyLock(6, "mtWorkerCoarseFlags[worker][w] = mtWorkerPoolCoarseActiveWords[w] | mtCoarseRegionSharedFlags[regionIndex][w].load(std::memory_order_acquire);\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "int mtaskIndex = found;\n");
-      emitAntichainMtaskInnerSwitch(region, 5);
-      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
-      emitBodyLock(6, "mtCoarseRegionSharedFlags[regionIndex][w].fetch_or(mtWorkerCoarseFlags[worker][w], std::memory_order_release);\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "mtCoarseMTaskRemaining.fetch_sub(1, std::memory_order_relaxed);\n");
-      emitBodyLock(5, "for (int s = kSuccOffset[found]; s < kSuccOffset[found + 1]; s ++) {\n");
-      emitBodyLock(6, "int succ = kSuccIndices[s];\n");
-      emitBodyLock(6, "if (evenCycle) {\n");
-      emitBodyLock(7, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
-      emitBodyLock(6, "} else {\n");
-      emitBodyLock(7, "mtCoarseMTaskUpstream[regionIndex][succ].fetch_add(1, std::memory_order_acq_rel);\n");
-      emitBodyLock(6, "}\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(3, "} else {\n");
-      // Ready-queue dispatch: each mtask is pushed once (when ready) and popped once.
-      emitBodyLock(4, "while (true) {\n");
-      emitBodyLock(5, "int found = mtCoarseReadyQueuePop(regionIndex, worker);\n");
-      emitBodyLock(5, "if (found < 0) {\n");
-      emitBodyLock(6, "if (mtCoarseMTaskRemaining.load(std::memory_order_acquire) == 0) {\n");
-      emitBodyLock(7, "std::lock_guard<std::mutex> lock(mtCoarseReadyQueueMutex);\n");
-      emitBodyLock(7, "if (mtCoarseReadyQueueParallel[regionIndex].empty() && mtCoarseReadyQueueWorker0[regionIndex].empty()) break;\n");
-      emitBodyLock(6, "}\n");
-      emitBodyLock(6, "mtWorkerPoolPause();\n");
-      emitBodyLock(6, "continue;\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "mtCoarseMTaskInFlight.fetch_add(1, std::memory_order_relaxed);\n");
-      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
-      emitBodyLock(6, "mtWorkerCoarseFlags[worker][w] = mtWorkerPoolCoarseActiveWords[w] | mtCoarseRegionSharedFlags[regionIndex][w].load(std::memory_order_acquire);\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "int mtaskIndex = found;\n");
-      emitAntichainMtaskInnerSwitch(region, 5);
-      emitBodyLock(5, "for (int w = 0; w < kActiveWordSpan; w ++) {\n");
-      emitBodyLock(6, "mtCoarseRegionSharedFlags[regionIndex][w].fetch_or(mtWorkerCoarseFlags[worker][w], std::memory_order_release);\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "for (int s = kSuccOffset[found]; s < kSuccOffset[found + 1]; s ++) {\n");
-      emitBodyLock(6, "int succ = kSuccIndices[s];\n");
-      emitBodyLock(6, "bool ready = false;\n");
-      emitBodyLock(6, "if (evenCycle) {\n");
-      emitBodyLock(7, "int old = mtCoarseMTaskUpstream[regionIndex][succ].fetch_sub(1, std::memory_order_acq_rel);\n");
-      emitBodyLock(7, "ready = (old == 1);\n");
-      emitBodyLock(6, "} else {\n");
-      emitBodyLock(7, "int old = mtCoarseMTaskUpstream[regionIndex][succ].fetch_add(1, std::memory_order_acq_rel);\n");
-      emitBodyLock(7, "ready = (old == kUpstream[succ] - 1);\n");
-      emitBodyLock(6, "}\n");
-      emitBodyLock(6, "if (ready) mtCoarseReadyQueuePush(regionIndex, succ, kWorkerZeroOnly[succ]);\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "mtCoarseMTaskRemaining.fetch_sub(1, std::memory_order_relaxed);\n");
-      emitBodyLock(5, "mtCoarseMTaskInFlight.fetch_sub(1, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "break;\n");
-      regionIndex ++;
-    }
-  }
   emitBodyLock(2, "default:\n");
   emitBodyLock(3, "break;\n");
   emitBodyLock(1, "}\n");
@@ -11953,28 +11092,15 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     }
   }
   emitBodyLock(0, "};\n");
-  // antichain runtime constant arrays.
+  // antichain runtime constant arrays (inert scaffold kept for emission
+  // byte-identity: the scheduler can no longer be selected, so every region
+  // emits the disabled value).
   {
-    std::vector<int> useAntichainRuntimeValues;
-    std::vector<int> antichainMTaskCountValues;
-    std::vector<int> antichainUpstreamOffsets;
+    std::vector<int> useAntichainRuntimeValues(a104EligibleCount, 0);
+    std::vector<int> antichainMTaskCountValues(a104EligibleCount, 0);
+    std::vector<int> antichainUpstreamOffsets(a104EligibleCount + 1, 0);
     std::vector<int> antichainUpstreamValues;
     std::vector<int> antichainWorker0OnlyValues;
-    antichainUpstreamOffsets.push_back(0);
-    for (const MtCoarseRegion& region : coarsePlan.regions) {
-      if (!region.runtimeEligible) continue;
-      bool useAntichain = region.useAntichainRuntime;
-      useAntichainRuntimeValues.push_back(useAntichain ? 1 : 0);
-      int antichainCount = useAntichain ? static_cast<int>(region.antichainProbeGroups.size()) : 0;
-      antichainMTaskCountValues.push_back(antichainCount);
-      if (useAntichain) {
-        for (const MtCoarseMTask& mtask : region.antichainProbeGroups) {
-          antichainUpstreamValues.push_back(mtask.upstreamDepCount);
-          antichainWorker0OnlyValues.push_back(mtask.workerZeroOnly ? 1 : 0);
-        }
-      }
-      antichainUpstreamOffsets.push_back(static_cast<int>(antichainUpstreamValues.size()));
-    }
     emitBodyLock(1, "static const bool kCoarseRegionUseAntichainRuntime[%d] = {%s};\n", a104EligibleCount, mtJoinIntList(useAntichainRuntimeValues).c_str());
     emitBodyLock(1, "static const int kCoarseRegionAntichainMTaskCount[%d] = {%s};\n", a104EligibleCount, mtJoinIntList(antichainMTaskCountValues).c_str());
     emitBodyLock(1, "static const int kCoarseRegionAntichainUpstreamOffset[%d] = {%s};\n", a104EligibleCount + 1, mtJoinIntList(antichainUpstreamOffsets).c_str());
@@ -16707,7 +15833,18 @@ void graph::cppEmitter() {
   fprintf(header, "uint64_t mtProfileRejectNotActiveWhole;\n");
   fprintf(header, "uint64_t mtProfileRejectAlwaysActiveTask;\n");
   fprintf(header, "uint64_t mtProfileRejectSerialTask;\n");
-  fprintf(header, "uint64_t mtProfileSafeSerialDispatched;\n");      // :vector<uint64_t> mtProfileRepCutBatchHits;\n");
+  fprintf(header, "uint64_t mtProfileSafeSerialDispatched;\n");      // 28c Phase 1A
+  fprintf(header, "uint64_t mtProfileWorker0OnlyDispatched;\n");
+  fprintf(header, "uint64_t mtProfileRejectDependencyEdge;\n");
+  fprintf(header, "uint64_t mtProfileRejectSameActiveWordHazard;\n");
+  fprintf(header, "uint64_t mtProfileRejectBelowMinBatch;\n");
+  fprintf(header, "uint64_t mtProfileRejectConfiguredSingleWorker;\n");
+  fprintf(header, "uint64_t mtProfileBatchMemberNodeCount;\n");
+  fprintf(header, "uint64_t mtProfileSameActiveWordForwardEdges;\n");
+  fprintf(header, "uint64_t mtProfileCrossBatchActivationFanout;\n");
+  fprintf(header, "uint64_t mtProfileBatchWallNs;\n");
+  fprintf(header, "uint64_t mtProfileTrueParallelWallNs;\n");
+  fprintf(header, "std::vector<uint64_t> mtProfileRepCutBatchHits;\n");
   fprintf(header, "uint64_t mtProfileSerialWallNs;\n");
   fprintf(header, "uint64_t mtProfileMergeWallNs;\n");
   fprintf(header, "uint64_t mtProfileTotalStepNs;\n");
@@ -17068,7 +16205,29 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileRejectNotActiveWhole = 0;\n");
   emitBodyLock(1, "mtProfileRejectAlwaysActiveTask = 0;\n");
   emitBodyLock(1, "mtProfileRejectSerialTask = 0;\n");
-  emitBodyLock(1, "mtProfileSafeSerialDispatched = 0;\n");      // 0;\n");
+  emitBodyLock(1, "mtProfileSafeSerialDispatched = 0;\n");      // 28c Phase 1A
+  emitBodyLock(1, "mtProfileWorker0OnlyDispatched = 0;\n");
+  emitBodyLock(1, "mtProfileRejectDependencyEdge = 0;\n");
+  emitBodyLock(1, "mtProfileRejectSameActiveWordHazard = 0;\n");
+  emitBodyLock(1, "mtProfileRejectBelowMinBatch = 0;\n");
+  emitBodyLock(1, "mtProfileRejectConfiguredSingleWorker = 0;\n");
+  emitBodyLock(1, "mtProfileBatchMemberNodeCount = 0;\n");
+  emitBodyLock(1, "mtProfileSameActiveWordForwardEdges = 0;\n");
+  emitBodyLock(1, "mtProfileCrossBatchActivationFanout = 0;\n");
+  emitBodyLock(1, "mtProfileBatchWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileTrueParallelWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileSerialWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileMergeWallNs = 0;\n");
+  emitBodyLock(1, "mtProfileTotalStepNs = 0;\n");
+  emitBodyLock(1, "mtProfileRepCutBatchHits.assign((size_t)%zu, 0);\n", mtProfileRepCutBatchBeginCppIds.size());
+  emitBodyLock(1, "mtProfileDynamicTraceFile = nullptr;\n");
+  emitBodyLock(1, "mtProfileDynamicTraceCycleStart = 0;\n");
+  emitBodyLock(1, "mtProfileDynamicTraceCycleLimit = 0;\n");
+  emitBodyLock(1, "mtProfileDynamicTraceTaskIds.clear();\n");
+  emitBodyLock(1, "if (dynamicTraceEnabled) {\n");
+  emitBodyLock(2, "const char *startEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_START\");\n");
+  emitBodyLock(2, "const char *cyclesEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_CYCLES\");\n");
+  emitBodyLock(2, "mtProfileDynamicTraceCycleStart = (startEnv != nullptr && startEnv[0] != '\\0') ? strtoull(startEnv, nullptr, 10) : 0;\n");
   emitBodyLock(2, "uint64_t traceCycleCount = (cyclesEnv != nullptr && cyclesEnv[0] != '\\0') ? strtoull(cyclesEnv, nullptr, 10) : 0;\n");
   emitBodyLock(2, "mtProfileDynamicTraceCycleLimit = mtProfileDynamicTraceCycleStart + traceCycleCount;\n");
   emitBodyLock(2, "if (traceCycleCount > 0 && mtProfileDynamicTraceCycleLimit > mtProfileDynamicTraceCycleStart) {\n");
