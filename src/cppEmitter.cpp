@@ -15374,12 +15374,6 @@ void graph::cppEmitter() {
       if (super->superType == SUPER_EXTMOD) {
         alwaysActive.insert(super->cppId);
       }
-#if 0
-      if (super->member.size() == 1) {
-        alwaysActive.insert(super->cppId);
-        printf("alwaysActive %d\n", super->cppId);
-      }
-#endif
     }
   }
   activeFlagNum = (superId + ACTIVE_WIDTH - 1) / ACTIVE_WIDTH;

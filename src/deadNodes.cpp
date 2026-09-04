@@ -7,7 +7,6 @@
 #include "phaseTimer.h"
 #include <stack>
 
-static std::set<Node*> nodesInUpdateTree;
 
 void getENodeRelyNodes(ENode* enode, std::set<Node*>& allNodes) {
   std::stack<ENode*> s;

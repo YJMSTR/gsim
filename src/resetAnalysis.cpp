@@ -4,7 +4,6 @@
 
 void fillEmptyWhen(ExpTree* newTree, ENode* oldNode);
 
-std::map<Node*, clockVal*> resetMap;
 
 ResetType Node::inferReset() {
   if (reset != UNCERTAIN) return reset;

@@ -121,20 +121,6 @@ void SuperNode::display() {
   }
   printf("[stmtTree]\n");
   if (stmtTree) stmtTree->display();
-#if 0
-  for (SuperNode* nextNode : next) {
-    printf("    super-next %d\n", nextNode->id);
-  }
-  for (SuperNode* nextNode : depNext) {
-    if (next.find(nextNode) == next.end()) printf("    super-depNext %d\n", nextNode->id);
-  }
-  for (SuperNode* prevNode : prev) {
-    printf("    super-prev %d\n", prevNode->id);
-  }
-  for (SuperNode* prevNode : depPrev) {
-    if (prev.find(prevNode) == prev.end()) printf("    super-depPrev %d\n", prevNode->id);
-  }
-#endif
 }
 
 
@@ -150,20 +136,6 @@ void Node::display() {
     printf("[resetTree]:\n");
     resetTree->display();
   }
-#if 0
-  for (Node* nextNode : next) {
-    printf("    next %p (super %d) %s\n", nextNode, nextNode->super->id, nextNode->name.c_str());
-  }
-  for (Node* nextNode : depNext) {
-    if (next.find(nextNode) == next.end()) printf("    depNext %d %s\n", nextNode->super->id, nextNode->name.c_str());
-  }
-  for (Node* prevNode : prev) {
-    printf("    prev %p (super %d) %s\n", prevNode, prevNode->super->id, prevNode->name.c_str());
-  }
-  for (Node* prevNode : depPrev) {
-    if (prev.find(prevNode) == prev.end()) printf("    depPrev %d %s\n", prevNode->super->id, prevNode->name.c_str());
-  }
-#endif
 }
 
 void ENode::display(int depth) {
