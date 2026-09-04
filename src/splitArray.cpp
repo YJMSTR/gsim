@@ -410,7 +410,7 @@ void graph::splitArrayNode(Node* node) {
     }
   }
 
-  // Determinism fix (2026-08-28, residual): a pointer-ordered std::set here made the
+  // Determinism fix (, residual): a pointer-ordered std::set here made the
   // updateConnect/updateDep/updateWithSplittedArray iteration order allocation-
   // dependent -> super construction order -> SuperNode id assignment -> DFS seed
   // stack order (406/6.94M local swaps measured via GSIM_DEBUG_TOPO_IDS). The

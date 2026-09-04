@@ -31,7 +31,7 @@
 #define ACTIVE_WIDTH 8
 #define RESET_PER_FUNC 400
 #define MT_PURE_BATCH_SHARD_SIZE 256
-// 28c Phase 1A: hard cap on coarse region active-word span under mt-level-dispatch.
+// hard cap on coarse region active-word span under mt-level-dispatch.
 // Pre-implementation G-1A2.0 simulation showed raw max span 649; cap=192 keeps the
 // dense merge upper bound bounded while only splitting 6 oversized regions.
 #define MT_LEVEL_DISPATCH_REGION_SPAN_CAP 192
@@ -275,11 +275,11 @@ struct MtCoarseMTask {
   int staticCost = 0;
   int memberNodeCost = 0;
   int orderingEdgeCount = 0;
-  // Track 2 Week 3: per-mtask dependency graph for atomic-counter scheduling.
+  // per-mtask dependency graph for atomic-counter scheduling.
   std::vector<int> predMTaskIndices;
   std::vector<int> succMTaskIndices;
   int upstreamDepCount = 0;
-  // Track 2 Week 4: serial/hazard singletons must stay on worker 0 for ordering correctness.
+  // serial/hazard singletons must stay on worker 0 for ordering correctness.
   bool workerZeroOnly = false;
 };
 
@@ -295,7 +295,7 @@ struct MtCoarseRegion {
   int expectedActiveCost = 0;
   int estimatedUsefulWork = 0;
   int pureTaskCount = 0;
-  int safeSerialTaskCount = 0;   // 28c Phase 1A: serial cppIds admitted under mt-level-dispatch
+  int safeSerialTaskCount = 0;   // serial cppIds admitted under mt-level-dispatch
   int serialBlockerCount = 0;
   int dependencyEdgeCount = 0;
   int activeVisibilityEdgeCount = 0;
@@ -314,11 +314,11 @@ struct MtCoarseRegion {
   std::vector<std::string> blockers;
   std::vector<MtCoarseLayer> layers;
   std::vector<MtCoarseMTask> mtasks;
-  std::vector<MtCoarseMTask> antichainProbeGroups;   // Track 2 Week 2: report-only inside-component antichain grouping
+  std::vector<MtCoarseMTask> antichainProbeGroups;   // report-only inside-component antichain grouping
   int antichainProbeMaxBlockWidth = 0;                  // max chain-cover width across non-serial blocks
   int antichainProbeTotalGroups = 0;                    // total groups incl. serial singletons (may be large)
-  bool antichainProbeDagAcyclic = false;                // Track 2 Week 3: quotient DAG on antichainProbeGroups acyclic
-  bool useAntichainRuntime = false;                     // Track 2 Week 4: route this region through atomic-counter scheduler
+  bool antichainProbeDagAcyclic = false;                // quotient DAG on antichainProbeGroups acyclic
+  bool useAntichainRuntime = false;                     // route this region through atomic-counter scheduler
   std::string antichainSelectionReason;
 };
 
@@ -631,7 +631,7 @@ static int mtDensePollYieldThreshold() {
 }
 
 // default-off observability-cone elimination (user-approved scope
-// 2026-07-17). Perf-counter/debug-observability nodes whose ENTIRE data and
+// ). Perf-counter/debug-observability nodes whose ENTIRE data and
 // activation fanout is itself observability or print-only are droppable: their
 // assignment spans are not emitted. [PERF] printout values become stale/zero
 // (accepted); NEMU architectural endpoints must stay exact, so classification
@@ -1181,7 +1181,7 @@ static bool mtTasksHaveDirectedEdge(SuperNode* from, SuperNode* to) {
   return false;
 }
 
-// 28c Phase 1A: any of these reasons forces the cppId to run on worker 0 (single-threaded
+// any of these reasons forces the cppId to run on worker 0 (single-threaded
 // fall-through). external/memory_write/memory_read_unsupported/special are kimi-2.7-code
 // review I5 conservative. super_type_SUPER_EXTMOD covers the alwaysActive set.
 static bool hasWorker0OnlyReason(const std::vector<std::string>& reasons) {
@@ -1368,7 +1368,7 @@ static bool mtUseActivationEventTraceCodegen() {
 }
 
 
-// Default-off v181 codegen: emit a whole-design dense schedule report and,
+// Default-off dense-executor codegen: emit a whole-design dense schedule report and,
 // when the graph is acyclic, dense runtime wrappers selected by GSIM_MT_EXECUTOR=dense.
 static bool mtUseDenseExecutorCodegen() {
   const char* env = std::getenv("GSIM_MT_DENSE_EXECUTOR_CODEGEN");
@@ -1443,7 +1443,7 @@ static bool mtUseDenseOwnerBankCountersDiag() {
 }
 
 // optionally emit compile-exclusive producer-owner ready flags beside the
-// v280 fixed-order owner-banked and identity dependency-counter layouts.
+// fixed-order owner-banked and identity dependency-counter layouts.
 static bool mtUseDenseOwnerReadyFlags() {
   const char* env = std::getenv("GSIM_MT_DENSE_OWNER_READY_FLAGS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -1518,7 +1518,7 @@ static bool mtUseDenseWorkerMajorText() {
 }
 
 
-// v379 table dispatch (2026-07-17): replace each worker's emitted wait/call/signal chain (~350KB of
+// table dispatch: replace each worker's emitted wait/call/signal chain (~350KB of
 // polling stubs, call sites, and token-store loops streamed through icache every cycle) with a
 // table-driven loop over {member-fn, wait range, store range} entries. Logical MTask order, owner
 // assignment, owner-ready wait/store semantics (parity + yield budget) are unchanged; only the
@@ -1548,7 +1548,7 @@ static int mtDenseLookaheadWindow() {
 // Default-off perturbation-free duty-cycle instrumentation.  Per-cycle, per-thread
 // chrono into 64B-padded per-lane counters (no shared cache line, ~8 clock reads
 // per worker per cycle, ~0.2% of a 106us cycle) — replaces the per-task chrono
-// whose single shared counter line distorted profiled runs ~19x (v470 retraction).
+// whose single shared counter line distorted profiled runs ~19x.
 static bool mtDenseDutyCodegen() {
   const char* env = std::getenv("GSIM_MT_DENSE_DUTY");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -1591,11 +1591,11 @@ static bool mtDenseBuildSparseGatePrefilter(const MtDenseSchedule& denseSchedule
   return true;
 }
 
-// v381 shared helpers (2026-07-17): emit per-site owner-ready waits/signals as calls to shared
+// shared helpers: emit per-site owner-ready waits/signals as calls to shared
 // noinline helpers instead of inline poll/store loops. iTLB measured at 38.8% miss on 27.8MB text;
 // the per-worker chain is ~350KB of which the inline wait (~40B) + dual-parity signal loops
 // (~60-80B) per site dominate. Helper calls shrink each site to ~15-30B (chain ~5.6MB -> ~1.4MB
-// total) while keeping direct static calls to MTask bodies (no indirect-call cost, unlike v379
+// total) while keeping direct static calls to MTask bodies (no indirect-call cost
 // table dispatch which regressed +4.0%). Default-off; requires owner-ready, no breakdown codegen.
 static bool mtUseDenseSharedHelpers() {
   const char* env = std::getenv("GSIM_MT_DENSE_SHARED_HELPERS");
@@ -1603,7 +1603,7 @@ static bool mtUseDenseSharedHelpers() {
 }
 
 
-// v384 activity local collector: register reads (REG_SRC) plus MEMORY/array reads. The shared
+// activity local collector: register reads (REG_SRC) plus MEMORY/array reads. The shared
 // MtBoundaryInfo read set only records NODE_REG_SRC names; memory readers (NODE_READER /
 // READWRITER / WRITER / MEMORY) were missing from the activation fanout, leaving a wavefront
 // closure hole (L2/array-driven one-hot assertions fired on the first V384 build). The collector
@@ -1710,7 +1710,7 @@ static bool mtSpecProbeDeclaredLocus(const std::string& nm) {
 }
 
 
-// v384 activity-driven dense evaluation (2026-07-17): gate each MTask body behind an epoch flag so
+// activity-driven dense evaluation: gate each MTask body behind an epoch flag so
 // only MTasks whose inputs may have changed evaluate. The dense executor otherwise recomputes the
 // full DAG every cycle although measured activation is ~1.5% of body work per cycle. Design:
 //   * Per-MTask uint32 epoch flag (single-value stores, release/acquire like owner-ready tokens).
@@ -1733,7 +1733,7 @@ static bool mtUseDenseActivity() {
 }
 
 
-// Sparse-in-dense hybrid (2026-07-09): run each dense MTask member under gsim's per-super
+// Sparse-in-dense hybrid: run each dense MTask member under gsim's per-super
 // activeFlags gate + activation production, instead of unconditionally. Dense execution order
 // (MTask-id major, cppId ascending minor) is a valid topological order of the dependency+
 // activation DAG (offline-proven: 0 backward edges in that order), so per-bit test-and-clear
@@ -1770,7 +1770,7 @@ static bool mtUseDenseCpContraction() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// Phase 82: retain the established VCONTRACT heuristic and expose a separate
+// retain the established VCONTRACT heuristic and expose a separate
 // default-off policy path for the coupled V3OrderParallel score/limit rules.
 // It intentionally keeps GSim's worker0-only safety boundary.
 static bool mtUseDenseV3ContractPolicy() {
@@ -1860,7 +1860,7 @@ static bool mtForceParallelRepCutBatches() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// 28c Phase 1A: admission gate for the coarse region under mt-level-dispatch.
+// admission gate for the coarse region under mt-level-dispatch.
 // pure_compute matches mtTaskCanEnterPureBatch; safe-serial cppIds whose only
 // serial_reasons are state_update/reset/async_reset/activate_all_path/
 // array_or_dynamic_index/super_type_SUPER_ASYNC_RESET are also admitted.
@@ -2009,7 +2009,7 @@ static bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId) {
   mtActiveEdgeCache.emplace(key, value);
   return value;
 }
-// Track 2 Week 7: check whether fromCppId's SuperNode has a needActivate edge to toCppId.
+// check whether fromCppId's SuperNode has a needActivate edge to toCppId.
 // Unlike nextActiveId (which includes always-active), nextNeedActivate tracks the
 // conditional activation edges gated by output change. Used by the Sarkar probe.
 static bool mtTaskHasNeedActivateEdgeTo(int fromCppId, int toCppId) {
@@ -2225,7 +2225,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // V331: use V3's critPathCostWithout edge score in the legacy contraction
   // without coupling to V3's cost domain or its soft stop policy.
   const bool edgeCpWithout = [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_EDGE_CPWO"); return e && e[0] && e[0] != '0'; }();
-  // Verilator PropagateCp port (2026-07-09): keep fwd/rev critical paths ACCURATE through merges so
+  // Verilator PropagateCp port: keep fwd/rev critical paths ACCURATE through merges so
   // edgeScore reflects live critical paths (gsim previously froze gF/gR at initial values -> stale
   // edgeScore -> suboptimal merge ORDER vs Verilator's lowest-local-CP order). Rather than
   // Verilator's incremental pairing-heap propagation, this port EXACTLY recomputes gF/gR over the
@@ -2269,7 +2269,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     // pristine graph WITH compaction and records its invariants. The winner is picked
     // by the calibrated two-term floor model (constants from the machine-measured
     // token latencies 24.5ns same-CCD / 290ns cross-CCD and one work-rate point per
-    // tier; ledger: v470 latency-augmented floor, vcontract-compact promotions):
+    // tier):
     //   score = maxW * A + crossEdges * B * L(threads),  L = 1 (<=16 workers, 1 CCD)
     //                                                         8 (>16 workers, CCD mix)
     // Essence: compaction trades sync points for balance. It wins when the plain
@@ -2652,7 +2652,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
 static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSchedule& schedule,
                                                                  int threadCount) {
   // Level-bucketed sibling contraction (Verilator-inspired, adapted for gsim's diamond-mesh
-  // dependency graph where pure edge contraction stalls: v237 edge-only contraction hit
+  // dependency graph where pure edge contraction stalls: edge-only contraction hit
   // 3.23M cycle rejections vs 27.8k merges). Each SCC gets a critical-path LEVEL = longest
   // dependency depth from a source. SCCs at the same level are mutually independent (no edge
   // between them), so grouping same-level SCCs is ALWAYS cycle-free (sibling contraction).
@@ -2722,7 +2722,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSc
     for (int t = 0; t < threadCount; t ++) emitBucket(buckets[(size_t)t], false);
   }
 
-  // 3b. v240 phase-2: band/edge contraction on the level-bucket MTask graph. Level-bucketing
+  // 3b. Band/edge contraction band/edge contraction on the level-bucket MTask graph. Level-bucketing
   //     (phase 1) gives depth==numLevels (~333) with many cross-level cross-thread deps. To reach
   //     Verilator's depth ~15 shape, merge each MTask with a successor MTask when they are within
   //     the same worker AND merging creates no cycle, using union-find + bounded reachability on the
@@ -3565,7 +3565,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   }
 }
 
-// v380 assignment feedback (2026-07-17): replay an externally optimized (worker, rank) plan keyed
+// assignment feedback: replay an externally optimized (worker, rank) plan keyed
 // by MTask content hash (FNV-1a over sorted member cppIds). The offline optimizer explores the
 // list scheduler's chaotic tie-break space with PROFILED per-MTask costs; the current assignment
 // (static-cost list schedule) measures 178us/RTL vs 126us for the optimized plan in the validated
@@ -3960,8 +3960,8 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
   }
   // Dense dependency executor: form MTasks and assign them to worker threads.
   // Default path: fixed 30-SCC topological chunking + round-robin assignment.
-  // v236 (GSIM_MT_DENSE_CP_CONTRACTION): Verilator-style critical-path edge contraction.
-  // v236 (GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT): DAG-aware list-scheduling assignment.
+  // GSIM_MT_DENSE_CP_CONTRACTION: Verilator-style critical-path edge contraction.
+  // GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT: DAG-aware list-scheduling assignment.
   {
   EmitPhaseTimer mtaskBuildTimer("Final.denseSched.mtaskBuild");
   {
@@ -4041,13 +4041,13 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
           std::vector<int> wc; long cross = probeInvariants(probeSched.mtasks, probeSched.mtaskThreadAssign, wc);
           long maxW = *std::max_element(wc.begin(), wc.end());
           long lvlSum = probeLevelSum(probeSched.mtasks, probeSched.mtaskThreadAssign);
-          // Pick rule (validated 2026-08-30 on two RTLs): the level-synchronous
+          // Pick rule (validated  on two RTLs): the level-synchronous
           // straggler sum is the primary physical invariant (v86-T16: argmin lvlSum
           // = 1200 = measured optimum, zero-fitting). The old maxW+cross floor
           // misranked both RTLs (picked 2400/1000 where 2000/1200 measured best).
           // lvlSum can overestimate schedules that bounded lookahead rescues, so
           // cross breaks near-ties and the recommended protocol prunes to the
-          // top-2 candidates and confirms by a real bench (see ledger).
+          // top-2 candidates and confirms by a real bench.
           double s = (double)lvlSum;
           fprintf(stderr, "[maxmt-auto]   cand=%d mtasks=%zu maxW=%ld cross=%ld lvlSum=%ld score=%.1f\n",
                   cand, probeSched.mtasks.size(), maxW, cross, lvlSum, s);
@@ -4097,7 +4097,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
         long maxWC = *std::max_element(wcC.begin(), wcC.end());
         double sP = scoreOf(maxWP, crossP, threadCount);
         double sC = scoreOf(maxWC, crossC, threadCount);
-        // Score rule (recalibrated 2026-08-29): the earlier conjunction with a
+        // Score rule (recalibrated ): the earlier conjunction with a
         // threads>16 prior was calibrated on two cross-graph contaminated T16
         // A/Bs; the CLEAN same-graph A/B (determinism-fixed binary, identical
         // graph verified) FLIPPED the T16 verdict to compact -8.4% (5-pair
@@ -4268,13 +4268,13 @@ static void mtAddCoarseLayers(MtCoarseRegion& region) {
   region.estimatedLayerCount = static_cast<int>(region.layers.size());
 }
 
-// Track 2 Week 2: report-only inside-component antichain grouping.
+// report-only inside-component antichain grouping.
 // Computes dependency-connected components, splits serial/hazard nodes into
 // singleton groups, and covers each contiguous non-serial block with a minimum
 // chain decomposition (Dilworth).  The resulting groups are stored only for
 // the coarse-region report; region.mtasks is left unchanged so the runtime
 // executor still sees the original ordering-edge components.
-// Forward declaration for Week 3 DAG builder.
+// Forward declaration for DAG builder.
 static bool mtBuildAntichainMTaskDAG(MtCoarseRegion& region);
 
 static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int, MtTaskInfo>& tasks) {
@@ -4536,18 +4536,18 @@ static void mtComputeAntichainGroups(MtCoarseRegion& region, const std::map<int,
     }
   }
   bool dagAcyclic = mtBuildAntichainMTaskDAG(region);
-  (void)dagAcyclic;  // Reported via JSON in Week 3; runtime not yet enabled.
+  (void)dagAcyclic;  // Reported via JSON ; runtime not yet enabled.
 
   region.antichainProbeTotalGroups = static_cast<int>(region.antichainProbeGroups.size());
 
-  // Week 3 gate: quotient DAG must be acyclic for antichain groups to be valid mtasks.
+  // Gate: quotient DAG must be acyclic for antichain groups to be valid mtasks.
   // If cyclic, report but do not enable runtime.
   region.antichainProbeDagAcyclic = dagAcyclic;
 }
 
 
 
-// Track 2 Week 3: build the cross-mtask dependency DAG for antichainProbeGroups.
+// build the cross-mtask dependency DAG for antichainProbeGroups.
 // Uses all ordering edges (dependency + active) between different groups.
 // Returns true iff the quotient DAG is acyclic (required for these groups to be
 // schedulable as atomic mtasks).
@@ -4671,8 +4671,8 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
       region.mtasks[groupIndex].orderingEdgeCount ++;
     }
   }
-  // Track 2 Week 2: report-only antichain probe.
-  // Track 2 Week 4: when GSIM_MT_ANTICHAIN_RUNTIME=1, compute antichain groups
+  // report-only antichain probe.
+  // when GSIM_MT_ANTICHAIN_RUNTIME=1, compute antichain groups
   // for selected runtime-eligible regions and use them as the real mtask set.
   static bool antichainRuntimeEnabled = []() {
     const char* env = std::getenv("GSIM_MT_ANTICHAIN_RUNTIME");
@@ -4736,7 +4736,7 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
   if (antichainSelectedRegion && (antichainRuntimeEnabled || probeEnabled || sarkarProbe || sarkarContract)) {
     mtComputeAntichainGroups(region, tasks);
   }
-  // Track 2 Week 7: cost-based Sarkar edge-contraction probe (report-only).
+  // cost-based Sarkar edge-contraction probe (report-only).
   // Phase 1 (fix-hazards): contract need-only edges (no structural dep).
   // Phase 2 (cost-based): contract any edge where min(staticCost_u, staticCost_v) < sync_cost.
   // sync_cost from GSIM_MT_SARKAR_COST env (default 100).
@@ -4854,7 +4854,7 @@ static void mtAddCoarseMTasks(MtCoarseRegion& region, const std::map<int, MtTask
       }
       fprintf(stderr, "\n");
     }
-  // Track 2 Week 7: actual Sarkar contraction (apply, not probe).
+  // actual Sarkar contraction (apply, not probe).
   // Gated by GSIM_MT_SARKAR_CONTRACT=1; uses GSIM_MT_SARKAR_COST for threshold.
   {
     const char* contractEnv = std::getenv("GSIM_MT_SARKAR_CONTRACT");
@@ -5330,7 +5330,7 @@ static int mtCoarseProfitableRecommendedWorkers(const MtCoarseRegion& region, in
   while (workerCap > 1) {
     int copyMergeWords = std::max(0, region.activeWordSpan) * workerCap * 2;
     int usefulPerWorker = usefulWork / workerCap;
-    // Track 2 Week 5: be much more conservative about which regions are worth
+    // be much more conservative about which regions are worth
     // parallelizing. Require meaningful per-worker work and a large ratio of
     // useful work to synchronization overhead before suggesting workers.
     if (mtaskCount >= 8 && region.estimatedMaxParallelWidth >= workerCap &&
@@ -5359,7 +5359,7 @@ static bool mtCoarseAdmitsRegionForPolicy(const MtCoarseRegion& region,
   int usefulWork = std::max(region.mtaskStaticCostTotal, region.mtaskMemberNodeCostTotal);
   if (usefulWork <= 0) usefulWork = region.estimatedUsefulWork;
   int copyMergeWords = std::max(0, region.activeWordSpan) * workerCount * 2;
-  // Track 2 Week 5: be much more conservative about which regions are worth
+  // be much more conservative about which regions are worth
   // parallelizing. The per-region barrier/copy/merge cost dominates for small
   // or low-width regions, so require meaningful per-worker work and a large
   // ratio of useful work to synchronization overhead.
@@ -10878,7 +10878,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
       emitBodyLock(3, "mtRunCoarseMTaskWorkerRange(worker, coarseRegionIndex, chunkBegin, chunkEnd);\n");
     }
     emitBodyLock(2, "} else if (jobKind == 3) {\n");
-    // 28c D-static Step 1: pool worker dispatched into the codegen-time
+    // pool worker dispatched into the codegen-time
     // flat-array path. Region/wc/begin/span carried on dedicated fields
     // so we don't overload chunk[].begin/.end semantics.
     emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(coarseRegionIndex, mtWorkerPoolCoarseStaticRoundedWC, worker, mtWorkerPoolCoarseStaticBeginActiveWord, mtWorkerPoolCoarseStaticActiveWordSpan);\n");
@@ -10935,7 +10935,7 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     if (globalConfig.MtCoarseWorkerPolicyMode == "profitable") {
       emitBodyLock(1, "mtWorkerPoolMTaskAssignments.resize((size_t)mtConfiguredWorkerCount);\n");
     }
-    // Track 2 Week 4: per-region atomic state for antichain runtime is initialized
+    // per-region atomic state for antichain runtime is initialized
     // in initMtProfile() so it is available even when the worker pool is disabled
     // or only one thread is used.
     emitBodyLock(1, "mtWorkerPoolCoarseActiveWords = nullptr;\n");
@@ -11264,7 +11264,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   markMtRepCutLiteRuntimeApplied(mtTasks);
   bool waitProbeCodegen = mtUseWaitProbeCodegen();
-  // 28c-2: shared emitter for `switch (mtaskIndex) { case M: <body>; break; ... }` body.
+  // shared emitter for `switch (mtaskIndex) { case M: <body>; break; ... }` body.
   // Used by both mtRunCoarseMTaskWorkerList and mtRunCoarseMTaskWorkerRange so the
   // per-mtask semantics stay in sync. Outer caller emits indent N for `switch (mtaskIndex)`.
   auto emitMtaskInnerSwitch = [&](const MtCoarseRegion& region, int outerIndent) {
@@ -11413,7 +11413,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "break;\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
-  // Track 2 Week 4: shared emitter for antichain mtask body switch.
+  // shared emitter for antichain mtask body switch.
   // Used by mtRunCoarseMTaskDynamic; walks region.antichainProbeGroups
   // in the same topo/layer order as the old mtask switch.
   auto emitAntichainMtaskInnerSwitch = [&](const MtCoarseRegion& region, int outerIndent) {
@@ -11449,7 +11449,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(outerIndent + 2, "break;\n");
     emitBodyLock(outerIndent, "}\n");
   };
-  // Track 2 Week 7: mutex-protected ready queue for antichain scheduler.
+  // mutex-protected ready queue for antichain scheduler.
   // Push is called by any worker after a predecessor completes; pop prefers
   // worker0-only tasks on logical worker 0, then parallel tasks.
   emitFuncDecl(0, "void S%s::mtCoarseReadyQueuePush(int regionIndex, int mtaskIndex, bool worker0Only) {\n", name.c_str());
@@ -11675,7 +11675,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
 
-  // 28c D-static Step 1: codegen-time LPT + flat per-cppId arrays.
+  // codegen-time LPT + flat per-cppId arrays.
   // For each runtime-eligible region and each rounded worker count
   // wc in {1, 2, 4, 8}, we pre-compute an LPT-balanced mtask -> worker
   // assignment and emit per-(region, wc, worker) flat arrays of
@@ -11960,7 +11960,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     }
   }
   emitBodyLock(0, "};\n");
-  // Track 2 Week 4: antichain runtime constant arrays.
+  // antichain runtime constant arrays.
   {
     std::vector<int> useAntichainRuntimeValues;
     std::vector<int> antichainMTaskCountValues;
@@ -12040,7 +12040,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
       emitBodyLock(3, "int activeUsefulCost = activeMTaskStaticCost > 0 ? activeMTaskStaticCost : regionUsefulWork;\n");
       emitBodyLock(3, "while (workerCount > 1) {\n");
       emitBodyLock(4, "int copyMergeWords = regionActiveWordSpan * workerCount * 2;\n");
-      emitBodyLock(4, "// Track 2 Week 5: mirror the stricter codegen-time admission gate.\n");
+      emitBodyLock(4, "// mirror the stricter codegen-time admission gate.\n");
       emitBodyLock(4, "if (regionMTaskCount >= 8 && regionMaxParallelWidth >= workerCount &&\n");
       emitBodyLock(4, "    activeUsefulCost >= 256 && activeUsefulCost / workerCount >= 64 &&\n");
       emitBodyLock(4, "    activeUsefulCost >= copyMergeWords * 16) break;\n");
@@ -12054,7 +12054,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(2, "if (workerCount < 1) workerCount = 1;\n");
     emitBodyLock(1, "}\n");
   }
-  // 28c-2: runtime profitability gate. Pop-count actual active bits in this
+  // runtime profitability gate. Pop-count actual active bits in this
   // region for this cycle. If below an explicit GSIM_MT_COARSE_MIN_ACTIVE_BITS
   // threshold (default 0 disables the gate), force workerCount=1 so the layer
   // loop runs inline and avoids per-region/per-layer worker-pool overhead.
@@ -12106,7 +12106,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "mtProfileLocalActivationDeltaEntries.assign((size_t)workerCount, 0);\n");
   emitBodyLock(2, "mtProfileLocalActivationDeltaMaxEntries.assign((size_t)workerCount, 0);\n");
   emitBodyLock(1, "}\n");
-  // Track 2 Week 4: atomic-counter antichain runtime. Single-threaded init,
+  // atomic-counter antichain runtime. Single-threaded init,
   // then workers scan/CAS ready mtasks and hand off via shared region flags.
   emitBodyLock(1, "if (mtCoarseUseAntichainRuntime && !mtVerilatorDualPathSelected && kCoarseRegionUseAntichainRuntime[regionIndex]) {\n");
   emitBodyLock(2, "mtWorkerPoolCoarseActiveWords = coarseActiveWords;\n");
@@ -12150,7 +12150,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtCoarseRegionSharedFlags[regionIndex][w].store(0, std::memory_order_relaxed);\n");
   emitBodyLock(2, "}\n");
   emitBodyLock(2, "mtCoarseMTaskRemaining.store(antichainMTaskCount, std::memory_order_relaxed);\n");
-    // Track 2 Week 7: seed the antichain ready queue with source mtasks (zero upstream deps).
+    // seed the antichain ready queue with source mtasks (zero upstream deps).
     emitBodyLock(2, "if (mtCoarseUseAntichainQueue) {\n");
     emitBodyLock(3, "{\n");
     emitBodyLock(4, "std::lock_guard<std::mutex> lock(mtCoarseReadyQueueMutex);\n");
@@ -12226,7 +12226,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(2, "if (mtProfileEnabled && antichainWorkerCount > 1) mtProfileTrueParallelWallNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileBatchBegin).count();\n");
   emitBodyLock(1, "return;\n");
   emitBodyLock(1, "}\n");
-  // 28c-2: mtask runtime is a runtime branch (env GSIM_MT_COARSE_RUNTIME=mtask|layered);
+  // mtask runtime is a runtime branch (env GSIM_MT_COARSE_RUNTIME=mtask|layered);
   // emit the mtask block unconditionally and gate execution by mtCoarseUseMTaskRuntime.
   emitBodyLock(1, "if (mtCoarseUseMTaskRuntime || mtVerilatorDualPathSelected) {\n");
   emitBodyLock(1, "if (regionMTaskCount <= 0) return;\n");
@@ -12298,7 +12298,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
     emitBodyLock(2, "mtProfileCoarseBalancedWorstStaticCost += balancedWorstStaticCost;\n");
   }
   emitBodyLock(1, "}\n");
-  // 28c D-static Step 1: when mtCoarseUseDStatic is set, replace the
+  // when mtCoarseUseDStatic is set, replace the
   // double-switch (regionIndex, mtaskIndex) dispatch with the codegen-time
   // LPT + flat-array path. mtaskWorkerCount was rounded above to match the
   // available precomputed plans.
@@ -13164,7 +13164,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
       } else if (isAlwaysActive(idx)) {
         emitBodyLock(indent + 1, "mtProfileRejectAlwaysActiveTask ++;\n");
       } else if (mtTasks[idx].taskKind != "pure_compute") {
-        // 28c Phase 1A: under mt-level-dispatch, distinguish worker0-only (forced
+        // under mt-level-dispatch, distinguish worker0-only (forced
         // serial by side-effect) from safe-serial that fell out of any region.
         if (mtIsLevelDispatchMode() && hasWorker0OnlyReason(mtTasks[idx].serialReasons)) {
           emitBodyLock(indent + 1, "mtProfileWorker0OnlyDispatched ++;\n");
@@ -13433,7 +13433,7 @@ void graph::genResetAllDense() {
 
 void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header) {
   Assert(denseSchedule.valid, "cannot emit dense executor for invalid schedule: %s", denseSchedule.fallbackReason.c_str());
-  Assert(!denseSchedule.mtasks.empty(), "v202 requires MTask partitioning");
+  Assert(!denseSchedule.mtasks.empty(), "dense executor requires MTask partitioning");
   bool savedActivationEventTraceSuppressed = mtActivationEventTraceSuppressed;
   mtActivationEventTraceSuppressed = true;
   int nMTasks = static_cast<int>(denseSchedule.mtasks.size());
@@ -14657,7 +14657,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         if (first) fprintf(header, "0");
         fprintf(header, "};\n");
       }
-      // v384 fix: shared noinline helpers keep the per-site fanout/succ stores as calls.
+      // fix: shared noinline helpers keep the per-site fanout/succ stores as calls.
       // The first V384 build inlined constant-bounded loops; clang -O3 unrolled ~400K of them
       // and SimTop1217.cpp compiled for 90+ minutes before the build was killed.
       fprintf(header, "void mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd);\n");
@@ -16297,7 +16297,7 @@ void graph::cppEmitter() {
   }
 
   if (!globalConfig.MtStableOutput) {
-    // 28c Phase 1A: remove stale SimTop*.cpp files from previous runs so the
+    // remove stale SimTop*.cpp files from previous runs so the
     // linker never sees a cppEmitter file the current run did not regenerate.
     for (int staleIdx = 0; ; staleIdx ++) {
       std::string stalePath = format("%s%d.cpp", (globalConfig.OutputDir + "/" + name).c_str(), staleIdx);
@@ -16347,7 +16347,7 @@ void graph::cppEmitter() {
     }
   }
   if (useDenseExecutorCodegen) {
-    Assert(useCoarseMt, "GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation in v181");
+    Assert(useCoarseMt, "GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation");
     if (mtRepCutHeaderTasks.empty()) {
       { EmitPhaseTimer infoMapTimer("Final.schedBuild.infoMap");
         mtRepCutHeaderTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
@@ -16714,18 +16714,7 @@ void graph::cppEmitter() {
   fprintf(header, "uint64_t mtProfileRejectNotActiveWhole;\n");
   fprintf(header, "uint64_t mtProfileRejectAlwaysActiveTask;\n");
   fprintf(header, "uint64_t mtProfileRejectSerialTask;\n");
-  fprintf(header, "uint64_t mtProfileSafeSerialDispatched;\n");      // 28c Phase 1A
-  fprintf(header, "uint64_t mtProfileWorker0OnlyDispatched;\n");     // 28c Phase 1A
-  fprintf(header, "uint64_t mtProfileRejectDependencyEdge;\n");
-  fprintf(header, "uint64_t mtProfileRejectSameActiveWordHazard;\n");
-  fprintf(header, "uint64_t mtProfileRejectBelowMinBatch;\n");
-  fprintf(header, "uint64_t mtProfileRejectConfiguredSingleWorker;\n");
-  fprintf(header, "uint64_t mtProfileBatchMemberNodeCount;\n");
-  fprintf(header, "uint64_t mtProfileSameActiveWordForwardEdges;\n");
-  fprintf(header, "uint64_t mtProfileCrossBatchActivationFanout;\n");
-  fprintf(header, "uint64_t mtProfileBatchWallNs;\n");
-  fprintf(header, "uint64_t mtProfileTrueParallelWallNs;\n");
-  fprintf(header, "std::vector<uint64_t> mtProfileRepCutBatchHits;\n");
+  fprintf(header, "uint64_t mtProfileSafeSerialDispatched;\n");      // :vector<uint64_t> mtProfileRepCutBatchHits;\n");
   fprintf(header, "uint64_t mtProfileSerialWallNs;\n");
   fprintf(header, "uint64_t mtProfileMergeWallNs;\n");
   fprintf(header, "uint64_t mtProfileTotalStepNs;\n");
@@ -16832,7 +16821,7 @@ void graph::cppEmitter() {
       fprintf(header, "int mtWorkerPoolCoarseRegionIndex;\n");
       fprintf(header, "int mtWorkerPoolCoarseLayerIndex;\n");
       fprintf(header, "bool mtCoarseUseMTaskRuntime;\n");
-      // 28c D-static Step 1: codegen-time LPT + flat per-cppId arrays.
+      // codegen-time LPT + flat per-cppId arrays.
       // SCoarseTaskFn points to the 2-arg mtTaskN/mtRepCutLiteTaskN overload
       // (uint%d_t&, ActivationDelta&). Keep mask before the member-function
       // pointer; cppId is uint32_t because XiangShan has >65535 emitted tasks.
@@ -16856,8 +16845,8 @@ void graph::cppEmitter() {
       fprintf(header, "int mtWorkerPoolCoarseStaticRoundedWC;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticBeginActiveWord;\n");
       fprintf(header, "int mtWorkerPoolCoarseStaticActiveWordSpan;\n");
-      // Track 2 Week 4: per-mtask atomic counters and shared region flags for antichain runtime.
-      // Track 2 Week 6: use a stamped claim-generation counter and even-cycle upstream target
+      // per-mtask atomic counters and shared region flags for antichain runtime.
+      // use a stamped claim-generation counter and even-cycle upstream target
       // so that neither state[] nor upstream[] need a per-invocation reset loop.
       fprintf(header, "std::vector<std::atomic<uint64_t>*> mtCoarseMTaskClaimGen;\n");
       fprintf(header, "std::vector<std::atomic<int>*> mtCoarseMTaskUpstream;\n");
@@ -16866,7 +16855,7 @@ void graph::cppEmitter() {
       fprintf(header, "alignas(64) std::atomic<int> mtCoarseMTaskRemaining;\n");
       fprintf(header, "std::vector<std::atomic<uint64_t>*> mtCoarseRegionCycle;\n");
       fprintf(header, "uint%d_t* mtWorkerPoolCoarseActiveWords;\n", ACTIVE_WIDTH);
-      // Track 2 Week 7: mutex-protected ready queues for antichain scheduler.
+      // mutex-protected ready queues for antichain scheduler.
       // Avoids O(M^2) scan/CAS by pushing ready mtasks once and popping once.
       // Kept behind GSIM_MT_ANTICHAIN_QUEUE env knob; old scan path still available.
       fprintf(header, "std::mutex mtCoarseReadyQueueMutex;\n");
@@ -16881,7 +16870,7 @@ void graph::cppEmitter() {
     fprintf(header, "bool mtWorkerPoolLazyStart;\n");
     fprintf(header, "int mtWorkerPoolThreadCount;\n");
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
-    // 28c-2 atomic-spin worker pool: hot atomics on independent cache lines.
+    // hot atomics on independent cache lines.
     fprintf(header, "alignas(64) std::atomic<uint64_t> mtWorkerPoolGeneration;\n");
   if (mtUseWorkerPoolWakeShardCodegen()) {
     fprintf(header, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
@@ -17086,41 +17075,7 @@ void graph::cppEmitter() {
   emitBodyLock(1, "mtProfileRejectNotActiveWhole = 0;\n");
   emitBodyLock(1, "mtProfileRejectAlwaysActiveTask = 0;\n");
   emitBodyLock(1, "mtProfileRejectSerialTask = 0;\n");
-  emitBodyLock(1, "mtProfileSafeSerialDispatched = 0;\n");      // 28c Phase 1A
-  emitBodyLock(1, "mtProfileWorker0OnlyDispatched = 0;\n");     // 28c Phase 1A
-  emitBodyLock(1, "mtProfileRejectDependencyEdge = 0;\n");
-  emitBodyLock(1, "mtProfileRejectSameActiveWordHazard = 0;\n");
-  emitBodyLock(1, "mtProfileRejectBelowMinBatch = 0;\n");
-  emitBodyLock(1, "mtProfileRejectConfiguredSingleWorker = 0;\n");
-  emitBodyLock(1, "mtProfileBatchMemberNodeCount = 0;\n");
-  emitBodyLock(1, "mtProfileSameActiveWordForwardEdges = 0;\n");
-  emitBodyLock(1, "mtProfileCrossBatchActivationFanout = 0;\n");
-  emitBodyLock(1, "mtProfileBatchWallNs = 0;\n");
-  emitBodyLock(1, "mtProfileTrueParallelWallNs = 0;\n");
-  emitBodyLock(1, "mtProfileSerialWallNs = 0;\n");
-  emitBodyLock(1, "mtProfileMergeWallNs = 0;\n");
-  emitBodyLock(1, "mtProfileTotalStepNs = 0;\n");
-  emitBodyLock(1, "mtProfileRepCutBatchHits.assign((size_t)%zu, 0);\n", mtProfileRepCutBatchBeginCppIds.size());
-  emitBodyLock(1, "mtProfileDynamicTraceFile = nullptr;\n");
-  emitBodyLock(1, "mtProfileDynamicTraceCycleStart = 0;\n");
-  emitBodyLock(1, "mtProfileDynamicTraceCycleLimit = 0;\n");
-  emitBodyLock(1, "mtProfileDynamicTraceTaskIds.clear();\n");
-  if (mtUseDynamicStateTraceCodegen()) {
-    emitBodyLock(1, "mtProfileDynamicStateTraceEnabled = dynamicTraceEnabled && dynamicStateTraceEnv != nullptr && dynamicStateTraceEnv[0] != '\\0' && dynamicStateTraceEnv[0] != '0';\n");
-    emitBodyLock(1, "static const uint8_t mtProfileStateUpdateTraceKindInit[%d] = {", superId);
-    for (int cppId = 0; cppId < static_cast<int>(mtProfileStateUpdateTraceKindByCppIdCodegen.size()); cppId ++) {
-      if (cppId != 0) emitBodyLock(0, ",");
-      if (cppId % 64 == 0) emitBodyLock(0, "\n    ");
-      emitBodyLock(0, "%u", static_cast<unsigned>(mtProfileStateUpdateTraceKindByCppIdCodegen[cppId]));
-    }
-    emitBodyLock(0, "\n");
-    emitBodyLock(1, "};\n");
-    emitBodyLock(1, "mtProfileStateUpdateTraceKindByCppId.assign(mtProfileStateUpdateTraceKindInit, mtProfileStateUpdateTraceKindInit + %d);\n", superId);
-  }
-  emitBodyLock(1, "if (dynamicTraceEnabled) {\n");
-  emitBodyLock(2, "const char *startEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_START\");\n");
-  emitBodyLock(2, "const char *cyclesEnv = getenv(\"GSIM_MT_DYNAMIC_TRACE_CYCLES\");\n");
-  emitBodyLock(2, "mtProfileDynamicTraceCycleStart = (startEnv != nullptr && startEnv[0] != '\\0') ? strtoull(startEnv, nullptr, 10) : 0;\n");
+  emitBodyLock(1, "mtProfileSafeSerialDispatched = 0;\n");      // 0;\n");
   emitBodyLock(2, "uint64_t traceCycleCount = (cyclesEnv != nullptr && cyclesEnv[0] != '\\0') ? strtoull(cyclesEnv, nullptr, 10) : 0;\n");
   emitBodyLock(2, "mtProfileDynamicTraceCycleLimit = mtProfileDynamicTraceCycleStart + traceCycleCount;\n");
   emitBodyLock(2, "if (traceCycleCount > 0 && mtProfileDynamicTraceCycleLimit > mtProfileDynamicTraceCycleStart) {\n");
@@ -17130,14 +17085,14 @@ void graph::cppEmitter() {
   emitBodyLock(2, "}\n");
   emitBodyLock(1, "}\n");
   if (useCoarseMt) {
-    // Track 2 Week 7: ready-queue state for antichain scheduler.
+    // ready-queue state for antichain scheduler.
     emitBodyLock(1, "mtCoarseMTaskInFlight.store(0, std::memory_order_relaxed);\n");
     emitBodyLock(1, "const char *antichainQueueEnv = getenv(\"GSIM_MT_ANTICHAIN_QUEUE\");\n");
     emitBodyLock(1, "mtCoarseUseAntichainQueue = (antichainQueueEnv == nullptr) || (antichainQueueEnv[0] != '0');\n");
     emitBodyLock(1, "mtProfileCoarseStaticRuntimeEligibleRegions = %d;\n", mtCoarseProfileFacts.runtimeEligibleRegionCount);
     emitBodyLock(1, "mtCoarseReadyQueueParallel.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, std::vector<int>());\n");
     emitBodyLock(1, "mtCoarseReadyQueueWorker0.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, std::vector<int>());\n");
-    // Track 2 Week 6: claim-generation + even-cycle arrays; cycle counters allocated per-region.
+    // claim-generation + even-cycle arrays; cycle counters allocated per-region.
     emitBodyLock(1, "mtCoarseMTaskClaimGen.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
     emitBodyLock(1, "mtCoarseMTaskUpstream.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
     emitBodyLock(1, "mtCoarseRegionCycle.assign((size_t)mtProfileCoarseStaticRuntimeEligibleRegions, nullptr);\n");
@@ -17234,7 +17189,7 @@ void graph::cppEmitter() {
     if (useCoarseMt) {
       emitBodyLock(1, "mtWorkerPoolCoarseRegionIndex = -1;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseLayerIndex = -1;\n");
-      // 28c-2 default: mtask runtime for mt-level-dispatch; env GSIM_MT_COARSE_RUNTIME=layered overrides.
+      // mtask runtime for mt-level-dispatch; env GSIM_MT_COARSE_RUNTIME=layered overrides.
       if (globalConfig.MtHelperMode == "mt-level-dispatch") {
         emitBodyLock(1, "mtCoarseUseMTaskRuntime = true;\n");
       } else {
@@ -17246,7 +17201,7 @@ void graph::cppEmitter() {
       emitBodyLock(2, "if (coarseRuntimeEnv[0] == 'l' || coarseRuntimeEnv[0] == 'L') mtCoarseUseMTaskRuntime = false;\n");
       emitBodyLock(2, "else if (coarseRuntimeEnv[0] == 'm' || coarseRuntimeEnv[0] == 'M') mtCoarseUseMTaskRuntime = true;\n");
       emitBodyLock(1, "}\n");
-      // 28c D-static Step 1: env GSIM_MT_COARSE_DSTATIC=0 disables the
+      // env GSIM_MT_COARSE_DSTATIC=0 disables the
       // codegen-time LPT + flat-array path so we can A/B without regenerating.
       emitBodyLock(1, "mtCoarseUseDStatic = true;\n");
       emitBodyLock(1, "const char *coarseDStaticEnv = getenv(\"GSIM_MT_COARSE_DSTATIC\");\n");
@@ -17273,7 +17228,7 @@ void graph::cppEmitter() {
       emitBodyLock(1, "}\n");
       emitBodyLock(1, "mtProfileVerilatorDualPathDispatches = 0;\n");
       emitBodyLock(1, "mtProfileVerilatorDualPathWorkerPoolDispatches = 0;\n");
-      // Track 2 Week 4: env GSIM_MT_ANTICHAIN_RUNTIME=1 enables per-mtask
+      // env GSIM_MT_ANTICHAIN_RUNTIME=1 enables per-mtask
       // atomic-counter scheduler for antichain-enabled coarse regions.
       emitBodyLock(1, "mtCoarseUseAntichainRuntime = false;\n");
       emitBodyLock(1, "const char *antichainRuntimeEnv = getenv(\"GSIM_MT_ANTICHAIN_RUNTIME\");\n");
@@ -17986,13 +17941,13 @@ void graph::cppEmitter() {
         fprintf(header, "void mtRunCoarseMTaskWorkerList(int worker, int regionIndex, const int *mtaskIndices, int mtaskCount);\n");
         fprintf(header, "void mtRunCoarseMTaskWorkerRange(int worker, int regionIndex, int mtaskBegin, int mtaskEnd);\n");
         fprintf(header, "void mtRunCoarseMTaskDynamic(int regionIndex, int worker);\n");
-        // Track 2 Week 7: antichain ready-queue helpers.
+        // antichain ready-queue helpers.
         fprintf(header, "void mtCoarseReadyQueuePush(int regionIndex, int mtaskIndex, bool worker0Only);\n");
         fprintf(header, "int mtCoarseReadyQueuePop(int regionIndex, int worker);\n");
         fprintf(header, "int mtCountActiveCoarseMTasks(int regionIndex, uint%d_t *coarseActiveWords, int *activeStaticCost);\n", ACTIVE_WIDTH);
         fprintf(header, "void mtBuildCoarseMTaskWorkerAssignment(int regionIndex, int workerCount, std::vector<std::vector<int>> &assignments, std::vector<uint64_t> &workerStaticCosts, std::vector<uint64_t> &workerTaskCounts);\n");
         fprintf(header, "void mtRunCoarseRegion(int regionIndex, uint%d_t *coarseActiveWords);\n", ACTIVE_WIDTH);
-        // 28c D-static Step 1: codegen-time LPT + flat per-cppId arrays.
+        // codegen-time LPT + flat per-cppId arrays.
         fprintf(header, "void mtRunCoarseStaticRefList(int regionIndex, int roundedWC, int worker, int regionBeginActiveWord, int regionActiveWordSpan, const SCoarseTaskRef *refs, int refCount);\n");
         fprintf(header, "void mtRunCoarseRegionStaticDispatch(int regionIndex, int roundedWC, int worker, int regionBeginActiveWord, int regionActiveWordSpan);\n");
         {

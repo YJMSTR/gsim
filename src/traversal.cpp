@@ -190,14 +190,3 @@ void ENode::display(int depth) {
     }
   }
 }
-
-void graph::traversalNoTree() {
-  int nodeIdx = 0;
-  for (size_t idx = 0; idx < sortedSuper.size(); idx ++) {
-    SuperNode* super = sortedSuper[idx];
-    printf("---%ld super id = %d---\n", idx, super->id);
-    for (Node* node : super->member) {
-      printf("%d: %s (super %d)\n", nodeIdx ++, node->name.c_str(), super->id);
-    }
-  }
-}

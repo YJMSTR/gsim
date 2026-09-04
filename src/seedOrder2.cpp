@@ -384,7 +384,7 @@ void mtSeed2Finalize() {
     Assert(std::fwrite(meta, 1, 20, fp) == 20, "seed2: write failed on %s", path);
   }
   // Verify flush/close BEFORE declaring success: a delayed write error (full disk) must
-  // never leave a silently truncated seed behind (observed in the campaign).
+  // never leave a silently truncated seed behind.
   Assert(std::fflush(fp) == 0, "seed2: flush failed on %s (disk full?)", path);
   Assert(std::fclose(fp) == 0, "seed2: close failed on %s (disk full?)", path);
   w.finalized = true;

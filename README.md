@@ -286,7 +286,7 @@ build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
 > what enables coarse batch formation (`MtBatchFormationMode=coarse`, promoted
 > automatically; no explicit `--mt-batch-formation` needed). Any of the
 > following aborts generation with
-> `GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation in v181`:
+> `GSIM_MT_DENSE_EXECUTOR_CODEGEN requires --mt-helper-mode=mt-level-dispatch with coarse batch formation`:
 > omitting `--mt-helper-mode`, using `--mt-helper-mode=mt` (the legacy upstream
 > mode), or explicitly overriding `--mt-batch-formation=legacy` /
 > `active-frequency`.

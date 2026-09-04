@@ -28,9 +28,7 @@ public:
   static uint64_t canonMixV1(const std::vector<std::string_view>& views);
   static uint64_t canonMixV2(const std::vector<std::string_view>& views);
   uint64_t canonRawHash();
-  // Renumber all emittable nodes by name (content-stable ids for emission).
-  void renumberNodesContentStable();
-  // seed2 pin-point wrappers (record/apply + canon verify at a pass boundary).
+    // seed2 pin-point wrappers (record/apply + canon verify at a pass boundary).
   void canonSeed2Record(const char* tag);
   void canonSeed2Apply(const char* tag);
 private:
@@ -153,8 +151,7 @@ private:
   void dumpMtDenseScheduleJson();
   void usedBits();
   void traversal();
-  void traversalNoTree();
-  void splitArray();
+    void splitArray();
   void removeDeadNodes();
   void aliasAnalysis();
   size_t countNodes();
@@ -167,17 +164,12 @@ private:
   void commonExpr();
   void splitNodes();
   void replicationOpt();
-  void perfAnalysis();
-  void exprOpt();
+    void exprOpt();
   void patternDetect();
   void graphPartition();
-  void MFFCPartition();
-  void mergeEssentSmallSubling(size_t maxSize, double sim);
-  void essentPartition();
-  void inferAllWidth();
+    void inferAllWidth();
   void dump(std::string FileName);
-  void depthPerf();
-  void generateStmtTree();
+    void generateStmtTree();
   void connectDep();
 };
 

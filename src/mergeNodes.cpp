@@ -152,7 +152,7 @@ void graph::mergeWhenNodes() {
   std::map<SuperNode*, std::vector<SuperNode*>, SeedRankLess> whenMapSeed;
   std::set<SuperNode*> condWaitOrig;
   std::map<SuperNode*, std::vector<SuperNode*>> whenMapOrig;
-  // Determinism (2026-08-28, residual round 3): the default path's depNext
+  // Determinism (, residual round 3): the default path's depNext
   // iteration, condWaitTop() tie-break, and whenMap apply order were all
   // pointer-ordered -> mergeNodes-when removed 32333 (jemalloc) vs 32331
   // (glibc) supers. The supers entering this pass are identical with identical
