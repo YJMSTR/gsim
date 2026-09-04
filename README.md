@@ -110,13 +110,65 @@ The quick start below assumes `SimTop.fir` already exists. The complete chain fr
 
 Reproducibility: with the champion seed, stage 2 replays the registered schedule exactly (facts line verbatim, 9/9 canon pins) and stages 3–4 land on the registered performance (Linux 100K 10.6–11.3 s vs registered mean 10.8 s; 1M 105.3 s vs 107.4 s). Note `emu` requires `NEMU_HOME` pointing at a tree containing `build/riscv64-nemu-interpreter-so` even for non-difftest runs (the difftest library is always linked).
 
-### From a fresh clone (copy-paste; verified end-to-end 2026-09-03 on EPYC 9654)
+### From a fresh clone (copy-paste; both flows verified end-to-end 2026-09-04 on EPYC 9654)
 
-Assumed layout: `gsim` and `XiangShan` as **sibling directories**, commands run from
-the gsim repo root unless noted. Known-good pins: this branch @ `6134430`;
-XiangShan `96f3a4d4b` (submodules: difftest `45638f51`, ready-to-run `e8840417`).
-Other XiangShan HEADs generally work but the FIR content drifts — regenerate the
-model, and expect benchmark numbers to differ from the registered ones.
+Assumed layout: `gsim` and `XiangShan` as **sibling directories**; commands run from
+the gsim repo root unless noted. There are **two** ways to get a XiangShan
+simulation running — Flow 1 is the XiangShan repo's own built-in target (simplest,
+untuned), Flow 2 is this branch's tuned dense-executor recipe (the numbers on this
+page). Both were executed verbatim from clean worktrees, difftest enabled, before
+being written here.
+
+**FIR generation depends on your XiangShan vintage** — `make sim-chirrtl` only
+exists since `caaf86302` (2026-08-20). A fresh clone today lands on the default
+branch `kunminghu-v3` (no `master` branch exists), which already contains it:
+
+| XiangShan vintage | FIR command |
+|---|---|
+| default branch / anything ≥ 2026-08-20 | `make sim-chirrtl GSIM=1 CONFIG=DefaultConfig` (~2–20 min) |
+| older, e.g. the registered pin `96f3a4d4b` (2026-06-07) | `make sim-verilog GSIM=1 CONFIG=DefaultConfig` (~8 min) — `sim-chirrtl` there dies with `No rule to make target 'sim-chirrtl'.  Stop.` |
+
+Three prerequisites apply to **both** vintages, each learned from a real failure:
+- `export NOOP_HOME=$(pwd)` **before** elaborating (else `java.util.NoSuchElementException: NOOP_HOME`).
+- `mkdir -p out` in a fresh worktree/clone (mill dies on `out/mill-lock` otherwise).
+- Pass `GSIM=1` on the **top-level** make: only then does elaboration emit
+  `difftest-extmodule.cpp`; without it every gsim model link fails with undefined
+  `DiffExt*`/`Mem1R1WHelper`.
+
+Known-good pins for the *registered* numbers: this branch @ `6134430`; XiangShan
+`96f3a4d4b` (which actually pins difftest `f9d0bb858`, ready-to-run `955e6e2a`).
+The registered figures are tied to the frozen FIRs of that vintage; the current
+default-branch tip elaborates a larger FIR (1.48 GB vs 1.27 GB) and its counters
+necessarily differ from the registered ones — drift, not a bug.
+
+#### Flow 1 — XiangShan built-in (`make gsim`, one command, untuned)
+
+Verified at `96f3a4d4b`: repo-default flags (`--supernode-max-size=15`, no
+`--mt-helper-mode` → single-threaded model), elaboration 453 s, emu build 731 s,
+emu 62 MB, CoreMark-50K in 38.2 s (instrCnt 95,650, IPC 1.91).
+
+```bash
+git clone git@github.com:YJMSTR/gsim.git && cd gsim
+git checkout deliver/gsim-mt-dense-v1
+make build-gsim -j$(nproc)
+
+git clone https://github.com/OpenXiangShan/XiangShan.git ../XiangShan
+cd ../XiangShan && make init && mkdir -p out
+export NOOP_HOME=$(pwd)
+GSIM_BIN=$(realpath ../gsim/build/gsim/gsim) make gsim GSIM=1 CONFIG=DefaultConfig -j$(nproc)
+# (on XiangShan < 2026-08-20 this runs sim-verilog for the FIR; newer uses sim-chirrtl)
+# emu lands at build/gsim-compile/emu — run:
+mkdir -p ready-to-run/build && ln -sf ../riscv64-nemu-interpreter-so ready-to-run/build/
+NEMU_HOME=$(pwd)/ready-to-run ./build/gsim-compile/emu \
+  -i ready-to-run/coremark-2-iteration.bin -C 50000
+```
+
+#### Flow 2 — dense recipe (the tuned flow; verified walls)
+
+Verified at the 2026-09 default-branch tip `3d03eac50`: sim-chirrtl 117 s (warm
+mill), dense T16 generation 1079 s (751 TUs), emu build 126 s, emu 117 MB,
+CoreMark-50K in 25.0 s (instrCnt 73,443, IPC 1.47). The registered-number runs on
+the frozen FIRs (incl. the instrCnt 46,562 below) were verified 2026-09-03.
 
 ```bash
 # 1. This repo + the generator (~25 s; links jemalloc when available)
@@ -126,18 +178,18 @@ make build-gsim -j$(nproc)
 
 # 2. XiangShan sibling + SimTop.fir (skip if you already have the FIR)
 git clone https://github.com/OpenXiangShan/XiangShan.git ../XiangShan
-cd ../XiangShan && git checkout 96f3a4d4b && make init     # submodules; needs JDK+mill env
-make sim-chirrtl CONFIG=DefaultConfig                       # ~15–20 min; JVM heap 40G (JVM_XMX)
+cd ../XiangShan && make init && mkdir -p out && export NOOP_HOME=$(pwd)
+make sim-chirrtl GSIM=1 CONFIG=DefaultConfig      # vintage table above; old trees: sim-verilog
 cd ../gsim        # FIR lands at ../XiangShan/build/rtl/SimTop.fir
 
 # 3. Generate the MT model: export the quick-start env block below, then
 mkdir -p ../mybuild/gsim-compile
 build/gsim/gsim --supernode-max-size=30 --cpp-max-size-KB=8192 \
   --sep-mod=__DOT__ --sep-aggr=__DOT__ --mt-helper-mode=mt-level-dispatch \
-  --dir ../mybuild/gsim-compile/model ../XiangShan/build/rtl/SimTop.fir   # ~8 min
+  --dir ../mybuild/gsim-compile/model ../XiangShan/build/rtl/SimTop.fir   # ~8–18 min
 
-# 4. Build the emu via the XiangShan difftest harness (~1.5 min, 559 TUs)
-cp -r ../XiangShan/difftest/build/generated-src ../mybuild/   # one-time prerequisite
+# 4. Build the emu via the XiangShan difftest harness (~1.5–2 min)
+cp -r ../XiangShan/build/generated-src ../mybuild/   # one-time prerequisite (see notes)
 make -C ../XiangShan/difftest gsim-build-emu \
   BUILD_DIR=$(realpath ../mybuild) \
   RTL_DIR=$(realpath ../XiangShan/build/rtl) \
@@ -147,7 +199,7 @@ make -C ../XiangShan/difftest gsim-build-emu \
   -j$(nproc)
 # → ../mybuild/gsim-compile/emu
 
-# 5. Run (CoreMark, ~7 s for 50K cycles)
+# 5. Run (CoreMark, ~7 s for 50K cycles on the frozen-FIR lineage)
 NEMU_HOME=../XiangShan/ready-to-run \
 GSIM_THREADS=32 GSIM_MT_EXECUTOR=dense GSIM_MT_CPU_AFFINITY=auto \
 taskset -c 0-31 ../mybuild/gsim-compile/emu \
@@ -163,18 +215,29 @@ Path rules that bite (all verified by failure before choosing this form):
   `XiangShan/mybuild/` and dies with `difftest-state.h: file not found`).
   `$(realpath ...)` also strips symlink components, which matter because clang/make
   resolve absolute paths containing `symlink/..` physically.
-- `$(BUILD_DIR)/generated-src` (from `difftest/build/generated-src`, normally a
-  Chisel-elaboration product) is a hard prerequisite of the build parse.
+- `$(BUILD_DIR)/generated-src` is a hard prerequisite of the build parse. Its correct
+  source is the **elaboration output** `../XiangShan/build/generated-src` (written by
+  `sim-verilog`/`sim-chirrtl`; complete with `difftest-extmodule.cpp` only when
+  elaborated with `GSIM=1`). A `difftest/build/generated-src` directory only exists
+  in trees that already ran difftest builds — and it can be a **stale vintage**:
+  mixing it into a build against a newer RTL causes deterministic false
+  "Refill test failed" errors (the make rules have no header deps; do a full `.o`
+  clean after swapping generated-src).
 - Keep the model's mtimes newer than the FIR, or make refires the generation rule
   (and then needs `GSIM_BIN` pointing at the generator).
-- Runtime `NEMU_HOME` may stay relative (resolved against your CWD); the
-  ready-to-run submodule ships `build/riscv64-nemu-interpreter-so`, so no separate
-  NEMU build is needed. `--no-diff` skips the NEMU comparison but `NEMU_HOME` is
-  still required (the library is always linked). For bit-exact difftest, the NEMU
-  vintage must match the RTL vintage — if in doubt, use `--no-diff`.
+- Runtime `NEMU_HOME` may stay relative (resolved against your CWD). The
+  ready-to-run submodule ships `riscv64-nemu-interpreter-so` at its **top level**,
+  but difftest loads `$(NEMU_HOME)/build/riscv64-nemu-interpreter-so` — one-time
+  workaround: `mkdir -p ready-to-run/build && ln -sf ../riscv64-nemu-interpreter-so ready-to-run/build/`.
+  `--no-diff` skips the NEMU comparison but `NEMU_HOME` is still required (the
+  library is always linked). For bit-exact difftest, the NEMU vintage must match
+  the RTL vintage — if in doubt, use `--no-diff`.
 - Thread-width discipline: the quick-start `GSIM_THREADS=32` (generation),
   `EMU_THREADS=32` (build) and runtime `GSIM_THREADS=32` must agree; a mismatched
   runtime width falls off a >10× performance cliff.
+- Flow 1 (`make gsim`) ignores the dense-executor env knobs by design — it drives
+  the generator with repo-default `GSIM_FLAGS` from `difftest/gsim.mk`. Tuning
+  lives in Flow 2's manual generation step.
 
 ### Quick start (XiangShan SimTop netlist, 32 threads)
 
