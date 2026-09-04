@@ -1743,14 +1743,6 @@ bool nameExist(std::string str) {
   return allSignals.find(str) != allSignals.end();
 }
 
-// GSIM_MT_DENSE_SPEC_PROBE support: resolve a signal name to its Node (or nullptr).
-// cppEmitter needs this to check that a locus name maps to a node actually declared
-// as a class member variable (definedNode) before emitting snapshot/memcmp code.
-Node* nodeByName(std::string str) {
-  auto it = allSignals.find(str);
-  return it == allSignals.end() ? nullptr : it->second;
-}
-
 void changeName(std::string oldName, std::string newName) {
   Assert(allSignals.find(oldName) != allSignals.end(), "signal %s not found", oldName.c_str());
   allSignals[oldName]->name = newName;

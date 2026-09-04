@@ -60,12 +60,10 @@ public:
   void emitUnitsParallel(size_t unitCount, const std::function<void(size_t)>& renderUnit);
   void emitPrintf();
   void activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
-                    std::string activeBufferName, int indent,
-                    const std::string& accumFlagName = "", bool emitActivation = true);
+                    std::string activeBufferName, int indent, bool emitActivation = true);
 private:
   void activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
-                          std::string activeBufferName, int indent,
-                          const std::string& accumFlagName = "", bool emitActivation = true);
+                          std::string activeBufferName, int indent, bool emitActivation = true);
 
   FILE* genHeaderStart();
   void genNodeDef(FILE* fp, Node* node);
@@ -87,7 +85,7 @@ private:
   void genResetActivation(SuperNode* super, bool isUIntReset, int indent, int resetId);
   void genResetActivationDense(SuperNode* super, bool isUIntReset, int indent, int resetId);
   void genResetDecl(FILE* fp);
-  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName = "", bool emitActivation = true);
+  int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, bool emitActivation = true);
   void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation = true);
   void genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType);
   void genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType);

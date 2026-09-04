@@ -153,17 +153,9 @@ static std::vector<int> mtProfileRepCutRuntimeCppIds;
 static std::set<int> alwaysActive;
 static std::vector<std::vector<int>> mtStepActiveWordGuards;
 static std::vector<char> mtStepActiveWordGuardable;
-// Parallel Final emission: the four context flags below are per-thread. Worker
+// Parallel Final emission: the two context flags below are per-thread. Worker
 // threads that render independent emission units each get their own copy;
 // emitUnitsParallel() snapshots the main-thread values into every worker.
-// Sparse-in-dense MT: when set, updateActiveStr emits per-byte __atomic_fetch_or into activeFlags
-// (ACTIVE_WIDTH==8 => each activeFlags[] is uint8_t, so byte atomics are aligned/UB-free) so
-// cross-thread same-word activations don't lose updates. Set only around the gated dense body.
-static thread_local bool mtDenseSparseGateAtomicEmit = false;
-// emit push-driven active-MTask registration only while generating the
-// single-thread sparse-dense executor body. Activation writes then mark the
-// static reverse-index candidates directly; no repeated active-word scans.
-static thread_local bool mtDenseActiveWorklistEmit = false;
 // Suppress sparse activation-event calls while emitting the optional dense executor body.
 static thread_local bool mtActivationEventTraceSuppressed = false;
 // Codegen-time semantic source: admitted sparse mtTask cppId, or -1 for reset/external paths.
@@ -185,7 +177,6 @@ static const std::pair<int, int>& super2ResetIdLookup(Node* resetNode) {
 
 extern int maxConcatNum;
 bool nameExist(std::string str);
-Node* nodeByName(std::string str);
 static int resetFuncNum = 0;
 std::pair<int, uint64_t> setIdxMask(int cppId);
 
@@ -605,17 +596,6 @@ static bool mtUseDenseMemberMetadata() {
 static bool mtUseDenseUnpinSpecial() {
   const char* env = std::getenv("GSIM_MT_DENSE_UNPIN_SPECIAL");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// default-off yield-threshold override for dense wait stubs. Default 256
-// preserves the promoted literal (measured 256 > 64); larger thresholds
-// trade pause-spin time for fewer yield syscalls. Affects every dense
-// depsDone/owner-ready wait stub.
-static int mtDensePollYieldThreshold() {
-  const char* env = std::getenv("GSIM_MT_DENSE_POLL_YIELD_THRESHOLD");
-  if (env == nullptr || env[0] == '\0') return 256;
-  int value = std::atoi(env);
-  return value < 1 ? 256 : value;
 }
 
 // default-off observability-cone elimination (user-approved scope
@@ -1303,13 +1283,6 @@ static bool mtUseSplitMixedStepGuards() {
 }
 
 
-// Default-off diagnostic codegen: wait-probe instrumentation is useful for
-// scheduler experiments but should not perturb normal generated models.
-static bool mtUseWaitProbeCodegen() {
-  const char* env = std::getenv("GSIM_MT_WAIT_PROBE_CODEGEN");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 // Probe-only: emit static graph data for runtime/cycle clean-region batching
 // validation. Default-off and report-only; normal generated execution is unchanged.
 static bool mtUseCycleBatchReport() {
@@ -1321,13 +1294,6 @@ static bool mtUseCycleBatchReport() {
 // and report-only; normal generated execution is unchanged.
 static bool mtUseReadyBatchReport() {
   const char* env = std::getenv("GSIM_MT_READY_BATCH_REPORT");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Probe-only: evaluate a gap-inclusive envelope SCC schedule over an existing
-// dynamic trace. Default-off and report-only; it does not emit runtime code.
-static bool mtUseEnvelopeLocalEval() {
-  const char* env = std::getenv("GSIM_MT_ENVELOPE_LOCAL_EVAL");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
@@ -1447,29 +1413,6 @@ static bool mtUseWorkerPoolFlagJoinCodegen() {
 
 
 
-// default-off compile-exclusive per-CCD wake-generation sharding. The
-// single shared mtWorkerPoolGeneration line is read-hammered by all N-1 workers
-// every post; at T32 those workers span 4 CCDs (4 L3 domains) so each post
-// broadcast-invalidates the line across CCDs. Sharding the wake signal into
-// cache-line-isolated per-shard copies keeps each worker's spin line shared by
-// only its CCD-group (~8 readers), cutting cross-CCD coherence traffic. The
-// global generation counter remains the authoritative epoch (release before the
-// shard stores, so a worker acquiring its shard sees the counter); this only
-// changes which line the inner spin polls. Generation is opt-in; the compile
-// macro GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE selects it in one A/B tree.
-static bool mtUseWorkerPoolWakeShardCodegen() {
-  const char* env = std::getenv("GSIM_MT_WORKER_POOL_WAKE_SHARD");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Default-off trim of the wake-shard publish loop: publish only shards that
-// can have readers (threadCount/stride + 1, clamped) instead of all 16.
-// Unset emits the original full-publish loop byte-for-byte.
-static bool mtUseWorkerPoolWakeShardTrimCodegen() {
-  const char* env = std::getenv("GSIM_MT_WORKER_POOL_WAKE_SHARD_TRIM");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 // Default-off emission of the GSIM_MT_OWNER_CPU_MAP runtime machinery.
 // Unset emits no map text and the original upstream spawn-pinning block.
 static bool mtUseOwnerCpuMapCodegen() {
@@ -1506,20 +1449,6 @@ static bool mtUseDenseWorkerMajorText() {
 }
 
 
-// table dispatch: replace each worker's emitted wait/call/signal chain (~350KB of
-// polling stubs, call sites, and token-store loops streamed through icache every cycle) with a
-// table-driven loop over {member-fn, wait range, store range} entries. Logical MTask order, owner
-// assignment, owner-ready wait/store semantics (parity + yield budget) are unchanged; only the
-// dispatch mechanism changes. Motivation: mt2200 measured wall 182.6us/RTL vs 126.4us simulated
-// with instant signaling — the ~56us gap is chain text streaming + token round-trips, and the
-// table converts ~350KB/worker of chain text into ~24KB of sequential data. Default-off; requires
-// owner-ready fixed-owner execution without breakdown codegen (falls back to the emitted chain
-// when the compile flag is off).
-static bool mtUseDenseTableDispatch() {
-  const char* env = std::getenv("GSIM_MT_DENSE_TABLE_DISPATCH");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 // Default-off bounded lookahead.  A positive value is the candidate window;
 // unset, empty, and zero retain the strict-order dispatch path byte-for-byte.
 static int mtDenseLookaheadWindow() {
@@ -1542,53 +1471,8 @@ static bool mtDenseDutyCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// Default-off speculation hit-rate probe (GSIM_MT_DENSE_SPEC_PROBE). Instruments the
-// lookahead tail's head-blocked spin: at block entry it determines the speculative
-// prefix segment (the blocked head plus subsequent dispatch entries whose cross-worker
-// wait tokens are all satisfied, up to the next entry that would itself block), copies
-// each member's cross-worker input loci into a thread-local snapshot buffer, and after
-// the token arrives memcmps the copies against the final values. Exact value comparison
-// (no hashes): single-writer semantics make producer values final at token arrival.
-// Report-only counters, drained in dumpMtProfile like mt-duty. Gen knob emits the
-// instrumentation; the runtime env of the same name enables counting.
-static bool mtDenseSpecProbeCodegen() {
-  const char* env = std::getenv("GSIM_MT_DENSE_SPEC_PROBE");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
 
 
-// Shared sparse-gate prefilter predicate builder (body R3 prefilter + hoisted call-site gate).
-// Returns false when the MTask must always run (any always-active member, or empty footprint);
-// otherwise fills guard with the word-OR predicate for `if (guard) body();`.
-static bool mtDenseBuildSparseGatePrefilter(const MtDenseSchedule& denseSchedule, int mtaskId, bool atomic, std::string& guard) {
-  bool safe = true;
-  std::set<int> footprintWords;
-  for (int sccId : denseSchedule.mtasks[(size_t)mtaskId].sccIds) {
-    if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
-    for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
-      if (isAlwaysActive(cppId)) { safe = false; break; }
-      footprintWords.insert(cppId / ACTIVE_WIDTH);
-    }
-    if (!safe) break;
-  }
-  if (!safe || footprintWords.empty()) return false;
-  for (int w : footprintWords) {
-    if (!guard.empty()) guard += " | ";
-    guard += atomic ? format("__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED)", w) : format("activeFlags[%d]", w);
-  }
-  return true;
-}
-
-// shared helpers: emit per-site owner-ready waits/signals as calls to shared
-// noinline helpers instead of inline poll/store loops. iTLB measured at 38.8% miss on 27.8MB text;
-// the per-worker chain is ~350KB of which the inline wait (~40B) + dual-parity signal loops
-// (~60-80B) per site dominate. Helper calls shrink each site to ~15-30B (chain ~5.6MB -> ~1.4MB
-// total) while keeping direct static calls to MTask bodies (no indirect-call cost
-// table dispatch which regressed +4.0%). Default-off; requires owner-ready, no breakdown codegen.
-static bool mtUseDenseSharedHelpers() {
-  const char* env = std::getenv("GSIM_MT_DENSE_SHARED_HELPERS");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
 
 
 // activity local collector: register reads (REG_SRC) plus MEMORY/array reads. The shared
@@ -1640,104 +1524,7 @@ static const MtActivityReads& mtActivityReadsForNode(Node* n) {
   return res.first->second;
 }
 
-// GSIM_MT_DENSE_SPEC_PROBE locus collectors. Unlike the activity collector above (which
-// expands comb reads down to base storage names), these keep LOCUS names: the probe must
-// snapshot/compare the actual mutable member variables that a blocked chain-head reads and
-// that its cross-worker producers write. Read loci record the names referenced by a tree
-// (comb nodes are recorded by name AND expanded, covering both variable-read and inlined
-// emission); write loci record what a supernode's emitted code assigns (tree owners, reg
-// commit targets via REG_DST/REG_RESET src, memory write parents).
-static void mtSpecProbeCollectReadLoci(ENode* root, std::set<std::string>& out, std::set<Node*>& expanded) {
-  if (!root) return;
-  std::stack<ENode*> st;
-  st.push(root);
-  std::set<ENode*> seen;
-  while (!st.empty()) {
-    ENode* t = st.top(); st.pop();
-    if (!t || seen.count(t)) continue;
-    seen.insert(t);
-    for (ENode* c : t->child) st.push(c);
-    Node* n = t->nodePtr;
-    if (!n) continue;
-    if (n->type == NODE_REG_SRC || n->type == NODE_INP) { out.insert(n->name); continue; }
-    if (n->type == NODE_MEMORY || n->type == NODE_READER || n->type == NODE_READWRITER) {
-      if (n->parent) out.insert(n->parent->name);
-      out.insert(n->name);
-      continue;
-    }
-    if (n->type == NODE_REG_DST || n->type == NODE_REG_RESET || n->type == NODE_WRITER) continue;
-    out.insert(n->name);
-    if (!n->assignTree.empty() && expanded.insert(n).second) {
-      for (ExpTree* tree : n->assignTree) mtSpecProbeCollectReadLoci(tree->getRoot(), out, expanded);
-    }
-  }
-}
 
-static void mtSpecProbeCollectWriteLoci(SuperNode* super, std::set<std::string>& out) {
-  for (Node* member : super->member) {
-    if (member->type == NODE_REG_DST) {
-      Node* s = member->getSrc();
-      if (s) out.insert(s->name);
-    } else if (member->type == NODE_REG_RESET) {
-      Node* s = member->getResetSrc();
-      if (s) out.insert(s->name);
-    } else if (member->type == NODE_WRITER) {
-      if (member->parent) out.insert(member->parent->name);
-    } else if (!member->assignTree.empty()) {
-      out.insert(member->name);
-    }
-  }
-}
-
-// A probeable locus: the name resolves to a node that genNodeDef actually declared as a
-// class member variable (so sizeof()/&name compile), and is not a whole memory array
-// (memories are excluded from snapshots; their read-port result nodes are kept).
-static bool mtSpecProbeDeclaredLocus(const std::string& nm) {
-  Node* n = nodeByName(nm);
-  return n != nullptr && definedNode.count(n) != 0 && n->type != NODE_MEMORY;
-}
-
-
-// activity-driven dense evaluation: gate each MTask body behind an epoch flag so
-// only MTasks whose inputs may have changed evaluate. The dense executor otherwise recomputes the
-// full DAG every cycle although measured activation is ~1.5% of body work per cycle. Design:
-//   * Per-MTask uint32 epoch flag (single-value stores, release/acquire like owner-ready tokens).
-//     A MTask runs its body iff flag == mtDenseActivityCounter (incremented once per cycle after
-//     the pool join; wraparound resets all flags at the barrier).
-//   * Activation sources: state-commit MTasks (REG_SRC / REG_RESET writes). After a commit body
-//     runs, each written scalar field is compared against a shadow copy; changed fields set the
-//     epoch flags of their reader MTasks (fanout precomputed from MtBoundaryInfo read/write sets).
-//     Wide (>64b) and array fields conservatively activate all readers on any writer run.
-//   * Propagation: a running MTask sets the epoch flags of all runtime DAG successors (redirected
-//     through elided MTasks). The owner-ready TOKEN protocol (waits/signals) is unchanged and runs
-//     for every MTask every cycle, so dependency counts settle exactly as before; only bodies are
-//     gated. worker0-only side-effect MTasks stay always-active.
-//   * Correctness closure: if a reader runs, all its producers ran (flags propagate down before);
-//     skipped producers leave outputs unchanged and unchanged cones evaluate bit-identically.
-// Default-off; requires owner-ready fixed-owner execution without breakdown codegen.
-static bool mtUseDenseActivity() {
-  const char* env = std::getenv("GSIM_MT_DENSE_ACTIVITY");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-
-// Sparse-in-dense hybrid: run each dense MTask member under gsim's per-super
-// activeFlags gate + activation production, instead of unconditionally. Dense execution order
-// (MTask-id major, cppId ascending minor) is a valid topological order of the dependency+
-// activation DAG (offline-proven: 0 backward edges in that order), so per-bit test-and-clear
-// gating in that order reproduces sparse-ST semantics. Default-off. First correctness build is
-// single-thread; MT adds atomic clear/OR after C5000 bit-exact. See docs/sparse-in-dense-design.md.
-static bool mtUseDenseSparseGate() {
-  const char* env = std::getenv("GSIM_MT_DENSE_SPARSE_GATE");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-// push-driven T1 de-risk for sparse-dense. This is intentionally
-// default-off and requires atomic sparse-gate writes so every activation can
-// register its target active word with the generated worklist.
-static bool mtUseDenseActiveWorklistPush() {
-  const char* env = std::getenv("GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
 
 
 static bool mtUseDenseHybridEligibilityDiag() {
@@ -1748,30 +1535,6 @@ static bool mtUseDenseHybridEligibilityDiag() {
 
 static bool mtUseDenseSplitWorker0MTasks() {
   const char* env = std::getenv("GSIM_MT_DENSE_SPLIT_WORKER0_MTASKS");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-// Verilator-style critical-path MTask contraction. Default-off. Replaces the
-// fixed 30-SCC topological chunking in mtBuildDenseMTasks with edge/sibling-score
-// contraction bounded by cpLimit and maxMTasks (see docs/verilator-partition-spec.md).
-static bool mtUseDenseCpContraction() {
-  const char* env = std::getenv("GSIM_MT_DENSE_CP_CONTRACTION");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// retain the established VCONTRACT heuristic and expose a separate
-// default-off policy path for the coupled V3OrderParallel score/limit rules.
-// It intentionally keeps GSim's worker0-only safety boundary.
-static bool mtUseDenseV3ContractPolicy() {
-  const char* env = std::getenv("GSIM_MT_DENSE_VCONTRACT_V3_POLICY");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-
-
-// wire the Verilator-like PackThreads DAG-aware assignment (already used only
-// for the report) into the codegen mtaskThreadAssign, replacing i % threadCount.
-static bool mtUseDensePackThreadsAssignment() {
-  const char* env = std::getenv("GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
@@ -1786,32 +1549,6 @@ static bool mtUseDenseWorkSteal() {
 }
 
 
-// Probe-only: emit extra counters for dynamic work inside the clean coarse
-// serial-inline fallback. Codegen-gated so normal generated models keep the
-// old hot path; runtime profiling still controls whether counters are updated.
-static bool mtUseSubchunkProbe() {
-  const char* env = std::getenv("GSIM_MT_SUBCHUNK_PROBE");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Probe-only: iterate active bits in clean coarse serial-inline words using
-// ascending ctz instead of emitting one fixed branch per bit. The generated loop
-// re-reads the flag after each task but masks off already-scanned lower bits, so
-// forward same-word activations are preserved while backward activations keep the
-// original fixed-order semantics.
-static bool mtUseCtzCoarseInlineWord() {
-  const char* env = std::getenv("GSIM_MT_CTZ_COARSE_INLINE_WORD");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Probe-only: optimize the common sparse case where a clean coarse serial-inline
-// word starts with exactly one active bit. Execute that bit directly, then scan
-// only higher bits so forward same-word activations remain visible.
-static bool mtUseSingleBitCoarseInlineWord() {
-  const char* env = std::getenv("GSIM_MT_SINGLEBIT_COARSE_INLINE_WORD");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 // Default-on active-path optimization: when a clean coarse region's static
 // maximum active bits cannot exceed the runtime inline threshold, generated code
 // skips the per-region popcount scan and goes straight to serial-inline fallback.
@@ -1819,33 +1556,6 @@ static bool mtUseSingleBitCoarseInlineWord() {
 // Set GSIM_MT_STATIC_INLINE_BOUND=0 during codegen to emit the old always-popcount gate.
 static bool mtUseStaticCoarseInlineBound() {
   return mtCodegenEnvEnabledByDefault("GSIM_MT_STATIC_INLINE_BOUND");
-}
-
-// Runtime partial-subchunk dispatch is now generated only when explicitly
-// requested. After static-bound serial-inline removed the popcount threshold
-// scan from the default hot path, the smaller no-subchunk model is consistently
-// slightly faster on XiangShan/CoreMark. Set GSIM_MT_SUBCHUNK_RUNTIME=1 during
-// gsim-gen-cpp to emit the diagnostic/runtime subchunk fields, branch,
-// counters, and printf paths.
-static bool mtUseSubchunkRuntime() {
-  const char* env = std::getenv("GSIM_MT_SUBCHUNK_RUNTIME");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Default-off XiangShan diagnostic: allow RepCut-lite cloned sink helpers to be
-// used under mt-level-dispatch. Keep off by default so promoted direct-inline
-// serial/coarse fallbacks are not disabled by selected-but-cold RepCut tasks.
-static bool mtUseLevelDispatchRepCutRuntime() {
-  const char* env = std::getenv("GSIM_MT_REPCUT_LEVEL_RUNTIME");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
-// Experimental RepCut runtime probe. Codegen-gated and default-off: when set,
-// parallel-safe RepCut batches may bypass the global min-batch single-worker
-// clamp so the cloned-value path can be measured on real designs.
-static bool mtForceParallelRepCutBatches() {
-  const char* env = std::getenv("GSIM_MT_REPCUT_FORCE_PARALLEL");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
 // admission gate for the coarse region under mt-level-dispatch.
@@ -2062,12 +1772,6 @@ static void mtDenseAddSuperEdges(MtDenseSchedule& schedule,
 //     uint64_t s = 1; while (s < c) s = s + s / 20 + 1; return s;
 //   }
 
-static uint64_t mtDenseStepCostV3(uint64_t cost) {
-  if (cost == 0) return 0;
-  double logCost = std::log(static_cast<double>(cost));
-  logCost = std::ceil(logCost * 20.0) / 20.0;
-  return static_cast<uint64_t>(std::exp(logCost));
-}
 static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount, std::vector<int>& assign, std::vector<int>& order);
 // ---- VCONTRACT_POLICY=auto pass control (file scope; recomputeCP's compaction
 // gate and the two-pass driver in mtaskBuild coordinate through these) ----
@@ -2092,15 +1796,8 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   std::vector<MtDenseMTask> mtasks;
   if (realN == 0) return mtasks;
   if (threadCount < 1) threadCount = 1;
-  const bool v3Policy = mtUseDenseV3ContractPolicy();
-  // V3OrderParallel connects all real roots through artificial zero-cost entry/exit vertices,
-  // then removes those vertices after contraction. They make disconnected components eligible
-  // for sibling pairing without permitting the artificial edges themselves to be contracted.
-  const int firstRealMTask = v3Policy ? 1 : 0;
-  const int entryMTask = v3Policy ? 0 : -1;
-  const int exitMTask = v3Policy ? realN + 1 : -1;
-  const int n = realN + (v3Policy ? 2 : 0);
-  const auto denseNode = [firstRealMTask](int scc) { return scc + firstRealMTask; };
+  const int n = realN;
+  const auto denseNode = [](int scc) { return scc; };
   auto sc = [&](int s) -> uint64_t { return (uint64_t)std::max(1, schedule.sccs[(size_t)s].memberNodeCost); };
   const uint64_t totalCost = [&]{ uint64_t c = 0; for (int scc = 0; scc < realN; ++scc) c += sc(scc); return c; }();
   // Legacy stepCost calls mtDenseStepCostV per query (a ~log_{1.05}(cost)-iteration loop with a
@@ -2109,26 +1806,14 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // group cost or pair sum, both <= totalCost) and answer by binary search. Identical values by
   // construction: the table IS the loop's trajectory, so decisions and output are unchanged.
   std::vector<uint64_t> legacyStepSeq;
-  if (!v3Policy) {
-    legacyStepSeq.push_back(1);
-    while (legacyStepSeq.back() < totalCost) {
-      uint64_t s = legacyStepSeq.back();
-      legacyStepSeq.push_back(s + s / 20 + 1);
-    }
+  legacyStepSeq.push_back(1);
+  while (legacyStepSeq.back() < totalCost) {
+    uint64_t s = legacyStepSeq.back();
+    legacyStepSeq.push_back(s + s / 20 + 1);
   }
-  std::vector<uint64_t> v3StepCostCache(v3Policy ? (size_t)totalCost + 1 : 0, 0);
-  const auto stepCost = [v3Policy, totalCost, &v3StepCostCache, &legacyStepSeq](uint64_t cost) -> uint64_t {
-    if (!v3Policy) {
-      if (cost <= 1) return cost;
-      return *std::lower_bound(legacyStepSeq.begin(), legacyStepSeq.end(), cost);
-    }
-    if (cost == 0) return 0;
-    if (cost <= totalCost) {
-      uint64_t &cached = v3StepCostCache[(size_t)cost];
-      if (cached == 0) cached = mtDenseStepCostV3(cost);
-      return cached;
-    }
-    return mtDenseStepCostV3(cost);
+  const auto stepCost = [&legacyStepSeq](uint64_t cost) -> uint64_t {
+    if (cost <= 1) return cost;
+    return *std::lower_bound(legacyStepSeq.begin(), legacyStepSeq.end(), cost);
   };
   // GSIM_EMIT_PHASE_TIMING=1 sub-phase accounting (pure measurement; zero
   // emitted-byte impact). Leaf timers (recomputeCP / pathExists /
@@ -2178,13 +1863,6 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   for (int scc = 0; scc < realN; ++scc) { int node = denseNode(scc); gcost[(size_t)node] = sc(scc); gw0[(size_t)node] = schedule.sccs[(size_t)scc].workerZeroOnly; }
   for (int u = 0; u < realN; ++u) for (int v : schedule.sccs[(size_t)u].succSccs) if (v != u && v >= 0 && v < realN) { int from = denseNode(u), to = denseNode(v); gS[(size_t)from].push_back(to); gP[(size_t)to].push_back(from); }
   for (int i = 0; i < n; i ++) { std::sort(gS[(size_t)i].begin(), gS[(size_t)i].end()); gS[(size_t)i].erase(std::unique(gS[(size_t)i].begin(), gS[(size_t)i].end()), gS[(size_t)i].end()); std::sort(gP[(size_t)i].begin(), gP[(size_t)i].end()); gP[(size_t)i].erase(std::unique(gP[(size_t)i].begin(), gP[(size_t)i].end()), gP[(size_t)i].end()); }
-  if (v3Policy) {
-    for (int scc = 0; scc < realN; ++scc) {
-      int node = denseNode(scc);
-      if (gP[(size_t)node].empty()) { relInsert(gS[(size_t)entryMTask], node); relInsert(gP[(size_t)node], entryMTask); }
-      if (gS[(size_t)node].empty()) { relInsert(gS[(size_t)node], exitMTask); relInsert(gP[(size_t)exitMTask], node); }
-    }
-  }
   // Forward (to-end) and reverse (from-start) stepped critical paths over the SCC DAG (topo by id).
   for (int u = n - 1; u >= 0; u --) { uint64_t b = 0; for (int v : gS[(size_t)u]) b = std::max(b, gF[(size_t)v] + stepCost(gcost[(size_t)v])); gF[(size_t)u] = b; }
   for (int u = 0; u < n; u ++) { uint64_t b = 0; for (int p : gP[(size_t)u]) b = std::max(b, gR[(size_t)p] + stepCost(gcost[(size_t)p])); gR[(size_t)u] = b; }
@@ -2193,10 +1871,8 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   int capMul = 3;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_CAP"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) capMul = v; } }
   const uint64_t legacyMTaskCap = std::max<uint64_t>(1, (totalCost / (uint64_t)maxMTasks) * (uint64_t)capMul);
-  const uint64_t perMTaskCap = v3Policy ? std::numeric_limits<uint64_t>::max() : legacyMTaskCap;
-  uint64_t scoreLimit = v3Policy
-      ? std::max<uint64_t>(1, (totalCost * 3) / ((uint64_t)threadCount * 5))
-      : std::numeric_limits<uint64_t>::max();
+  const uint64_t perMTaskCap = legacyMTaskCap;
+  uint64_t scoreLimit = std::numeric_limits<uint64_t>::max();
   bool sibEnabled = true;
   { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_SIBLING"); if (e && e[0] == '0') sibEnabled = false; }
   // use V3's critPathCostWithout edge score in the legacy contraction
@@ -2211,12 +1887,10 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   // shifts merge ORDER (a heuristic, safe for any CP value) -- contraction correctness never
   // depends on it. Default-off knob. NOTE: no CP-ordering cycle prune is added (a prune on stale CP
   // is unsound), so cycle-safety stays the plain gen-tagged DFS; CP feeds ONLY edgeScore.
-  bool propagateCp = v3Policy || edgeCpWithout || [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP"); return e && e[0] && e[0] != '0'; }();
+  bool propagateCp = edgeCpWithout || [](){ const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP"); return e && e[0] && e[0] != '0'; }();
   // recomputeEvery K: recompute cost is O(V+E) per call * (merges/K), so K amortizes it against the
   // merge loop. The exact recompute (vs Verilator's incremental heap) sidesteps the union-find
   // quotient hazard where CP both rises (cost growth) and falls (a->b edge internalizes) per merge.
-  int recomputeEvery = 256;
-  { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_PROPCP_EVERY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 1) recomputeEvery = v; } }
   // Scratch buffers reused across recomputeCP calls (cleared per call): 143 calls each
   // allocating ~n vectors of vectors was most of recomputeCP's wall. clear()/assign() reuse
   // the existing allocations; the traversal and arithmetic below are byte-for-byte the
@@ -2423,7 +2097,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
         + stepCost(gcost[(size_t)a] + gcost[(size_t)b]);
   };
   auto edgeScore = [&](int a, int b) -> uint64_t {
-    if (!v3Policy && !edgeCpWithout) {
+    if (!edgeCpWithout) {
       return std::max(gF[(size_t)a], gF[(size_t)b]) + std::max(gR[(size_t)a], gR[(size_t)b])
           + stepCost(gcost[(size_t)a] + gcost[(size_t)b]);
     }
@@ -2433,103 +2107,51 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   };
   auto candidateScore = [&](int a, int b, bool sibling) -> uint64_t {
     uint64_t score = sibling ? siblingScore(a, b) : edgeScore(a, b);
-    if (v3Policy && !sibling && score < std::numeric_limits<uint64_t>::max()) ++score;
     return score;
   };
   struct Cand { uint64_t score; int a; int b; bool sibling; };
   struct Cmp {
-    bool v3Policy = false;
     bool operator()(const Cand& x, const Cand& y) const {
-      if (x.score != y.score) return x.score > y.score;
-      if (!v3Policy) return false;
-      if (x.sibling != y.sibling) return !x.sibling && y.sibling;
-      if (x.a != y.a) return x.a > y.a;
-      return x.b > y.b;
+      return x.score > y.score;
     }
   };
-  std::priority_queue<Cand, std::vector<Cand>, Cmp> pq(Cmp{v3Policy});
+  std::priority_queue<Cand, std::vector<Cand>, Cmp> pq;
   auto pushEdges = [&](int r) {
     for (int s2 : gS[(size_t)r]) { int rs = find(s2); if (rs != r && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) pq.push({candidateScore(r, rs, false), r, rs, false}); }
   };
-  // The legacy heuristic pairs a node with successors of each predecessor.  The V3 policy
-  // uses V3OrderParallel's bounded sorted sibling pairing in both adjacency directions.
-  auto pushSiblings = [&](int r, bool exhaustive) {
-    if (!v3Policy) {
-      int emitted = 0; const int sibCap = 8;
-      for (int p : gP[(size_t)r]) { int rp = find(p);
-        for (int s2 : gS[(size_t)rp]) { int rs = find(s2);
-          if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({candidateScore(r, rs, true), r, rs, true}); if (++ emitted >= sibCap) return; } } }
-      return;
-    }
-    const auto addPairs = [&](const std::vector<int>& relatives, bool useForwardCp) {
-      constexpr size_t siblingEdgeLimit = 72;
-      constexpr size_t nonExhaustivePairs = 3;
-      std::vector<int> neighbors;
-      neighbors.reserve(std::min(siblingEdgeLimit, relatives.size()));
-      for (int relative : relatives) {
-        int root = find(relative);
-        if (root == r || std::find(neighbors.begin(), neighbors.end(), root) != neighbors.end()) continue;
-        neighbors.push_back(root);
-        if (neighbors.size() == siblingEdgeLimit) break;
-      }
-      std::sort(neighbors.begin(), neighbors.end(), [&](int lhs, int rhs) {
-        const uint64_t lhsCp = (useForwardCp ? gF[(size_t)lhs] : gR[(size_t)lhs]) + gcost[(size_t)lhs];
-        const uint64_t rhsCp = (useForwardCp ? gF[(size_t)rhs] : gR[(size_t)rhs]) + gcost[(size_t)rhs];
-        return lhsCp != rhsCp ? lhsCp < rhsCp : lhs < rhs;
-      });
-      const size_t pairEnd = exhaustive || neighbors.size() <= 2 * nonExhaustivePairs
-          ? neighbors.size() & ~size_t{1}
-          : 2 * nonExhaustivePairs;
-      for (size_t i = 0; i < pairEnd; i += 2) {
-        int a = neighbors[i];
-        int b = neighbors[i + 1];
-        if (gw0[(size_t)a] != gw0[(size_t)b] || gcost[(size_t)a] + gcost[(size_t)b] > perMTaskCap) continue;
-        pq.push({candidateScore(a, b, true), a, b, true});
-      }
-    };
-    addPairs(gP[(size_t)r], false);
-    addPairs(gS[(size_t)r], true);
+  // The legacy heuristic pairs a node with successors of each predecessor.
+  auto pushSiblings = [&](int r) {
+    int emitted = 0; const int sibCap = 8;
+    for (int p : gP[(size_t)r]) { int rp = find(p);
+      for (int s2 : gS[(size_t)rp]) { int rs = find(s2);
+        if (rs != r && rs != rp && gw0[(size_t)r] == gw0[(size_t)rs] && gcost[(size_t)r] + gcost[(size_t)rs] <= perMTaskCap) { pq.push({candidateScore(r, rs, true), r, rs, true}); if (++ emitted >= sibCap) return; } } }
   };
   auto rebuildPQ = [&]() {
     EmitPhaseAccumScope vcScope(vcAccRebuildPQ, vcPhaseTiming);
     // Rebuild the candidate heap from scratch over all live roots with LIVE edgeScore. Called after
     // recomputeCP() so every candidate is scored against the freshly-recomputed critical paths
     // (a recompute can LOWER a CP, burying a now-cheaper edge under a stale-high key that on-pop
-    // revalidation alone could never surface). O(V+E) per call, amortized by recomputeEvery.
-    std::priority_queue<Cand, std::vector<Cand>, Cmp> empty(Cmp{v3Policy}); pq.swap(empty);
-    for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u, true); }
+    // revalidation alone could never surface). O(V+E) per call, amortized by the fixed K=256.
+    std::priority_queue<Cand, std::vector<Cand>, Cmp> empty; pq.swap(empty);
+    for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
   };
-  for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u, true); }
+  for (int u = 0; u < n; u ++) if (find(u) == u) { pushEdges(u); if (sibEnabled) pushSiblings(u); }
   if (vcPhaseTiming) vcAccInit.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - vcInitBegin).count();
   int live = n; uint64_t merges = 0, cycRej = 0, sibMerges = 0, entryExitSkips = 0, scoreLimitEscalations = 0;
   {
   EmitPhaseAccumScope vcLoopScope(vcAccLoop, vcPhaseTiming);
   while (!pq.empty()) {
-    if (!v3Policy && live <= maxMTasks) break;
+    if (live <= maxMTasks) break;
     Cand c = pq.top(); pq.pop();
     int a = find(c.a), b = find(c.b);
     if (a == b || gw0[(size_t)a] != gw0[(size_t)b]) continue;
     if (gcost[(size_t)a] + gcost[(size_t)b] > perMTaskCap) continue;
-    if (v3Policy && c.score > scoreLimit) {
-      if (live <= maxMTasks) break;
-      const uint64_t limitMax = std::numeric_limits<uint64_t>::max();
-      scoreLimit = scoreLimit > limitMax / 120 * 100
-          ? limitMax
-          : std::max(scoreLimit + 1, (scoreLimit * 120) / 100);
-      ++ scoreLimitEscalations;
-      pq.push(c);
-      continue;
-    }
     if (propagateCp) {
       // Lazy stale-key check: gcost grows within a recompute window, so a candidate's stored score
       // may no longer equal the live score.  The periodic full rebuild also repairs score decreases.
       uint64_t liveScore = candidateScore(a, b, c.sibling);
       if (liveScore != c.score) { pq.push({liveScore, a, b, c.sibling}); continue; }
-    }
-    if (v3Policy && !c.sibling && (a == find(entryMTask) || b == find(exitMTask))) {
-      ++entryExitSkips;
-      continue;
     }
     bool cyc;
     if (c.sibling) {
@@ -2577,15 +2199,13 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
     pathMemo.clear(); // quotient graph changed: reachability answers are stale
     pathEpoch ++;     // ... and every gSN snapshot is stale
     }
-    if (propagateCp && (merges % (uint64_t)recomputeEvery) == 0) { recomputeCP(); ++scoreCacheGeneration; rebuildPQ(); }
+    if (propagateCp && (merges % 256u) == 0) { recomputeCP(); ++scoreCacheGeneration; rebuildPQ(); }
     {
     EmitPhaseAccumScope vcScope(vcAccMergeApply, vcPhaseTiming);
-    pushEdges(a); if (sibEnabled) pushSiblings(a, true);
-    int siblingRefreshes = 0;
+    pushEdges(a); if (sibEnabled) pushSiblings(a);
     for (int p : gP[(size_t)a]) {
       int rp = find(p);
       if (rp != a && gw0[(size_t)rp] == gw0[(size_t)a] && gcost[(size_t)rp] + gcost[(size_t)a] <= perMTaskCap) pq.push({candidateScore(rp, a, false), rp, a, false});
-      if (v3Policy && sibEnabled && rp != a && siblingRefreshes ++ < 72) pushSiblings(rp, false);
     }
     }
   }
@@ -2612,7 +2232,7 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   std::vector<std::set<int>> predSets((size_t)R), succSets((size_t)R);
   for (int fromScc = 0; fromScc < realN; ++fromScc) { int fm = sccToMTask[(size_t)fromScc]; if (fm < 0) continue; for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) { int tm = (toScc >= 0 && toScc < realN) ? sccToMTask[(size_t)toScc] : -1; if (tm < 0 || tm == fm) continue; succSets[(size_t)fm].insert(tm); predSets[(size_t)tm].insert(fm); } }
   for (int mi = 0; mi < R; mi ++) { mtasks[(size_t)mi].predMTasks.assign(predSets[(size_t)mi].begin(), predSets[(size_t)mi].end()); mtasks[(size_t)mi].succMTasks.assign(succSets[(size_t)mi].begin(), succSets[(size_t)mi].end()); }
-  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu entryExitSkips=%llu maxMTasks=%d v3Policy=%d scoreLimit=%llu escalations=%llu pathMemoHits=%llu pathCapHits=%llu\n", realN, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, (unsigned long long)entryExitSkips, maxMTasks, v3Policy ? 1 : 0, (unsigned long long)scoreLimit, (unsigned long long)scoreLimitEscalations, (unsigned long long)pathMemoHits, (unsigned long long)pathCapHits);
+  fprintf(stderr, "[mt-dense-vcontract] sccs=%d -> mtasks=%d merges=%llu (sibling=%llu) cycRej=%llu entryExitSkips=%llu maxMTasks=%d v3Policy=%d scoreLimit=%llu escalations=%llu pathMemoHits=%llu pathCapHits=%llu\n", realN, R, (unsigned long long)merges, (unsigned long long)sibMerges, (unsigned long long)cycRej, (unsigned long long)entryExitSkips, maxMTasks, 0, (unsigned long long)scoreLimit, (unsigned long long)scoreLimitEscalations, (unsigned long long)pathMemoHits, (unsigned long long)pathCapHits);
   if (vcPhaseTiming) vcAccMaterialize.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - vcMaterializeBegin).count();
   emitPhaseAccumReport(vcAccInit);
@@ -2623,186 +2243,6 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   emitPhaseAccumReport(vcAccRebuildPQ);
   emitPhaseAccumReport(vcAccMergeApply);
   emitPhaseAccumReport(vcAccMaterialize);
-  return mtasks;
-}
-
-static std::vector<MtDenseMTask> mtBuildDenseMTasksCpContraction(const MtDenseSchedule& schedule,
-                                                                 int threadCount) {
-  // Level-bucketed sibling contraction (Verilator-inspired, adapted for gsim's diamond-mesh
-  // dependency graph where pure edge contraction stalls: edge-only contraction hit
-  // 3.23M cycle rejections vs 27.8k merges). Each SCC gets a critical-path LEVEL = longest
-  // dependency depth from a source. SCCs at the same level are mutually independent (no edge
-  // between them), so grouping same-level SCCs is ALWAYS cycle-free (sibling contraction).
-  // Within a level, non-worker0 SCCs are bucketed across threads balancing member-node cost
-  // (LPT); worker0-only SCCs form their own separate MTask (never mixed with parallel SCCs,
-  // preserving the worker0 boundary). One MTask per (level, bucket). MTask ids follow
-  // (level, bucket) order, and every SCC edge goes to a strictly greater level, so ids are
-  // topologically monotone (succ>from) as the runtime protocol / transitive reduction require.
-  const int nSccs = static_cast<int>(schedule.sccs.size());
-  std::vector<MtDenseMTask> mtasks;
-  if (nSccs == 0) return mtasks;
-  if (threadCount < 1) threadCount = 1;
-  auto sccCost = [&](int s) -> int { return std::max(1, schedule.sccs[(size_t)s].memberNodeCost); };
-
-  // 1. Critical-path level per SCC. schedule.topoSccOrder is a valid topological order, so a
-  //    single forward relaxation computes the longest-path depth.
-  std::vector<int> level((size_t)nSccs, 0);
-  int maxLevel = 0;
-  for (int s : schedule.topoSccOrder) {
-    int lv = level[(size_t)s];
-    if (lv > maxLevel) maxLevel = lv;
-    for (int t : schedule.sccs[(size_t)s].succSccs) {
-      if (t < 0 || t >= nSccs) continue;
-      if (level[(size_t)t] < lv + 1) { level[(size_t)t] = lv + 1; if (lv + 1 > maxLevel) maxLevel = lv + 1; }
-    }
-  }
-  const int numLevels = maxLevel + 1;
-
-  // 2. Group SCC ids by level, preserving topo order within a level.
-  std::vector<std::vector<int>> levelSccs((size_t)numLevels);
-  for (int s : schedule.topoSccOrder) levelSccs[(size_t)level[(size_t)s]].push_back(s);
-
-  // 3. Per level: emit worker0-only SCCs as one dedicated MTask, and bucket the parallel
-  //    SCCs into <=threadCount MTasks balancing member cost. Ids assigned in emission order.
-  std::vector<int> sccToMTask((size_t)nSccs, -1);
-  auto emitBucket = [&](const std::vector<int>& members, bool isW0) {
-    if (members.empty()) return;
-    int mi = static_cast<int>(mtasks.size());
-    mtasks.emplace_back();
-    MtDenseMTask& mt = mtasks.back();
-    mt.workerZeroOnly = isW0;
-    std::vector<int> sorted = members;
-    std::sort(sorted.begin(), sorted.end()); // topo (ascending scc id) for deterministic emission
-    for (int s : sorted) {
-      mt.sccIds.push_back(s);
-      mt.staticCost += schedule.sccs[(size_t)s].staticCost;
-      mt.schedCost += sccCost(s);
-      mt.taskCount += static_cast<int>(schedule.sccs[(size_t)s].cppIds.size());
-      sccToMTask[(size_t)s] = mi;
-    }
-  };
-  for (int lv = 0; lv < numLevels; lv ++) {
-    std::vector<int> normal, w0;
-    for (int s : levelSccs[(size_t)lv]) {
-      if (schedule.sccs[(size_t)s].workerZeroOnly) w0.push_back(s); else normal.push_back(s);
-    }
-    if (!w0.empty()) emitBucket(w0, true); // worker0-only: its own MTask (no contamination)
-    // LPT bucketing of parallel SCCs by descending cost.
-    std::sort(normal.begin(), normal.end(), [&](int a, int b) { return sccCost(a) != sccCost(b) ? sccCost(a) > sccCost(b) : a < b; });
-    std::vector<std::vector<int>> buckets((size_t)threadCount);
-    std::vector<long long> bucketLoad((size_t)threadCount, 0);
-    for (int s : normal) {
-      int best = 0;
-      for (int t = 1; t < threadCount; t ++) if (bucketLoad[(size_t)t] < bucketLoad[(size_t)best]) best = t;
-      buckets[(size_t)best].push_back(s); bucketLoad[(size_t)best] += sccCost(s);
-    }
-    for (int t = 0; t < threadCount; t ++) emitBucket(buckets[(size_t)t], false);
-  }
-
-  // 3b. Band/edge contraction band/edge contraction on the level-bucket MTask graph. Level-bucketing
-  //     (phase 1) gives depth==numLevels (~333) with many cross-level cross-thread deps. To reach
-  //     Verilator's depth ~15 shape, merge each MTask with a successor MTask when they are within
-  //     the same worker AND merging creates no cycle, using union-find + bounded reachability on the
-  //     (small, ~few-thousand) MTask graph. Gated by GSIM_MT_DENSE_BAND_CONTRACT (levels per band);
-  //     0/unset disables (pure level-bucket). Cycle checks are cheap here vs 45k-node graph.
-  int bandContract = 0;
-  { const char* env = std::getenv("GSIM_MT_DENSE_BAND_CONTRACT"); if (env && env[0]) bandContract = std::atoi(env); }
-  if (bandContract > 0 && static_cast<int>(mtasks.size()) > threadCount) {
-    const int nm = static_cast<int>(mtasks.size());
-    // Build the level-bucket MTask DAG (adjacency) for contraction.
-    std::vector<int> mtLevel((size_t)nm, 0);
-    for (int mi = 0; mi < nm; mi ++) {
-      int lv = 0; for (int s : mtasks[(size_t)mi].sccIds) lv = std::max(lv, level[(size_t)s]); mtLevel[(size_t)mi] = lv;
-    }
-    std::vector<int> sccToMT((size_t)nSccs, -1);
-    for (int mi = 0; mi < nm; mi ++) for (int s : mtasks[(size_t)mi].sccIds) sccToMT[(size_t)s] = mi;
-    std::vector<std::set<int>> bSucc((size_t)nm), bPred((size_t)nm);
-    for (int fromScc = 0; fromScc < nSccs; fromScc ++) {
-      int fm = sccToMT[(size_t)fromScc]; if (fm < 0) continue;
-      for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) {
-        int tm = (toScc >= 0 && toScc < nSccs) ? sccToMT[(size_t)toScc] : -1;
-        if (tm < 0 || tm == fm) continue;
-        bSucc[(size_t)fm].insert(tm); bPred[(size_t)tm].insert(fm);
-      }
-    }
-    std::vector<int> uf((size_t)nm); for (int i = 0; i < nm; i ++) uf[(size_t)i] = i;
-    std::function<int(int)> find = [&](int x){ while (uf[(size_t)x]!=x){ uf[(size_t)x]=uf[(size_t)uf[(size_t)x]]; x=uf[(size_t)x]; } return x; };
-    std::vector<long long> gcost((size_t)nm, 0); std::vector<bool> gw0((size_t)nm, false); std::vector<int> gbase((size_t)nm, 0);
-    for (int mi = 0; mi < nm; mi ++) { gcost[(size_t)mi] = mtasks[(size_t)mi].schedCost; gw0[(size_t)mi] = mtasks[(size_t)mi].workerZeroOnly; gbase[(size_t)mi] = mtLevel[(size_t)mi]; }
-    long long total = 0; for (int mi = 0; mi < nm; mi ++) total += gcost[(size_t)mi];
-    const long long capCost = std::max<long long>(1, (total / std::max(1, 50 * threadCount)) * 3);
-    auto reachB = [&](int from, int to, int budget) -> bool {
-      if (from == to) return true;
-      std::vector<int> st; st.push_back(from); std::set<int> seen; seen.insert(from); int steps = 0;
-      while (!st.empty()) { int g = st.back(); st.pop_back(); if (++steps > budget) return true;
-        for (int s : bSucc[(size_t)g]) { int rs = find(s); if (rs == to) return true; if (seen.insert(rs).second) st.push_back(rs); } }
-      return false;
-    };
-    auto mergeB = [&](int a, int b){ a=find(a); b=find(b); if(a==b) return; uf[(size_t)b]=a; gcost[(size_t)a]+=gcost[(size_t)b]; gw0[(size_t)a]=gw0[(size_t)a]||gw0[(size_t)b];
-      for (int s : bSucc[(size_t)b]){ int rs=find(s); if(rs!=a){ bSucc[(size_t)a].insert(rs); bPred[(size_t)rs].insert(a);} }
-      for (int p : bPred[(size_t)b]){ int rp=find(p); if(rp!=a){ bPred[(size_t)a].insert(rp); bSucc[(size_t)rp].insert(a);} }
-      bSucc[(size_t)a].erase(a); bPred[(size_t)a].erase(a); bSucc[(size_t)a].erase(b); bPred[(size_t)a].erase(b); };
-    // Contract a->b (b a successor of a) when within the band window, same w0, cost ok, cycle-safe.
-    bool changed = true; int mergeCount = 0; const int cycBudget = 4000;
-    while (changed) { changed = false;
-      for (int mi = 0; mi < nm; mi ++) { int a = find(mi); if (a != mi) continue;
-        int chosen = -1;
-        for (int s : bSucc[(size_t)a]) { int rs = find(s); if (rs == a) continue;
-          if (gw0[(size_t)a] != gw0[(size_t)rs]) continue;
-          if (gbase[(size_t)rs] - gbase[(size_t)a] > bandContract) continue; // band window
-          if (gcost[(size_t)a] + gcost[(size_t)rs] > capCost) continue;
-          bool cyc = false; for (int s2 : bSucc[(size_t)a]) { int rs2 = find(s2); if (rs2 == rs || rs2 == a) continue; if (reachB(rs2, rs, cycBudget)) { cyc = true; break; } }
-          if (cyc) continue; chosen = rs; break; }
-        if (chosen >= 0) { mergeB(a, chosen); mergeCount ++; changed = true; }
-      }
-    }
-    // Rebuild mtasks from union-find groups, in topological (Kahn) order for monotone ids.
-    std::map<int,int> rootTmp; for (int mi = 0; mi < nm; mi ++) { int r = find(mi); if (!rootTmp.count(r)) rootTmp[r] = static_cast<int>(rootTmp.size()); }
-    int R = static_cast<int>(rootTmp.size());
-    std::vector<std::set<int>> rSucc((size_t)R), rPred((size_t)R);
-    for (int mi = 0; mi < nm; mi ++) { int ra = rootTmp[find(mi)]; for (int s : bSucc[(size_t)find(mi)]) { int rs = rootTmp[find(s)]; if (rs != ra) { rSucc[(size_t)ra].insert(rs); rPred[(size_t)rs].insert(ra); } } }
-    std::vector<int> rIndeg((size_t)R, 0); for (int i = 0; i < R; i ++) rIndeg[(size_t)i] = static_cast<int>(rPred[(size_t)i].size());
-    std::vector<int> minBase((size_t)R, INT32_MAX); for (int mi = 0; mi < nm; mi ++) { int ri = rootTmp[find(mi)]; minBase[(size_t)ri] = std::min(minBase[(size_t)ri], gbase[(size_t)mi]); }
-    auto cmpB = [&](int a, int b){ if (minBase[(size_t)a] != minBase[(size_t)b]) return minBase[(size_t)a] > minBase[(size_t)b]; return a > b; };
-    std::priority_queue<int, std::vector<int>, decltype(cmpB)> rq(cmpB);
-    for (int i = 0; i < R; i ++) if (rIndeg[(size_t)i] == 0) rq.push(i);
-    std::vector<int> rootOrder((size_t)R, -1); int nextR = 0;
-    while (!rq.empty()) { int u = rq.top(); rq.pop(); rootOrder[(size_t)u] = nextR ++; for (int v : rSucc[(size_t)u]) if (-- rIndeg[(size_t)v] == 0) rq.push(v); }
-    Assert(nextR == R, "dense band contraction produced a cyclic MTask graph (%d of %d)", nextR, R);
-    std::vector<MtDenseMTask> newMtasks((size_t)R);
-    for (int mi = 0; mi < nm; mi ++) {
-      int ri = rootOrder[(size_t)rootTmp[find(mi)]]; MtDenseMTask& nt = newMtasks[(size_t)ri]; const MtDenseMTask& ot = mtasks[(size_t)mi];
-      for (int s : ot.sccIds) nt.sccIds.push_back(s);
-      nt.staticCost += ot.staticCost; nt.schedCost += ot.schedCost; nt.taskCount += ot.taskCount; nt.workerZeroOnly = nt.workerZeroOnly || ot.workerZeroOnly;
-    }
-    for (int ri = 0; ri < R; ri ++) std::sort(newMtasks[(size_t)ri].sccIds.begin(), newMtasks[(size_t)ri].sccIds.end());
-    fprintf(stderr, "[mt-dense-band] band=%d level-bucket-mtasks=%d -> contracted=%d merges=%d\n", bandContract, nm, R, mergeCount);
-    mtasks.swap(newMtasks);
-    // Rebuild sccToMTask for the new mtasks (used by the DAG build below).
-    std::fill(sccToMTask.begin(), sccToMTask.end(), -1);
-    for (int mi = 0; mi < static_cast<int>(mtasks.size()); mi ++) for (int s : mtasks[(size_t)mi].sccIds) sccToMTask[(size_t)s] = mi;
-  }
-
-  // 4. Build the MTask dependency DAG from SCC edges (ids are topologically monotone).
-  const int nMTasks = static_cast<int>(mtasks.size());
-  std::vector<std::set<int>> predSets((size_t)nMTasks), succSets((size_t)nMTasks);
-  for (int fromScc = 0; fromScc < nSccs; fromScc ++) {
-    int fromMTask = sccToMTask[(size_t)fromScc];
-    if (fromMTask < 0) continue;
-    for (int toScc : schedule.sccs[(size_t)fromScc].succSccs) {
-      int toMTask = (toScc >= 0 && toScc < nSccs) ? sccToMTask[(size_t)toScc] : -1;
-      if (toMTask < 0 || toMTask == fromMTask) continue;
-      Assert(toMTask > fromMTask, "dense level-bucket contraction backward MTask edge %d->%d (lv %d->%d)",
-             fromMTask, toMTask, level[(size_t)fromScc], level[(size_t)toScc]);
-      succSets[(size_t)fromMTask].insert(toMTask);
-      predSets[(size_t)toMTask].insert(fromMTask);
-    }
-  }
-  for (int mi = 0; mi < nMTasks; mi ++) {
-    mtasks[(size_t)mi].predMTasks.assign(predSets[(size_t)mi].begin(), predSets[(size_t)mi].end());
-    mtasks[(size_t)mi].succMTasks.assign(succSets[(size_t)mi].begin(), succSets[(size_t)mi].end());
-  }
-  fprintf(stderr, "[mt-dense-levelbucket] levels=%d mtasks=%d threads=%d\n", numLevels, nMTasks, threadCount);
   return mtasks;
 }
 
@@ -3315,60 +2755,6 @@ static int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& ru
   return removed;
 }
 
-// V3OrderParallel removes transitive edges on the complete MTask DAG before
-// PackThreads runs.  The existing runtime reduction additionally models worker
-// chains, so it cannot be reused here without changing the static schedule.
-static int mtReduceDenseMTaskEdgesTransitive(std::vector<MtDenseMTask>& mtasks) {
-  const int nMTasks = static_cast<int>(mtasks.size());
-  if (nMTasks <= 1) return 0;
-  const int wordCount = (nMTasks + 63) / 64;
-  std::vector<std::vector<uint64_t>> reachable(
-      (size_t)nMTasks, std::vector<uint64_t>((size_t)wordCount, 0));
-  auto setReachable = [&](int from, int to) {
-    reachable[(size_t)from][(size_t)to >> 6] |= uint64_t{1} << (to & 63);
-  };
-  auto isReachable = [&](int from, int to) {
-    return (reachable[(size_t)from][(size_t)to >> 6] & (uint64_t{1} << (to & 63))) != 0;
-  };
-  for (int from = nMTasks - 1; from >= 0; --from) {
-    for (int succ : mtasks[(size_t)from].succMTasks) {
-      Assert(succ > from && succ < nMTasks,
-             "dense MTask transitive reduction requires topo edge %d->%d", from, succ);
-      setReachable(from, succ);
-      for (int word = 0; word < wordCount; ++word) {
-        reachable[(size_t)from][(size_t)word] |= reachable[(size_t)succ][(size_t)word];
-      }
-    }
-  }
-  int removed = 0;
-  for (int from = 0; from < nMTasks; ++from) {
-    std::vector<int> kept;
-    kept.reserve(mtasks[(size_t)from].succMTasks.size());
-    for (int succ : mtasks[(size_t)from].succMTasks) {
-      bool redundant = false;
-      for (int alternative : mtasks[(size_t)from].succMTasks) {
-        if (alternative != succ && isReachable(alternative, succ)) {
-          redundant = true;
-          break;
-        }
-      }
-      if (redundant) {
-        ++removed;
-      } else {
-        kept.push_back(succ);
-      }
-    }
-    mtasks[(size_t)from].succMTasks.swap(kept);
-  }
-  for (MtDenseMTask& mtask : mtasks) mtask.predMTasks.clear();
-  for (int from = 0; from < nMTasks; ++from) {
-    for (int succ : mtasks[(size_t)from].succMTasks) {
-      mtasks[(size_t)succ].predMTasks.push_back(from);
-    }
-  }
-  return removed;
-}
-
 static std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const std::vector<MtDenseMTask>& mtasks,
                                                                           int threadCount) {
   if (threadCount < 1) threadCount = 1;
@@ -3454,14 +2840,11 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
                                       std::vector<int>& outAssign, std::vector<int>& outOrder) {
   if (threadCount < 1) threadCount = 1;
   const int n = static_cast<int>(mtasks.size());
-  const bool v3Policy = mtUseDenseV3ContractPolicy();
   auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
   outAssign.assign((size_t)n, -1);
   outOrder.clear(); outOrder.reserve((size_t)n);
   std::vector<long long> completion((size_t)n, 0);
   std::vector<long long> busyUntil((size_t)threadCount, 0);
-  std::vector<int> nextOnWorker((size_t)n, -1);
-  std::vector<int> lastOnWorker((size_t)threadCount, -1);
   std::vector<int> remainingPreds((size_t)n, 0);
   std::vector<long long> priority((size_t)n, 0);
   for (int i = 0; i < n; i ++) remainingPreds[(size_t)i] = static_cast<int>(mtasks[(size_t)i].predMTasks.size());
@@ -3491,13 +2874,6 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           int predWorker = outAssign[(size_t)pred];
           if (predWorker >= 0 && predWorker != worker) {
             predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
-            // V3 PackThreads bounds a cross-thread estimate by the end of the next task
-            // already packed on the predecessor's worker, avoiding a priority inversion.
-            int next = v3Policy ? nextOnWorker[(size_t)pred] : -1;
-            if (next >= 0) {
-              const long long successorEnd = completion[(size_t)next];
-              if (predEnd >= successorEnd && successorEnd > 1) predEnd = successorEnd - 1;
-            }
           }
           if (predEnd > timeBegin) timeBegin = predEnd;
         }
@@ -3511,9 +2887,6 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     if (bestMTask < 0) break;
     outAssign[(size_t)bestMTask] = bestWorker;
     completion[(size_t)bestMTask] = bestTime + std::max(1, costOf(mtasks[(size_t)bestMTask]));
-    int previousOnWorker = lastOnWorker[(size_t)bestWorker];
-    if (previousOnWorker >= 0) nextOnWorker[(size_t)previousOnWorker] = bestMTask;
-    lastOnWorker[(size_t)bestWorker] = bestMTask;
     busyUntil[(size_t)bestWorker] = completion[(size_t)bestMTask];
     outOrder.push_back(bestMTask);
     ready[(size_t)bestReadyIndex] = ready.back(); ready.pop_back();
@@ -3521,18 +2894,6 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
       if (succ < 0 || succ >= n) continue;
       if (-- remainingPreds[(size_t)succ] == 0) ready.push_back(succ);
     }
-  }
-  if (v3Policy) {
-    long long makespan = 0;
-    std::vector<long long> workerLoads((size_t)threadCount, 0);
-    for (int mtaskId = 0; mtaskId < n; ++mtaskId) {
-      makespan = std::max(makespan, completion[(size_t)mtaskId]);
-      int worker = outAssign[(size_t)mtaskId];
-      if (worker >= 0 && worker < threadCount) workerLoads[(size_t)worker] += costOf(mtasks[(size_t)mtaskId]);
-    }
-    fprintf(stderr, "[mt-dense-schedule] predicted_makespan=%lld worker_loads=", makespan);
-    for (int worker = 0; worker < threadCount; ++worker) fprintf(stderr, "%s%lld", worker ? "," : "", workerLoads[(size_t)worker]);
-    fprintf(stderr, "\n");
   }
   // Any unscheduled (shouldn't happen for a DAG) appended in id order.
   if (static_cast<int>(outOrder.size()) != n) {
@@ -3542,73 +2903,6 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   }
 }
 
-// assignment feedback: replay an externally optimized (worker, rank) plan keyed
-// by MTask content hash (FNV-1a over sorted member cppIds). The offline optimizer explores the
-// list scheduler's chaotic tie-break space with PROFILED per-MTask costs; the current assignment
-// (static-cost list schedule) measures 178us/RTL vs 126us for the optimized plan in the validated
-// full-DAG event simulator (realized 182.6us). Default-off: GSIM_MT_DENSE_ASSIGN_FEEDBACK=<path>.
-static uint64_t mtDenseFeedbackHashMTask(const MtDenseSchedule& schedule, const MtDenseMTask& mtask) {
-  std::vector<int> cpps;
-  for (int s : mtask.sccIds) {
-    if (s < 0 || s >= static_cast<int>(schedule.sccs.size())) continue;
-    for (int c : schedule.sccs[(size_t)s].cppIds) cpps.push_back(c);
-  }
-  std::sort(cpps.begin(), cpps.end());
-  uint64_t h = 1469598103934665603ULL;
-  for (int c : cpps) {
-    uint32_t u = static_cast<uint32_t>(c);
-    for (int b = 0; b < 4; b++) {
-      h ^= (u >> (8 * b)) & 0xFFu;
-      h *= 1099511628211ULL;
-    }
-  }
-  return h;
-}
-static bool mtLoadDenseAssignFeedback(const MtDenseSchedule& schedule, const char* path,
-                                      std::vector<int>& outAssign, std::vector<int>& outOrder) {
-  FILE* fp = std::fopen(path, "r");
-  if (fp == nullptr) { fprintf(stderr, "[mt-dense-assign-feedback] cannot open %s\n", path); return false; }
-  std::unordered_map<uint64_t, std::pair<int, int>> plan;
-  char line[128];
-  while (std::fgets(line, sizeof(line), fp) != nullptr) {
-    unsigned long long h = 0; int w = 0, r = 0;
-    if (std::sscanf(line, "H %llx %d %d", &h, &w, &r) == 3) plan[(uint64_t)h] = {w, r};
-  }
-  std::fclose(fp);
-  const int n = static_cast<int>(schedule.mtasks.size());
-  outAssign.assign((size_t)n, -1);
-  std::vector<int> rank((size_t)n, -1);
-  int matched = 0;
-  for (int i = 0; i < n; i++) {
-    auto it = plan.find(mtDenseFeedbackHashMTask(schedule, schedule.mtasks[(size_t)i]));
-    if (it == plan.end()) continue;
-    outAssign[(size_t)i] = it->second.first;
-    rank[(size_t)i] = it->second.second;
-    matched++;
-  }
-  auto fail = [&](const char* why) {
-    fprintf(stderr, "[mt-dense-assign-feedback] %s; falling back to list scheduler\n", why);
-    outAssign.clear(); outOrder.clear();
-    return false;
-  };
-  if (matched != n) {
-    fprintf(stderr, "[mt-dense-assign-feedback] matched %d of %d MTasks\n", matched, n);
-    return fail("feedback is stale for this recipe");
-  }
-  std::vector<char> seen((size_t)n, 0);
-  for (int i = 0; i < n; i++) {
-    if (rank[(size_t)i] < 0 || rank[(size_t)i] >= n || seen[(size_t)rank[(size_t)i]]) return fail("rank set is not a permutation");
-    seen[(size_t)rank[(size_t)i]] = 1;
-  }
-  for (int i = 0; i < n; i++) {
-    if (schedule.mtasks[(size_t)i].workerZeroOnly && outAssign[(size_t)i] != 0) return fail("worker0-only MTask assigned off worker 0");
-    if (outAssign[(size_t)i] < 0) return fail("missing worker assignment");
-  }
-  outOrder.assign((size_t)n, -1);
-  for (int i = 0; i < n; i++) outOrder[(size_t)rank[(size_t)i]] = i;
-  fprintf(stderr, "[mt-dense-assign-feedback] loaded %d assignments from %s\n", matched, path);
-  return true;
-}
 static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {
   MtDenseSchedule schedule;
   schedule.codegenEnabled = codegenEnabled;
@@ -3937,8 +3231,6 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
   }
   // Dense dependency executor: form MTasks and assign them to worker threads.
   // Default path: fixed 30-SCC topological chunking + round-robin assignment.
-  // GSIM_MT_DENSE_CP_CONTRACTION: Verilator-style critical-path edge contraction.
-  // GSIM_MT_DENSE_PACKTHREADS_ASSIGNMENT: DAG-aware list-scheduling assignment.
   {
   EmitPhaseTimer mtaskBuildTimer("Final.denseSched.mtaskBuild");
   {
@@ -3947,8 +3239,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
     if (threadCount < 1) threadCount = 1;
 
-    const bool v3Policy = mtUseDenseV3ContractPolicy();
-    if (v3Policy || (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1')) {
+    if (std::getenv("GSIM_MT_DENSE_VCONTRACT") && std::getenv("GSIM_MT_DENSE_VCONTRACT")[0] == '1') {
 
       // GSIM_MT_DENSE_VCONTRACT_MAXMT_AUTO=1: in-generation MAXMT search. The
       // contract builder rebuilds its quotient graph from schedule.sccs on every
@@ -4004,9 +3295,7 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
         };
         // (the maxW+cross floor score was retired: it misranked both validated RTLs)
         std::vector<int> probeCands;
-        { const char* e = std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT_LADDER");
-          if (e && e[0]) { char* dup = strdup(e); for (char* t = strtok(dup, ","); t; t = strtok(nullptr, ",")) { int v = atoi(t); if (v > threadCount) probeCands.push_back(v); } free(dup); } }
-        if (probeCands.empty()) { static const int probeMults[] = {25, 50, 75, 100, 150, 200, 300}; for (int m : probeMults) probeCands.push_back(m * threadCount); }
+        { static const int probeMults[] = {25, 50, 75, 100, 150, 200, 300}; for (int m : probeMults) probeCands.push_back(m * threadCount); }
         fprintf(stderr, "[maxmt-auto] searching MAXMT ladder for threads=%d\n", threadCount);
         int bestVal = -1; double bestScore = 1e30; long bestMaxW = 0, bestCross = 0;
         for (int cand : probeCands) {
@@ -4090,30 +3379,17 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
       } else {
         schedule.mtasks = mtBuildDenseMTasksVerilatorContract(schedule, threadCount);
       }
-    } else if (mtUseDenseCpContraction()) {
-      schedule.mtasks = mtBuildDenseMTasksCpContraction(schedule, threadCount);
     } else {
       schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
     }
-    if (v3Policy) {
-      const int removed = mtReduceDenseMTaskEdgesTransitive(schedule.mtasks);
-      fprintf(stderr, "[mt-dense-policy] removed_full_dag_transitive_edges=%d\n", removed);
-    }
     // Executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
     // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.
-    bool schedOrder = v3Policy;
+    bool schedOrder = false;
     { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_ORDER"); if (e) schedOrder = e[0] && e[0] != '0'; }
     std::vector<int> schedOrderAssign;
     if (schedOrder && static_cast<int>(schedule.mtasks.size()) > 1) {
       std::vector<int> assignTmp, orderTmp;
-      const char* assignFeedback = std::getenv("GSIM_MT_DENSE_ASSIGN_FEEDBACK");
-      bool feedbackApplied = false;
-      if (assignFeedback != nullptr && assignFeedback[0] != '\0' && assignFeedback[0] != '0') {
-        feedbackApplied = mtLoadDenseAssignFeedback(schedule, assignFeedback, assignTmp, orderTmp);
-      }
-      if (!feedbackApplied) {
-        mtBuildDenseScheduleOrder(schedule.mtasks, threadCount, assignTmp, orderTmp);
-      }
+      mtBuildDenseScheduleOrder(schedule.mtasks, threadCount, assignTmp, orderTmp);
       const int n = static_cast<int>(schedule.mtasks.size());
       if (static_cast<int>(orderTmp.size()) == n) {
         std::vector<int> newId((size_t)n, -1);
@@ -4138,40 +3414,13 @@ static MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tas
     }
     int nMTasks = static_cast<int>(schedule.mtasks.size());
     schedule.mtaskThreadAssign.resize(nMTasks);
-    bool lptAssign = false;
-    { const char* e = std::getenv("GSIM_MT_DENSE_LPT_ASSIGN"); lptAssign = e && e[0] && e[0] != '0'; }
-    if (!lptAssign && !schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
-      // schedule-order ids WITHOUT LPT -> use the list-scheduler's own (earliest-free)
-      // assignment, co-designed with the order. With LPT on, we instead keep schedule-order ids
-      // (reduced stalls) but override with cost-balanced LPT assignment below.
+    if (!schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
+      // schedule-order ids -> use the list-scheduler's own (earliest-free)
+      // assignment, co-designed with the order.
       for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : schedOrderAssign[(size_t)i];
     }
-    if (lptAssign && nMTasks > 0) {
-      // LPT (longest-processing-time) balancing by real dense work (schedCost=member cost, else
-      // staticCost). Sorts non-worker0 MTasks by descending cost, greedily assigns each to the
-      // least-loaded worker. worker0-only MTasks pinned to thread 0. Fixes the severe imbalance
-      // seen with round-robin/PackThreads on coarse graphs where cost is concentrated.
-      auto mtCost = [&](int i) { return schedule.mtasks[(size_t)i].schedCost > 0 ? schedule.mtasks[(size_t)i].schedCost : schedule.mtasks[(size_t)i].staticCost; };
-      std::vector<int> order; order.reserve(nMTasks);
-      for (int i = 0; i < nMTasks; i ++) if (!schedule.mtasks[(size_t)i].workerZeroOnly) order.push_back(i);
-      std::sort(order.begin(), order.end(), [&](int a, int b){ int ca=mtCost(a), cb=mtCost(b); return ca != cb ? ca > cb : a < b; });
-      std::vector<long long> loads((size_t)threadCount, 0);
-      for (int i = 0; i < nMTasks; i ++) if (schedule.mtasks[(size_t)i].workerZeroOnly) { schedule.mtaskThreadAssign[(size_t)i] = 0; loads[0] += mtCost(i); }
-      for (int i : order) {
-        int best = 0; for (int t = 1; t < threadCount; t ++) if (loads[(size_t)t] < loads[(size_t)best]) best = t;
-        schedule.mtaskThreadAssign[(size_t)i] = best; loads[(size_t)best] += mtCost(i);
-      }
-    } else if (!schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
+    if (!schedOrderAssign.empty() && static_cast<int>(schedOrderAssign.size()) == nMTasks) {
       // schedule-order assignment already installed above; nothing to do.
-    } else if (mtUseDensePackThreadsAssignment() && nMTasks > 0) {
-      std::vector<int> packAssign = mtBuildDensePackThreadsAssignment(schedule.mtasks, threadCount).first;
-      bool ok = true;
-      for (int i = 0; i < nMTasks; i ++) { if (packAssign[(size_t)i] < 0) { ok = false; break; } }
-      if (ok) {
-        for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : packAssign[(size_t)i];
-      } else {
-        for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : (i % threadCount);
-      }
     } else {
       for (int i = 0; i < nMTasks; i ++) schedule.mtaskThreadAssign[(size_t)i] = schedule.mtasks[(size_t)i].workerZeroOnly ? 0 : (i % threadCount);
     }
@@ -6027,8 +5276,7 @@ static void logMtReportTimer(const char* name, struct timeval start, struct time
 
 
 static bool mtRepCutLiteRuntimeHelperModeEnabled() {
-  if (globalConfig.MtHelperMode == "mt") return true;
-  return globalConfig.MtHelperMode == "mt-level-dispatch" && mtUseLevelDispatchRepCutRuntime();
+  return globalConfig.MtHelperMode == "mt";
 }
 
 static bool mtTaskUsesRepCutLiteRuntime(const std::map<int, MtTaskInfo>& tasks, int cppId) {
@@ -8511,7 +7759,7 @@ void graph::dumpMtReadyBatchReport() {
 
   bool traceEnabled = false;
   bool envelopeLocalEvalDiagnosticsEnabled = mtUseEnvelopeLocalEvalDiagnostics();
-  bool envelopeLocalEvalEnabled = mtUseEnvelopeLocalEval() || envelopeLocalEvalDiagnosticsEnabled;
+  bool envelopeLocalEvalEnabled = envelopeLocalEvalDiagnosticsEnabled;
   int traceCycles = 0;
   const char* tracePath = std::getenv("GSIM_MT_READY_BATCH_TRACE");
   if (tracePath != nullptr && tracePath[0] != '\0') {
@@ -8989,17 +8237,6 @@ ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveTy
 
 std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBufferName = "") {
   if (!activeBufferName.empty()) return format("%s.orWord(%d, 0x%lx);", activeBufferName.c_str(), idx, mask);
-  if (mtDenseSparseGateAtomicEmit) {
-    // Mirror `*(uintN*)&activeFlags[idx] |= mask` byte-for-byte with aligned uint8_t atomics
-    // (ACTIVE_WIDTH==8). Byte i of mask targets activeFlags[idx+i].
-    std::string s;
-    for (int i = 0; i * ACTIVE_WIDTH < 64; i ++) {
-      uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
-      if (byteMask == 0) continue;
-      s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)0x%lx, __ATOMIC_RELAXED); ", idx + i, ACTIVE_WIDTH, byteMask);
-    }
-    return s;
-  }
   if (mask <= MAX_U8) return format("activeFlags[%d] |= 0x%lx;", idx, mask);
   if (mask <= MAX_U16) return format("*(uint16_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
   if (mask <= MAX_U32) return format("*(uint32_t*)&activeFlags[%d] |= 0x%lx;", idx, mask);
@@ -9016,22 +8253,6 @@ std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqu
     else if (mask <= MAX_U16) castWidth = 16;
     else if (mask <= MAX_U32) castWidth = 32;
     return format("%s.orWord(%d, -(uint%d_t)%s & 0x%lx);", activeBufferName.c_str(), idx, castWidth, cond.c_str(), mask);
-  }
-  if (mtDenseSparseGateAtomicEmit) {
-    if (uniqueId >= 0) {
-      // single-byte target word idx, bit set from cond shifted to uniqueId
-      return format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(%s%s), __ATOMIC_RELAXED); %s",
-                    idx, ACTIVE_WIDTH, cond.c_str(), shiftBits(uniqueId, ShiftDir::Left).c_str(),
-                    mtDenseActiveWorklistEmit ? format("markDenseActiveWorklistWord(%d);", idx).c_str() : "");
-    }
-    std::string s;
-    for (int i = 0; i * ACTIVE_WIDTH < 64; i ++) {
-      uint64_t byteMask = (mask >> (i * ACTIVE_WIDTH)) & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
-      if (byteMask == 0) continue;
-      s += format("__atomic_fetch_or(&activeFlags[%d], (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); ",
-                  idx + i, ACTIVE_WIDTH, ACTIVE_WIDTH, cond.c_str(), byteMask);
-    }
-    return s;
   }
   auto activeFlags = std::string("activeFlags[") + std::to_string(idx) + std::string("]");
 
@@ -9428,8 +8649,7 @@ void graph::genNodeDef(FILE* fp, Node* node) {
 }
 
 void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldName, bool inStep, std::string flagName,
-                         std::string activeBufferName, int indent,
-                         const std::string& accumFlagName, bool emitActivation) {
+                         std::string activeBufferName, int indent, bool emitActivation) {
   std::string nodeName = node->name;
   if (!emitActivation) {
     if (inStep) {
@@ -9463,13 +8683,7 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   if (node->isAsyncReset()) {
     Assert(!opt, "invalid opt");
     if (activeBufferName.empty()) {
-      // Sparse-gate dense bodies run concurrently with other workers' atomic gate-clear /
-      // activation RMWs on activeFlags. activateAll() is a plain memset and "%s = -1" a plain
-      // byte store: both silently erase concurrently-produced bits (lost activations freeze
-      // the core). Route both through atomic full-word ORs (same resulting bits, race-free).
-      bool denseAtomic = mtDenseSparseGateAtomicEmit;
       if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) emitBodyLock(indent, "activateAll(%d);\n", mtActivationEventTraceSourceCppId);
-      else if (denseAtomic) emitBodyLock(indent, "activateAllAtomicDense();\n");
       else emitBodyLock(indent, "activateAll();\n");
     } else {
       emitBodyLock(indent, "%s.activateAll();\n", activeBufferName.c_str());
@@ -9477,27 +8691,11 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
         emitBodyLock(indent, "recordMtActivationEvent(%d, 0, UINT64_MAX, MT_ACTIVATION_EVENT_ACTIVATE_ALL);\n", mtActivationEventTraceSourceCppId);
       }
     }
-    if (mtDenseSparseGateAtomicEmit && flagName.rfind("activeFlags[", 0) == 0) {
-      emitBodyLock(indent, "__atomic_fetch_or(&%s, (uint%d_t)-1, __ATOMIC_RELAXED);\n", flagName.c_str(), ACTIVE_WIDTH);
-    } else {
-      emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
-    }
-    if (mtDenseActiveWorklistEmit && activeBufferName.empty()) emitBodyLock(indent, "markDenseActiveWorklistAll();\n");
+    emitBodyLock(indent, "%s = -1;\n", flagName.c_str());
   } else {
     if (ACTIVE_MASK(curMask) != 0) {
-      std::string flagForOr = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
-      // In the sparse-gate dense body flagName is "activeFlags[w]" (a single uint8_t word);
-      // same-word activations must be atomic to avoid cross-thread lost updates on split words.
-      bool atomicWord = mtDenseSparseGateAtomicEmit && flagForOr.rfind("activeFlags[", 0) == 0;
-      if (atomicWord) {
-        std::string addr = "&" + flagForOr;
-        if (opt) emitBodyLock(indent, "__atomic_fetch_or(%s, (uint%d_t)(-(uint%d_t)%s & 0x%lx), __ATOMIC_RELAXED); // %s\n", addr.c_str(), ACTIVE_WIDTH, ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-        else emitBodyLock(indent, "__atomic_fetch_or(%s, (uint%d_t)0x%lx, __ATOMIC_RELAXED); // %s\n", addr.c_str(), ACTIVE_WIDTH, ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-      } else if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-      else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagForOr.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-      if (mtDenseActiveWorklistEmit && activeBufferName.empty() && accumFlagName.empty()) {
-        emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", node->super->cppId / ACTIVE_WIDTH);
-      }
+      if (opt) emitBodyLock(indent, "%s |= -(uint%d_t)%s & 0x%lx; // %s\n", flagName.c_str(), ACTIVE_WIDTH, condName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
+      else emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
       if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
         if (opt) {
           emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%d, (-(uint64_t)%s & (uint64_t)0x%lx), MT_ACTIVATION_EVENT_CONDITIONAL);\n",
@@ -9538,23 +8736,12 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
   if (!opt) emitBodyLock(-- indent, "}\n");
 }
 void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
-                               std::string activeBufferName, int indent,
-                               const std::string& accumFlagName, bool emitActivation) {
+                               std::string activeBufferName, int indent, bool emitActivation) {
   if (!emitActivation) return;
   std::map<uint64_t, ActiveType> bitMapInfo;
   auto curMask = activeSet2bitMap(activateId, bitMapInfo, node->super->cppId);
   if (ACTIVE_MASK(curMask) != 0) {
-    std::string orFlag = (!accumFlagName.empty() && activeBufferName.empty()) ? accumFlagName : flagName;
-    // In the sparse-gate dense body flagName is "activeFlags[w]" (shared uint8_t word): the
-    // unconditional same-word activation must be an atomic RMW or a concurrent gate-clear /
-    // activation on another worker (word split across MTasks) loses this bit entirely.
-    bool atomicWord = mtDenseSparseGateAtomicEmit && orFlag.rfind("activeFlags[", 0) == 0;
-    if (atomicWord) {
-      emitBodyLock(indent, "__atomic_fetch_or(&%s, (uint%d_t)0x%lx, __ATOMIC_RELAXED); // %s\n",
-                   orFlag.c_str(), ACTIVE_WIDTH, ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-    } else {
-      emitBodyLock(indent, "%s |= 0x%lx; // %s\n", orFlag.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
-    }
+    emitBodyLock(indent, "%s |= 0x%lx; // %s\n", flagName.c_str(), ACTIVE_MASK(curMask), ACTIVE_COMMENT(curMask).c_str());
     if (mtUseActivationEventTraceCodegen() && !mtActivationEventTraceSuppressed) {
       emitBodyLock(indent, "recordMtActivationEvent(%d, (uint32_t)%d, (uint64_t)0x%lx, MT_ACTIVATION_EVENT_UNCONDITIONAL);\n",
                    mtActivationEventTraceSourceCppId, node->super->cppId / ACTIVE_WIDTH, ACTIVE_MASK(curMask));
@@ -9656,7 +8843,7 @@ bool Node::isLocal() { // TODO: isArray is OK
 }
 
 
-int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, const std::string& accumFlagName, bool emitActivation) {
+int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, bool emitActivation) {
   switch (inst.infoType) {
     case SUPER_INFO_IF:
       emitBodyLock(indent ++, "%s\n", mtRepCutReplaceNodeNames(inst.inst, mtRepCutActiveReplacements).c_str());
@@ -9683,8 +8870,8 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
       break;
     case SUPER_INFO_ASSIGN_END:
       if (inst.node->isLocal() || !inst.node->needActivate()) break;
-      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent, accumFlagName, emitActivation);
-      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent, accumFlagName, emitActivation);
+      if (inst.node->isArray() || inst.node->type == NODE_WRITER) activateUncondNext(inst.node, inst.node->nextActiveId, false, flagName, activeBufferName, indent, emitActivation);
+      else activateNext(inst.node, inst.node->nextActiveId, oldName(inst.node), false, flagName, activeBufferName, indent, emitActivation);
       break;
     default:
       break;
@@ -9692,20 +8879,9 @@ int graph::translateInst(InstInfo inst, int indent, std::string flagName, std::s
   return indent;
 }
 
-static bool mtActAccEnabled() {
-  const char* e = std::getenv("GSIM_MT_ACTACC");
-  return e && e[0] == '1';
-}
-
 void graph::genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation) { // current indent = 2
   int savedTraceSourceCppId = mtActivationEventTraceSourceCppId;
   if (emitActivation && !mtActivationEventTraceSuppressed) mtActivationEventTraceSourceCppId = super->cppId;
-  bool useAccum = emitActivation && mtActAccEnabled() && activeBufferName.empty() && super->superType != SUPER_EXTMOD && super->superType != SUPER_ASYNC_RESET;
-  std::string accumVar;
-  if (useAccum) {
-    accumVar = format("__actac_%d", super->cppId);
-    emitBodyLock(indent, "uint%d_t %s = 0;\n", ACTIVE_WIDTH, accumVar.c_str());
-  }
   if (super->superType == SUPER_EXTMOD) { // TODO: normalize
     auto emitExtAsyncReset = [&](Node* extOut) {
       if (!extOut->isAsyncReset()) return;
@@ -9723,15 +8899,15 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       emitBodyLock(indent, "%s %s = %s;\n", widthUType(extOut->width).c_str(), oldName(extOut).c_str(), extOut->name.c_str());
     }
     for (InstInfo inst : super->insts) {
-      indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+      indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
     }
     for (size_t i = 1; i < super->member.size(); i ++) {
       emitExtAsyncReset(super->member[i]);
     }
     for (size_t i = 1; i < super->member.size(); i ++) {
       if (!super->member[i]->needActivate()) continue;
-      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent, accumVar, emitActivation);
-      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent, accumVar, emitActivation);
+      if (super->member[i]->isArray()) activateUncondNext(super->member[i], super->member[i]->nextActiveId, false, flagName, activeBufferName, indent, emitActivation);
+      else activateNext(super->member[i], super->member[i]->nextActiveId, oldName(super->member[i]), false, flagName, activeBufferName, indent, emitActivation);
     }
   } else {
     if (super->superType == SUPER_ASYNC_RESET) {
@@ -9763,26 +8939,26 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
         for (InstInfo inst : super->insts) {
           if (inst.infoType == SUPER_INFO_ASSIGN_BEG) {
             frameStack.push_back(inst.node);
-            if (droppable.find(inst.node) == droppable.end()) indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+            if (droppable.find(inst.node) == droppable.end()) indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
             continue;
           }
           if (inst.infoType == SUPER_INFO_ASSIGN_END) {
             Node* endNode = inst.node;
             if (!frameStack.empty()) frameStack.pop_back();
-            if (droppable.find(endNode) == droppable.end()) indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+            if (droppable.find(endNode) == droppable.end()) indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
             continue;
           }
           if (!frameStack.empty() && droppable.find(frameStack.back()) != droppable.end()) continue;
-          indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+          indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
         }
       } else {
         for (InstInfo inst : super->insts) {
-          indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+          indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
         }
       }
     } else {
       for (InstInfo inst : super->insts) {
-        indent = translateInst(inst, indent, flagName, activeBufferName, accumVar, emitActivation);
+        indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
       }
     }
     if (super->superType == SUPER_ASYNC_RESET) {
@@ -9806,14 +8982,6 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
     for (Node* n : super->member) nodeDisplay(n, indent);
     emitBodyLock(-- indent, "}\n");
     emitBodyLock(indent, "#endif\n");
-  }
-  if (useAccum) {
-    if (mtDenseSparseGateAtomicEmit && flagName.rfind("activeFlags[", 0) == 0) {
-      emitBodyLock(indent, "__atomic_fetch_or(&%s, (uint%d_t)%s, __ATOMIC_RELAXED);\n", flagName.c_str(), ACTIVE_WIDTH, accumVar.c_str());
-    } else {
-      emitBodyLock(indent, "%s |= %s;\n", flagName.c_str(), accumVar.c_str());
-    }
-    if (mtDenseActiveWorklistEmit) emitBodyLock(indent, "markDenseActiveWorklistWord(%d);\n", super->cppId / ACTIVE_WIDTH);
   }
   mtActivationEventTraceSourceCppId = savedTraceSourceCppId;
 }
@@ -9908,7 +9076,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   const bool denseBreakdownWindowCodegen = mtUseDenseBreakdownProfileCodegen() && mtUseDenseBreakdownWindowCodegen();
   int shardCount = mtPureBatchShardCount();
   bool useCoarse = globalConfig.MtBatchFormationMode == "coarse";
-  bool waitProbeCodegen = mtUseWaitProbeCodegen();
   // Dense-only: pure-batch shard switch tables and mtRunPureBatchWorkerRange
   // are sparse-dispatch text (they call the dropped buffered mtTaskN /
   // mtRepCutLiteTaskN helpers); the worker pool core below stays because the
@@ -10049,23 +9216,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(1, "}\n");
   }
   emitBodyLock(1, "mtWorkerPoolGeneration.fetch_add(1, std::memory_order_release);\n");
-  if (mtUseWorkerPoolWakeShardCodegen()) {
-    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
-    if (mtUseWorkerPoolWakeShardTrimCodegen()) {
-      emitBodyLock(1, "{ const uint64_t g = mtWorkerPoolGeneration.load(std::memory_order_relaxed);\n");
-      emitBodyLock(1, "  // Publish only shards that can have readers: workers are 1..threadCount, max\n");
-      emitBodyLock(1, "  // shard = threadCount/stride (exact division incl.), so threadCount/stride + 1\n");
-      emitBodyLock(1, "  // covers every reader. ceil(threadCount/stride) is WRONG when threadCount %% stride == 0\n");
-      emitBodyLock(1, "  // (worker threadCount reads shard threadCount/8 -> unpublished -> hang).\n");
-      emitBodyLock(1, "  const int mtWakePublish = mtWorkerPoolThreadCount / kMtWorkerPoolWakeShardStride + 1;\n");
-      emitBodyLock(1, "  const int mtWakePublishClamped = mtWakePublish < kMtWorkerPoolWakeShardCount ? mtWakePublish : kMtWorkerPoolWakeShardCount;\n");
-      emitBodyLock(1, "  for (int s = 0; s < mtWakePublishClamped; s ++) mtWorkerPoolGenShard[s].gen.store(g, std::memory_order_release); }\n");
-    } else {
-      emitBodyLock(1, "{ const uint64_t g = mtWorkerPoolGeneration.load(std::memory_order_relaxed);\n");
-      emitBodyLock(1, "  for (int s = 0; s < kMtWorkerPoolWakeShardCount; s ++) mtWorkerPoolGenShard[s].gen.store(g, std::memory_order_release); }\n");
-    }
-    emitBodyLock(1, "#endif\n");
-  }
   emitBodyLock(0, "}\n");
 
   emitFuncDecl(0, "void S%s::mtWorkerPoolWaitForDone(int expectedDoneCount) {\n", name.c_str());
@@ -10094,25 +9244,12 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   // post cannot race a late-start worker that has not captured the baseline generation.
   emitBodyLock(1, "uint64_t seenGeneration = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
   emitBodyLock(1, "mtWorkerPoolReadyCount.fetch_add(1, std::memory_order_release);\n");
-  if (mtUseWorkerPoolWakeShardCodegen()) {
-    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
-    emitBodyLock(1, "int mtWakeShard = worker / kMtWorkerPoolWakeShardStride; if (mtWakeShard >= kMtWorkerPoolWakeShardCount) mtWakeShard = kMtWorkerPoolWakeShardCount - 1;\n");
-    emitBodyLock(1, "#endif\n");
-  }
   emitBodyLock(1, "while (true) {\n");
   emitBodyLock(2, "uint64_t generation = seenGeneration;\n");
   if (mtDenseDutyCodegen()) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutySpinBegin; if (mtDutyEnabled) mtDutySpinBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "while (true) {\n");
   emitBodyLock(3, "if (mtWorkerPoolStop.load(std::memory_order_acquire)) return;\n");
-  if (mtUseWorkerPoolWakeShardCodegen()) {
-    emitBodyLock(3, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
-    emitBodyLock(3, "generation = mtWorkerPoolGenShard[mtWakeShard].gen.load(std::memory_order_acquire);\n");
-    emitBodyLock(3, "#else\n");
-    emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
-    emitBodyLock(3, "#endif\n");
-  } else {
-    emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
-  }
+  emitBodyLock(3, "generation = mtWorkerPoolGeneration.load(std::memory_order_acquire);\n");
   emitBodyLock(3, "if (generation != seenGeneration) break;\n");
   emitBodyLock(3, "mtWorkerPoolPause();\n");
   emitBodyLock(2, "}\n");
@@ -10160,7 +9297,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     // flat-array path. Region/wc/begin/span carried on dedicated fields
     // so we don't overload chunk[].begin/.end semantics.
     emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(coarseRegionIndex, mtWorkerPoolCoarseStaticRoundedWC, worker, mtWorkerPoolCoarseStaticBeginActiveWord, mtWorkerPoolCoarseStaticActiveWordSpan);\n");
-    if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled && (size_t)worker < mtWaitProbeWorkerFinishNs.size()) mtWaitProbeWorkerFinishNs[(size_t)worker] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
     emitBodyLock(2, "} else if (jobKind == 4) {\n");
     emitBodyLock(3, "/* A35-P empty-barrier microbench: worker performs no work */\n");
     emitBodyLock(2, "} else if (jobKind == 5) {\n");
@@ -10271,11 +9407,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "#endif\n");
   }
-  if (mtUseWorkerPoolWakeShardCodegen() && mtUseWorkerPoolWakeShardTrimCodegen()) {
-    emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
-    emitBodyLock(1, "if (mtWorkerPoolThreadCount / kMtWorkerPoolWakeShardStride + 1 > kMtWorkerPoolWakeShardCount) { fprintf(stderr, \"[mt-wake-shard] %%d workers exceed shard capacity %%d\\n\", mtWorkerPoolThreadCount, kMtWorkerPoolWakeShardCount); abort(); }\n");
-    emitBodyLock(1, "#endif\n");
-  }
   emitBodyLock(1, "for (int worker = 1; worker < mtConfiguredWorkerCount; worker ++) {\n");
   emitBodyLock(2, "mtWorkerPoolThreads.emplace_back([this, worker]() { mtWorkerPoolLoop(worker); });\n");
   emitBodyLock(2, "std::thread& t = mtWorkerPoolThreads.back();\n");
@@ -10358,24 +9489,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
     emitBodyLock(4, "break;\n");
     emitBodyLock(2, "}\n");
     emitBodyLock(1, "}\n");
-  }
-  if (mtForceParallelRepCutBatches()) {
-    bool hasParallelSafeBatch = false;
-    for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
-      if (batch.parallelSafe) hasParallelSafeBatch = true;
-    }
-    if (hasParallelSafeBatch) {
-      emitBodyLock(1, "switch (beginCppId) {\n");
-      for (const MtRepCutBatch& batch : semanticPlan.cutBatches) {
-        if (batch.parallelSafe) emitBodyLock(2, "case %d:\n", batch.beginCppId);
-      }
-      emitBodyLock(3, "workerCount = mtConfiguredWorkerCount;\n");
-      emitBodyLock(3, "mtSkippedBelowMinBatch = false;\n");
-      emitBodyLock(3, "break;\n");
-      emitBodyLock(2, "default:\n");
-      emitBodyLock(3, "break;\n");
-      emitBodyLock(1, "}\n");
-    }
   }
   emitBodyLock(1, "if (workerCount > taskCount) workerCount = taskCount;\n");
   emitBodyLock(1, "if (workerCount < 2) workerCount = 1;\n");
@@ -10541,7 +9654,6 @@ void graph::genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan) {
 void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan) {
   std::map<int, MtTaskInfo> mtTasks = buildMtTaskInfoMapWithRepCutSelectionForInvocation();
   markMtRepCutLiteRuntimeApplied(mtTasks);
-  bool waitProbeCodegen = mtUseWaitProbeCodegen();
   // shared emitter for `switch (mtaskIndex) { case M: <body>; break; ... }` body.
   // Used by both mtRunCoarseMTaskWorkerList and mtRunCoarseMTaskWorkerRange so the
   // per-mtask semantics stay in sync. Outer caller emits indent N for `switch (mtaskIndex)`.
@@ -10847,14 +9959,7 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
         return region.mtasks[lhs].taskCount > region.mtasks[rhs].taskCount;
       return lhs < rhs;
     });
-    static int w0Penalty = []() {
-      const char* env = std::getenv("GSIM_MT_W0_PENALTY");
-      if (env == nullptr || env[0] == '\0') return 0;
-      int value = std::atoi(env);
-      return value > 0 ? value : 0;
-    }();
     std::vector<int> staticCosts(wc, 0);
-    if (wc > 1 && w0Penalty > 0) staticCosts[0] = w0Penalty;
     std::vector<int> taskCounts(wc, 0);
     for (int mi : order) {
       int best = 0;
@@ -11435,10 +10540,8 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "mtWorkerPoolCurrentWorkerCount = dstaticRoundedWC;\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseBodyBegin;\n");
   emitBodyLock(3, "if (mtProfileEnabled) mtPhaseBodyBegin = std::chrono::steady_clock::now();\n");
-  if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled) mtWaitProbePostTp = std::chrono::steady_clock::now();\n");
   emitBodyLock(3, "mtWorkerPoolPost();\n");
   emitBodyLock(3, "mtRunCoarseRegionStaticDispatch(regionIndex, dstaticRoundedWC, 0, regionBeginActiveWord, regionActiveWordSpan);\n");
-  if (waitProbeCodegen) emitBodyLock(3, "if (mtWaitProbeEnabled && !mtWaitProbeWorkerFinishNs.empty()) mtWaitProbeWorkerFinishNs[0] = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
   emitBodyLock(3, "std::chrono::steady_clock::time_point mtPhaseWaitBegin;\n");
   emitBodyLock(3, "if (mtProfileEnabled) {\n");
   emitBodyLock(4, "mtPhaseWaitBegin = std::chrono::steady_clock::now();\n");
@@ -11446,28 +10549,6 @@ void graph::genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, co
   emitBodyLock(3, "}\n");
   emitBodyLock(3, "mtWorkerPoolWaitForDone(dstaticRoundedWC - 1);\n");
   emitBodyLock(3, "if (mtProfileEnabled) mtProfileCoarseWaitNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtPhaseWaitBegin).count();\n");
-  if (waitProbeCodegen) {
-    emitBodyLock(3, "if (mtWaitProbeEnabled) {\n");
-    emitBodyLock(4, "uint64_t mtwpWaitDone = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtWaitProbePostTp).count();\n");
-    emitBodyLock(4, "uint64_t mtwpW0 = mtWaitProbeWorkerFinishNs[0];\n");
-    emitBodyLock(4, "uint64_t mtwpMaxFinish = 0, mtwpMaxBg = 0, mtwpMinBg = (uint64_t)-1; int mtwpLast = 0;\n");
-    emitBodyLock(4, "for (int w = 0; w < dstaticRoundedWC; w ++) {\n");
-    emitBodyLock(5, "uint64_t f = mtWaitProbeWorkerFinishNs[(size_t)w];\n");
-    emitBodyLock(5, "mtWaitProbeWorkerFinishSumNs[(size_t)w] += f;\n");
-    emitBodyLock(5, "if (f > mtwpMaxFinish) { mtwpMaxFinish = f; mtwpLast = w; }\n");
-    emitBodyLock(5, "if (w >= 1) { if (f > mtwpMaxBg) mtwpMaxBg = f; if (f < mtwpMinBg) mtwpMinBg = f; }\n");
-    emitBodyLock(4, "}\n");
-    emitBodyLock(4, "if (dstaticRoundedWC <= 1) { mtwpMaxBg = 0; mtwpMinBg = 0; }\n");
-    emitBodyLock(4, "mtWaitProbeDispatchCount ++;\n");
-    emitBodyLock(4, "mtWaitProbeW0BodySumNs += mtwpW0;\n");
-    emitBodyLock(4, "mtWaitProbeWaitSumNs += (mtwpWaitDone >= mtwpW0 ? mtwpWaitDone - mtwpW0 : 0);\n");
-    emitBodyLock(4, "mtWaitProbeMaxFinishSumNs += mtwpMaxFinish;\n");
-    emitBodyLock(4, "mtWaitProbeMinBgFinishSumNs += mtwpMinBg;\n");
-    emitBodyLock(4, "mtWaitProbeTailBeyondW0SumNs += (mtwpMaxBg > mtwpW0 ? mtwpMaxBg - mtwpW0 : 0);\n");
-    emitBodyLock(4, "if (mtwpW0 >= mtwpMaxBg) mtWaitProbeWorker0LastCount ++;\n");
-    emitBodyLock(4, "if ((size_t)mtwpLast < mtWaitProbeWorkerLastHist.size()) mtWaitProbeWorkerLastHist[(size_t)mtwpLast] ++;\n");
-    emitBodyLock(3, "}\n");
-  }
   emitBodyLock(2, "} else {\n");
   emitBodyLock(3, "std::vector<std::thread> workers;\n");
   emitBodyLock(3, "workers.reserve(dstaticRoundedWC);\n");
@@ -11867,7 +10948,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
         }
         for (int word = 0; word < region.activeWordSpan; word ++) recordMtSubStepGuardWord(currentSubStepIdx, region.beginActiveWord + word);
         emitBodyLock(indent ++, "if(unlikely((%s) != 0)) {\n", coarseGuard.c_str());
-        if (!profileOffDirectSerial || mtUseSubchunkProbe()) {
+        if (!profileOffDirectSerial) {
           emitBodyLock(indent, "if (mtProfileEnabled) {\n");
           for (int word = 0; word < region.activeWordSpan; word ++) {
             emitBodyLock(indent + 1, "if (mtCoarseWords%d[%d] != 0) mtProfileActiveWordCount ++;\n", idx, word);
@@ -11889,31 +10970,12 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           if (mtIter != mtTasks.end() && mtIter->second.repcutRuntimeApplied) regionHasRepcut = true;
         }
         bool regionCleanSerialFallback = !regionHasRepcut && !regionHasNonPure;
-        auto emitCoarseInlineWord = [&](int word, int wordIndent, bool declareFlag = true) {
+        auto emitCoarseInlineWord = [&](int word, int wordIndent) {
           int activeWord = region.beginActiveWord + word;
-          if (declareFlag) {
-            emitBodyLock(wordIndent, "uint%d_t coarseInlineFlag%d_%d = mtCoarseWords%d[%d] | activeFlags[%d];\n",
-                         ACTIVE_WIDTH, idx, word, idx, word, activeWord);
-          }
-          if (mtUseSubchunkProbe()) {
-            emitBodyLock(wordIndent ++, "if (mtProfileEnabled && coarseInlineFlag%d_%d != 0) {\n", idx, word);
-            emitBodyLock(wordIndent, "mtProfileCoarseSerialFallbackDynamicWords ++;\n");
-            emitBodyLock(--wordIndent, "}\n");
-          }
-          if (mtUseSubchunkProbe()) {
-            emitBodyLock(wordIndent, "int subchunkProbeWordTasks%d_%d = 0;\n", idx, word);
-            emitBodyLock(wordIndent, "int subchunkProbeWordStaticCost%d_%d = 0;\n", idx, word);
-          }
+          emitBodyLock(wordIndent, "uint%d_t coarseInlineFlag%d_%d = mtCoarseWords%d[%d] | activeFlags[%d];\n",
+                       ACTIVE_WIDTH, idx, word, idx, word, activeWord);
           auto emitCoarseInlineTask = [&](int cppId, int taskIndent) {
-            if (mtUseSubchunkProbe()) {
-              emitBodyLock(taskIndent ++, "if (mtProfileEnabled) {\n");
-              emitBodyLock(taskIndent, "mtProfileCoarseSerialFallbackDynamicTasks ++;\n");
-              emitBodyLock(taskIndent, "mtProfileCoarseSerialFallbackDynamicTaskStaticCost += %d;\n", mtTaskEstimatedCost(mtTasks, cppId));
-              emitBodyLock(taskIndent, "subchunkProbeWordTasks%d_%d ++;\n", idx, word);
-              emitBodyLock(taskIndent, "subchunkProbeWordStaticCost%d_%d += %d;\n", idx, word, mtTaskEstimatedCost(mtTasks, cppId));
-              emitBodyLock(--taskIndent, "}\n");
-            }
-            if (profileOffDirectSerial && !mtUseSubchunkProbe()) {
+            if (profileOffDirectSerial) {
               if (directInlineFallback) {
                 genSuperEval(cppId2Super[cppId], format("coarseInlineFlag%d_%d", idx, word), "", taskIndent, true);
               } else {
@@ -11936,77 +10998,21 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           };
           emitBodyLock(wordIndent, "activeFlags[%d] = 0;\n", activeWord);
           emitBodyLock(wordIndent ++, "if (coarseInlineFlag%d_%d) {\n", idx, word);
-          if (mtUseCtzCoarseInlineWord()) {
-            emitBodyLock(wordIndent, "uint32_t coarseInlineTodo%d_%d = (uint32_t)coarseInlineFlag%d_%d;\n", idx, word, idx, word);
-            emitBodyLock(wordIndent ++, "while (coarseInlineTodo%d_%d) {\n", idx, word);
-            emitBodyLock(wordIndent, "int coarseInlineBit%d_%d = __builtin_ctz(coarseInlineTodo%d_%d);\n", idx, word, idx, word);
-            emitBodyLock(wordIndent, "coarseInlineTodo%d_%d &= coarseInlineTodo%d_%d - 1u;\n", idx, word, idx, word);
-            emitBodyLock(wordIndent ++, "switch (coarseInlineBit%d_%d) {\n", idx, word);
+          auto emitFixedBitScan = [&](int scanIndent) {
             for (int bit = 0; bit < ACTIVE_WIDTH; bit ++) {
               int cppId = activeWord * ACTIVE_WIDTH + bit;
               if (cppId >= region.endCppId) break;
               if (cppId < region.beginCppId) continue;
-              emitBodyLock(wordIndent ++, "case %d: {\n", bit);
-              emitCoarseInlineTask(cppId, wordIndent);
-              emitBodyLock(wordIndent, "break;\n");
-              emitBodyLock(--wordIndent, "}\n");
+              emitBodyLock(scanIndent ++, "if (coarseInlineFlag%d_%d & 0x%lx) {\n", idx, word, (uint64_t)1 << bit);
+              emitCoarseInlineTask(cppId, scanIndent);
+              emitBodyLock(--scanIndent, "}\n");
             }
-            emitBodyLock(--wordIndent, "}\n");
-            emitBodyLock(wordIndent, "coarseInlineTodo%d_%d = (coarseInlineTodo%d_%d | (uint32_t)coarseInlineFlag%d_%d) & (~((1u << (coarseInlineBit%d_%d + 1)) - 1u) & 0x%xu);\n", idx, word, idx, word, idx, word, idx, word, (1u << ACTIVE_WIDTH) - 1u);
-            emitBodyLock(--wordIndent, "}\n");
-          } else {
-            auto emitFixedBitScan = [&](int scanIndent, int minBit) {
-              for (int bit = 0; bit < ACTIVE_WIDTH; bit ++) {
-                int cppId = activeWord * ACTIVE_WIDTH + bit;
-                if (cppId >= region.endCppId) break;
-                if (cppId < region.beginCppId) continue;
-                if (minBit >= 0) {
-                  emitBodyLock(scanIndent ++, "if (%d > coarseInlineFirstBit%d_%d && (coarseInlineFlag%d_%d & 0x%lx)) {\n", bit, idx, word, idx, word, (uint64_t)1 << bit);
-                } else {
-                  emitBodyLock(scanIndent ++, "if (coarseInlineFlag%d_%d & 0x%lx) {\n", idx, word, (uint64_t)1 << bit);
-                }
-                emitCoarseInlineTask(cppId, scanIndent);
-                emitBodyLock(--scanIndent, "}\n");
-              }
-            };
-            if (mtUseSingleBitCoarseInlineWord()) {
-              emitBodyLock(wordIndent ++, "if ((coarseInlineFlag%d_%d & (coarseInlineFlag%d_%d - 1)) == 0) {\n", idx, word, idx, word);
-              emitBodyLock(wordIndent, "int coarseInlineFirstBit%d_%d = __builtin_ctz((uint32_t)coarseInlineFlag%d_%d);\n", idx, word, idx, word);
-              emitBodyLock(wordIndent ++, "switch (coarseInlineFirstBit%d_%d) {\n", idx, word);
-              for (int bit = 0; bit < ACTIVE_WIDTH; bit ++) {
-                int cppId = activeWord * ACTIVE_WIDTH + bit;
-                if (cppId >= region.endCppId) break;
-                if (cppId < region.beginCppId) continue;
-                emitBodyLock(wordIndent ++, "case %d: {\n", bit);
-                emitCoarseInlineTask(cppId, wordIndent);
-                emitBodyLock(wordIndent, "break;\n");
-                emitBodyLock(--wordIndent, "}\n");
-              }
-              emitBodyLock(--wordIndent, "}\n");
-              emitFixedBitScan(wordIndent, 0);
-              emitBodyLock(--wordIndent, "} else {\n");
-              emitFixedBitScan(wordIndent, -1);
-              emitBodyLock(--wordIndent, "}\n");
-            } else {
-              emitFixedBitScan(wordIndent, -1);
-            }
-          }
+          };
+          emitFixedBitScan(wordIndent);
           emitBodyLock(--wordIndent, "}\n");
-          if (mtUseSubchunkProbe()) {
-            emitBodyLock(wordIndent ++, "if (mtProfileEnabled) {\n");
-            emitBodyLock(wordIndent, "int subchunkProbeCostBucket%d_%d = subchunkProbeWordStaticCost%d_%d < 64 ? 0 : (subchunkProbeWordStaticCost%d_%d < 128 ? 1 : (subchunkProbeWordStaticCost%d_%d < 256 ? 2 : (subchunkProbeWordStaticCost%d_%d < 512 ? 3 : (subchunkProbeWordStaticCost%d_%d < 1024 ? 4 : 5))));\n", idx, word, idx, word, idx, word, idx, word, idx, word, idx, word);
-            emitBodyLock(wordIndent, "int subchunkProbeTaskBucket%d_%d = subchunkProbeWordTasks%d_%d <= 1 ? 0 : (subchunkProbeWordTasks%d_%d == 2 ? 1 : (subchunkProbeWordTasks%d_%d <= 4 ? 2 : (subchunkProbeWordTasks%d_%d <= 8 ? 3 : (subchunkProbeWordTasks%d_%d <= 15 ? 4 : 5))));\n", idx, word, idx, word, idx, word, idx, word, idx, word, idx, word);
-            emitBodyLock(wordIndent, "mtProfileCoarseSerialFallbackDynamicWordCostHist[subchunkProbeCostBucket%d_%d] ++;\n", idx, word);
-            emitBodyLock(wordIndent, "mtProfileCoarseSerialFallbackDynamicWordTaskHist[subchunkProbeTaskBucket%d_%d] ++;\n", idx, word);
-            emitBodyLock(wordIndent, "if (subchunkProbeWordStaticCost%d_%d >= 64) mtProfileCoarseSerialFallbackDynamicWordCostGe64 ++;\n", idx, word);
-            emitBodyLock(wordIndent, "if (subchunkProbeWordStaticCost%d_%d >= 128) mtProfileCoarseSerialFallbackDynamicWordCostGe128 ++;\n", idx, word);
-            emitBodyLock(wordIndent, "if (subchunkProbeWordStaticCost%d_%d >= 256) mtProfileCoarseSerialFallbackDynamicWordCostGe256 ++;\n", idx, word);
-            emitBodyLock(wordIndent, "if (subchunkProbeWordTasks%d_%d >= 2) mtProfileCoarseSerialFallbackDynamicWordTasksGe2 ++;\n", idx, word);
-            emitBodyLock(--wordIndent, "}\n");
-          }
         };
         auto emitCoarseInlineSavedProfile = [&](int profileIndent) {
-          if (profileOffDirectSerial && !mtUseSubchunkProbe()) return;
+          if (profileOffDirectSerial) return;
           emitBodyLock(profileIndent, "if (mtProfileEnabled) {\n");
           emitBodyLock(profileIndent + 1, "int coarseInlineSavedWorkers%d = mtConfiguredWorkerCount;\n", idx);
           emitBodyLock(profileIndent + 1, "if (coarseInlineSavedWorkers%d > %d) coarseInlineSavedWorkers%d = %d;\n", idx, region.taskCount, idx, region.taskCount);
@@ -12037,7 +11043,7 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
           }
           emitBodyLock(indent ++, "if (mtCoarseInlineThreshold > 0) {\n");
           emitBodyLock(indent, "int coarseInlineActiveBits%d = 0;\n", idx);
-          if (mtUseStaticCoarseInlineBound() && profileOffDirectSerial && !mtUseSubchunkProbe()) {
+          if (mtUseStaticCoarseInlineBound() && profileOffDirectSerial) {
             int coarseInlineStaticMaxBits = region.activeWordSpan * ACTIVE_WIDTH;
             emitBodyLock(indent ++, "if (unlikely(mtCoarseInlineThreshold < %d)) {\n", coarseInlineStaticMaxBits);
             for (int word = 0; word < region.activeWordSpan; word ++) {
@@ -12051,102 +11057,10 @@ int graph::genActivateMtHelpers(int serialFastSubStepMax, const std::string& ser
               emitBodyLock(indent, "coarseInlineActiveBits%d += __builtin_popcountll((unsigned long long)mtCoarseWords%d[%d]);\n", idx, idx, word);
             }
           }
-          if (!profileOffDirectSerial || mtUseSubchunkProbe()) emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSerialFallbackEligible ++;\n");
+          if (!profileOffDirectSerial) emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSerialFallbackEligible ++;\n");
           emitBodyLock(indent ++, "if (coarseInlineActiveBits%d <= mtCoarseInlineThreshold) {\n", idx);
-          if (!mtUseSubchunkRuntime()) {
-            emitCoarseInlineSavedProfile(indent);
-            for (int word = 0; word < region.activeWordSpan; word ++) emitCoarseInlineWord(word, indent);
-          } else {
-          // Default-off subchunk dispatch must not sit before the hot clean
-          // serial-inline fallback in generated code: the cold block is large
-          // enough to perturb the default model's code layout even when the
-          // runtime cost knob is zero.
-          emitBodyLock(indent ++, "if (likely(mtSubchunkDispatchCost <= 0)) {\n");
           emitCoarseInlineSavedProfile(indent);
           for (int word = 0; word < region.activeWordSpan; word ++) emitCoarseInlineWord(word, indent);
-          emitBodyLock(--indent, "} else {\n");
-          if (regionHasRepcut) {
-            indent ++;
-            emitCoarseDispatchAndMerge(indent);
-            emitBodyLock(--indent, "}\n");
-          } else {
-          indent ++;
-          // Prefix-hybrid fallback: decide the cut dynamically in word order.
-          // Each candidate word observes activations produced by earlier inlined
-          // prefix words via activeFlags. The cost gate intentionally uses the
-          // pre-task word flag; same-word activations produced while executing
-          // the word stay in the normal by-reference serial semantics.
-          emitBodyLock(indent, "bool coarseSubchunkDispatch%d = false;\n", idx);
-          emitBodyLock(indent, "int coarseSubchunkCut%d = %d;\n", idx, region.activeWordSpan);
-          emitBodyLock(indent, "uint64_t coarseSubchunkInlineActiveBits%d = 0;\n", idx);
-          for (int word = 0; word < region.activeWordSpan; word ++) {
-            int activeWord = region.beginActiveWord + word;
-            emitBodyLock(indent ++, "if (!coarseSubchunkDispatch%d) {\n", idx);
-            emitBodyLock(indent, "uint%d_t coarseInlineFlag%d_%d = mtCoarseWords%d[%d] | activeFlags[%d];\n", ACTIVE_WIDTH, idx, word, idx, word, activeWord);
-            emitBodyLock(indent, "int coarseSubchunkWordCost%d_%d = 0;\n", idx, word);
-            for (int bit = 0; bit < ACTIVE_WIDTH; bit ++) {
-              int cppId = activeWord * ACTIVE_WIDTH + bit;
-              if (cppId >= region.endCppId) break;
-              if (cppId < region.beginCppId) continue;
-              emitBodyLock(indent, "if (coarseInlineFlag%d_%d & 0x%lx) coarseSubchunkWordCost%d_%d += %d;\n", idx, word, (uint64_t)1 << bit, idx, word, mtTaskEstimatedCost(mtTasks, cppId));
-            }
-            emitBodyLock(indent ++, "if (coarseInlineFlag%d_%d != 0 && coarseSubchunkWordCost%d_%d >= mtSubchunkDispatchCost) {\n", idx, word, idx, word);
-            emitBodyLock(indent, "coarseSubchunkDispatch%d = true;\n", idx);
-            emitBodyLock(indent, "coarseSubchunkCut%d = %d;\n", idx, word);
-            emitBodyLock(--indent, "} else {\n");
-            emitBodyLock(indent, "if (mtProfileEnabled) coarseSubchunkInlineActiveBits%d += (uint64_t)__builtin_popcountll((unsigned long long)coarseInlineFlag%d_%d);\n", idx, idx, word);
-            emitCoarseInlineWord(word, indent, false);
-            emitBodyLock(--indent, "}\n");
-            emitBodyLock(--indent, "}\n");
-          }
-          emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSubchunkDispatchEligible ++;\n");
-          emitBodyLock(indent ++, "if (coarseSubchunkDispatch%d) {\n", idx);
-          emitBodyLock(indent, "int coarseSubchunkResidualActiveBits%d = 0;\n", idx);
-          for (int word = 0; word < region.activeWordSpan; word ++) {
-            int activeWord = region.beginActiveWord + word;
-            emitBodyLock(indent ++, "if (coarseSubchunkCut%d > %d) {\n", idx, word);
-            emitBodyLock(indent, "mtCoarseWords%d[%d] = 0;\n", idx, word);
-            emitBodyLock(--indent, "} else {\n");
-            emitBodyLock(indent, "mtCoarseWords%d[%d] |= activeFlags[%d];\n", idx, word, activeWord);
-            emitBodyLock(indent, "coarseSubchunkResidualActiveBits%d += __builtin_popcountll((unsigned long long)mtCoarseWords%d[%d]);\n", idx, idx, word);
-            emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSubchunkDispatchResidualInitialActiveBits += (uint64_t)__builtin_popcountll((unsigned long long)mtCoarseWords%d[%d]);\n", idx, word);
-            emitBodyLock(indent, "activeFlags[%d] = 0;\n", activeWord);
-            emitBodyLock(--indent, "}\n");
-          }
-          emitBodyLock(indent ++, "if (mtSubchunkMinActiveBits > 0 && coarseSubchunkResidualActiveBits%d < mtSubchunkMinActiveBits) {\n", idx);
-          emitBodyLock(indent ++, "if (mtProfileEnabled) {\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchSkippedBelowMinActive ++;\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchInlineWords += (uint64_t)%d;\n", region.activeWordSpan);
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchInlineActiveBits += coarseSubchunkInlineActiveBits%d;\n", idx);
-          emitBodyLock(--indent, "}\n");
-          for (int word = 0; word < region.activeWordSpan; word ++) {
-            int activeWord = region.beginActiveWord + word;
-            emitBodyLock(indent ++, "if (coarseSubchunkCut%d <= %d) {\n", idx, word);
-            emitBodyLock(indent, "uint%d_t coarseInlineFlag%d_%d = mtCoarseWords%d[%d] | activeFlags[%d];\n", ACTIVE_WIDTH, idx, word, idx, word, activeWord);
-            emitBodyLock(indent, "if (mtProfileEnabled) mtProfileCoarseSubchunkDispatchInlineActiveBits += (uint64_t)__builtin_popcountll((unsigned long long)coarseInlineFlag%d_%d);\n", idx, word);
-            emitCoarseInlineWord(word, indent, false);
-            emitBodyLock(--indent, "}\n");
-          }
-          emitBodyLock(--indent, "} else {\n");
-          emitBodyLock(indent ++, "if (mtProfileEnabled) {\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchTaken ++;\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchResidualDispatches ++;\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchInlineWords += (uint64_t)coarseSubchunkCut%d;\n", idx);
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchInlineActiveBits += coarseSubchunkInlineActiveBits%d;\n", idx);
-          emitBodyLock(--indent, "}\n");
-          emitCoarseDispatchAndMerge(indent);
-          emitBodyLock(--indent, "}\n");
-          emitBodyLock(--indent, "} else {\n");
-          indent ++;
-          emitBodyLock(indent ++, "if (mtProfileEnabled) {\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchFullyInlined ++;\n");
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchInlineWords += (uint64_t)%d;\n", region.activeWordSpan);
-          emitBodyLock(indent, "mtProfileCoarseSubchunkDispatchInlineActiveBits += coarseSubchunkInlineActiveBits%d;\n", idx);
-          emitBodyLock(--indent, "}\n");
-          emitBodyLock(--indent, "}\n");
-          emitBodyLock(--indent, "}\n");
-          }
-          }
           emitBodyLock(--indent, "} else {\n");
           indent ++;
           emitCoarseDispatchAndMerge(indent);
@@ -12387,8 +11301,6 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
         }
       } else if (mtUseActivationEventTraceCodegen()) {
         emitBodyLock(indent, "activateAll(traceSourceCppId);\n");
-      } else if (mtDenseSparseGateAtomicEmit) {
-        emitBodyLock(indent, "activateAllAtomicDense();\n");
       } else {
         emitBodyLock(indent, "activateAll();\n");
       }
@@ -12497,13 +11409,7 @@ void graph::genResetAll() {
     bool isUIntReset = super->superType == SUPER_UINT_RESET;
     if (isUIntReset) super2ResetId[super->resetNode].first = resetId;
     else super2ResetId[super->resetNode].second = resetId;
-    // Sparse-gate dense bodies call subResetN() concurrently with other workers' atomic
-    // activeFlags RMWs, so the unbuffered subReset bodies must emit atomic activation writes
-    // too (same bits, race-free). Default builds keep the plain form.
-    bool savedSparseGateAtomic = mtDenseSparseGateAtomicEmit;
-    mtDenseSparseGateAtomicEmit = mtDenseSparseGateAtomicEmit || mtUseDenseSparseGate();
     genResetDef(super, isUIntReset, false, resetId, 0);
-    mtDenseSparseGateAtomicEmit = savedSparseGateAtomic;
     if (globalConfig.MtHelperMode == "buffered-seq" ||
         globalConfig.MtHelperMode == "mt" ||
         globalConfig.MtHelperMode == "mt-level-dispatch") {
@@ -12614,155 +11520,17 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           denseRuntimeSuccs, denseSchedule.mtaskThreadAssign, threadCount);
     }
   }
-  // Sparse-gate ordering audit (runs whenever GSIM_MT_DENSE_SPARSE_GATE is on): the gate is
-  // only exact when the runtime schedule orders every cross-MTask activation pair the way the
-  // ascending-cppId sparse-ST scan does — producer before consumer for cppId-forward pairs
-  // (same-cycle consumption), consumer before producer for cppId-backward pairs (bit must
-  // survive to the next cycle). The enforced order is: token/counter edges in
-  // denseRuntimeSuccs PLUS per-worker program order (ascending MTask id within a worker).
-  // Compute the transitive closure of that order and check every member-level activation
-  // edge (nextActiveId/nextNeedActivate) against it. Also asserts dependency edges ascend in
-  // cppId (the precondition that keeps the cppId-classified edge set acyclic).
-  if (mtUseDenseSparseGate()) {
-    const int nAuditMT = nMTasks;
-    std::vector<int> mtaskOfCpp((size_t)superId, -1);
-    for (int m = 0; m < nAuditMT; m++) {
-      for (int sccId : denseSchedule.mtasks[(size_t)m].sccIds) {
-        if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
-        for (int c : denseSchedule.sccs[(size_t)sccId].cppIds) {
-          if (c >= 0 && c < superId) mtaskOfCpp[(size_t)c] = m;
-        }
-      }
-    }
-    std::vector<std::vector<int>> orderSuccs = denseRuntimeSuccs;
-    {
-      // Per-worker program order: a worker executes its MTasks in ascending id, so chain each
-      // worker's MTasks prev->cur (ids interleave across workers; adjacency is not required).
-      int maxWorker = -1;
-      for (int m = 0; m < nAuditMT; m++) {
-        int w = denseSchedule.mtaskThreadAssign[(size_t)m];
-        if (w > maxWorker) maxWorker = w;
-      }
-      std::vector<int> prevOnWorker((size_t)maxWorker + 1, -1);
-      for (int m = 0; m < nAuditMT; m++) {
-        int w = denseSchedule.mtaskThreadAssign[(size_t)m];
-        if (w < 0 || w > maxWorker) continue;
-        int prev = prevOnWorker[(size_t)w];
-        if (prev >= 0) orderSuccs[(size_t)prev].push_back(m);
-        prevOnWorker[(size_t)w] = m;
-      }
-    }
-    bool orderEdgesAscending = true;
-    for (int m = 0; m < nAuditMT; m++) {
-      for (int s : orderSuccs[(size_t)m]) {
-        if (s <= m || s >= nAuditMT) orderEdgesAscending = false;
-      }
-    }
-    const int auditWordCount = (nAuditMT + 63) / 64;
-    std::vector<std::vector<uint64_t>> reach((size_t)nAuditMT,
-                                             std::vector<uint64_t>((size_t)std::max(1, auditWordCount), 0));
-    auto reachTest = [&](int from, int to) -> bool {
-      if (from == to) return true;
-      if (from < 0 || to < 0 || from >= nAuditMT || to >= nAuditMT) return false;
-      return (reach[(size_t)from][(size_t)to >> 6] & (uint64_t{1} << (to & 63))) != 0;
-    };
-    if (orderEdgesAscending) {
-      for (int from = nAuditMT - 1; from >= 0; from--) {
-        for (int succ : orderSuccs[(size_t)from]) {
-          if (succ <= from || succ >= nAuditMT) continue;
-          reach[(size_t)from][(size_t)succ >> 6] |= (uint64_t{1} << (succ & 63));
-          for (int w = 0; w < auditWordCount; w++) {
-            reach[(size_t)from][(size_t)w] |= reach[(size_t)succ][(size_t)w];
-          }
-        }
-      }
-    }
-    uint64_t pairForward = 0, pairBackward = 0, badForward = 0, badBackward = 0, badSameMTaskBackward = 0;
-    uint64_t depEdges = 0, depNonAscending = 0;
-    for (const MtDenseEdge& edge : denseSchedule.edges) {
-      if (edge.kind != "dependency") continue;
-      depEdges++;
-      if (edge.fromCppId >= edge.toCppId) depNonAscending++;
-    }
-    const int sampleLimit = 12;
-    auto reportBad = [&](const char* cls, int fromCppId, int toCppId, int fromMT, int toMT) {
-      if (badForward + badBackward >= (uint64_t)sampleLimit) return;
-      (void)cls;
-      fprintf(stderr,
-              "[sparse-gate-order-audit] %s violation: activation cpp %d -> cpp %d (mtasks %d -> %d, "
-              "workers %d -> %d, required order %s)\n",
-              cls, fromCppId, toCppId, fromMT, toMT,
-              fromMT >= 0 && fromMT < nAuditMT ? denseSchedule.mtaskThreadAssign[(size_t)fromMT] : -1,
-              toMT >= 0 && toMT < nAuditMT ? denseSchedule.mtaskThreadAssign[(size_t)toMT] : -1,
-              fromCppId < toCppId ? "producer-before-consumer" : "consumer-before-producer");
-    };
-    for (int cppId = 0; cppId < superId; cppId++) {
-      auto superIter = cppId2Super.find(cppId);
-      if (superIter == cppId2Super.end() || !superIter->second) continue;
-      SuperNode* super = superIter->second;
-      int fromMT = mtaskOfCpp[(size_t)cppId];
-      for (Node* member : super->member) {
-        if (!member) continue;
-        for (int listIdx = 0; listIdx < 2; listIdx++) {
-          const std::set<int>& targets = listIdx == 0 ? member->nextActiveId : member->nextNeedActivate;
-          for (int toCppId : targets) {
-            if (toCppId < 0 || toCppId >= superId || toCppId == cppId) continue;
-            int toMT = mtaskOfCpp[(size_t)toCppId];
-            if (fromMT < 0 || toMT < 0) continue;
-            if (fromMT == toMT) {
-              // Same MTask: ascending-cppId member emission enforces both directions.
-              if (cppId > toCppId && listIdx == 0) badSameMTaskBackward++;  // counted, never a violation
-              continue;
-            }
-            bool ok;
-            if (cppId < toCppId) { pairForward++; ok = reachTest(fromMT, toMT); if (!ok) { badForward++; reportBad("forward", cppId, toCppId, fromMT, toMT); } }
-            else { pairBackward++; ok = reachTest(toMT, fromMT); if (!ok) { badBackward++; reportBad("backward", cppId, toCppId, fromMT, toMT); } }
-          }
-        }
-      }
-    }
-    fprintf(stderr,
-            "[sparse-gate-order-audit] mtasks=%d order_edges_ascending=%d dep_edges=%llu dep_non_ascending=%llu "
-            "pairs: forward=%llu bad_forward=%llu backward=%llu bad_backward=%llu same_mtask_backward=%llu%s\n",
-            nAuditMT, orderEdgesAscending ? 1 : 0, (unsigned long long)depEdges,
-            (unsigned long long)depNonAscending, (unsigned long long)pairForward,
-            (unsigned long long)badForward, (unsigned long long)pairBackward,
-            (unsigned long long)badBackward, (unsigned long long)badSameMTaskBackward,
-            (!orderEdgesAscending || depNonAscending || badForward || badBackward)
-                ? "  RESULT: ORDER VIOLATIONS PRESENT" : "  RESULT: order OK");
-  }
   const int denseLookaheadWindow = mtDenseLookaheadWindow();
   const bool denseLookahead = denseLookaheadWindow > 0;
   const bool denseDuty = mtDenseDutyCodegen();
-  const bool denseSpecProbe = mtDenseSpecProbeCodegen();
   Assert(!denseLookahead || ownerReadyFlags,
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseDuty || ownerReadyFlags,
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
-  Assert(!denseSpecProbe || (ownerReadyFlags && denseLookahead),
-         "GSIM_MT_DENSE_SPEC_PROBE requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1 and GSIM_MT_DENSE_LOOKAHEAD>0");
-  Assert(!denseSpecProbe || !workSteal,
-         "GSIM_MT_DENSE_SPEC_PROBE is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || !workSteal,
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with dense breakdown codegen");
-  bool tableDispatch = mtUseDenseTableDispatch();
-  if (tableDispatch && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen)) {
-    fprintf(stderr, "[mt-dense-table-dispatch] requires owner-ready fixed-owner execution without breakdown codegen; disabled\n");
-    tableDispatch = false;
-  }
-  bool sharedHelpers = mtUseDenseSharedHelpers();
-  if (sharedHelpers && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen)) {
-    fprintf(stderr, "[mt-dense-shared-helpers] requires owner-ready fixed-owner execution without breakdown codegen; disabled\n");
-    sharedHelpers = false;
-  }
-  if (sharedHelpers) fprintf(stderr, "[mt-dense-shared-helpers] enabled\n");
-  bool activity = mtUseDenseActivity();
-  if (activity && (!ownerReadyFlags || workSteal || denseBreakdownProfileCodegen || denseBreakdownWindowCodegen || tableDispatch || denseLookahead)) {
-    fprintf(stderr, "[mt-dense-activity] requires owner-ready fixed-owner execution without breakdown/table-dispatch/lookahead; disabled\n");
-    activity = false;
-  }
   struct MtActivityCommitField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
   struct MtActivityInputField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
   std::vector<MtActivityInputField> activityInputFields;
@@ -12778,22 +11546,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   std::vector<std::string> activityRegionNames;
   int activityShadowCount = 0;
   int activitySuccTotal = 0;
-  int activitySuccLiteTotal = 0;
   int activityNextTotal = 0;
   int activityConservativeFields = 0;
   int activityScalarFields = 0;
   int activityAlwaysActiveCount = 0;
-  // The PEG dump (GSIM_MT_DENSE_PEG_DUMP) and the speculation probe
-  // (GSIM_MT_DENSE_SPEC_PROBE) need the field read/write sets computed in this block
-  // even when the activity feature itself is off (e.g. under LOOKAHEAD, which
-  // force-disables activity). Widen the gate; the activity-only outputs remain
-  // unused locals when activity=false.
+  // The PEG dump (GSIM_MT_DENSE_PEG_DUMP) needs the field read/write sets
+  // computed in this block. The activity-only outputs remain unused locals.
   const bool pegDump = std::getenv("GSIM_MT_DENSE_PEG_DUMP") != nullptr;
-  // Speculation-probe per-MTask cross-worker input loci (sorted, deterministic) and a
-  // blind flag for MTasks whose producer write-set resolves to no declared locus.
-  std::vector<std::vector<std::string>> specProbeFields;
-  std::vector<char> specProbeBlind;
-  if (activity || pegDump || denseSpecProbe) {
+  if (pegDump) {
     const int nM = nMTasks;
     activityAlwaysActive.assign((size_t)nM, 0);
     activityResetHandler.assign((size_t)nM, 0);
@@ -12820,12 +11580,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     std::vector<std::set<std::string>> commitFields((size_t)nM);
     std::vector<std::set<std::string>> nextWriteFields((size_t)nM);
     std::map<std::string, Node*> commitTargetNode;
-    std::vector<std::set<std::string>> specProbeReadLoci;
-    std::vector<std::set<std::string>> specProbeWriteLoci;
-    if (denseSpecProbe) {
-      specProbeReadLoci.assign((size_t)nM, {});
-      specProbeWriteLoci.assign((size_t)nM, {});
-    }
     for (int m = 0; m < nM; m++) {
       const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
       for (int sccId : mt.sccIds) {
@@ -12846,15 +11600,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             activityRegionOf[(size_t)m] = rid->second + 1;
           }
           for (const std::string& r : b.rhsReadStateTargetNames) readFields[(size_t)m].insert(r);
-          if (denseSpecProbe) {
-            mtSpecProbeCollectWriteLoci(super, specProbeWriteLoci[(size_t)m]);
-            std::set<Node*> specExpanded;
-            for (Node* member : super->member) {
-              for (ExpTree* tree : member->assignTree) {
-                mtSpecProbeCollectReadLoci(tree->getRoot(), specProbeReadLoci[(size_t)m], specExpanded);
-              }
-            }
-          }
           for (Node* member : super->member) {
             for (ExpTree* tree : member->assignTree) {
               MtActivityReads tr;
@@ -12881,57 +11626,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             for (const std::string& f : b.stateTargetNames) nextWriteFields[(size_t)m].insert(f);
           }
         }
-      }
-    }
-    // Speculation probe field sets: per-MTask cross-worker INPUT loci = loci the MTask
-    // reads that are written by any cross-worker producer behind its owner-ready wait
-    // tokens (the protocol guarantees every cross-worker writer of a read locus is a
-    // wait-token producer, so this is exact up to locus-name resolution). Superset-safe:
-    // extra stable loci (e.g. commit-deferred registers) never flip an episode to
-    // "changed"; memories are excluded wholesale (their read-port result nodes remain).
-    if (denseSpecProbe) {
-      specProbeFields.assign((size_t)nM, {});
-      specProbeBlind.assign((size_t)nM, 0);
-      std::vector<std::set<int>> specProducers((size_t)nM);
-      for (int m = 0; m < nM; m++) {
-        const int myThread = denseSchedule.mtaskThreadAssign[(size_t)m];
-        if (myThread < 0) continue;
-        for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)m]) {
-          if (slot < 0 || slot >= static_cast<int>(ownerReadyLayout.logicalTokenByPhysicalSlot.size())) continue;
-          int token = ownerReadyLayout.logicalTokenByPhysicalSlot[(size_t)slot];
-          if (token < 0 || token >= ownerReadyLayout.tokenCount) continue;
-          const MtDenseOwnerReadyTokenProvenance& prov =
-              ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token];
-          if (prov.producerMTask >= 0 && prov.producerMTask != m) {
-            int w = prov.producerMTask;
-            if (w < nM && denseSchedule.mtaskThreadAssign[(size_t)w] >= 0 &&
-                denseSchedule.mtaskThreadAssign[(size_t)w] != myThread) {
-              specProducers[(size_t)m].insert(w);
-            }
-          }
-          for (int w : ownerReadyLayout.sourceMTasksByLogicalToken[(size_t)token]) {
-            if (w < 0 || w >= nM || w == m) continue;
-            if (denseSchedule.mtaskThreadAssign[(size_t)w] >= 0 &&
-                denseSchedule.mtaskThreadAssign[(size_t)w] != myThread) {
-              specProducers[(size_t)m].insert(w);
-            }
-          }
-        }
-      }
-      for (int m = 0; m < nM; m++) {
-        if (specProducers[(size_t)m].empty()) continue;
-        std::set<std::string> writes;
-        for (int w : specProducers[(size_t)m]) {
-          writes.insert(specProbeWriteLoci[(size_t)w].begin(), specProbeWriteLoci[(size_t)w].end());
-        }
-        std::set<std::string> chosen;
-        for (const std::string& nm : specProbeReadLoci[(size_t)m]) {
-          if (writes.count(nm) && mtSpecProbeDeclaredLocus(nm)) chosen.insert(nm);
-        }
-        specProbeFields[(size_t)m].assign(chosen.begin(), chosen.end());
-        // Has cross-worker producers but no resolvable input locus: inputs unverifiable;
-        // episodes headed here are counted "blind" (excluded from the equal numerator).
-        if (specProbeFields[(size_t)m].empty()) specProbeBlind[(size_t)m] = 1;
       }
     }
     std::vector<char> activityElided((size_t)nM, 0);
@@ -13199,7 +11893,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         for (int j = cf.fanoutBegin; j < cf.fanoutEnd; j++) covered.insert(activityFanoutList[(size_t)j]);
       for (int s : activitySuccFlags[(size_t)m])
         if (!covered.count(s)) activitySuccLite[(size_t)m].push_back(s);
-      activitySuccLiteTotal += (int)activitySuccLite[(size_t)m].size();
     }
     int activityCommitMTasks = 0;
     activityIsCommitMTask.assign((size_t)nMTasks, 0);
@@ -13234,30 +11927,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   std::vector<uint32_t> denseDispatchStoreBegin, denseDispatchStoreEnd;
   uint32_t denseDispatchWaitTotal = 0;
   const std::chrono::steady_clock::time_point denseProFieldSetsBegin = std::chrono::steady_clock::now();
-  if (tableDispatch && !denseLookahead) {
-    denseDispatchWorkerCounts.assign((size_t)threadCount, 0);
-    denseDispatchWaitBegin.assign((size_t)nMTasks, 0);
-    denseDispatchWaitEnd.assign((size_t)nMTasks, 0);
-    denseDispatchStoreBegin.assign((size_t)nMTasks, 0);
-    denseDispatchStoreEnd.assign((size_t)nMTasks, 0);
-    uint32_t storeOff = 0;
-    for (int m = 0; m < nMTasks; m++) {
-      denseDispatchStoreBegin[(size_t)m] = storeOff;
-      storeOff += (uint32_t)ownerReadyLayout.storeSlotsByMTask[(size_t)m].size();
-      denseDispatchStoreEnd[(size_t)m] = storeOff;
-    }
-    for (int t = 0; t < threadCount; t++) {
-      for (int m = 0; m < nMTasks; m++) {
-        if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
-        denseDispatchWorkerCounts[(size_t)t]++;
-        denseDispatchWaitBegin[(size_t)m] = denseDispatchWaitTotal;
-        denseDispatchWaitTotal += (uint32_t)ownerReadyLayout.waitSlotsByMTask[(size_t)m].size();
-        denseDispatchWaitEnd[(size_t)m] = denseDispatchWaitTotal;
-      }
-    }
-    fprintf(stderr, "[mt-dense-table-dispatch] mtasks=%d wait_slots=%u threads=%d\n",
-            nMTasks, denseDispatchWaitTotal, threadCount);
-  }
   if (emitPhaseTimingEnabled()) {
     fprintf(stderr, "[emit-phase] Final.densePrologue.fieldSets = %ld ms\n",
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -13567,7 +12236,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "alignas(64) MtDenseOwnerReadyToken mtDenseOwnerReadyTokens[%d];\n",
             ownerReadyLayout.physicalSlotCount);
     fprintf(header, "bool mtDenseOwnerReadyTokensPrimed = false;\n");
-    if (tableDispatch || denseLookahead) {
+    if (denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
               std::max(1, (int)denseDispatchWaitTotal));
       bool firstSlot = true;
@@ -13583,7 +12252,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       }
       if (firstSlot) fprintf(header, "0");
       fprintf(header, "};\n");
-      if (denseLookahead) {
         int denseLookaheadDoneWordCount = 1;
         for (int count : denseDispatchWorkerCounts)
           denseLookaheadDoneWordCount = std::max(denseLookaheadDoneWordCount, (count + 63) / 64);
@@ -13630,159 +12298,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         } else {
           fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target);\n");
         }
-      } else {
-        fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; };\n",
-                name.c_str());
-      }
       for (int t = 0; t < threadCount; t++) {
         fprintf(header, "static const MtDenseDispatchEntry kDenseDispatchTableW%d[%d];\n",
                 t, std::max(1, denseDispatchWorkerCounts[(size_t)t]));
       }
-    }
-    if (denseSpecProbe) {
-      // Speculation probe (GSIM_MT_DENSE_SPEC_PROBE): constants + counters + per-MTask
-      // snapshot/compare helpers. All report-only; zero effect on dispatch semantics.
-      uint64_t specProbeCostTotal = 0;
-      for (int m = 0; m < nMTasks; m++) {
-        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
-        specProbeCostTotal += (uint64_t)(mt.schedCost > 0 ? mt.schedCost : mt.staticCost);
-      }
-      fprintf(header, "static constexpr uint32_t kSpecProbeMaxSeg = 32u;\n");
-      fprintf(header, "static constexpr uint32_t kSpecProbeMemberBytes = 2048u;\n");
-      fprintf(header, "static constexpr uint32_t kSpecProbeBuckets = 16u;\n");
-      fprintf(header, "static constexpr uint64_t kSpecProbeBucketMaxNs[15] = {250,500,1000,2000,4000,8000,16000,32000,64000,128000,256000,512000,1024000,2048000,4096000};\n");
-      fprintf(header, "static constexpr uint64_t kSpecProbeCostTotalNs = %llu;\n", (unsigned long long)specProbeCostTotal);
-      fprintf(header, "static constexpr uint32_t kSpecProbeCost[%d] = {", std::max(1, nMTasks));
-      for (int m = 0; m < nMTasks; m++) {
-        const MtDenseMTask& mt = denseSchedule.mtasks[(size_t)m];
-        fprintf(header, "%s%u", m ? "," : "", (unsigned)(mt.schedCost > 0 ? mt.schedCost : mt.staticCost));
-      }
-      if (nMTasks == 0) fprintf(header, "0");
-      fprintf(header, "};\n");
-      fprintf(header, "static constexpr uint8_t kSpecProbeBlind[%d] = {", std::max(1, nMTasks));
-      for (int m = 0; m < nMTasks; m++) fprintf(header, "%s%u", m ? "," : "", (unsigned)specProbeBlind[(size_t)m]);
-      if (nMTasks == 0) fprintf(header, "0");
-      fprintf(header, "};\n");
-      for (int t = 0; t < threadCount; t++) {
-        if (denseDispatchWorkerCounts[(size_t)t] <= 0) continue;
-        fprintf(header, "static constexpr uint16_t kSpecProbeIdxW%d[%d] = {", t, denseDispatchWorkerCounts[(size_t)t]);
-        int emitted = 0;
-        for (int m = 0; m < nMTasks; m++) {
-          if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
-          fprintf(header, "%s%u", emitted ? "," : "", (unsigned)m);
-          emitted++;
-        }
-        if (emitted == 0) fprintf(header, "0");
-        fprintf(header, "};\n");
-      }
-      fprintf(header, "struct alignas(64) MtSpecProbeBucket { std::atomic<uint64_t> episodes{0}, equal{0}, diff{0}, waitNs{0}, segNs{0}, minNs{0}, cmpNs{0}, trunc{0}; };\n");
-      fprintf(header, "MtSpecProbeBucket mtSpecProbeBuckets[kSpecProbeBuckets];\n");
-      fprintf(header, "struct MtSpecProbeGlobal { std::atomic<uint64_t> episodes{0}, equal{0}, diffEpisodes{0}, blindEpisodes{0}, waitNs{0}, segNs{0}, diffSegNs{0}, minNs{0}, cmpNs{0}, members{0}, memberDiffFields{0}, truncSegs{0}, lenCapSegs{0}; };\n");
-      fprintf(header, "MtSpecProbeGlobal mtSpecProbeG;\n");
-      fprintf(header, "std::atomic<uint64_t> mtSpecProbeSegLenAll[7] = {};\n");
-      fprintf(header, "std::atomic<uint64_t> mtSpecProbeSegLenEqual[7] = {};\n");
-      fprintf(header, "bool mtSpecProbeEnabled = false;\n");
-      fprintf(header, "struct MtSpecProbeTL { uint16_t ids[kSpecProbeMaxSeg]; uint32_t offs[kSpecProbeMaxSeg]; uint32_t count; uint8_t buf[kSpecProbeMaxSeg * kSpecProbeMemberBytes]; };\n");
-      fprintf(header, "static thread_local MtSpecProbeTL mtSpecProbeTL;\n");
-      fprintf(header, "uint32_t specProbeSnapDispatch(uint32_t mtaskId, uint8_t* buf);\n");
-      fprintf(header, "uint32_t specProbeCmpDispatch(uint32_t mtaskId, const uint8_t* buf);\n");
-      for (int m = 0; m < nMTasks; m++) {
-        if (specProbeFields[(size_t)m].empty()) continue;
-        fprintf(header, "uint32_t specProbeSnapM%d(uint8_t* buf);\n", m);
-        fprintf(header, "uint32_t specProbeCmpM%d(const uint8_t* buf);\n", m);
-      }
-    }
-    if (sharedHelpers) {
-      fprintf(header, "void mtDenseWaitOwnerReady(int slot, uint8_t target);\n");
-      fprintf(header, "void mtDenseSignalOwnerReady(int storeBegin, int storeEnd, uint8_t target);\n");
-    }
-    if (activity) {
-      fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActivityEpoch[%d];\n", nMTasks);
-      fprintf(header, "static constexpr int kDenseActivityRegionOf[%d] = {", nMTasks);
-      for (int m = 0; m < nMTasks; m++) fprintf(header, "%s%d", m ? "," : "", activityRegionOf[(size_t)m]);
-      fprintf(header, "};\n");
-      fprintf(header, "uint32_t mtDenseActivityCounter = 1;\n");
-      fprintf(header, "uint64_t mtDenseActivityShadow[%d] = {};\n", std::max(1, activityShadowCount));
-      fprintf(header, "static constexpr int kDenseActivityFanout[%d] = {", std::max(1, (int)activityFanoutList.size()));
-      for (size_t i = 0; i < activityFanoutList.size(); i++) fprintf(header, "%s%d", i ? "," : "", activityFanoutList[i]);
-      if (activityFanoutList.empty()) fprintf(header, "0");
-      fprintf(header, "};\n");
-      fprintf(header, "static constexpr int kDenseActivitySuccOffsets[%d] = {", nMTasks + 1);
-      {
-        int off = 0;
-        for (int m = 0; m < nMTasks; m++) {
-          if (m > 0) fprintf(header, ",");
-          fprintf(header, "%d", off);
-          off += (int)activitySuccFlags[(size_t)m].size();
-        }
-        fprintf(header, ",%d};\n", off);
-      }
-      fprintf(header, "static constexpr int kDenseActivitySuccList[%d] = {", std::max(1, activitySuccTotal));
-      {
-        bool first = true;
-        for (int m = 0; m < nMTasks; m++) {
-          for (int s : activitySuccFlags[(size_t)m]) {
-            if (!first) fprintf(header, ",");
-            fprintf(header, "%d", s);
-            first = false;
-          }
-        }
-        if (first) fprintf(header, "0");
-        fprintf(header, "};\n");
-      }
-      fprintf(header, "static constexpr int kDenseActivityNextOffsets[%d] = {", nMTasks + 1);
-      {
-        int off = 0;
-        for (int m = 0; m < nMTasks; m++) {
-          if (m > 0) fprintf(header, ",");
-          fprintf(header, "%d", off);
-          off += (int)activityNextEdges[(size_t)m].size();
-        }
-        fprintf(header, ",%d};\n", off);
-      }
-      fprintf(header, "static constexpr int kDenseActivityNextList[%d] = {", std::max(1, activityNextTotal));
-      {
-        bool first = true;
-        for (int m = 0; m < nMTasks; m++) {
-          for (int s : activityNextEdges[(size_t)m]) {
-            if (!first) fprintf(header, ",");
-            fprintf(header, "%d", s);
-            first = false;
-          }
-        }
-        if (first) fprintf(header, "0");
-        fprintf(header, "};\n");
-      }
-      fprintf(header, "static constexpr int kDenseActivitySuccLiteOffsets[%d] = {", nMTasks + 1);
-      {
-        int off = 0;
-        for (int m = 0; m < nMTasks; m++) {
-          if (m > 0) fprintf(header, ",");
-          fprintf(header, "%d", off);
-          off += (int)activitySuccLite[(size_t)m].size();
-        }
-        fprintf(header, ",%d};\n", off);
-      }
-      fprintf(header, "static constexpr int kDenseActivitySuccLiteList[%d] = {", std::max(1, activitySuccLiteTotal));
-      {
-        bool first = true;
-        for (int m = 0; m < nMTasks; m++) {
-          for (int s : activitySuccLite[(size_t)m]) {
-            if (!first) fprintf(header, ",");
-            fprintf(header, "%d", s);
-            first = false;
-          }
-        }
-        if (first) fprintf(header, "0");
-        fprintf(header, "};\n");
-      }
-      // fix: shared noinline helpers keep the per-site fanout/succ stores as calls.
-      // Inlining these constant-bounded loops made clang -O3 unroll ~400K of them
-      // and one TU compiled for 90+ minutes before the build was killed; keep the calls outlined.
-      fprintf(header, "void mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd);\n");
-      fprintf(header, "void mtDenseActivitySuccStore(int mtask);\n");
-      fprintf(header, "void mtDenseActivitySuccLiteStore(int mtask);\n");
-      fprintf(header, "void mtDenseActivityNextStore(int mtask);\n");
     }
     fprintf(header, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
     emitDenseDepCounts();
@@ -13817,69 +12336,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
   for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
-  bool sparseGate = mtUseDenseSparseGate();
-  // Atomic activeFlags ops for MT safety; default ON when sparse-gate is on (correct for T1 too,
-  // just uint8_t atomics). GSIM_MT_DENSE_SPARSE_GATE_ATOMIC=0 forces the plain non-atomic form
-  // (only bit-exact at THREADS=1; used for the ST-only A/B).
-  bool sparseGateAtomic = sparseGate && [](){ const char* e = std::getenv("GSIM_MT_DENSE_SPARSE_GATE_ATOMIC"); return !(e && e[0] == '0'); }();
-  const bool activeWorklistPush = mtUseDenseActiveWorklistPush();
-  Assert(!activeWorklistPush || sparseGate,
-         "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH requires GSIM_MT_DENSE_SPARSE_GATE");
-  Assert(!activeWorklistPush || sparseGateAtomic,
-         "GSIM_MT_DENSE_ACTIVE_WORKLIST_PUSH requires atomic sparse-gate updates");
-  const bool activeWorklistMt = activeWorklistPush && threadCount > 1;
-  std::vector<std::vector<int>> activeWorklistWordMTasks;
-  std::vector<char> activeWorklistAlwaysMTasks;
-  if (activeWorklistPush) {
-    activeWorklistWordMTasks.resize((size_t)activeFlagNum);
-    activeWorklistAlwaysMTasks.assign((size_t)nMTasks, false);
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-      std::set<int> words;
-      for (int sccId : denseSchedule.mtasks[(size_t)mtaskId].sccIds) {
-        for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
-          if (isAlwaysActive(cppId)) activeWorklistAlwaysMTasks[(size_t)mtaskId] = true;
-          words.insert(cppId / ACTIVE_WIDTH);
-        }
-      }
-      for (int wordId : words) {
-        Assert(wordId >= 0 && wordId < activeFlagNum, "active-worklist word out of range");
-        activeWorklistWordMTasks[(size_t)wordId].push_back(mtaskId);
-      }
-    }
-    std::vector<int> wordOffsets((size_t)activeFlagNum + 1, 0);
-    int entries = 0;
-    for (int wordId = 0; wordId < activeFlagNum; wordId++) {
-      wordOffsets[(size_t)wordId] = entries;
-      entries += (int)activeWorklistWordMTasks[(size_t)wordId].size();
-    }
-    wordOffsets[(size_t)activeFlagNum] = entries;
-    fprintf(header, "static constexpr int kDenseActiveWorklistWordCount = %d;\n", activeFlagNum);
-    fprintf(header, "static constexpr int kDenseActiveWorklistWordOffsets[%d] = {", activeFlagNum + 1);
-    for (int wordId = 0; wordId <= activeFlagNum; wordId++) fprintf(header, "%s%d", wordId ? "," : "", wordOffsets[(size_t)wordId]);
-    fprintf(header, "};\n");
-    fprintf(header, "static constexpr int kDenseActiveWorklistWordMTasks[%d] = {", std::max(1, entries));
-    int emitted = 0;
-    for (const auto& mtasks : activeWorklistWordMTasks) for (int mtaskId : mtasks) fprintf(header, "%s%d", emitted++ ? "," : "", mtaskId);
-    if (entries == 0) fprintf(header, "0");
-    fprintf(header, "};\n");
-    fprintf(header, "static constexpr bool kDenseActiveWorklistAlwaysMTasks[%d] = {", std::max(1, nMTasks));
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) fprintf(header, "%s%s", mtaskId ? "," : "", activeWorklistAlwaysMTasks[(size_t)mtaskId] ? "true" : "false");
-    if (nMTasks == 0) fprintf(header, "false");
-    fprintf(header, "};\n");
-    if (activeWorklistMt) {
-      fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActiveWorklistEpoch{1};\n");
-      fprintf(header, "alignas(64) std::atomic<uint32_t> mtDenseActiveWorklistMTaskEpoch[%d];\n", std::max(1, nMTasks));
-    } else {
-      fprintf(header, "uint32_t mtDenseActiveWorklistEpoch = 0;\n");
-      fprintf(header, "uint32_t mtDenseActiveWorklistMTaskEpoch[%d] = {};\n", std::max(1, nMTasks));
-    }
-    fprintf(header, "int mtDenseActiveWorklistNextMTask = 0;\n");
-    fprintf(header, "void markDenseActiveWorklistWord(int wordId);\n");
-    fprintf(header, "void markDenseActiveWorklistWordD(int wordId, int delta);\n");
-    fprintf(header, "void markDenseActiveWorklistAll();\n");
-    fprintf(header, "void stepDenseActiveWorklistSingleThread();\n");
-    fprintf(stderr, "[mt-dense-active-worklist-push] mtasks=%d words=%d reverse_entries=%d\n", nMTasks, activeFlagNum, entries);
-  }
   bool workerMajorText = mtUseDenseWorkerMajorText();
   Assert(!workerMajorText || !workSteal,
          "GSIM_MT_DENSE_WORKER_MAJOR_TEXT requires fixed-owner dense execution");
@@ -13928,9 +12384,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // saved/restored around genSuperEval exactly as in the sequential loop).
   // Unit u renders denseMTaskEmissionOrder[u]; assembly replays buffers in
   // emission order, so output is byte-identical.
-  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder,
-                                                     sparseGate, sparseGateAtomic, activeWorklistPush,
-                                                     activeWorklistMt, threadCount](size_t unit) {
+  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder](size_t unit) {
     int mtaskId = denseMTaskEmissionOrder[unit];
 
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
@@ -13943,96 +12397,21 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       const MtDenseScc& scc = denseSchedule.sccs[(size_t)sccId];
       for (int cppId : scc.cppIds) memberCppIds.push_back(cppId);
     }
-    if (sparseGate) std::sort(memberCppIds.begin(), memberCppIds.end());
-    // R3 prefilter: if EVERY member is gated (none isAlwaysActive), skip the whole MTask body when
-    // none of its footprint words are set. Converts the 0.18%-active reality into skipped bodies
-    // instead of 45313 idle per-super gate loads/cycle. Guard uses the same relaxed atomic load as
-    // the per-super gate (ordered by the dep-counter HB, so no missed activation).
-    // When activeWorklistMt hoisting is enabled, the identical predicate already runs at the call
-    // site; suppress the duplicate in-body prefilter.
-    std::string prefilterGuard;
-    if (sparseGate && !activeWorklistMt && mtDenseBuildSparseGatePrefilter(denseSchedule, mtaskId, sparseGateAtomic, prefilterGuard)) {
-      emitBodyLock(1, "if (!(%s)) return;\n", prefilterGuard.c_str());
-    }
     for (int cppId : memberCppIds) {
       auto superIter = cppId2Super.find(cppId);
       if (superIter == cppId2Super.end() || !superIter->second) continue;
       SuperNode* super = superIter->second;
-      if (sparseGate) {
-        // Per-super live-activeFlags gate + activation production, matching sparse-ST. Under MT the
-        // shared activeFlags byte is touched by multiple threads (83.8% of words split across
-        // MTasks), so gate clear + activations use uint8_t atomics (ACTIVE_WIDTH==8 => aligned,
-        // UB-free). Cross-thread same-cycle visibility holds via the dep-counter release/acquire HB
-        // (activation edges are runtime dep-counter edges). isAlwaysActive supers run ungated.
-        int wordId; uint64_t mask;
-        std::tie(wordId, mask) = setIdxMask(cppId);
-        uint64_t clrBit = mask & (((uint64_t)1 << ACTIVE_WIDTH) - 1);
-        int localIndent = 1;
-        bool gated = !isAlwaysActive(cppId);
-        bool atomicGate = sparseGateAtomic;
-        if (gated) {
-          if (atomicGate) {
-            emitBodyLock(localIndent ++, "if (__atomic_load_n(&activeFlags[%d], __ATOMIC_RELAXED) & 0x%lx) {\n", wordId, mask);
-            emitBodyLock(localIndent, "__atomic_fetch_and(&activeFlags[%d], (uint%d_t)~0x%lx, __ATOMIC_RELAXED);\n", wordId, ACTIVE_WIDTH, clrBit);
-          } else {
-            emitBodyLock(localIndent ++, "if (activeFlags[%d] & 0x%lx) {\n", wordId, mask);
-            emitBodyLock(localIndent, "activeFlags[%d] &= (uint%d_t)~0x%lx;\n", wordId, ACTIVE_WIDTH, clrBit);
-          }
-        }
-        bool savedAtomic = mtDenseSparseGateAtomicEmit;
-        bool savedActiveWorklistEmit = mtDenseActiveWorklistEmit;
-        mtDenseSparseGateAtomicEmit = atomicGate;
-        mtDenseActiveWorklistEmit = activeWorklistPush && threadCount == 1;
-        genSuperEval(super, format("activeFlags[%d]", wordId), "", localIndent, true);
-        mtDenseActiveWorklistEmit = savedActiveWorklistEmit;
-        mtDenseSparseGateAtomicEmit = savedAtomic;
-        if (gated) emitBodyLock(-- localIndent, "}\n");
-      } else {
-        emitBodyLock(1, "{\n");
-        emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileDenseTaskBegin;\n");
-        emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
-        genSuperEval(super, "activeFlags[0]", "", 2, false);
-        emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", cppId);
-        emitBodyLock(1, "}\n");
-      }
+      emitBodyLock(1, "{\n");
+      emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileDenseTaskBegin;\n");
+      emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
+      genSuperEval(super, "activeFlags[0]", "", 2, false);
+      emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", cppId);
+      emitBodyLock(1, "}\n");
     }
     emitBodyLock(0, "}\n");
   });
   }
 
-  if (activeWorklistPush) {
-    emitFuncDecl(0, "void S%s::markDenseActiveWorklistWord(int wordId) {\n", name.c_str());
-    emitBodyLock(1, "if (wordId < 0 || wordId >= kDenseActiveWorklistWordCount) return;\n");
-    emitBodyLock(1, "for (int i = kDenseActiveWorklistWordOffsets[wordId]; i < kDenseActiveWorklistWordOffsets[wordId + 1]; i++) {\n");
-    emitBodyLock(2, "const int mtaskId = kDenseActiveWorklistWordMTasks[i];\n");
-    if (activeWorklistMt) {
-      emitBodyLock(2, "mtDenseActiveWorklistMTaskEpoch[mtaskId].store(mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed), std::memory_order_release);\n");
-    } else {
-      emitBodyLock(2, "if (mtaskId >= mtDenseActiveWorklistNextMTask) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n");
-    }
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "void S%s::markDenseActiveWorklistAll() {\n", name.c_str());
-    if (activeWorklistMt) {
-      emitBodyLock(1, "const uint32_t e = mtDenseActiveWorklistEpoch.load(std::memory_order_relaxed);\n");
-      emitBodyLock(1, "for (int mtaskId = 0; mtaskId < %d; mtaskId++) {\n", nMTasks);
-      emitBodyLock(2, "mtDenseActiveWorklistMTaskEpoch[mtaskId].store(e, std::memory_order_release);\n");
-      emitBodyLock(1, "}\n");
-    } else {
-      emitBodyLock(1, "for (int mtaskId = mtDenseActiveWorklistNextMTask; mtaskId < %d; mtaskId++) mtDenseActiveWorklistMTaskEpoch[mtaskId] = mtDenseActiveWorklistEpoch;\n", nMTasks);
-    }
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "void S%s::stepDenseActiveWorklistSingleThread() {\n", name.c_str());
-    emitBodyLock(1, "if (unlikely(++mtDenseActiveWorklistEpoch == 0)) { std::memset(mtDenseActiveWorklistMTaskEpoch, 0, sizeof(mtDenseActiveWorklistMTaskEpoch)); mtDenseActiveWorklistEpoch = 1; }\n");
-    emitBodyLock(1, "mtDenseActiveWorklistNextMTask = 0;\n");
-    emitBodyLock(1, "for (int wordId = 0; wordId < kDenseActiveWorklistWordCount; wordId++) if (__atomic_load_n(&activeFlags[wordId], __ATOMIC_RELAXED)) markDenseActiveWorklistWord(wordId);\n");
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-      emitBodyLock(1, "mtDenseActiveWorklistNextMTask = %d;\n", mtaskId);
-      emitBodyLock(1, "if (kDenseActiveWorklistAlwaysMTasks[%d] || mtDenseActiveWorklistMTaskEpoch[%d] == mtDenseActiveWorklistEpoch) stepDenseMTask%d();\n", mtaskId, mtaskId, mtaskId);
-      emitBodyLock(1, "mtDenseActiveWorklistNextMTask = %d;\n", mtaskId + 1);
-    }
-    emitBodyLock(0, "}\n");
-  }
   if (workSteal) {
     // Dispatch an MTask body by id (work-stealing runs MTasks in dynamic order).
     emitFuncDecl(0, "void S%s::stepDenseMTaskById(int mtaskId) {\n", name.c_str());
@@ -14078,9 +12457,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "switch (threadId) {\n");
     for (int t = 0; t < threadCount; t++) {
       emitBodyLock(2, "case %d: {\n", t);
-      if (tableDispatch || denseLookahead) {
+      if (denseLookahead) {
         emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-        if (denseLookahead) {
           emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
           int tablePosition = 0;
           for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
@@ -14104,23 +12482,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             ++tablePosition;
           }
           emitBodyLock(3, "}\n");
-        } else {
-          emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
-          emitBodyLock(3, "  const MtDenseDispatchEntry *mtDenseDispatchEntry = kDenseDispatchTableW%d;\n", t);
-          emitBodyLock(3, "  const MtDenseDispatchEntry *mtDenseDispatchEnd = mtDenseDispatchEntry + %d;\n", denseDispatchWorkerCounts[(size_t)t]);
-          emitBodyLock(3, "  for (; mtDenseDispatchEntry != mtDenseDispatchEnd; ++mtDenseDispatchEntry) {\n");
-          emitBodyLock(4, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
-          emitBodyLock(5, "unsigned ct = 0;\n");
-          emitBodyLock(5, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
-          emitBodyLock(6, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
-          emitBodyLock(4, "}\n");
-          emitBodyLock(4, "(this->*mtDenseDispatchEntry->fn)();\n");
-          emitBodyLock(4, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
-          emitBodyLock(5, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
-          emitBodyLock(4, "}\n");
-          emitBodyLock(3, "  }\n");
-          emitBodyLock(3, "}\n");
-        }
         emitBodyLock(3, "#else\n");
       }
       for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
@@ -14138,7 +12499,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             }
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
             if (ownerBankCounters) emitBodyLock(3, "#endif\n");
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
             emitBodyLock(3, "}\n");
           }
         } else {
@@ -14156,7 +12517,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
               emitBodyLock(5, "if (!mtDenseBreakdownBlocked) { mtDenseBreakdownBlocked = true; mtDenseBreakdownBlockedBegin = std::chrono::steady_clock::now(); }\n");
-              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", mtDensePollYieldThreshold());
+              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
               emitBodyLock(4, "}\n");
               emitBodyLock(4, "if (mtDenseBreakdownBlocked) {\n");
               emitBodyLock(5, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
@@ -14192,17 +12553,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(3, "  } else {\n");
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", mtDensePollYieldThreshold());
+              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
               emitBodyLock(4, "}\n");
               emitBodyLock(3, "  }\n");
               emitBodyLock(3, "}\n");
-            } else if (sharedHelpers) {
-              emitBodyLock(3, "mtDenseWaitOwnerReady(%d, evenCycle ? uint8_t{1} : uint8_t{0});\n", slot);
             } else {
               emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
               emitBodyLock(3, "  unsigned ct = 0;\n");
               emitBodyLock(3, "  while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+              emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
               emitBodyLock(3, "}\n");
             }
 
@@ -14212,7 +12571,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
             emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#else\n");
@@ -14220,7 +12579,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
             emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#endif\n");
@@ -14260,75 +12619,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
           emitBodyLock(3, "}\n");
         } else {
-          if (activity && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly && !activityAlwaysActive[(size_t)mtaskId]) {
-            emitBodyLock(3, "if (mtDenseActivityEpoch[%d].load(std::memory_order_acquire) == mtDenseActivityCounter) {\n", mtaskId);
-            emitBodyLock(4, "stepDenseMTask%d();\n", mtaskId);
-            if (mtaskId < static_cast<int>(activityResetHandler.size()) && activityResetHandler[(size_t)mtaskId]) {
-              emitBodyLock(4, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(mtDenseActivityCounter + 1, std::memory_order_release);\n", nMTasks);
-            }
-            if (mtaskId < static_cast<int>(activityCommitFields.size()) && !activityCommitFields[(size_t)mtaskId].empty()) {
-              for (const MtActivityCommitField& cf : activityCommitFields[(size_t)mtaskId]) {
-                if (cf.conservative) {
-                  emitBodyLock(4, "mtDenseActivityFanoutStore(%d, %d);\n", cf.fanoutBegin, cf.fanoutEnd);
-                } else {
-                  emitBodyLock(4, "{ uint64_t nv = ((uint64_t)%s) & 0x%llxULL; if (nv != mtDenseActivityShadow[%d]) { mtDenseActivityShadow[%d] = nv; mtDenseActivityFanoutStore(%d, %d); } }\n",
-                               cf.name.c_str(), (unsigned long long)cf.mask, cf.shadowSlot, cf.shadowSlot, cf.fanoutBegin, cf.fanoutEnd);
-                }
-              }
-            }
-            if (activityIsCommitMTask[(size_t)mtaskId]) {
-              if (mtaskId < static_cast<int>(activitySuccLite.size()) && !activitySuccLite[(size_t)mtaskId].empty()) {
-                emitBodyLock(4, "mtDenseActivitySuccLiteStore(%d);\n", mtaskId);
-              }
-            } else if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
-              emitBodyLock(4, "mtDenseActivitySuccStore(%d);\n", mtaskId);
-            }
-            if (mtaskId < static_cast<int>(activityNextEdges.size()) && !activityNextEdges[(size_t)mtaskId].empty()) {
-              emitBodyLock(4, "mtDenseActivityNextStore(%d);\n", mtaskId);
-            }
-            emitBodyLock(3, "}\n");
-          } else if (activity) {
-            emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
-            if (mtaskId < static_cast<int>(activityResetHandler.size()) && activityResetHandler[(size_t)mtaskId]) {
-              emitBodyLock(3, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(mtDenseActivityCounter + 1, std::memory_order_release);\n", nMTasks);
-            }
-            if (mtaskId < static_cast<int>(activityCommitFields.size()) && !activityCommitFields[(size_t)mtaskId].empty()) {
-              for (const MtActivityCommitField& cf : activityCommitFields[(size_t)mtaskId]) {
-                if (cf.conservative) {
-                  emitBodyLock(3, "mtDenseActivityFanoutStore(%d, %d);\n", cf.fanoutBegin, cf.fanoutEnd);
-                } else {
-                  emitBodyLock(3, "{ uint64_t nv = ((uint64_t)%s) & 0x%llxULL; if (nv != mtDenseActivityShadow[%d]) { mtDenseActivityShadow[%d] = nv; mtDenseActivityFanoutStore(%d, %d); } }\n",
-                               cf.name.c_str(), (unsigned long long)cf.mask, cf.shadowSlot, cf.shadowSlot, cf.fanoutBegin, cf.fanoutEnd);
-                }
-              }
-            }
-            if (activityIsCommitMTask[(size_t)mtaskId]) {
-              if (mtaskId < static_cast<int>(activitySuccLite.size()) && !activitySuccLite[(size_t)mtaskId].empty()) {
-                emitBodyLock(3, "mtDenseActivitySuccLiteStore(%d);\n", mtaskId);
-              }
-            } else if (mtaskId < static_cast<int>(activitySuccFlags.size()) && !activitySuccFlags[(size_t)mtaskId].empty()) {
-              emitBodyLock(3, "mtDenseActivitySuccStore(%d);\n", mtaskId);
-            }
-            if (mtaskId < static_cast<int>(activityNextEdges.size()) && !activityNextEdges[(size_t)mtaskId].empty()) {
-              emitBodyLock(3, "mtDenseActivityNextStore(%d);\n", mtaskId);
-            }
-          } else {
-            if (activeWorklistMt && !denseSchedule.mtasks[(size_t)mtaskId].workerZeroOnly) {
-              // Hoisted exact prefilter (same predicate as the body's R3 prefilter, shared helper):
-              // skip the body when no member super's activeFlags word is set. A bit set by a
-              // producer before this site in topo order is seen now; a bit set later persists and
-              // is seen next cycle. No extra timing state: activeFlags bits are the activation
-              // lifecycle (set by production, consumed by the inner per-super gates).
-              std::string hoistedGuard;
-              if (mtDenseBuildSparseGatePrefilter(denseSchedule, mtaskId, true, hoistedGuard)) {
-                emitBodyLock(3, "if (%s) stepDenseMTask%d();\n", hoistedGuard.c_str(), mtaskId);
-              } else {
-                emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
-              }
-            } else {
-              emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
-            }
-          }
+          emitBodyLock(3, "stepDenseMTask%d();\n", mtaskId);
         }
         const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
         if (!ownerReadyFlags) {
@@ -14344,11 +12635,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           }
         } else {
           emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-          if (sharedHelpers) {
-            if (!ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].empty()) {
-              emitBodyLock(3, "mtDenseSignalOwnerReady(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d], evenCycle ? uint8_t{1} : uint8_t{0});\n", mtaskId, mtaskId + 1);
-            }
-          } else if (!ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].empty()) {
+          if (!ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].empty()) {
             emitBodyLock(3, "if (evenCycle) {\n");
             emitBodyLock(4, "for (int j = kDenseOwnerReadyStoreOffsets[%d]; j < kDenseOwnerReadyStoreOffsets[%d]; j++) {\n", mtaskId, mtaskId + 1);
             if (denseBreakdownProfileCodegen) {
@@ -14399,7 +12686,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           emitBodyLock(3, "}\n");
         }
       }
-      if (tableDispatch || denseLookahead) {
+      if (denseLookahead) {
         emitBodyLock(3, "#endif\n");
       }
       emitBodyLock(3, "break;\n");
@@ -14429,40 +12716,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
 
     emitBodyLock(0, "}\n");
   };
-  if (activity) {
-    // Activations produced during cycle N target cycle N+1: the counter is incremented after
-    // the pool join, so stores must write counter+1 (the upcoming cycle's epoch). The first
-    // Storing the current counter here leaves cycle 1+ with no active MTasks (frozen
-    // core, C5000 hang).
-    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivityFanoutStore(int fanoutBegin, int fanoutEnd) {\n", name.c_str());
-    emitBodyLock(1, "for (int j = fanoutBegin; j < fanoutEnd; j++)\n");
-    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivityFanout[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivitySuccStore(int mtask) {\n", name.c_str());
-    emitBodyLock(1, "for (int j = kDenseActivitySuccOffsets[mtask]; j < kDenseActivitySuccOffsets[mtask + 1]; j++)\n");
-    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivitySuccList[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivitySuccLiteStore(int mtask) {\n", name.c_str());
-    emitBodyLock(1, "for (int j = kDenseActivitySuccLiteOffsets[mtask]; j < kDenseActivitySuccLiteOffsets[mtask + 1]; j++)\n");
-    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivitySuccLiteList[j]].store(mtDenseActivityCounter, std::memory_order_release);\n");
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseActivityNextStore(int mtask) {\n", name.c_str());
-    emitBodyLock(1, "const uint32_t mtDenseActivityNext = mtDenseActivityCounter + 1;\n");
-    emitBodyLock(1, "for (int j = kDenseActivityNextOffsets[mtask]; j < kDenseActivityNextOffsets[mtask + 1]; j++)\n");
-    emitBodyLock(2, "mtDenseActivityEpoch[kDenseActivityNextList[j]].store(mtDenseActivityNext, std::memory_order_release);\n");
-    emitBodyLock(0, "}\n");
-  }
-  if (sharedHelpers) {
-    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseWaitOwnerReady(int slot, uint8_t target) {\n", name.c_str());
-    emitBodyLock(1, "unsigned ct = 0;\n");
-    emitBodyLock(1, "while (mtDenseOwnerReadyTokens[slot].ready.load(std::memory_order_acquire) != target) {\n");
-    emitBodyLock(2, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "__attribute__((noinline)) void S%s::mtDenseSignalOwnerReady(int storeBegin, int storeEnd, uint8_t target) {\n", name.c_str());
-    emitBodyLock(1, "for (int j = storeBegin; j < storeEnd; ++j)\n");
-    emitBodyLock(2, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(target, std::memory_order_release);\n");
-    emitBodyLock(0, "}\n");
-  }
   if (denseLookahead) {
     // Tail-scan instrumentation (E3): zero-cost unless the stats compile macro is set.
     // Counters live in the HEADER as inline variables: the tail function and the
@@ -14538,113 +12791,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "if (!progressed) mtDenseLookaheadFullMiss.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(2, "#endif\n");
     emitBodyLock(2, "if (progressed) continue;\n");
-    if (denseSpecProbe) {
-      // Speculation probe: block-episode entry. Determine the speculative prefix segment
-      // (head plus subsequent entries whose cross-worker wait tokens are all satisfied,
-      // up to the next entry that would itself block), snapshot each member's
-      // cross-worker input loci into the thread-local buffer, then start the wait timer.
-      emitBodyLock(2, "uint64_t mtSpecSegCostNs = 0; uint32_t mtSpecMembersAll = 0; uint32_t mtSpecTrunc = 0; uint32_t mtSpecBlind = 0; uint64_t mtSpecSnapNs = 0;\n");
-      emitBodyLock(2, "std::chrono::steady_clock::time_point mtSpecT0;\n");
-      emitBodyLock(2, "if (mtSpecProbeEnabled) {\n");
-      emitBodyLock(3, "mtSpecProbeTL.count = 0u;\n");
-      emitBodyLock(3, "const uint16_t* mtSpecIdx = nullptr;\n");
-      for (int t = 0; t < threadCount; t++) {
-        if (denseDispatchWorkerCounts[(size_t)t] <= 0) continue;
-        emitBodyLock(3, "if (mtDenseDispatchBegin == kDenseDispatchTableW%d) mtSpecIdx = kSpecProbeIdxW%d;\n", t, t);
-      }
-      emitBodyLock(3, "if (mtSpecIdx != nullptr) {\n");
-      emitBodyLock(4, "uint32_t mtSpecSnapCount = 1u;\n");
-      emitBodyLock(4, "mtSpecProbeTL.ids[0] = mtSpecIdx[head];\n");
-      emitBodyLock(4, "mtSpecSegCostNs += kSpecProbeCost[mtSpecIdx[head]];\n");
-      emitBodyLock(4, "for (uint32_t j = head + 1u; j < mtDenseDispatchCount; ++j) {\n");
-      emitBodyLock(5, "if (anyOutOfOrder && (mtDenseDoneBits[j >> 6] & (uint64_t{1} << (j & 63))) != 0) continue;\n");
-      emitBodyLock(5, "const MtDenseDispatchEntry* mtSpecEntry = mtDenseDispatchBegin + j;\n");
-      emitBodyLock(5, "bool mtSpecReady = true;\n");
-      emitBodyLock(5, "for (uint32_t mtSpecW = mtSpecEntry->waitBegin; mtSpecW < mtSpecEntry->waitEnd; ++mtSpecW) {\n");
-      emitBodyLock(6, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtSpecW]].ready.load(std::memory_order_acquire) != target) { mtSpecReady = false; break; }\n");
-      emitBodyLock(5, "}\n");
-      emitBodyLock(5, "if (!mtSpecReady) break;\n");
-      emitBodyLock(5, "mtSpecSegCostNs += kSpecProbeCost[mtSpecIdx[j]];\n");
-      emitBodyLock(5, "++mtSpecMembersAll;\n");
-      emitBodyLock(5, "if (mtSpecSnapCount < kSpecProbeMaxSeg) mtSpecProbeTL.ids[mtSpecSnapCount++] = mtSpecIdx[j];\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(4, "const std::chrono::steady_clock::time_point mtSpecSnapT0 = std::chrono::steady_clock::now();\n");
-      emitBodyLock(4, "uint32_t mtSpecOff = 0u;\n");
-      emitBodyLock(4, "for (uint32_t i = 0; i < mtSpecSnapCount; ++i) {\n");
-      emitBodyLock(5, "mtSpecProbeTL.offs[i] = mtSpecOff;\n");
-      emitBodyLock(5, "const uint32_t mtSpecB = specProbeSnapDispatch(mtSpecProbeTL.ids[i], mtSpecProbeTL.buf + mtSpecOff);\n");
-      emitBodyLock(5, "if ((mtSpecB & 0x80000000u) != 0u) mtSpecTrunc = 1u; else mtSpecOff += mtSpecB;\n");
-      emitBodyLock(4, "}\n");
-      emitBodyLock(4, "mtSpecProbeTL.count = mtSpecSnapCount;\n");
-      emitBodyLock(4, "mtSpecSnapNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtSpecSnapT0).count();\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "mtSpecT0 = std::chrono::steady_clock::now();\n");
-      emitBodyLock(2, "}\n");
-    }
     if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
     emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
-    emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", mtDensePollYieldThreshold());
+    emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
     emitBodyLock(2, "}\n");
     if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
-    if (denseSpecProbe) {
-      // Speculation probe: block-episode exit. Token(s) arrived; recompare the snapshots
-      // against the now-final producer values (single-writer, exact memcmp), then book
-      // the episode into its wait-duration bucket. gross win per equal episode =
-      // min(wait, segment-exec); diff episodes additionally pay the segment redo.
-      emitBodyLock(2, "if (mtSpecProbeEnabled) {\n");
-      emitBodyLock(3, "const uint64_t mtSpecWaitNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtSpecT0).count();\n");
-      emitBodyLock(3, "const std::chrono::steady_clock::time_point mtSpecCmpT0 = std::chrono::steady_clock::now();\n");
-      emitBodyLock(3, "uint32_t mtSpecDiffTasks = 0u; uint32_t mtSpecDiffFields = 0u;\n");
-      emitBodyLock(3, "for (uint32_t i = 0; i < mtSpecProbeTL.count; ++i) {\n");
-      emitBodyLock(4, "const uint32_t mtSpecR = specProbeCmpDispatch(mtSpecProbeTL.ids[i], mtSpecProbeTL.buf + mtSpecProbeTL.offs[i]);\n");
-      emitBodyLock(4, "if ((mtSpecR & 0x80000000u) != 0u) mtSpecTrunc = 1u;\n");
-      emitBodyLock(4, "if ((mtSpecR & 0x7fffffffu) != 0u) ++mtSpecDiffTasks;\n");
-      emitBodyLock(4, "mtSpecDiffFields += (mtSpecR & 0x7fffffffu);\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "const uint64_t mtSpecCmpNs = mtSpecSnapNs + (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtSpecCmpT0).count();\n");
-      emitBodyLock(3, "const uint32_t mtSpecLen = mtSpecMembersAll + 1u;\n");
-      emitBodyLock(3, "uint32_t mtSpecBkt = kSpecProbeBuckets - 1u;\n");
-      emitBodyLock(3, "for (uint32_t b = 0u; b + 1u < kSpecProbeBuckets; ++b) if (mtSpecWaitNs < kSpecProbeBucketMaxNs[b]) { mtSpecBkt = b; break; }\n");
-      emitBodyLock(3, "uint32_t mtSpecLenBkt = 6u;\n");
-      emitBodyLock(3, "if (mtSpecLen <= 1u) mtSpecLenBkt = 0u; else if (mtSpecLen == 2u) mtSpecLenBkt = 1u; else if (mtSpecLen <= 4u) mtSpecLenBkt = 2u; else if (mtSpecLen <= 8u) mtSpecLenBkt = 3u; else if (mtSpecLen <= 16u) mtSpecLenBkt = 4u; else if (mtSpecLen <= 32u) mtSpecLenBkt = 5u;\n");
-      emitBodyLock(3, "bool mtSpecAnyBlind = false;\n");
-      emitBodyLock(3, "for (uint32_t i = 0; i < mtSpecProbeTL.count; ++i) if (kSpecProbeBlind[mtSpecProbeTL.ids[i]] != 0u) { mtSpecAnyBlind = true; break; }\n");
-      emitBodyLock(3, "if (mtSpecAnyBlind) mtSpecBlind = 1u;\n");
-      emitBodyLock(3, "const bool mtSpecEqual = (mtSpecDiffTasks == 0u) && !mtSpecAnyBlind;\n");
-      emitBodyLock(3, "MtSpecProbeBucket& mtSpecB = mtSpecProbeBuckets[mtSpecBkt];\n");
-      emitBodyLock(3, "mtSpecB.episodes.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecB.waitNs.fetch_add(mtSpecWaitNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecB.segNs.fetch_add(mtSpecSegCostNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecB.cmpNs.fetch_add(mtSpecCmpNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "if (mtSpecEqual) {\n");
-      emitBodyLock(4, "mtSpecB.equal.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "mtSpecB.minNs.fetch_add(mtSpecWaitNs < mtSpecSegCostNs ? mtSpecWaitNs : mtSpecSegCostNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "} else if (!mtSpecAnyBlind) {\n");
-      emitBodyLock(4, "mtSpecB.diff.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "if (mtSpecTrunc != 0u) mtSpecB.trunc.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeG.episodes.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeG.waitNs.fetch_add(mtSpecWaitNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeG.segNs.fetch_add(mtSpecSegCostNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeG.cmpNs.fetch_add(mtSpecCmpNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeG.members.fetch_add(mtSpecLen, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeG.memberDiffFields.fetch_add(mtSpecDiffFields, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "mtSpecProbeSegLenAll[mtSpecLenBkt].fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "if (mtSpecEqual) {\n");
-      emitBodyLock(4, "mtSpecProbeG.equal.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "mtSpecProbeG.minNs.fetch_add(mtSpecWaitNs < mtSpecSegCostNs ? mtSpecWaitNs : mtSpecSegCostNs, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "mtSpecProbeSegLenEqual[mtSpecLenBkt].fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "} else if (!mtSpecAnyBlind) {\n");
-      emitBodyLock(4, "mtSpecProbeG.diffEpisodes.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(4, "mtSpecProbeG.diffSegNs.fetch_add(mtSpecSegCostNs, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "}\n");
-      emitBodyLock(3, "if (mtSpecBlind != 0u) mtSpecProbeG.blindEpisodes.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "if (mtSpecTrunc != 0u) mtSpecProbeG.truncSegs.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(3, "if (mtSpecLen > kSpecProbeMaxSeg) mtSpecProbeG.lenCapSegs.fetch_add(1u, std::memory_order_relaxed);\n");
-      emitBodyLock(2, "}\n");
-    }
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
@@ -14658,7 +12811,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(0, "}\n");
     emitBodyLock(0, "#endif\n");
   }
-  if (tableDispatch || denseLookahead) {
+  if (denseLookahead) {
     // The entry type, table declarations and the lookahead tail are all gated on the
     // owner-ready compile macro; the definitions must match or a macro-less compile
     // sees definitions of undeclared members (build failure).
@@ -14668,78 +12821,20 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(0, "const S%s::MtDenseDispatchEntry S%s::kDenseDispatchTableW%d[%d] = {\n",
                    name.c_str(), name.c_str(), t, std::max(1, cnt));
       if (cnt == 0) {
-        if (denseLookahead) {
-          emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u}\n");
-        } else {
-          emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u}\n");
-        }
+        emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u}\n");
       } else {
         for (int m = 0; m < nMTasks; m++) {
           if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
-          if (denseLookahead) {
-            emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu, %uu, %uu},\n",
-                         name.c_str(), m,
-                         denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
-                         denseDispatchStoreBegin[(size_t)m], denseDispatchStoreEnd[(size_t)m],
-                         denseLookaheadLocalBegin[(size_t)m], denseLookaheadLocalEnd[(size_t)m]);
-          } else {
-            emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu},\n",
-                         name.c_str(), m,
-                         denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
-                         denseDispatchStoreBegin[(size_t)m], denseDispatchStoreEnd[(size_t)m]);
-          }
+          emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu, %uu, %uu},\n",
+                       name.c_str(), m,
+                       denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
+                       denseDispatchStoreBegin[(size_t)m], denseDispatchStoreEnd[(size_t)m],
+                       denseLookaheadLocalBegin[(size_t)m], denseLookaheadLocalEnd[(size_t)m]);
         }
       }
       emitBodyLock(0, "};\n");
     }
     emitBodyLock(0, "#endif\n");
-  }
-  if (denseSpecProbe) {
-    // Speculation probe support functions (unconditional definitions: they reference only
-    // always-declared members, so they compile regardless of the owner-ready compile macro;
-    // unused when the runtime env is off and the tail's probe branch is never taken).
-    // Thread-local snapshot buffer definition (single out-of-line definition in one shard).
-    emitFuncDecl(0, "thread_local S%s::MtSpecProbeTL S%s::mtSpecProbeTL;\n", name.c_str(), name.c_str());
-    // Per-MTask snapshot (memcpy prefix up to the byte budget; return bytes | 0x80000000
-    // on truncation) and compare (memcmp the same deterministic prefix; return differing
-    // field count | 0x80000000 on truncation).
-    for (int m = 0; m < nMTasks; m++) {
-      if (specProbeFields[(size_t)m].empty()) continue;
-      emitFuncDecl(0, "uint32_t S%s::specProbeSnapM%d(uint8_t* buf) {\n", name.c_str(), m);
-      emitBodyLock(1, "uint32_t off = 0u;\n");
-      for (const std::string& field : specProbeFields[(size_t)m]) {
-        emitBodyLock(1, "if (off + (uint32_t)sizeof(%s) <= kSpecProbeMemberBytes) { __builtin_memcpy(buf + off, &%s, sizeof(%s)); off += (uint32_t)sizeof(%s); } else return off | 0x80000000u;\n",
-                     field.c_str(), field.c_str(), field.c_str(), field.c_str());
-      }
-      emitBodyLock(1, "return off;\n");
-      emitBodyLock(0, "}\n");
-      emitFuncDecl(0, "uint32_t S%s::specProbeCmpM%d(const uint8_t* buf) {\n", name.c_str(), m);
-      emitBodyLock(1, "uint32_t off = 0u; uint32_t diff = 0u;\n");
-      for (const std::string& field : specProbeFields[(size_t)m]) {
-        emitBodyLock(1, "if (off + (uint32_t)sizeof(%s) <= kSpecProbeMemberBytes) { if (__builtin_memcmp(buf + off, &%s, sizeof(%s)) != 0) ++diff; off += (uint32_t)sizeof(%s); } else return diff | 0x80000000u;\n",
-                     field.c_str(), field.c_str(), field.c_str(), field.c_str());
-      }
-      emitBodyLock(1, "return diff;\n");
-      emitBodyLock(0, "}\n");
-    }
-    emitFuncDecl(0, "uint32_t S%s::specProbeSnapDispatch(uint32_t mtaskId, uint8_t* buf) {\n", name.c_str());
-    emitBodyLock(1, "switch (mtaskId) {\n");
-    for (int m = 0; m < nMTasks; m++) {
-      if (specProbeFields[(size_t)m].empty()) continue;
-      emitBodyLock(2, "case %d: return specProbeSnapM%d(buf);\n", m, m);
-    }
-    emitBodyLock(2, "default: return 0u;\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
-    emitFuncDecl(0, "uint32_t S%s::specProbeCmpDispatch(uint32_t mtaskId, const uint8_t* buf) {\n", name.c_str());
-    emitBodyLock(1, "switch (mtaskId) {\n");
-    for (int m = 0; m < nMTasks; m++) {
-      if (specProbeFields[(size_t)m].empty()) continue;
-      emitBodyLock(2, "case %d: return specProbeCmpM%d(buf);\n", m, m);
-    }
-    emitBodyLock(2, "default: return 0u;\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
   }
   if (workSteal) {
     emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
@@ -14821,13 +12916,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
 
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
-  // Sparse-in-dense: use the sparse resetAll() seeder (no memset, activation-producing resets) so
-  // cross-cycle activation carry is preserved (the gated bodies clear bits as they consume them).
-  // Default dense path keeps resetAllDense() (memset + reset activation, fine when bodies are
-  // unconditional).
   if (denseDuty) emitBodyLock(1, "std::chrono::steady_clock::time_point mtDutyResetBegin; if (mtDutyEnabled) mtDutyResetBegin = std::chrono::steady_clock::now();\n");
-  if (sparseGate) emitBodyLock(1, "resetAll();\n");
-  else emitBodyLock(1, "resetAllDense();\n");
+  emitBodyLock(1, "resetAllDense();\n");
   if (denseDuty) emitBodyLock(1, "if (mtDutyEnabled) mtDutyLanes[%d].resetNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyResetBegin).count();\n", threadCount);
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {
@@ -14869,28 +12959,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(3, "for (int i = 0; i < kDenseOwnerReadyTokenCount; i++)\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[i]].ready.store(mtDenseOwnerReadyRephaseValue, std::memory_order_relaxed);\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokensPrimed = true;\n");
-    if (activity) {
-      emitBodyLock(3, "for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed);\n", nMTasks);
-      emitBodyLock(3, "mtDenseActivityCounter = 1;\n");
-    }
     emitBodyLock(2, "}\n");
     emitBodyLock(2, "#endif\n");
   }
   if (denseBreakdownProfileCodegen) {
     emitBodyLock(2, "std::chrono::steady_clock::time_point mtDenseBreakdownPoolIdleBegin;\n");
     emitBodyLock(2, "std::chrono::steady_clock::time_point mtDenseBreakdownPoolDoneBegin;\n");
-  }
-  if (activity && !activityInputFields.empty()) {
-    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-    for (const MtActivityInputField& inf : activityInputFields) {
-      if (inf.conservative) {
-        emitBodyLock(2, "mtDenseActivityFanoutStore(%d, %d);\n", inf.fanoutBegin, inf.fanoutEnd);
-      } else {
-        emitBodyLock(2, "{ uint64_t nv = ((uint64_t)%s) & 0x%llxULL; if (nv != mtDenseActivityShadow[%d]) { mtDenseActivityShadow[%d] = nv; mtDenseActivityFanoutStore(%d, %d); } }\n",
-                     inf.name.c_str(), (unsigned long long)inf.mask, inf.shadowSlot, inf.shadowSlot, inf.fanoutBegin, inf.fanoutEnd);
-      }
-    }
-    emitBodyLock(2, "#endif\n");
   }
 
   emitBodyLock(2, "mtWorkerPoolPost();\n");
@@ -14918,11 +12992,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyJoinBegin; if (mtDutyEnabled) mtDutyJoinBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
   if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[%d].joinNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyJoinBegin).count();\n", threadCount);
-  if (activity) {
-    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-    emitBodyLock(2, "if (++mtDenseActivityCounter == 0) { for (int i = 0; i < %d; i++) mtDenseActivityEpoch[i].store(1, std::memory_order_relaxed); mtDenseActivityCounter = 1; }\n", nMTasks);
-    emitBodyLock(2, "#endif\n");
-  }
   if (denseBreakdownWindowCodegen) {
     emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle && mtDenseBreakdownWindowCausalChainMode)) {\n");
     emitBodyLock(3, "const int mtDenseBreakdownWindowCausalSlot = mtDenseBreakdownWindowCurrentSlot;\n");
@@ -15066,13 +13135,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "mtDenseOwnerReadyTokensPrimed = false;\n");
     emitBodyLock(2, "#endif\n");
   }
-  if (activeWorklistPush) {
-    emitBodyLock(2, "if (unlikely(mtConfiguredWorkerCount != 1)) { fprintf(stderr, \"[mt-dense-active-worklist-push] requires one worker\\n\"); abort(); }\n");
-    emitBodyLock(2, "stepDenseActiveWorklistSingleThread();\n");
-  } else {
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-      emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
-    }
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
+    emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
   }
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
@@ -15272,18 +13336,12 @@ void graph::flushEmitBufs(std::vector<EmitBuf>& bufs) {
 }
 
 struct EmitCtxSnapshot {
-  bool sparseGateAtomic;
-  bool activeWorklistEmit;
   bool traceSuppressed;
   int traceSourceCppId;
 };
 
 static int emitParallelThreadCount() {
-  const char* env = std::getenv("GSIM_EMIT_THREADS");
-  int n = 0;
-  if (env != nullptr && env[0] != '\0') n = std::atoi(env);
-  if (n <= 0) n = std::min(16, (int)std::thread::hardware_concurrency());
-  return std::max(1, n);
+  return std::max(1, std::min(16, (int)std::thread::hardware_concurrency()));
 }
 
 // Renders `unitCount` independent emission units on a worker pool, then
@@ -15303,8 +13361,6 @@ void graph::emitUnitsParallel(size_t unitCount, const std::function<void(size_t)
     return;
   }
   EmitCtxSnapshot ctx;
-  ctx.sparseGateAtomic = mtDenseSparseGateAtomicEmit;
-  ctx.activeWorklistEmit = mtDenseActiveWorklistEmit;
   ctx.traceSuppressed = mtActivationEventTraceSuppressed;
   ctx.traceSourceCppId = mtActivationEventTraceSourceCppId;
   std::atomic<size_t> nextUnit(0);
@@ -15312,8 +13368,6 @@ void graph::emitUnitsParallel(size_t unitCount, const std::function<void(size_t)
   pool.reserve(nWorkers);
   for (size_t w = 0; w < nWorkers; w ++) {
     pool.emplace_back([&, ctx]() {
-      mtDenseSparseGateAtomicEmit = ctx.sparseGateAtomic;
-      mtDenseActiveWorklistEmit = ctx.activeWorklistEmit;
       mtActivationEventTraceSuppressed = ctx.traceSuppressed;
       mtActivationEventTraceSourceCppId = ctx.traceSourceCppId;
       size_t u;
@@ -15396,7 +13450,7 @@ void graph::cppEmitter() {
   { EmitPhaseTimer t("Final.dumpMtCoarseRegionReport");
     if (globalConfig.DumpMtCoarseRegionReport || globalConfig.MtBatchFormationMode == "coarse") dumpMtCoarseRegionReport(); }
   { EmitPhaseTimer t("Final.dumpMtReadyBatchReport");
-    if (mtUseReadyBatchReport() || mtUseEnvelopeLocalEval() || mtUseEnvelopeLocalEvalDiagnostics()) dumpMtReadyBatchReport(); }
+    if (mtUseReadyBatchReport() || mtUseEnvelopeLocalEvalDiagnostics()) dumpMtReadyBatchReport(); }
   { EmitPhaseTimer t("Final.dumpMtDenseScheduleJson");
     if (mtUseDenseExecutorCodegen()) dumpMtDenseScheduleJson(); }
   // Intern node names only after every report/dump above (mt schedule JSON,
@@ -15802,10 +13856,6 @@ void graph::cppEmitter() {
   fprintf(header, "int mtSparseSerialFastMaxWorkers;\n");
   fprintf(header, "int mtCoarseMinActiveBits;\n");
   fprintf(header, "int mtCoarseInlineThreshold;\n");
-  if (mtUseSubchunkRuntime()) {
-    fprintf(header, "int mtSubchunkDispatchCost;\n");
-    fprintf(header, "int mtSubchunkMinActiveBits;\n");
-  }
   fprintf(header, "bool mtCoarseSkeletalMode;\n");
   fprintf(header, "int mtProfileConfiguredWorkerCount;\n");
   fprintf(header, "int mtProfileMaxWorkerCount;\n");
@@ -15879,46 +13929,9 @@ void graph::cppEmitter() {
     fprintf(header, "uint64_t mtProfileCoarseSerialFallbackSavedFlagWordCopies;\n");
     fprintf(header, "uint64_t mtProfileCoarseSerialFallbackSavedMergeWordScans;\n");
     fprintf(header, "uint64_t mtProfileCoarseSerialFallbackSavedBarriers;\n");
-    if (mtUseSubchunkRuntime()) {
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchEligible;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchTaken;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchInlineWords;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchSkippedBelowMinActive;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchResidualDispatches;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchFullyInlined;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchInlineActiveBits;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSubchunkDispatchResidualInitialActiveBits;\n");
-    }
-    if (mtUseSubchunkProbe()) {
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWords;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicTasks;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicTaskStaticCost;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWordCostHist[6];\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWordTaskHist[6];\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWordCostGe64;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWordCostGe128;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWordCostGe256;\n");
-      fprintf(header, "uint64_t mtProfileCoarseSerialFallbackDynamicWordTasksGe2;\n");
-    }
     fprintf(header, "uint64_t mtProfileCoarseLayerSizeHist[6];\n");
     fprintf(header, "uint64_t mtProfileCoarseRegionLayerCountHist[6];\n");
     fprintf(header, "std::vector<uint64_t> mtProfileCoarseSelectedWorkerCountHist;\n");
-    if (mtUseWaitProbeCodegen()) {
-      fprintf(header, "bool mtWaitProbeEnabled;\n");
-      fprintf(header, "std::chrono::steady_clock::time_point mtWaitProbePostTp;\n");
-      fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerFinishNs;\n");
-      fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerFinishSumNs;\n");
-      fprintf(header, "std::vector<uint64_t> mtWaitProbeWorkerLastHist;\n");
-      fprintf(header, "uint64_t mtWaitProbeDispatchCount;\n");
-      fprintf(header, "uint64_t mtWaitProbeWaitSumNs;\n");
-      fprintf(header, "uint64_t mtWaitProbeW0BodySumNs;\n");
-      fprintf(header, "uint64_t mtWaitProbeTailBeyondW0SumNs;\n");
-      fprintf(header, "uint64_t mtWaitProbeMaxFinishSumNs;\n");
-      fprintf(header, "uint64_t mtWaitProbeMinBgFinishSumNs;\n");
-      fprintf(header, "uint64_t mtWaitProbeWorker0LastCount;\n");
-      fprintf(header, "uint64_t mtWaitProbeEmptyBarrierIters;\n");
-      fprintf(header, "uint64_t mtWaitProbeEmptyBarrierTotalNs;\n");
-    }
   }
   fprintf(header, "uint64_t mtProfileTaskExecCount[%d];\n", superId);
   fprintf(header, "uint64_t mtProfileTaskWallNs[%d];\n", superId);
@@ -15996,15 +14009,6 @@ void graph::cppEmitter() {
     fprintf(header, "std::vector<std::thread> mtWorkerPoolThreads;\n");
     // hot atomics on independent cache lines.
     fprintf(header, "alignas(64) std::atomic<uint64_t> mtWorkerPoolGeneration;\n");
-  if (mtUseWorkerPoolWakeShardCodegen()) {
-    fprintf(header, "#if defined(GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE) && GSIM_MT_WORKER_POOL_WAKE_SHARD_COMPILE\n");
-    fprintf(header, "struct alignas(64) MtWorkerPoolGenShard { std::atomic<uint64_t> gen{0}; };\n");
-    fprintf(header, "static_assert(alignof(MtWorkerPoolGenShard) == 64 && sizeof(MtWorkerPoolGenShard) == 64, \"wake-shard needs one cache line each\");\n");
-    fprintf(header, "static constexpr int kMtWorkerPoolWakeShardStride = 8;\n");
-    fprintf(header, "static constexpr int kMtWorkerPoolWakeShardCount = 16;\n");
-    fprintf(header, "MtWorkerPoolGenShard mtWorkerPoolGenShard[kMtWorkerPoolWakeShardCount];\n");
-    fprintf(header, "#endif\n");
-  }
   if (mtUseWorkerPoolFlagJoinCodegen()) {
     fprintf(header, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
     fprintf(header, "struct alignas(64) MtWorkerPoolDoneFlag { std::atomic<uint8_t> parity{0}; };\n");
@@ -16116,10 +14120,6 @@ void graph::cppEmitter() {
     fprintf(header, "void flushMtActivationEventTraceCycle();\n");
     fprintf(header, "void closeMtActivationEventTrace();\n");
   }
-  if (useCoarseMt && mtUseWaitProbeCodegen()) {
-    fprintf(header, "void runMtWaitProbeEmptyBarrier();\n");
-    fprintf(header, "void dumpMtWaitProbe();\n");
-  }
 
   emitBodyLock(0, "}\n");
 
@@ -16152,10 +14152,6 @@ void graph::cppEmitter() {
     emitBodyLock(1, "const char *dutyEnv = getenv(\"GSIM_MT_DENSE_DUTY\");\n");
     emitBodyLock(1, "mtDutyEnabled = dutyEnv != nullptr && dutyEnv[0] != '\\0' && dutyEnv[0] != '0';\n");
   }
-  if (mtDenseSpecProbeCodegen()) {
-    emitBodyLock(1, "const char *specProbeEnv = getenv(\"GSIM_MT_DENSE_SPEC_PROBE\");\n");
-    emitBodyLock(1, "mtSpecProbeEnabled = specProbeEnv != nullptr && specProbeEnv[0] != '\\0' && specProbeEnv[0] != '0';\n");
-  }
   emitBodyLock(1, "int mtCoarseMinActiveBits = 0;\n");
   emitBodyLock(1, "const char *coarseMinActiveBitsEnv = getenv(\"GSIM_MT_COARSE_MIN_ACTIVE_BITS\");\n");
   emitBodyLock(1, "if (coarseMinActiveBitsEnv != nullptr) mtCoarseMinActiveBits = atoi(coarseMinActiveBitsEnv);\n");
@@ -16166,18 +14162,6 @@ void graph::cppEmitter() {
   emitBodyLock(1, "if (coarseInlineThresholdEnv != nullptr) mtCoarseInlineThreshold = atoi(coarseInlineThresholdEnv);\n");
   emitBodyLock(1, "if (mtCoarseInlineThreshold < 0) mtCoarseInlineThreshold = 0;\n");
   emitBodyLock(1, "this->mtCoarseInlineThreshold = mtCoarseInlineThreshold;\n");
-  if (mtUseSubchunkRuntime()) {
-    emitBodyLock(1, "int mtSubchunkDispatchCost = 0;\n");
-    emitBodyLock(1, "const char *subchunkDispatchCostEnv = getenv(\"GSIM_MT_SUBCHUNK_DISPATCH_COST\");\n");
-    emitBodyLock(1, "if (subchunkDispatchCostEnv != nullptr) mtSubchunkDispatchCost = atoi(subchunkDispatchCostEnv);\n");
-    emitBodyLock(1, "if (mtSubchunkDispatchCost < 0) mtSubchunkDispatchCost = 0;\n");
-    emitBodyLock(1, "this->mtSubchunkDispatchCost = mtSubchunkDispatchCost;\n");
-    emitBodyLock(1, "int mtSubchunkMinActiveBits = 0;\n");
-    emitBodyLock(1, "const char *subchunkMinActiveBitsEnv = getenv(\"GSIM_MT_SUBCHUNK_MIN_ACTIVE_BITS\");\n");
-    emitBodyLock(1, "if (subchunkMinActiveBitsEnv != nullptr) mtSubchunkMinActiveBits = atoi(subchunkMinActiveBitsEnv);\n");
-    emitBodyLock(1, "if (mtSubchunkMinActiveBits < 0) mtSubchunkMinActiveBits = 0;\n");
-    emitBodyLock(1, "this->mtSubchunkMinActiveBits = mtSubchunkMinActiveBits;\n");
-  }
   emitBodyLock(1, "bool mtCoarseSkeletalMode = false;\n");
   emitBodyLock(1, "const char *coarseSkeletalEnv = getenv(\"GSIM_MT_COARSE_SKELETAL\");\n");
   emitBodyLock(1, "if (coarseSkeletalEnv != nullptr && coarseSkeletalEnv[0] != '\\0' && coarseSkeletalEnv[0] != '0') mtCoarseSkeletalMode = true;\n");
@@ -16281,26 +14265,6 @@ void graph::cppEmitter() {
     emitBodyLock(1, "mtProfileCoarseSerialFallbackSavedFlagWordCopies = 0;\n");
     emitBodyLock(1, "mtProfileCoarseSerialFallbackSavedMergeWordScans = 0;\n");
     emitBodyLock(1, "mtProfileCoarseSerialFallbackSavedBarriers = 0;\n");
-    if (mtUseSubchunkRuntime()) {
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchEligible = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchTaken = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchInlineWords = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchSkippedBelowMinActive = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchResidualDispatches = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchFullyInlined = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchInlineActiveBits = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSubchunkDispatchResidualInitialActiveBits = 0;\n");
-    }
-    if (mtUseSubchunkProbe()) {
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicWords = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicTasks = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicTaskStaticCost = 0;\n");
-      emitBodyLock(1, "for (int i = 0; i < 6; i ++) { mtProfileCoarseSerialFallbackDynamicWordCostHist[i] = 0; mtProfileCoarseSerialFallbackDynamicWordTaskHist[i] = 0; }\n");
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicWordCostGe64 = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicWordCostGe128 = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicWordCostGe256 = 0;\n");
-      emitBodyLock(1, "mtProfileCoarseSerialFallbackDynamicWordTasksGe2 = 0;\n");
-    }
     emitBodyLock(1, "mtProfileCoarseSelectedWorkerCountHist.assign((size_t)mtProfileConfiguredWorkerCount + 1, 0);\n");
     emitBodyLock(1, "for (int i = 0; i < 6; i ++) mtProfileCoarseLayerSizeHist[i] = 0;\n");
     for (int i = 0; i < 6; i ++) {
@@ -16382,22 +14346,6 @@ void graph::cppEmitter() {
       emitBodyLock(1, "mtWorkerPoolCoarseStaticRoundedWC = 0;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseStaticBeginActiveWord = 0;\n");
       emitBodyLock(1, "mtWorkerPoolCoarseStaticActiveWordSpan = 0;\n");
-      if (mtUseWaitProbeCodegen()) {
-        emitBodyLock(1, "const char *waitProbeEnv = getenv(\"GSIM_MT_WAIT_PROBE\");\n");
-        emitBodyLock(1, "mtWaitProbeEnabled = waitProbeEnv != nullptr && waitProbeEnv[0] != '\\0' && waitProbeEnv[0] != '0';\n");
-        emitBodyLock(1, "mtWaitProbeWorkerFinishNs.assign((size_t)mtConfiguredWorkerCount, 0);\n");
-        emitBodyLock(1, "mtWaitProbeWorkerFinishSumNs.assign((size_t)mtConfiguredWorkerCount, 0);\n");
-        emitBodyLock(1, "mtWaitProbeWorkerLastHist.assign((size_t)mtConfiguredWorkerCount, 0);\n");
-        emitBodyLock(1, "mtWaitProbeDispatchCount = 0;\n");
-        emitBodyLock(1, "mtWaitProbeWaitSumNs = 0;\n");
-        emitBodyLock(1, "mtWaitProbeW0BodySumNs = 0;\n");
-        emitBodyLock(1, "mtWaitProbeTailBeyondW0SumNs = 0;\n");
-        emitBodyLock(1, "mtWaitProbeMaxFinishSumNs = 0;\n");
-        emitBodyLock(1, "mtWaitProbeMinBgFinishSumNs = 0;\n");
-        emitBodyLock(1, "mtWaitProbeWorker0LastCount = 0;\n");
-        emitBodyLock(1, "mtWaitProbeEmptyBarrierIters = 0;\n");
-        emitBodyLock(1, "mtWaitProbeEmptyBarrierTotalNs = 0;\n");
-      }
     }
   }
   emitBodyLock(0, "}\n");
@@ -16749,7 +14697,6 @@ void graph::cppEmitter() {
   }
 
   emitFuncDecl(0, "S%s::~S%s() {\n", name.c_str(), name.c_str());
-  if (useMtHelpers && useCoarseMt && mtUseWaitProbeCodegen()) emitBodyLock(1, "runMtWaitProbeEmptyBarrier();\n");
   if (useMtHelpers) emitBodyLock(1, "stopMtWorkerPool();\n");
   if (useMtHelpers && mtUseWorkerPoolFlagJoinCodegen()) {
     emitBodyLock(1, "#if defined(GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE) && GSIM_MT_WORKER_POOL_FLAG_JOIN_COMPILE\n");
@@ -16762,7 +14709,6 @@ void graph::cppEmitter() {
   emitBodyLock(2, "fprintf(stderr, \"[wallfrac] commit_cycles=%%lu comb_cycles=%%lu commit_brackets=%%lu comb_brackets=%%lu commit_frac=%%.4f comb_frac=%%.4f\\n\", wallfracCommitCycles, wallfracCombCycles, wallfracCommitBrackets, wallfracCombBrackets, __wf_tot? (double)wallfracCommitCycles/__wf_tot : 0.0, __wf_tot? (double)wallfracCombCycles/__wf_tot : 0.0);\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "dumpMtProfile();\n");
-  if (useCoarseMt && mtUseWaitProbeCodegen()) emitBodyLock(1, "dumpMtWaitProbe();\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) { fclose(mtProfileDynamicTraceFile); mtProfileDynamicTraceFile = nullptr; }\n");
   if (activationEventTraceCodegen) emitBodyLock(1, "closeMtActivationEventTrace();\n");
   emitBodyLock(0, "}\n");
@@ -16839,26 +14785,6 @@ void graph::cppEmitter() {
     emitBodyLock(2, "}\n");
     emitBodyLock(1, "}\n");
   }
-  if (mtDenseSpecProbeCodegen()) {
-    // Speculation probe report: per-bucket episode stats and the headline net number.
-    // netPerCycleNs = (Σ_equal min(wait,segExec) − Σ compare overhead − Σ_diff redo) / cycles.
-    emitBodyLock(1, "if (mtSpecProbeEnabled) {\n");
-    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] costTotalNs=%%llu cycles=%%lu\\n\", (unsigned long long)kSpecProbeCostTotalNs, (unsigned long)cycles);\n");
-    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] episodes=%%llu equal=%%llu diff=%%llu blind=%%llu waitNs=%%llu segNs=%%llu diffSegNs=%%llu minNs=%%llu cmpNs=%%llu members=%%llu memberDiffFields=%%llu truncSegs=%%llu lenCapSegs=%%llu\\n\",\n");
-    emitBodyLock(3, "(unsigned long long)mtSpecProbeG.episodes.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.equal.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.diffEpisodes.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.blindEpisodes.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.waitNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.segNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.diffSegNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.minNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.cmpNs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.members.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.memberDiffFields.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.truncSegs.load(std::memory_order_relaxed), (unsigned long long)mtSpecProbeG.lenCapSegs.load(std::memory_order_relaxed));\n");
-    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] netPerCycleNs=%%.3f\\n\", (double)(mtSpecProbeG.minNs.load(std::memory_order_relaxed) - mtSpecProbeG.cmpNs.load(std::memory_order_relaxed) - mtSpecProbeG.diffSegNs.load(std::memory_order_relaxed)) / (double)(cycles + 1));\n");
-    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] seglen labels=1,2,3-4,5-8,9-16,17-32,33+ all=\");\n");
-    emitBodyLock(2, "for (int i = 0; i < 7; i++) fprintf(stderr, \"%%s%%llu\", i ? \",\" : \"\", (unsigned long long)mtSpecProbeSegLenAll[i].load(std::memory_order_relaxed));\n");
-    emitBodyLock(2, "fprintf(stderr, \" equal=\");\n");
-    emitBodyLock(2, "for (int i = 0; i < 7; i++) fprintf(stderr, \"%%s%%llu\", i ? \",\" : \"\", (unsigned long long)mtSpecProbeSegLenEqual[i].load(std::memory_order_relaxed));\n");
-    emitBodyLock(2, "fprintf(stderr, \"\\n\");\n");
-    emitBodyLock(2, "fprintf(stderr, \"[mt-specprobe] bucket upperNs episodes equal diff waitNs segNs minNs cmpNs trunc\\n\");\n");
-    emitBodyLock(2, "for (uint32_t b = 0u; b < kSpecProbeBuckets; ++b) {\n");
-    emitBodyLock(3, "const MtSpecProbeBucket &B = mtSpecProbeBuckets[b];\n");
-    emitBodyLock(3, "fprintf(stderr, \"[mt-specprobe] %%2u %%10llu %%6llu %%6llu %%6llu %%10llu %%10llu %%10llu %%8llu %%6llu\\n\", b, (unsigned long long)(b + 1u < kSpecProbeBuckets ? kSpecProbeBucketMaxNs[b] : ~(uint64_t)0), (unsigned long long)B.episodes.load(std::memory_order_relaxed), (unsigned long long)B.equal.load(std::memory_order_relaxed), (unsigned long long)B.diff.load(std::memory_order_relaxed), (unsigned long long)B.waitNs.load(std::memory_order_relaxed), (unsigned long long)B.segNs.load(std::memory_order_relaxed), (unsigned long long)B.minNs.load(std::memory_order_relaxed), (unsigned long long)B.cmpNs.load(std::memory_order_relaxed), (unsigned long long)B.trunc.load(std::memory_order_relaxed));\n");
-    emitBodyLock(2, "}\n");
-    emitBodyLock(1, "}\n");
-  }
   emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] calls=%%llu scanned=%%llu found=%%llu fullmiss=%%llu\\n\", (unsigned long long)mtDenseLookaheadTailCalls.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadScanned.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFound.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFullMiss.load(std::memory_order_relaxed));\n");
   emitBodyLock(1, "#endif\n");
@@ -16875,14 +14801,6 @@ void graph::cppEmitter() {
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_phase body_ns=%%lu wait_ns=%%lu\\n\", mtProfileCoarseBodyNs, mtProfileCoarseWaitNs);\n");
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_assignment worst_worker_static_cost=%%lu best_worker_static_cost=%%lu contiguous_worst_static_cost=%%lu balanced_worst_static_cost=%%lu\\n\", mtProfileCoarseWorstWorkerStaticCost, mtProfileCoarseBestWorkerStaticCost, mtProfileCoarseContiguousWorstStaticCost, mtProfileCoarseBalancedWorstStaticCost);\n");
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_serial_fallback eligible=%%lu taken=%%lu active_bits=%%lu repcut_excluded=%%lu nonpure_excluded=%%lu saved_worker_jobs=%%lu saved_flag_word_copies=%%lu saved_merge_word_scans=%%lu saved_barriers=%%lu\\n\", mtProfileCoarseSerialFallbackEligible, mtProfileCoarseSerialFallbackTaken, mtProfileCoarseSerialFallbackActiveBits, mtProfileCoarseSerialFallbackRepcutExcluded, mtProfileCoarseSerialFallbackNonPureExcluded, mtProfileCoarseSerialFallbackSavedWorkerJobs, mtProfileCoarseSerialFallbackSavedFlagWordCopies, mtProfileCoarseSerialFallbackSavedMergeWordScans, mtProfileCoarseSerialFallbackSavedBarriers);\n");
-    if (mtUseSubchunkRuntime()) {
-      emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_subchunk_dispatch cost_threshold=%%d min_active_bits=%%d eligible=%%lu taken=%%lu fully_inlined=%%lu skipped_below_min_active=%%lu inline_words=%%lu residual_dispatches=%%lu inline_active_bits=%%lu residual_initial_active_bits=%%lu\\n\", mtSubchunkDispatchCost, mtSubchunkMinActiveBits, mtProfileCoarseSubchunkDispatchEligible, mtProfileCoarseSubchunkDispatchTaken, mtProfileCoarseSubchunkDispatchFullyInlined, mtProfileCoarseSubchunkDispatchSkippedBelowMinActive, mtProfileCoarseSubchunkDispatchInlineWords, mtProfileCoarseSubchunkDispatchResidualDispatches, mtProfileCoarseSubchunkDispatchInlineActiveBits, mtProfileCoarseSubchunkDispatchResidualInitialActiveBits);\n");
-    }
-    if (mtUseSubchunkProbe()) {
-      emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_subchunk_fallback codegen_enabled=1 dynamic_words=%%lu dynamic_tasks=%%lu dynamic_task_static_cost=%%lu\\n\", mtProfileCoarseSerialFallbackDynamicWords, mtProfileCoarseSerialFallbackDynamicTasks, mtProfileCoarseSerialFallbackDynamicTaskStaticCost);\n");
-      emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_subchunk_word_cost_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu labels=0-63,64-127,128-255,256-511,512-1023,1024+ ge64=%%lu ge128=%%lu ge256=%%lu\\n\", mtProfileCoarseSerialFallbackDynamicWordCostHist[0], mtProfileCoarseSerialFallbackDynamicWordCostHist[1], mtProfileCoarseSerialFallbackDynamicWordCostHist[2], mtProfileCoarseSerialFallbackDynamicWordCostHist[3], mtProfileCoarseSerialFallbackDynamicWordCostHist[4], mtProfileCoarseSerialFallbackDynamicWordCostHist[5], mtProfileCoarseSerialFallbackDynamicWordCostGe64, mtProfileCoarseSerialFallbackDynamicWordCostGe128, mtProfileCoarseSerialFallbackDynamicWordCostGe256);\n");
-      emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_subchunk_word_task_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu labels=1,2,3-4,5-8,9-15,16+ ge2=%%lu\\n\", mtProfileCoarseSerialFallbackDynamicWordTaskHist[0], mtProfileCoarseSerialFallbackDynamicWordTaskHist[1], mtProfileCoarseSerialFallbackDynamicWordTaskHist[2], mtProfileCoarseSerialFallbackDynamicWordTaskHist[3], mtProfileCoarseSerialFallbackDynamicWordTaskHist[4], mtProfileCoarseSerialFallbackDynamicWordTaskHist[5], mtProfileCoarseSerialFallbackDynamicWordTasksGe2);\n");
-    }
     emitBodyLock(1, "fprintf(stderr, \"[mt-profile] coarse_layer_size_hist=%%lu,%%lu,%%lu,%%lu,%%lu,%%lu static=%%d,%%d,%%d,%%d,%%d,%%d labels=1,2,3-4,5-8,9-15,16+\\n\", mtProfileCoarseLayerSizeHist[0], mtProfileCoarseLayerSizeHist[1], mtProfileCoarseLayerSizeHist[2], mtProfileCoarseLayerSizeHist[3], mtProfileCoarseLayerSizeHist[4], mtProfileCoarseLayerSizeHist[5], %d, %d, %d, %d, %d, %d);\n",
                  mtCoarseProfileFacts.layerSizeHist[0], mtCoarseProfileFacts.layerSizeHist[1], mtCoarseProfileFacts.layerSizeHist[2],
                  mtCoarseProfileFacts.layerSizeHist[3], mtCoarseProfileFacts.layerSizeHist[4], mtCoarseProfileFacts.layerSizeHist[5]);
@@ -16934,38 +14852,6 @@ void graph::cppEmitter() {
   emitBodyLock(2, "fprintf(stderr, \"\\n\");\n");
   emitBodyLock(1, "}\n");
   emitBodyLock(0, "}\n");
-  if (useCoarseMt && mtUseWaitProbeCodegen()) {
-    emitFuncDecl(0, "void S%s::runMtWaitProbeEmptyBarrier() {\n", name.c_str());
-    emitBodyLock(1, "if (!mtWaitProbeEnabled || !mtWorkerPoolEnabled || mtConfiguredWorkerCount <= 1) return;\n");
-    emitBodyLock(1, "int wc = mtConfiguredWorkerCount;\n");
-    emitBodyLock(1, "if (mtWorkerPoolThreadCount + 1 < wc) return;\n");
-    emitBodyLock(1, "const char *itersEnv = getenv(\"GSIM_MT_WAIT_PROBE_ITERS\");\n");
-    emitBodyLock(1, "uint64_t iters = (itersEnv != nullptr && itersEnv[0] != '\\0') ? strtoull(itersEnv, nullptr, 10) : 200000;\n");
-    emitBodyLock(1, "if (iters == 0) return;\n");
-    emitBodyLock(1, "mtWorkerPoolJobKind = 4;\n");
-    emitBodyLock(1, "mtWorkerPoolCurrentWorkerCount = wc;\n");
-    emitBodyLock(1, "for (uint64_t i = 0; i < 2000; i ++) { mtWorkerPoolPost(); mtWorkerPoolWaitForDone(wc - 1); }\n");
-    emitBodyLock(1, "std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();\n");
-    emitBodyLock(1, "for (uint64_t i = 0; i < iters; i ++) { mtWorkerPoolPost(); mtWorkerPoolWaitForDone(wc - 1); }\n");
-    emitBodyLock(1, "mtWaitProbeEmptyBarrierTotalNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();\n");
-    emitBodyLock(1, "mtWaitProbeEmptyBarrierIters = iters;\n");
-    emitBodyLock(0, "}\n");
-
-    emitFuncDecl(0, "void S%s::dumpMtWaitProbe() {\n", name.c_str());
-    emitBodyLock(1, "if (!mtWaitProbeEnabled) return;\n");
-    emitBodyLock(1, "double empAvgNs = mtWaitProbeEmptyBarrierIters ? (double)mtWaitProbeEmptyBarrierTotalNs / (double)mtWaitProbeEmptyBarrierIters : 0.0;\n");
-    emitBodyLock(1, "uint64_t dc = mtWaitProbeDispatchCount;\n");
-    emitBodyLock(1, "fprintf(stderr, \"[mt-wait-probe] empty_barrier_iters=%%lu empty_barrier_total_ns=%%lu empty_barrier_ns_per_iter=%%.2f worker_count=%%d\\n\", mtWaitProbeEmptyBarrierIters, mtWaitProbeEmptyBarrierTotalNs, empAvgNs, mtConfiguredWorkerCount);\n");
-    emitBodyLock(1, "fprintf(stderr, \"[mt-wait-probe] dispatch_count=%%lu wait_sum_ns=%%lu w0_body_sum_ns=%%lu tail_beyond_w0_sum_ns=%%lu max_finish_sum_ns=%%lu min_bg_finish_sum_ns=%%lu worker0_last_count=%%lu\\n\", dc, mtWaitProbeWaitSumNs, mtWaitProbeW0BodySumNs, mtWaitProbeTailBeyondW0SumNs, mtWaitProbeMaxFinishSumNs, mtWaitProbeMinBgFinishSumNs, mtWaitProbeWorker0LastCount);\n");
-    emitBodyLock(1, "if (dc) fprintf(stderr, \"[mt-wait-probe] avg_wait_ns=%%.2f avg_w0_body_ns=%%.2f avg_tail_beyond_w0_ns=%%.2f avg_max_finish_ns=%%.2f tail_share=%%.4f\\n\", (double)mtWaitProbeWaitSumNs/dc, (double)mtWaitProbeW0BodySumNs/dc, (double)mtWaitProbeTailBeyondW0SumNs/dc, (double)mtWaitProbeMaxFinishSumNs/dc, mtWaitProbeWaitSumNs ? (double)mtWaitProbeTailBeyondW0SumNs/(double)mtWaitProbeWaitSumNs : 0.0);\n");
-    emitBodyLock(1, "fprintf(stderr, \"[mt-wait-probe] worker_last_hist=\");\n");
-    emitBodyLock(1, "for (size_t i = 0; i < mtWaitProbeWorkerLastHist.size(); i ++) fprintf(stderr, \"%%s%%zu:%%lu\", i == 0 ? \"\" : \",\", i, mtWaitProbeWorkerLastHist[i]);\n");
-    emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
-    emitBodyLock(1, "fprintf(stderr, \"[mt-wait-probe] worker_finish_avg_ns=\");\n");
-    emitBodyLock(1, "for (size_t i = 0; i < mtWaitProbeWorkerFinishSumNs.size(); i ++) fprintf(stderr, \"%%s%%zu:%%.2f\", i == 0 ? \"\" : \",\", i, dc ? (double)mtWaitProbeWorkerFinishSumNs[i]/dc : 0.0);\n");
-    emitBodyLock(1, "fprintf(stderr, \"\\n\");\n");
-    emitBodyLock(0, "}\n");
-  }
 
   /* activation all nodes for reset */
   if (activationEventTraceCodegen) {
@@ -16980,18 +14866,6 @@ void graph::cppEmitter() {
                  "  memset(activeFlags, 0xff, sizeof(activeFlags));\n"
                  "}\n", name.c_str());
   }
-
-  // Sparse-gate dense executor: concurrent-safe activate-all. activateAll()'s plain memset
-  // erases bits concurrently produced by other workers' atomic gate-clear/activation RMWs
-  // (lost activations freeze the core); this variant sets the same bits with per-byte atomic
-  // ORs. Only emitted when the sparse gate is enabled; unused otherwise.
-  if (mtUseDenseSparseGate()) {
-    fprintf(header, "void activateAllAtomicDense();\n");
-    emitFuncDecl(0, "void S%s::activateAllAtomicDense() {\n"
-                 "  for (int i = 0; i < %d; i ++) __atomic_fetch_or(&activeFlags[i], (uint%d_t)-1, __ATOMIC_RELAXED);\n"
-                 "}\n", name.c_str(), activeFlagNum, ACTIVE_WIDTH);
-  }
-
    /* input/output interface */
   for (Node* node : input) {
     fprintf(header, "void set_%s(%s val);\n", node->name.c_str(), widthUType(node->width).c_str());
