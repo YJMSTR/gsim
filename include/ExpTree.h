@@ -446,15 +446,6 @@ public:
 
 };
 
-class NodeList {
-public:
-  std::vector<Node*> nodes;
-  
-  void merge(NodeList* newList) {
-    if (!newList) return;
-    nodes.insert(nodes.end(), newList->nodes.begin(), newList->nodes.end());
-  }
-};
 
 ENode* allocIntEnode(int width, std::string val, bool sign = false);
 
