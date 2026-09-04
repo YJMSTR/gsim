@@ -300,6 +300,8 @@ Then build and run the emitted model with your MT harness (a difftest-based flow
 | `GSIM_MT_DENSE_EXECUTOR_CODEGEN` | off | Emit the dense executor + schedule JSON reportrequires `--mt-helper-mode=mt-level-dispatch` (see quick start) |
 | `GSIM_MT_DENSE_VCONTRACT` | off | Verilator-style SCC contraction into MTasks |
 | `GSIM_MT_DENSE_VCONTRACT_MAXMT` | `max(threads, 50·threads)` (1600 at T32, 800 at T16) | MTask count cap (granularity; T32 optimum 2400, T16 optimum 800 on XiangShan — the landscape is non-smooth, sweep per design) |
+| `GSIM_MT_DENSE_VCONTRACT_COMPACT` | off | Dead-entry compaction during contraction (coarser MTasks for perf experiments; NOT schedule-neutral — measured 12275→8253 MTasks on the T32 graph, so off preserves the registered champion schedules) |
+| `GSIM_MT_DENSE_VCONTRACT_MAXMT_AUTO` | off | In-generation MAXMT search: evaluates a candidate ladder on the same pristine-rebuilt quotient graph and picks by the level-straggler cost model (balance vs cross-edge count, U-shaped in MAXMT); the winner is exported to the real contraction. Off = explicit `MAXMT` |
 | `GSIM_MT_DENSE_VCONTRACT_EDGE_CPWO` | off | Critical-path-weighted edge scoring (load-bearing) |
 | `GSIM_MT_DENSE_VCONTRACT_PROPCP` | off | Periodic exact critical-path recompute during contraction |
 | `GSIM_MT_DENSE_OWNER_READY_FLAGS` | off | Owner-ready token protocol (single-writer, parity tags) |
