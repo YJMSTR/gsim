@@ -9888,6 +9888,15 @@ bool mtStaticDenseProbeEmit = []{ const char* e = std::getenv("GSIM_EMIT_STATIC_
 // lookahead scan. The 16KB token array is MESI-churned by 16 writers; prefetches
 // overlap the coherence-miss latency (measured: L3-latency-bound, 12% cross-CCD).
 bool mtScanPrefetchEmit = []{ const char* e = std::getenv("GSIM_EMIT_SCAN_PREFETCH"); return e && e[0] && e[0] != '0'; }();
+// GSIM_EMIT_CHAIN_FUSION=1 (default off): fuse consecutive same-worker mtasks
+// into per-segment functions (cut at every mtask with non-empty waitSlots, i.e.
+// cross-worker consumers; ~91 segments/worker at T16 instead of ~595 calls).
+// Inside a segment, state values flow through locals (register) instead of
+// state-array round-trips - attacking the measured +62G boundary-load excess
+// (T1 decomposition: dense 206.8G instr vs serial 105.8G). Token stores stay
+// interleaved after each body (identical signal timing); waits stay at segment
+// heads in the dispatch (tail-rescue unchanged at segment granularity).
+bool mtChainFusionEmit = []{ const char* e = std::getenv("GSIM_EMIT_CHAIN_FUSION"); return e && e[0] && e[0] != '0'; }();
 struct MtBatchActiveAccum { std::string name; int word; int bit; };
 static thread_local std::vector<MtBatchActiveAccum> mtBatchActiveAccums;
 
@@ -14952,6 +14961,25 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
   for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
+  if (mtChainFusionEmit) {
+    // Fused-segment declarations: recompute the same segmentation used by the
+    // dispatch (cut at non-empty waitSlots, cap 64 mtasks/segment).
+    for (int t = 0; t < threadCount; t++) {
+      std::vector<int> chain;
+      for (int mid = 0; mid < nMTasks; ++mid)
+        if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) chain.push_back(mid);
+      int segHead = -1, segStartPos = -1;
+      size_t segIdx = 0;
+      auto closeSeg = [&](int){ if (segHead >= 0) { fprintf(header, "void mtFusedSegW%d_%zu();\n", t, segIdx); segIdx ++; } };
+      for (size_t ci = 0; ci < chain.size(); ci ++) {
+        int mid = chain[ci];
+        bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segHead < 0;
+        if (segHead >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true;
+        if (cut) { closeSeg(mid); segHead = mid; segStartPos = (int)ci; }
+      }
+      closeSeg(-1);
+    }
+  }
   bool sparseGate = mtUseDenseSparseGate();
   // Atomic activeFlags ops for MT safety; default ON when sparse-gate is on (correct for T1 too,
   // just uint8_t atomics). GSIM_MT_DENSE_SPARSE_GATE_ATOMIC=0 forces the plain non-atomic form
@@ -15133,6 +15161,65 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(0, "}\n");
   });
+
+  // GSIM_EMIT_CHAIN_FUSION: emit the fused per-worker segment functions.
+  // Each mtFusedSegW{t}_{k} contains, for every mtask in the segment, the same
+  // per-cppId body blocks stepDenseMTask would emit (non-sparse path), with the
+  // mtask's token stores interleaved immediately after its bodies (identical
+  // release-store timing to the table dispatch). Only the non-sparse dense
+  // config is supported (the champion configuration); sparseGate falls back to
+  // the unfused path.
+  if (mtChainFusionEmit && !sparseGate) {
+    for (int t = 0; t < threadCount; t++) {
+      std::vector<int> chain;
+      for (int mid = 0; mid < nMTasks; ++mid)
+        if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) chain.push_back(mid);
+      int segHead = -1;
+      size_t segIdx = 0;
+      auto emitSegment = [&](int headM, int endM) {
+        emitFuncDecl(0, "void S%s::mtFusedSegW%d_%zu() {\n", name.c_str(), t, segIdx);
+        // locate headM..endM (exclusive; endM=-1 means to chain end) in chain
+        size_t beginPos = 0, endPos = chain.size();
+        for (size_t ci = 0; ci < chain.size(); ci ++) {
+          if (chain[ci] == headM) beginPos = ci;
+          if (endM >= 0 && chain[ci] == endM) { endPos = ci; break; }
+        }
+        for (size_t ci = beginPos; ci < endPos; ci ++) {
+          int mtaskId = chain[ci];
+          const MtDenseMTask& mtask = denseSchedule.mtasks[(size_t)mtaskId];
+          for (int sccId : mtask.sccIds) {
+            if (sccId < 0 || sccId >= (int)denseSchedule.sccs.size()) continue;
+            for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+              auto superIter = cppId2Super.find(cppId);
+              if (superIter == cppId2Super.end() || !superIter->second) continue;
+              emitBodyLock(1, "{\n");
+              emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileDenseTaskBegin;\n");
+              emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
+              genSuperEval(superIter->second, "activeFlags[0]", "", 2, false);
+              emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", mtaskId);
+              emitBodyLock(1, "}\n");
+            }
+          }
+          for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId])
+            emitBodyLock(1, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
+        }
+        emitBodyLock(0, "}\n");
+        segIdx ++;
+      };
+      int segStartPos = -1;
+      for (size_t ci = 0; ci < chain.size(); ci ++) {
+        int mid = chain[ci];
+        bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segHead < 0;
+        if (segHead >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true; // Clang src-loc cap
+        if (cut) {
+          if (segHead >= 0) emitSegment(segHead, mid);
+          segHead = mid;
+          segStartPos = (int)ci;
+        }
+      }
+      if (segHead >= 0) emitSegment(segHead, -1);
+    }
+  }
   }
 
   if (activeWorklistPush) {
@@ -15218,6 +15305,46 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         if (denseLookahead) {
           emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
           int tablePosition = 0;
+          // GSIM_EMIT_CHAIN_FUSION: precompute this worker's segments (cut at
+          // every mtask with non-empty waitSlots). Segments are emitted as
+          // fused functions; the dispatch walks segment heads only.
+          std::vector<std::pair<int,int>> mtFusionSegs; // (headMTask, endMTaskExclusive per worker-order index list)
+          std::vector<int> mtWorkerChain;
+          if (mtChainFusionEmit) {
+            for (int mid = 0; mid < nMTasks; ++mid)
+              if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) mtWorkerChain.push_back(mid);
+            int segHead = -1;
+            int segStartPos = -1;
+            for (size_t ci = 0; ci < mtWorkerChain.size(); ci ++) {
+              int mid = mtWorkerChain[ci];
+              bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segHead < 0;
+              if (segHead >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true;
+              if (cut) {
+                if (segHead >= 0) mtFusionSegs.push_back({segHead, mid});
+                segHead = mid;
+                segStartPos = (int)ci;
+              }
+            }
+            if (segHead >= 0) mtFusionSegs.push_back({segHead, -1});
+          }
+          if (mtChainFusionEmit) {
+            for (size_t si = 0; si < mtFusionSegs.size(); si ++) {
+              int head = mtFusionSegs[si].first;
+              emitBodyLock(4, "{ bool mtDenseInlineReady = true;\n");
+              for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)head])
+                emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
+              if (denseDuty) {
+                emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
+                             t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
+              } else {
+                emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); return; }\n",
+                             t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+              }
+              emitBodyLock(5, "mtFusedSegW%d_%zu();\n", t, si);
+              emitBodyLock(4, "}\n");
+              ++tablePosition;
+            }
+          } else
           for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
             if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] != t) continue;
             emitBodyLock(4, "{ bool mtDenseInlineReady = true;\n");

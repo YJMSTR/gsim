@@ -585,7 +585,7 @@ int main(int argc, char** argv) {
   FUNC_WRAPPER(g = AST2Graph(globalRoot), "Init");
   if (std::getenv("GSIM_DEBUG_PRE_CANON")) fprintf(stderr, "[pre-canon] ast2graph %016zx\n", (size_t)g->canonRawHash());
 
-  FUNC_TIMER(g->splitArray());
+  if (!std::getenv("GSIM_SKIP_SPLIT_ARRAY")) FUNC_TIMER(g->splitArray());
   if (std::getenv("GSIM_DEBUG_PRE_CANON")) fprintf(stderr, "[pre-canon] splitArray %016zx\n", (size_t)g->canonRawHash());
 
   FUNC_TIMER(g->detectLoop());
