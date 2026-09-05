@@ -169,13 +169,6 @@ void ref_init(REF_NAME* ref) {
   ref->set_difftest$$logCtrl$$end(0);
   ref->set_difftest$$uart$$in$$ch(-1);
 #elif defined(__DUT_minimal_xiangshan__) || defined(__DUT_default_xiangshan__)
-#if 0
-  ref->set_difftest$$perfCtrl$$clean(0);
-  ref->set_difftest$$perfCtrl$$dump(0);
-  ref->set_difftest$$logCtrl$$begin(0);
-  ref->set_difftest$$logCtrl$$end(0);
-  ref->set_difftest$$logCtrl$$level(0);
-#endif
   ref->set_difftest$$uart$$in$$ch(-1);
 #endif
 }

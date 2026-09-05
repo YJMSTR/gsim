@@ -33,50 +33,6 @@ bool anyPath(SuperNode* src, SuperNode* dst) {
   }
   return false;
 }
-#if 0
-void graph::mergeWhenNodes() {
-/* each superNode contain one node */
-  std::map<Node*, SuperNode*> whenMap;
-  for (SuperNode* super : sortedSuper) {
-    if (super->superType != SUPER_VALID) continue;
-    Assert(super->member.size() <= 1, "invalid super size %ld", super->member.size());
-    for (Node* member : super->member) {
-      if (member->isArray() || member->assignTree.size() != 1) continue;
-      if (member->assignTree[0]->getRoot()->opType != OP_WHEN) continue;
-      Node* whenNode = member->assignTree[0]->getRoot()->getChild(0)->getNode();
-      if (!whenNode) continue; // TODO: expr can also be optimized
-      /* exists and no loop */
-      if (whenMap.find(whenNode) == whenMap.end()) {
-        whenMap[whenNode] = super;
-        continue;
-      }
-      SuperNode* whenSuper = whenMap[whenNode];
-      if (anyPath(super, whenSuper)) continue;
-      /* merge member to whenSuper */
-      whenSuper->member.push_back(member);
-      member->super = whenSuper;
-      super->member.clear();
-      /* update super connection */
-      whenSuper->addNext(super->next);
-      for (SuperNode* next : super->next) {
-        next->erasePrev(super);
-        next->addPrev(whenSuper);
-      }
-      whenSuper->addPrev(super->prev);
-      for (SuperNode* prev : super->prev) {
-        prev->eraseNext(super);
-        prev->addNext(whenSuper);
-      }
-    }
-  }
-
-  size_t prevSuper = sortedSuper.size();
-  removeEmptySuper();
-  reconnectSuper();
-  detectSortedSuperLoop();
-  printf("[mergeNodes-when] remove %ld superNodes (%ld -> %ld)\n", prevSuper - sortedSuper.size(), prevSuper, sortedSuper.size());
-}
-#else
 void graph::mergeWhenNodes() {
   // diagnostic (env value = dump filepath): canonical pre-merge graph record per
   // super: id, member names, sorted depPrev/depNext endpoint ids and names. Lets two
@@ -152,7 +108,7 @@ void graph::mergeWhenNodes() {
   std::map<SuperNode*, std::vector<SuperNode*>, SeedRankLess> whenMapSeed;
   std::set<SuperNode*> condWaitOrig;
   std::map<SuperNode*, std::vector<SuperNode*>> whenMapOrig;
-  // Determinism (2026-08-28, residual round 3): the default path's depNext
+  // Determinism (, residual round 3): the default path's depNext
   // iteration, condWaitTop() tie-break, and whenMap apply order were all
   // pointer-ordered -> mergeNodes-when removed 32333 (jemalloc) vs 32331
   // (glibc) supers. The supers entering this pass are identical with identical
@@ -317,7 +273,6 @@ void graph::mergeWhenNodes() {
     when2mux();
   }
 }
-#endif
 
 
 void graph::when2mux() {

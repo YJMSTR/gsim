@@ -1,25 +1,5 @@
 #include "common.h"
 
-// node->id is assigned from a global allocation-sequence counter, which drifts
-// with pointer-order-driven creation counts (e.g. temporary dup()s) and leaks into
-// emitted names (oldName = name + "$old$" + id) and JSON metadata. Renumber by name
-// once the graph is final: deterministic ids, byte-identical emission.
-void graph::renumberNodesContentStable() {
-  std::vector<Node*> all;
-  std::set<Node*> seen;
-  auto addNodes = [&](const std::vector<Node*>& members) {
-    for (Node* m : members) if (seen.insert(m).second) all.push_back(m);
-  };
-  for (SuperNode* super : sortedSuper) addNodes(super->member);
-  for (SuperNode* super : allReset) addNodes(super->member);
-  addNodes(specialNodes);
-  std::sort(all.begin(), all.end(), [](const Node* a, const Node* b) { return a->name < b->name; });
-  int next = 1;
-  for (Node* n : all) n->id = next ++;
-  Node::setCounter(next);
-  fprintf(stderr, "[renumber] %zu nodes content-stably renumbered\n", all.size());
-}
-
 void graph::reconnectAll() {
   for (SuperNode* super : sortedSuper) {
     for (Node* member : super->member) {

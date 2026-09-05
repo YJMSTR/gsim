@@ -4,7 +4,6 @@
 
 void fillEmptyWhen(ExpTree* newTree, ENode* oldNode);
 
-std::map<Node*, clockVal*> resetMap;
 
 ResetType Node::inferReset() {
   if (reset != UNCERTAIN) return reset;
@@ -55,18 +54,6 @@ ResetType ENode::inferReset() {
       Panic();
   }
   return reset;
-}
-
-void fillOuterWhen(ExpTree* newTree, ENode* enode) {
-  ENode* whenNode = newTree->getRoot();
-  while (whenNode->opType == OP_WHEN) {
-    if (!whenNode->getChild(1)) whenNode->setChild(1, enode);
-    if (!whenNode->getChild(2)) whenNode->setChild(2, enode);
-    if (whenNode->getChild(1) && whenNode->getChild(2)) break;
-    else if (whenNode->getChild(1)) whenNode = whenNode->getChild(1);
-    else if (whenNode->getChild(2)) whenNode = whenNode->getChild(2);
-    else Assert(0, "emptyWhen");
-  }
 }
 
 void Node::addReset() { // remove

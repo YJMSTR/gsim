@@ -185,7 +185,7 @@ static void printUsage(const char* ProgName) {
             << "      --mt-helper-mode=off|seq|buffered-seq|mt|mt-level-dispatch\n"
             << "                                      Emit gsim-mt per-super helpers; off is the default.\n"
             << "                                      mt emits a bounded scan-order-preserving threaded helper runtime.\n"
-            << "                                      mt-level-dispatch (28c Phase 1A) admits safe-serial cppIds into the\n"
+            << "                                      mt-level-dispatch admits safe-serial cppIds into the\n"
             << "                                      coarse region path and routes worker0-only cppIds to the main thread.\n"
             << "                                      mt-level-dispatch implies coarse batch formation + static profitability\n"
             << "                                      unless the user already chose otherwise.\n"
@@ -555,7 +555,7 @@ int main(int argc, char** argv) {
 
 
 
-  // 28c Phase 1A: mt-level-dispatch implies coarse formation + static profitability.
+  // mt-level-dispatch implies coarse formation + static profitability.
   // Promote only when user has not explicitly chosen otherwise (defaults from
   // Config::Config(): MtBatchFormationMode="legacy", MtCoarseProfitabilityMode="off").
   if (globalConfig.MtHelperMode == "mt-level-dispatch") {
@@ -565,7 +565,7 @@ int main(int argc, char** argv) {
     if (globalConfig.MtCoarseProfitabilityMode == "off") {
       globalConfig.MtCoarseProfitabilityMode = "static";
     }
-    // Track 2 Week 5: cost-based LPT worker assignment measurably improves
+    // cost-based LPT worker assignment measurably improves
     // dynamic runtime load balance, so default to profitable for mt-level-dispatch.
     if (globalConfig.MtCoarseWorkerPolicyMode == "static") {
       globalConfig.MtCoarseWorkerPolicyMode = "profitable";

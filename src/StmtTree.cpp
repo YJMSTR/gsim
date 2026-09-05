@@ -280,50 +280,6 @@ void getCommonPath(std::vector<int>& path1, ExpTree* referTree, std::vector<int>
   path1.resize(commonNum);
 }
 
-void getRelyPath(std::vector<int>&path, Node* node, ExpTree* tree) { // get the [path] in [tree] that refers [node]
-  enum status {NOT_VISITED, EXPANDED, VISITED};
-  std::map<ENode*, status> enodeStatus;
-  std::set<Node*> lvalueNodes;
-  getENodeRelyNodes(tree->getlval(), lvalueNodes);
-  bool inLvalue = lvalueNodes.find(node) != lvalueNodes.end(); // the path leads to assignment
-  std::stack<std::pair<ENode*, int>> s;
-  std::vector<int> currentPath;
-  bool isFirst = true;
-  s.push(std::make_pair(tree->getRoot(), 0));
-  while (!s.empty()) {
-    ENode* top;
-    int idx;
-    std::tie(top, idx) = s.top();
-    if (enodeStatus.find(top) == enodeStatus.end()) { // not visited
-      currentPath.push_back(idx);
-      /* compute common path of all referrence */
-      if (top->getNode() == node || (inLvalue && (top->getNode() || top->opType == OP_INT))) {
-        if (isFirst) {
-          path = currentPath;
-          isFirst = false;
-        } else {
-          getCommonPath(path, tree, currentPath, tree);
-        }
-        enodeStatus[top] = VISITED;
-        s.pop();
-        currentPath.pop_back();
-        continue;
-      }
-      /* expand top */
-      enodeStatus[top] = EXPANDED;
-      for (int i = 0; i < top->getChildNum(); i ++) {
-        Assert(enodeStatus.find(top->getChild(i)) == enodeStatus.end(), "already visited %p in %s\n", top->getChild(i), node->name.c_str());
-        if (top->getChild(i)) s.push(std::make_pair(top->getChild(i), i));
-      }
-    } else if (enodeStatus[top] == EXPANDED) {
-      enodeStatus[top] = VISITED;
-      s.pop();
-      currentPath.pop_back();
-    } else {
-      Panic();
-    }
-  }
-}
 
 bool isLastWhenCond(std::vector<int>&path, ExpTree* referTree) {
   if (path.back() != 0) return false;
