@@ -11763,6 +11763,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const bool denseDuty = mtDenseDutyCodegen();
   Assert(!denseLookahead || ownerReadyFlags,
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!mtChainFusionEmit || (denseLookahead && ownerReadyFlags && !workSteal),
+         "GSIM_EMIT_CHAIN_FUSION requires fixed-owner owner-ready lookahead (GSIM_MT_DENSE_LOOKAHEAD>0, OWNER_READY_FLAGS=1, no WORKSTEAL)");
+  Assert(!mtChainFusionEmit || !denseBreakdownProfileCodegen,
+         "GSIM_EMIT_CHAIN_FUSION is incompatible with GSIM_MT_DENSE_BREAKDOWN_PROFILE codegen (per-mtask bodies are not emitted)");
   Assert(!denseDuty || ownerReadyFlags,
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseLookahead || !workSteal,
@@ -12164,6 +12168,20 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   std::vector<uint32_t> denseDispatchWaitBegin, denseDispatchWaitEnd;
   std::vector<uint32_t> denseDispatchStoreBegin, denseDispatchStoreEnd;
   uint32_t denseDispatchWaitTotal = 0;
+  // GSIM_EMIT_CHAIN_FUSION segment model (per worker): cut at every mtask
+  // with non-empty waitSlots (cross-worker consumers) and at a 64-mtask cap.
+  // Computed once in the lookahead prologue; shared by header decls, segment
+  // bodies, fast-path dispatch, and the segment-granular dispatch tables.
+  std::vector<std::vector<int>> fusionSegHeadsByWorker;
+  std::vector<int> fusionSegIndexByMTask;
+  std::vector<uint32_t> fusionLocalPrereqs;
+  std::vector<uint8_t> fusionLocalPrereqKinds;
+  std::vector<std::vector<std::pair<uint32_t,uint32_t>>> fusionLocalRangeByWorkerSeg;
+  // Hoisted from the lookahead prologue so the chain-fusion segmentation
+  // (which runs after that block) can remap head-mtask prereqs to segments.
+  std::vector<std::set<uint32_t>> sameWorkerPredsByMTask((size_t)nMTasks);
+  std::vector<std::set<uint32_t>> publisherSiblingsByMTask((size_t)nMTasks);
+  std::vector<char> publisherConstrained((size_t)nMTasks, 0);
   const std::chrono::steady_clock::time_point denseProFieldSetsBegin = std::chrono::steady_clock::now();
   if (emitPhaseTimingEnabled()) {
     fprintf(stderr, "[emit-phase] Final.densePrologue.fieldSets = %ld ms\n",
@@ -12249,9 +12267,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           positionByMTask[(size_t)mtaskId] = position++;
       }
     }
-    std::vector<std::set<uint32_t>> sameWorkerPredsByMTask((size_t)nMTasks);
-    std::vector<std::set<uint32_t>> publisherSiblingsByMTask((size_t)nMTasks);
-    std::vector<char> publisherConstrained((size_t)nMTasks, 0);
     for (int pred = 0; pred < nMTasks; ++pred) {
       for (int succ : denseLookaheadDagOnlySuccs[(size_t)pred]) {
         Assert(succ > pred && succ < nMTasks,
@@ -12330,6 +12345,81 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         denseDispatchWaitEnd[(size_t)mtaskId] = denseDispatchWaitTotal;
       }
     }
+  }
+  if (denseLookahead && mtChainFusionEmit) {
+    Assert(ownerReadyFlags && !workSteal,
+           "GSIM_EMIT_CHAIN_FUSION requires the fixed-owner owner-ready lookahead configuration");
+    fusionSegHeadsByWorker.assign((size_t)threadCount, {});
+    fusionSegIndexByMTask.assign((size_t)nMTasks, -1);
+    fusionLocalRangeByWorkerSeg.assign((size_t)threadCount, {});
+    for (int t = 0; t < threadCount; ++t) {
+      std::vector<int> chain;
+      for (int mid = 0; mid < nMTasks; ++mid)
+        if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) chain.push_back(mid);
+      int segStartPos = -1;
+      for (size_t ci = 0; ci < chain.size(); ++ci) {
+        int mid = chain[(size_t)ci];
+        bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segStartPos < 0;
+        if (segStartPos >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true; // Clang src-loc cap
+        if (cut) {
+          fusionSegHeadsByWorker[(size_t)t].push_back(mid);
+          segStartPos = (int)ci;
+        }
+        fusionSegIndexByMTask[(size_t)mid] = (int)fusionSegHeadsByWorker[(size_t)t].size() - 1;
+      }
+    }
+    // Segment-granular local prereqs: union over ALL member mtasks (not just
+    // the head) of same-worker direct predecessors and publisher siblings,
+    // remapped from mtask positions to containing segment indices. The union
+    // is REQUIRED: an out-of-order tail scan runs a whole segment when the
+    // scanned prereqs are met, so every member's same-worker dependency must
+    // be represented or the segment reads stale state (v1 head-only version
+    // failed exactly this way: boot abort at cycle 8252). Prereqs landing
+    // inside the same segment are satisfied by in-segment order and excluded.
+    for (int t = 0; t < threadCount; ++t) {
+      std::vector<int> chain;
+      for (int mid = 0; mid < nMTasks; ++mid)
+        if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) chain.push_back(mid);
+      auto& heads = fusionSegHeadsByWorker[(size_t)t];
+      auto& ranges = fusionLocalRangeByWorkerSeg[(size_t)t];
+      ranges.reserve(heads.size());
+      std::vector<size_t> segBeginPos;
+      {
+        std::vector<char> isHead((size_t)nMTasks, 0);
+        for (int h : heads) isHead[(size_t)h] = 1;
+        for (size_t ci = 0; ci < chain.size(); ci ++)
+          if (isHead[(size_t)chain[ci]]) segBeginPos.push_back(ci);
+      }
+      for (size_t k = 0; k < heads.size(); ++k) {
+        uint32_t begin = (uint32_t)fusionLocalPrereqs.size();
+        std::set<uint32_t> segSet;
+        std::set<uint32_t> directSegs, siblingSegs;
+        const size_t endPos = (k + 1 < heads.size()) ? segBeginPos[k + 1] : chain.size();
+        for (size_t ci = segBeginPos[k]; ci < endPos; ++ci) {
+          int member = chain[ci];
+          for (uint32_t p : sameWorkerPredsByMTask[(size_t)member]) {
+            int seg = fusionSegIndexByMTask[(size_t)chain[p]];
+            Assert(seg >= 0 && (size_t)seg <= k, "fusion: member %d same-worker prereq beyond its own segment", member);
+            if ((size_t)seg == k) continue; // satisfied by in-segment order
+            segSet.insert((uint32_t)seg); directSegs.insert((uint32_t)seg);
+          }
+          for (uint32_t p : publisherSiblingsByMTask[(size_t)member]) {
+            int seg = fusionSegIndexByMTask[(size_t)chain[p]];
+            Assert(seg >= 0 && (size_t)seg <= k, "fusion: member %d publisher sibling beyond its own segment", member);
+            if ((size_t)seg == k) continue;
+            segSet.insert((uint32_t)seg); siblingSegs.insert((uint32_t)seg);
+          }
+        }
+        for (uint32_t seg : segSet) {
+          fusionLocalPrereqs.push_back(seg);
+          fusionLocalPrereqKinds.push_back((uint8_t)((directSegs.count(seg) ? 1u : 0u) | (siblingSegs.count(seg) ? 2u : 0u)));
+        }
+        ranges.push_back({begin, (uint32_t)fusionLocalPrereqs.size()});
+      }
+    }
+    // The dispatch tables become segment-granular: resize the worker counts.
+    for (int t = 0; t < threadCount; ++t)
+      denseDispatchWorkerCounts[(size_t)t] = (int)fusionSegHeadsByWorker[(size_t)t].size();
   }
   if (emitPhaseTimingEnabled()) {
     fprintf(stderr, "[emit-phase] Final.densePrologue.lookahead = %ld ms\n",
@@ -12520,13 +12610,17 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           denseLookaheadDoneWordCount = std::max(denseLookaheadDoneWordCount, (count + 63) / 64);
         fprintf(header, "static constexpr uint32_t kDenseLookaheadWindow = %du;\n", denseLookaheadWindow);
         fprintf(header, "static constexpr uint32_t kDenseLookaheadDoneWordCount = %du;\n", denseLookaheadDoneWordCount);
-        fprintf(header, "static constexpr uint32_t kDenseLookaheadLocalPrereqs[%zu] = {", std::max<size_t>(1, denseLookaheadLocalPrereqs.size()));
-        for (size_t i = 0; i < denseLookaheadLocalPrereqs.size(); ++i) fprintf(header, "%s%u", i ? "," : "", denseLookaheadLocalPrereqs[i]);
-        if (denseLookaheadLocalPrereqs.empty()) fprintf(header, "0");
+        // Under CHAIN_FUSION the tables are segment-granular: emit the
+        // segment-remapped prereq arrays instead of the per-mtask ones.
+        const std::vector<uint32_t>& emitLocalPrereqs = mtChainFusionEmit ? fusionLocalPrereqs : denseLookaheadLocalPrereqs;
+        const std::vector<uint8_t>& emitLocalPrereqKinds = mtChainFusionEmit ? fusionLocalPrereqKinds : denseLookaheadLocalPrereqKinds;
+        fprintf(header, "static constexpr uint32_t kDenseLookaheadLocalPrereqs[%zu] = {", std::max<size_t>(1, emitLocalPrereqs.size()));
+        for (size_t i = 0; i < emitLocalPrereqs.size(); ++i) fprintf(header, "%s%u", i ? "," : "", emitLocalPrereqs[i]);
+        if (emitLocalPrereqs.empty()) fprintf(header, "0");
         fprintf(header, "};\n");
-        fprintf(header, "static constexpr uint8_t kDenseLookaheadLocalPrereqKinds[%zu] = {", std::max<size_t>(1, denseLookaheadLocalPrereqKinds.size()));
-        for (size_t i = 0; i < denseLookaheadLocalPrereqKinds.size(); ++i) fprintf(header, "%s%u", i ? "," : "", static_cast<unsigned>(denseLookaheadLocalPrereqKinds[i]));
-        if (denseLookaheadLocalPrereqKinds.empty()) fprintf(header, "0");
+        fprintf(header, "static constexpr uint8_t kDenseLookaheadLocalPrereqKinds[%zu] = {", std::max<size_t>(1, emitLocalPrereqKinds.size()));
+        for (size_t i = 0; i < emitLocalPrereqKinds.size(); ++i) fprintf(header, "%s%u", i ? "," : "", static_cast<unsigned>(emitLocalPrereqKinds[i]));
+        if (emitLocalPrereqKinds.empty()) fprintf(header, "0");
         fprintf(header, "};\n");
         fprintf(header, "static constexpr uint32_t kDenseLookaheadGroupDestination[%d] = {", std::max(1, ownerReadyLayout.tokenCount));
         for (int token = 0; token < ownerReadyLayout.tokenCount; ++token) fprintf(header, "%s%u", token ? "," : "", static_cast<unsigned>(ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerMTask));
@@ -12598,24 +12692,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "void stepDenseMTaskById(int mtaskId);\n");
   }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
-  for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
+  // CHAIN_FUSION: per-mtask functions are dead (segments carry the bodies);
+  // skipping them removes the double-emission .text confounder measured at +1.8%.
+  if (!mtChainFusionEmit) for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
   if (mtChainFusionEmit) {
-    // Fused-segment declarations: recompute the same segmentation used by the
-    // dispatch (cut at non-empty waitSlots, cap 64 mtasks/segment).
+    // Fused-segment declarations from the shared prologue segmentation.
     for (int t = 0; t < threadCount; t++) {
-      std::vector<int> chain;
-      for (int mid = 0; mid < nMTasks; ++mid)
-        if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) chain.push_back(mid);
-      int segHead = -1, segStartPos = -1;
-      size_t segIdx = 0;
-      auto closeSeg = [&](int){ if (segHead >= 0) { fprintf(header, "void mtFusedSegW%d_%zu();\n", t, segIdx); segIdx ++; } };
-      for (size_t ci = 0; ci < chain.size(); ci ++) {
-        int mid = chain[ci];
-        bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segHead < 0;
-        if (segHead >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true;
-        if (cut) { closeSeg(mid); segHead = mid; segStartPos = (int)ci; }
-      }
-      closeSeg(-1);
+      for (size_t k = 0; k < fusionSegHeadsByWorker[(size_t)t].size(); k++)
+        fprintf(header, "void mtFusedSegW%d_%zu();\n", t, k);
     }
   }
   bool workerMajorText = mtUseDenseWorkerMajorText();
@@ -12666,6 +12750,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // saved/restored around genSuperEval exactly as in the sequential loop).
   // Unit u renders denseMTaskEmissionOrder[u]; assembly replays buffers in
   // emission order, so output is byte-identical.
+  // CHAIN_FUSION: segment functions carry the bodies; per-mtask functions are
+  // dead code (and double the dispatched .text). Skip them entirely.
+  if (!mtChainFusionEmit)
   emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder](size_t unit) {
     int mtaskId = denseMTaskEmissionOrder[unit];
 
@@ -12705,16 +12792,20 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       std::vector<int> chain;
       for (int mid = 0; mid < nMTasks; ++mid)
         if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) chain.push_back(mid);
-      int segHead = -1;
-      size_t segIdx = 0;
-      auto emitSegment = [&](int headM, int endM) {
-        emitFuncDecl(0, "void S%s::mtFusedSegW%d_%zu() {\n", name.c_str(), t, segIdx);
-        // locate headM..endM (exclusive; endM=-1 means to chain end) in chain
-        size_t beginPos = 0, endPos = chain.size();
-        for (size_t ci = 0; ci < chain.size(); ci ++) {
-          if (chain[ci] == headM) beginPos = ci;
-          if (endM >= 0 && chain[ci] == endM) { endPos = ci; break; }
-        }
+      const auto& heads = fusionSegHeadsByWorker[(size_t)t];
+      std::vector<size_t> segBeginPos;
+      {
+        std::vector<char> isHead((size_t)nMTasks, 0);
+        for (int h : heads) isHead[(size_t)h] = 1;
+        for (size_t ci = 0; ci < chain.size(); ci ++)
+          if (isHead[(size_t)chain[ci]]) segBeginPos.push_back(ci);
+      }
+      for (size_t k = 0; k < heads.size(); k ++) {
+        const size_t beginPos = segBeginPos[k];
+        const size_t endPos = (k + 1 < heads.size()) ? segBeginPos[k + 1] : chain.size();
+        emitFuncDecl(0, "void S%s::mtFusedSegW%d_%zu() {\n", name.c_str(), t, k);
+        // target mirrors stepDenseThreadWorker's evenCycle derivation (cycles is a member).
+        emitBodyLock(1, "const uint8_t target = ((cycles & 1) == 0) ? uint8_t{1} : uint8_t{0};\n");
         for (size_t ci = beginPos; ci < endPos; ci ++) {
           int mtaskId = chain[ci];
           const MtDenseMTask& mtask = denseSchedule.mtasks[(size_t)mtaskId];
@@ -12727,7 +12818,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(2, "std::chrono::steady_clock::time_point mtProfileDenseTaskBegin;\n");
               emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
               genSuperEval(superIter->second, "activeFlags[0]", "", 2, false);
-              emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", mtaskId);
+              emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", cppId);
               emitBodyLock(1, "}\n");
             }
           }
@@ -12735,20 +12826,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(1, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
         }
         emitBodyLock(0, "}\n");
-        segIdx ++;
-      };
-      int segStartPos = -1;
-      for (size_t ci = 0; ci < chain.size(); ci ++) {
-        int mid = chain[ci];
-        bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segHead < 0;
-        if (segHead >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true; // Clang src-loc cap
-        if (cut) {
-          if (segHead >= 0) emitSegment(segHead, mid);
-          segHead = mid;
-          segStartPos = (int)ci;
-        }
       }
-      if (segHead >= 0) emitSegment(segHead, -1);
     }
   }
   }
@@ -12802,31 +12880,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
           emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
           int tablePosition = 0;
-          // GSIM_EMIT_CHAIN_FUSION: precompute this worker's segments (cut at
-          // every mtask with non-empty waitSlots). Segments are emitted as
-          // fused functions; the dispatch walks segment heads only.
-          std::vector<std::pair<int,int>> mtFusionSegs; // (headMTask, endMTaskExclusive per worker-order index list)
-          std::vector<int> mtWorkerChain;
+          // GSIM_EMIT_CHAIN_FUSION: the dispatch walks the shared prologue
+          // segmentation (segment k of worker t = mtFusedSegW{t}_{k}); the
+          // segment-granular dispatch table carries the same order, so
+          // tablePosition doubles as the segment index for the tail call.
           if (mtChainFusionEmit) {
-            for (int mid = 0; mid < nMTasks; ++mid)
-              if (denseSchedule.mtaskThreadAssign[(size_t)mid] == t) mtWorkerChain.push_back(mid);
-            int segHead = -1;
-            int segStartPos = -1;
-            for (size_t ci = 0; ci < mtWorkerChain.size(); ci ++) {
-              int mid = mtWorkerChain[ci];
-              bool cut = !ownerReadyLayout.waitSlotsByMTask[(size_t)mid].empty() || segHead < 0;
-              if (segHead >= 0 && (int)(ci - (size_t)segStartPos) >= 64) cut = true;
-              if (cut) {
-                if (segHead >= 0) mtFusionSegs.push_back({segHead, mid});
-                segHead = mid;
-                segStartPos = (int)ci;
-              }
-            }
-            if (segHead >= 0) mtFusionSegs.push_back({segHead, -1});
-          }
-          if (mtChainFusionEmit) {
-            for (size_t si = 0; si < mtFusionSegs.size(); si ++) {
-              int head = mtFusionSegs[si].first;
+            const auto& fusionHeads = fusionSegHeadsByWorker[(size_t)t];
+            for (size_t si = 0; si < fusionHeads.size(); si ++) {
+              int head = fusionHeads[si];
               emitBodyLock(4, "{ bool mtDenseInlineReady = true;\n");
               for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)head])
                 emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
@@ -13247,6 +13308,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                    name.c_str(), name.c_str(), t, std::max(1, cnt));
       if (cnt == 0) {
         emitBodyLock(0, "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u}\n");
+      } else if (mtChainFusionEmit) {
+        // Segment-granular entries: fn = fused segment; waits = head mtask's
+        // cross-worker slots; stores EMPTY (interleaved inside the segment);
+        // locals = segment-remapped prereqs of the head.
+        const auto& heads = fusionSegHeadsByWorker[(size_t)t];
+        const auto& ranges = fusionLocalRangeByWorkerSeg[(size_t)t];
+        for (size_t k = 0; k < heads.size(); k++) {
+          int head = heads[k];
+          emitBodyLock(0, "{&S%s::mtFusedSegW%d_%zu, %uu, %uu, 0u, 0u, %uu, %uu},\n",
+                       name.c_str(), t, k,
+                       denseDispatchWaitBegin[(size_t)head], denseDispatchWaitEnd[(size_t)head],
+                       ranges[k].first, ranges[k].second);
+        }
       } else {
         for (int m = 0; m < nMTasks; m++) {
           if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
@@ -13560,6 +13634,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "mtDenseOwnerReadyTokensPrimed = false;\n");
     emitBodyLock(2, "#endif\n");
   }
+  if (mtChainFusionEmit) {
+    // Per-mtask bodies are not emitted under fusion (segments carry them), and
+    // a correct global segment order for the serial path requires a cross-worker
+    // segment topo walk that does not exist yet. Refuse the ST path loudly.
+    emitBodyLock(2, "fprintf(stderr, \"[chain-fusion] single-thread dense path unsupported in fused models; run with GSIM_THREADS>1\\n\");\n");
+    emitBodyLock(2, "abort();\n");
+  } else
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
     emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
   }
