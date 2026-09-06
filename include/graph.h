@@ -9,8 +9,7 @@
 #include <vector>
 #include <string_view>
 
-struct MtRepCutClone;
-struct MtRepCutSemanticPlan;
+struct MtPureBatchPlan;
 struct MtCoarseRegionPlan;
 struct MtDenseSchedule;
 
@@ -88,9 +87,8 @@ private:
   int translateInst(InstInfo inst, int indent, std::string flagName, std::string activeBufferName, bool emitActivation = true);
   void genSuperEval(SuperNode* super, std::string flagName, std::string activeBufferName, int indent, bool emitActivation = true);
   void genMtTaskHelper(SuperNode* super, bool buffered, const std::string& activeSinkType);
-  void genMtRepCutLiteTaskHelper(SuperNode* super, const std::vector<MtRepCutClone>& clones, const std::string& activeSinkType);
-  void genMtTaskRunner(const MtRepCutSemanticPlan& semanticPlan);
-  void genMtCoarseRegionRunner(const MtRepCutSemanticPlan& semanticPlan, const MtCoarseRegionPlan& coarsePlan);
+  void genMtTaskRunner(const MtPureBatchPlan& batchPlan);
+  void genMtCoarseRegionRunner(const MtCoarseRegionPlan& coarsePlan);
   int genActivateSeqHelpers(bool buffered);
   int genActivateMtHelpers(int serialFastSubStepMax = -1, const std::string& serialFastSuffix = "");
   void genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header);
@@ -143,7 +141,6 @@ private:
   void mtInternNodeNames();
   void cppEmitter();
   void dumpMtScheduleJson();
-  void dumpMtRepCutLiteReport();
   void dumpMtCoarseRegionReport();
   void dumpMtReadyBatchReport();
   void dumpMtDenseScheduleJson();

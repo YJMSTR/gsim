@@ -65,7 +65,6 @@ Config::Config() {
   DumpAssignTree = false;
   DumpConstStatus = false;
   DumpMtScheduleJson = false;
-  DumpMtRepCutLiteReport = false;
   DumpMtCoarseRegionReport = false;
   DisableReplicationOpt = false;
   MtReportOnly = false;
@@ -73,7 +72,6 @@ Config::Config() {
   MtContextCache = false;
   MtReportTimers = false;
   MtHelperMode = "off";
-  MtRepCutLiteMode = "off";
   MtBatchFormationMode = "legacy";
   MtCoarseRuntimeMode = "layered";
   MtCoarseProfitabilityMode = "off";
@@ -82,8 +80,6 @@ Config::Config() {
   InputBaseName = "";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
-  MtRepCutCopyBudget = 0;
-  MtRepCutFanoutBudget = 0;
   MtActiveFrequencyCostThreshold = 2;
   sep_module = "$";
   sep_aggr = "$$";
@@ -189,9 +185,6 @@ static void printUsage(const char* ProgName) {
             << "                                      coarse region path and routes worker0-only cppIds to the main thread.\n"
             << "                                      mt-level-dispatch implies coarse batch formation + static profitability\n"
             << "                                      unless the user already chose otherwise.\n"
-            << "      --mt-repcut-lite=off|on       Enable bounded RepCut-lite candidate selection; off is the default.\n"
-            << "      --mt-repcut-copy-budget=N     Total RepCut-lite copy cost budget; default 0.\n"
-            << "      --mt-repcut-fanout-budget=N   Per-candidate RepCut-lite fanout budget; default 0.\n"
             << "      --mt-batch-formation=legacy|active-frequency|coarse\n"
             << "                                      Select pure batch formation mode; legacy is default.\n"
             << "      --mt-coarse-runtime=layered|mtask\n"
@@ -202,7 +195,6 @@ static void printUsage(const char* ProgName) {
             << "                                      Select coarse MTask worker assignment policy; static preserves 20X.\n"
             << "      --mt-active-frequency-cost-threshold=N\n"
             << "                                      Minimum estimated released static cost for active-frequency batches; default 2.\n"
-            << "      --dump-mt-repcut-lite-report  Write a deterministic RepCut-lite candidate report JSON.\n"
             << "      --dump-mt-coarse-region-report\n"
             << "                                      Write a deterministic coarse-region report JSON.\n"
             << "      --disable-replication-opt     Skip the existing gsim replicationOpt pass.\n"
@@ -241,15 +233,11 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_CONST_STATUS,
     OPT_DUMP_MT_SCHEDULE_JSON,
     OPT_MT_HELPER_MODE,
-    OPT_MT_REPCUT_LITE,
-    OPT_MT_REPCUT_COPY_BUDGET,
-    OPT_MT_REPCUT_FANOUT_BUDGET,
     OPT_MT_BATCH_FORMATION,
     OPT_MT_COARSE_RUNTIME,
     OPT_MT_COARSE_PROFITABILITY,
     OPT_MT_COARSE_WORKER_POLICY,
     OPT_MT_ACTIVE_FREQUENCY_COST_THRESHOLD,
-    OPT_DUMP_MT_REPCUT_LITE_REPORT,
     OPT_DUMP_MT_COARSE_REGION_REPORT,
     OPT_DISABLE_REPLICATION_OPT,
     OPT_MT_REPORT_ONLY,
@@ -278,15 +266,11 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-const-status", no_argument, nullptr, 0},
       {"dump-mt-schedule-json", no_argument, nullptr, 0},
       {"mt-helper-mode", required_argument, nullptr, 0},
-      {"mt-repcut-lite", required_argument, nullptr, 0},
-      {"mt-repcut-copy-budget", required_argument, nullptr, 0},
-      {"mt-repcut-fanout-budget", required_argument, nullptr, 0},
       {"mt-batch-formation", required_argument, nullptr, 0},
       {"mt-coarse-runtime", required_argument, nullptr, 0},
       {"mt-coarse-profitability", required_argument, nullptr, 0},
       {"mt-coarse-worker-policy", required_argument, nullptr, 0},
       {"mt-active-frequency-cost-threshold", required_argument, nullptr, 0},
-      {"dump-mt-repcut-lite-report", no_argument, nullptr, 0},
       {"dump-mt-coarse-region-report", no_argument, nullptr, 0},
       {"disable-replication-opt", no_argument, nullptr, 0},
       {"mt-report-only", no_argument, nullptr, 0},
@@ -387,35 +371,6 @@ static char* parseCommandLine(int argc, char** argv) {
                     _exit(EXIT_FAILURE);
                   }
                   break;
-                case OPT_MT_REPCUT_LITE:
-                  globalConfig.MtRepCutLiteMode = optarg;
-                  if (globalConfig.MtRepCutLiteMode != "off" &&
-                      globalConfig.MtRepCutLiteMode != "on") {
-                    fprintf(stderr, "Error: unknown --mt-repcut-lite '%s' (expected off or on).\n", optarg);
-                    printUsage(argv[0]);
-                    std::cout.flush();
-                    fflush(nullptr);
-                    _exit(EXIT_FAILURE);
-                  }
-                  break;
-                case OPT_MT_REPCUT_COPY_BUDGET:
-                  if (!parseNonNegativeInt(optarg, globalConfig.MtRepCutCopyBudget)) {
-                    fprintf(stderr, "Error: invalid --mt-repcut-copy-budget '%s' (expected non-negative integer).\n", optarg);
-                    printUsage(argv[0]);
-                    std::cout.flush();
-                    fflush(nullptr);
-                    _exit(EXIT_FAILURE);
-                  }
-                  break;
-                case OPT_MT_REPCUT_FANOUT_BUDGET:
-                  if (!parseNonNegativeInt(optarg, globalConfig.MtRepCutFanoutBudget)) {
-                    fprintf(stderr, "Error: invalid --mt-repcut-fanout-budget '%s' (expected non-negative integer).\n", optarg);
-                    printUsage(argv[0]);
-                    std::cout.flush();
-                    fflush(nullptr);
-                    _exit(EXIT_FAILURE);
-                  }
-                  break;
                 case OPT_MT_BATCH_FORMATION:
                   globalConfig.MtBatchFormationMode = optarg;
                   if (globalConfig.MtBatchFormationMode != "legacy" &&
@@ -469,9 +424,6 @@ static char* parseCommandLine(int argc, char** argv) {
                     fflush(nullptr);
                     _exit(EXIT_FAILURE);
                   }
-                  break;
-                case OPT_DUMP_MT_REPCUT_LITE_REPORT:
-                  globalConfig.DumpMtRepCutLiteReport = true;
                   break;
                 case OPT_DUMP_MT_COARSE_REGION_REPORT:
                   globalConfig.DumpMtCoarseRegionReport = true;
