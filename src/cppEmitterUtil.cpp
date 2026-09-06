@@ -209,11 +209,13 @@ static bool mtDenseObservabilityNameClassified(const std::string& name) {
 }
 
 const std::set<Node*>& mtDenseObservabilityDroppableSet() {
-  static std::set<Node*> droppable;
-  static bool computed = false;
-  if (computed) return droppable;
-  computed = true;
-  if (!mtUseDenseElideObservability()) return droppable;
+  // C++11 magic-static: the initializer runs exactly once under the compiler's
+  // guard, fixing the hand-rolled computed-flag race (first call may happen
+  // inside an emitUnitsParallel worker - the old pattern could publish a
+  // half-built set). The set is built on first call and read-only after.
+  static const std::set<Node*> droppable = [] {
+  std::set<Node*> built;
+  if (!mtUseDenseElideObservability()) return built;
   std::vector<Node*> candidates;
   for (int cppId = 0; cppId < superId; cppId ++) {
     auto superIter = cppId2Super.find(cppId);
@@ -231,7 +233,7 @@ const std::set<Node*>& mtDenseObservabilityDroppableSet() {
     for (Node* member : super->member) {
       if (!member) continue;
       if (member->type == NODE_SPECIAL) continue;
-      if (droppable.find(member) == droppable.end()) return false;
+      if (built.find(member) == built.end()) return false;
     }
     return true;
   };
@@ -239,10 +241,10 @@ const std::set<Node*>& mtDenseObservabilityDroppableSet() {
   while (changed) {
     changed = false;
     for (Node* node : candidates) {
-      if (droppable.find(node) != droppable.end()) continue;
+      if (built.find(node) != built.end()) continue;
       bool alive = false;
       auto consumerAlive = [&](Node* consumer) {
-        return consumer && droppable.find(consumer) == droppable.end();
+        return consumer && built.find(consumer) == built.end();
       };
       for (Node* consumer : node->next) if (consumerAlive(consumer)) { alive = true; break; }
       if (!alive) for (Node* consumer : node->depNext) if (consumerAlive(consumer)) { alive = true; break; }
@@ -259,13 +261,15 @@ const std::set<Node*>& mtDenseObservabilityDroppableSet() {
         }
       }
       if (!alive) {
-        droppable.insert(node);
+        built.insert(node);
         changed = true;
       }
     }
   }
   fprintf(stderr, "[mt-dense-elide-observability] candidates=%zu droppable=%zu\n",
-          candidates.size(), droppable.size());
+          candidates.size(), built.size());
+  return built;
+  }();
   return droppable;
 }
 
