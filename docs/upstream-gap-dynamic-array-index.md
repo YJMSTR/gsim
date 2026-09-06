@@ -13,9 +13,9 @@ Assert(begin >= 0 && end >= begin, "Invalid index for array %s: %d-%d", ...)
 
 直接失败（对 `(-1,-1)` 渲染为 `... : -1--1`）。
 
-该缺口在旧 XiangShan v86 RTL 上从不触发（无此构造），在新的 kunminghu-v3 RTL
-（v86 之后 253 个提交，FIR 1.46GB、sha256 前缀 `5f97158e0064aec5`、2007 个 .sv）
-上必然触发：FTQ 性能元数据 `curPerfMeta` 用运行时计算的 `cfiPosition` 写
+该缺口在旧一代 XiangShan RTL（kunminghu 前代快照）上从不触发（无此构造），在
+新的 kunminghu-v3 RTL（领先旧快照 253 个提交，FIR 1.46GB、sha256 前缀
+`5f97158e0064aec5`、2007 个 .sv）上必然触发：FTQ 性能元数据 `curPerfMeta` 用运行时计算的 `cfiPosition` 写
 `cfiAttr`/`isCfi` 数组。本分支已修复并完成验证（提交 `770bab7` 引入 when-展开，
 `e710a43` 修正其 else 分支为验证过的 EMPTY 变体）。本文记录触发构造、根因、四种
 失败尝试及其失败原因、最终修复、正确性论证、验证证据，以及按 origin/master 视角
@@ -28,10 +28,9 @@ Assert(begin >= 0 && end >= begin, "Invalid index for array %s: %d-%d", ...)
 
 ## 1. 触发构造
 
-新 FIR（kunminghu-v3）中 FTQ 引入 `curPerfMeta` 结构：当前盘上的
-`/home/zhangyangjie/test/XiangShan/build-sv/rtl/SimTop.fir` 中 `curPerfMeta`
-出现 120 次；冻结的旧 RTL `/home/zhangyangjie/test/rtl-v86-frozen/SimTop.fir`
-中为 0 次——该构造是全新的。
+新 FIR（kunminghu-v3）中 FTQ 引入 `curPerfMeta` 结构：新版 SimTop.fir
+（XiangShan build-sv 生成输出）中 `curPerfMeta` 出现 120 次；冻结的旧一代
+RTL 快照 SimTop.fir 中为 0 次——该构造是全新的。
 
 触发写（FIR 第 2124270 行，位于 `when beforeKnownMispredict_1 :` 块内）：
 
@@ -56,10 +55,10 @@ AST2Graph 解析后，数组引用 `curPerfMeta_1.cfiAttr[...]` 的索引子节�
 树，不是 `OP_INDEX_INT`，`getIdx()` 无法解析。
 
 历史注记：最初拉取并被该断言挡住的新 FIR 记录为 1.46GB、sha256 前缀
-`5f97158e0064aec5`、2007 个 .sv（见 `champions/newrtl-*/registry.json` 的
-`rtl` 字段与 candidates.jsonl `new-rtl-pull-blocker` 条目）；当前盘上 build-sv
-的 FIR 是其后重新生成的（sha 前缀 `4a0f4533`），触发构造逐字仍存在，上文引用的
-行号即来自当前盘文件。
+`5f97158e0064aec5`、2007 个 .sv（记录于实验账本 candidates.jsonl 的
+`new-rtl-pull-blocker` 条目及对应冠军注册表 registry.json 的 `rtl` 字段）；
+其后 build-sv 重新生成的 FIR（sha 前缀 `4a0f4533`）触发构造逐字仍存在，上文
+引用的行号即来自该文件。
 
 ## 2. 根因
 
@@ -86,8 +85,9 @@ AST2Graph 解析后，数组引用 `curPerfMeta_1.cfiAttr[...]` 的索引子节�
    ```
 
    无任何动态索引分支。本分支修复前的代码相同；当时崩溃点即
-   `new-rtl-pull-blocker` 记录的 `splitArray.cpp:216 distributeTree assertion`，
-   数组 `curPerfMeta_1__DOT__cfiAttr__DOT__branchType`（FTQ 性能元数据）。
+   `new-rtl-pull-blocker` 记录的 `distributeTree` 断言（该断言现位于
+   `src/splitArray.cpp:267`），数组 `curPerfMeta_1__DOT__cfiAttr__DOT__branchType`
+   （FTQ 性能元数据）。
 
 3. **架构缺口是不对称的：读有支持，写没有。** `ExpTree::updateWithSplittedArray`
    （`src/splitArray.cpp`）对数组**读**已有动态索引处理——`range.first < 0` 时
@@ -133,8 +133,7 @@ AST2Graph 解析后，数组引用 `curPerfMeta_1.cfiAttr[...]` 的索引子节�
 则保持"。结果：mux 展开本身能着火（实测 6 个数组、每个 32 项，原断言不再触发），
 但 **false 分支对 member[i] 的引用在依赖图里构成成员自环**，FTQ 的
 `_T_149/_T_150/_T_151` 仍卡死在 `partialVisited`——拓扑排序要求拆分后是 DAG。
-（`new-rtl-mux-expansion-blocker` 条目；半成品保存在本 worktree 的
-`stash@{0}`。）
+（`new-rtl-mux-expansion-blocker` 条目记录了该失败。）
 
 深层原因：对**寄存器数组**，`connect arr[idx], val` 是时钟沿语义
 （`arr[idx]$NEXT = val`）。静态索引写正是走寄存器 `$NEXT`/resetTree 机制
@@ -241,8 +240,8 @@ if (begin < 0) {
 
 ## 6. 验证证据
 
-全部数字取自候选账本（`gsim-task-saturate-sparse/candidates.jsonl`）与冠军注册表
-（`gsim-task-verilator-dual-default4488/champions/*/registry.json`）：
+全部数字取自候选账本（实验工作区的 candidates.jsonl）与冠军注册表
+（champions/*/registry.json）：
 
 - **旧 RTL 回归**：FIR 门 22/22 PASS——修复不影响静态索引生成
   （`new-rtl-adaptation-complete` 条目 `fir_gate` 字段）。
@@ -250,7 +249,7 @@ if (begin < 0) {
   无 COMPACT）与保全的验证过 plain 模型（`champions/newrtl-v1-baseline`）字节
   匹配，合并文件哈希 `d1c39cb55729af4a`（`newrtl-t16-compact-v1` 条目
   `code_integrity` 字段与 baseline registry 注记）。
-- **新 RTL 生成**：727 cpp、sccs=65965（比 v86 的 45163 大 46%），生成墙钟约
+- **新 RTL 生成**：727 cpp、sccs=65965（比旧一代 RTL 的 45163 大 46%），生成墙钟约
   981s。
 - **端到端正确性**：CoreMark 2-iteration 跑到 **HIT GOOD TRAP**，trap
   pc=0x80001ca0，**663,758 指令 / 304,246 周期**（IPC 2.18），NEMU difftest
@@ -273,7 +272,7 @@ COMPACT 探针生成 panic（const-read else 在 `getSplitArray` 里造成员自
 暴露"提交的代码无法再生验证过的模型"。`e710a43` 恢复验证过的 EMPTY 变体，并
 以再生字节匹配（`d1c39cb55729af4a`）作为复现证明闭环。
 
-规则（已沉淀到 mtwiki `wiki-ab-isolation-discipline.md`）：生成器的任何"改进"
+规则（已沉淀为工作流纪律记录）：生成器的任何"改进"
 必须走完 重新生成 → 字节比对 → 重跑门 之后才能提交；**验证用的二进制与提交
 的源码必须是同一版本**。这对上游 PR 尤其重要：PR 里贴的验证数字必须能被 PR
 的代码再生。
@@ -318,16 +317,14 @@ COMPACT 探针生成 panic（const-read else 在 `getSplitArray` 里造成员自
   （EMPTY else 发射兜底）。
 - 上游对照：`origin/master:src/splitArray.cpp` `distributeTree` 的无守卫断言；
   `origin/master:src/ENode.cpp:329` `hasVarIdx`（定义、零调用，git grep 可核）。
-- 触发材料：`/home/zhangyangjie/test/XiangShan/build-sv/rtl/SimTop.fir`（当前盘，
-  触发 connect 在第 2124270 行）；`/home/zhangyangjie/test/rtl-v86-frozen/SimTop.fir`
-  （旧 RTL 冻结，sha 前缀 `04933259`，curPerfMeta 零引用）。首次拉取的新 FIR
-  记录：1.46GB、sha 前缀 `5f97158e0064aec5`、2007 .sv、领先 v86 253 提交。
-- 账本与注册表：`gsim-task-saturate-sparse/candidates.jsonl` 条目
-  `new-rtl-pull-blocker` / `new-rtl-mux-expansion-blocker` /
-  `new-rtl-adaptation-complete` / `advisory-audit-checknode-split` /
-  `linux-30k-crossrtl-bench` / `newrtl-t16-compact-v1`；
-  `gsim-task-verilator-dual-default4488/champions/` 下 `newrtl-v1-baseline`、
+- 触发材料：新版 SimTop.fir（XiangShan build-sv 生成输出，sha 前缀
+  `4a0f4533`，触发 connect 在第 2124270 行）；冻结的旧一代 SimTop.fir 快照
+  （sha 前缀 `04933259`，curPerfMeta 零引用）。首次拉取的新 FIR 记录：
+  1.46GB、sha 前缀 `5f97158e0064aec5`、2007 .sv、领先旧快照 253 提交。
+- 账本与注册表：候选账本 candidates.jsonl 条目 `new-rtl-pull-blocker` /
+  `new-rtl-mux-expansion-blocker` / `new-rtl-adaptation-complete` /
+  `advisory-audit-checknode-split` / `linux-30k-crossrtl-bench` /
+  `newrtl-t16-compact-v1`；冠军注册表 champions/ 下 `newrtl-v1-baseline`、
   `newrtl-t16-compact-v1`、`newrtl-t32-compact-v1` 的 registry.json。
-- 过程记录：mtwiki `wiki-generator-speed.md` 追记补 4（三次失败尝试）与补 5
-  （when-展开完成）；`wiki-ab-isolation-discipline.md`（验证后改码直接提交的
-  陷阱）。
+- 过程记录：实验工作区过程笔记（三次失败尝试与 when-展开完成的追记；验证后
+  改码直接提交的陷阱）——本文第 3、7 节即其整理。
