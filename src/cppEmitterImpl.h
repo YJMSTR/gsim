@@ -561,4 +561,9 @@ int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& runtimeSu
 std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const std::vector<MtDenseMTask>& mtasks,
                                                                           int threadCount);
 MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled);
+
+// cppEmitterReset.cpp - reset chunking + reset def/activation/all; owns the
+// super2ResetId/super2DenseResetId/resetFuncNum write side (header-inline state)
+const std::pair<int, int>& super2ResetIdLookup(Node* resetNode);
+std::vector<std::string>& mtResetChunkDecls();
 #endif  // CPPEMITTER_IMPL_H
