@@ -535,4 +535,30 @@ std::map<int, MtTaskInfo> buildMtTaskInfoMapForInvocation();
 MtCoarseRegionPlan planMtCoarseRegionsForInvocation();
 std::vector<MtStateUpdateTraceInfo> buildMtStateUpdateTraceInfoForInvocation(const std::map<int, MtTaskInfo>& tasks);
 void logMtReportTimer(const char* name, struct timeval start, struct timeval end);
+
+// cppEmitterDenseSchedule.cpp - dense DAG build: edges, Kosaraju SCC, chain coarsening,
+// vcontract (gVcAutoPass two-pass state is TU-local), mtask partition, owner-ready layouts
+std::vector<MtDenseMTask> mtBuildDenseMTasks(const MtDenseSchedule& schedule,
+                                                    bool preserveWorkerZeroOnlyBoundary);
+std::vector<std::vector<int>> mtBuildDenseRuntimeSuccs(const std::vector<MtDenseMTask>& mtasks,
+                                                             const std::vector<int>& assignment,
+                                                             bool xthreadDepsOnly,
+                                                             int* sameThreadElidedCount = nullptr);
+int mtDenseRuntimeEdgeCount(const std::vector<std::vector<int>>& runtimeSuccs);
+MtDenseOwnerReadyLayout mtBuildDenseOwnerReadyLayout(
+    const std::vector<std::vector<int>>& runtimeSuccs,
+    const std::vector<int>& assignment,
+    int threadCount);
+MtDenseBreakdownWindowWaitLayout mtBuildDenseBreakdownWindowWaitLayout(
+    const MtDenseOwnerReadyLayout& readyLayout,
+    const std::vector<int>& assignment,
+    int threadCount);
+MtDenseBreakdownWindowAllOwnerLayout mtBuildDenseBreakdownWindowAllOwnerLayout(
+    const std::vector<int>& assignment, int threadCount);
+int mtReduceDenseRuntimeSuccsTransitive(std::vector<std::vector<int>>& runtimeSuccs,
+                                               const std::vector<int>& assignment,
+                                               bool injectWorkerChains = true);
+std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const std::vector<MtDenseMTask>& mtasks,
+                                                                          int threadCount);
+MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled);
 #endif  // CPPEMITTER_IMPL_H
