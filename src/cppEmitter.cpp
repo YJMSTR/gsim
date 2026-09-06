@@ -13223,6 +13223,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(4, "}\n");
       emitBodyLock(3, "}\n");
     } else {
+      emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+      emitBodyLock(3, "mtDenseLookaheadTokenLoads.fetch_add(1, std::memory_order_relaxed);\n");
+      emitBodyLock(3, "#endif\n");
       emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
     }
     emitBodyLock(2, "}\n");
@@ -13249,20 +13252,35 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
     emitBodyLock(3, "mtDenseLookaheadScanned.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(3, "#endif\n");
+    emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(3, "if (anyOutOfOrder && (mtDenseDoneBits[j >> 6] & (uint64_t{1} << (j & 63))) != 0) { mtDenseLookaheadDoneSkips.fetch_add(1, std::memory_order_relaxed); continue; }\n");
+    emitBodyLock(3, "#else\n");
     emitBodyLock(3, "if (anyOutOfOrder && (mtDenseDoneBits[j >> 6] & (uint64_t{1} << (j & 63))) != 0) continue;\n");
+    emitBodyLock(3, "#endif\n");
     emitBodyLock(3, "const MtDenseDispatchEntry* mtDenseCandidate = mtDenseDispatchBegin + j;\n");
     emitBodyLock(3, "bool mtDenseCandidateReady = true;\n");
     emitBodyLock(3, "for (uint32_t mtDenseLocalPrereq = mtDenseCandidate->localBegin; mtDenseLocalPrereq < mtDenseCandidate->localEnd; ++mtDenseLocalPrereq) {\n");
     emitBodyLock(4, "const uint32_t mtDensePredPosition = kDenseLookaheadLocalPrereqs[mtDenseLocalPrereq];\n");
+    emitBodyLock(4, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(4, "mtDenseLookaheadPrereqChecks.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(4, "if (!(mtDensePredPosition < head || (anyOutOfOrder && (mtDenseDoneBits[mtDensePredPosition >> 6] & (uint64_t{1} << (mtDensePredPosition & 63))) != 0))) { mtDenseCandidateReady = false; mtDenseLookaheadRejectLocal.fetch_add(1, std::memory_order_relaxed); break; }\n");
+    emitBodyLock(4, "#else\n");
     emitBodyLock(4, "if (!(mtDensePredPosition < head || (anyOutOfOrder && (mtDenseDoneBits[mtDensePredPosition >> 6] & (uint64_t{1} << (mtDensePredPosition & 63))) != 0))) { mtDenseCandidateReady = false; break; }\n");
+    emitBodyLock(4, "#endif\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchWait = mtDenseCandidate->waitBegin; mtDenseDispatchWait < mtDenseCandidate->waitEnd; ++mtDenseDispatchWait) {\n");
+    emitBodyLock(4, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(4, "mtDenseLookaheadTokenLoads.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(4, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; mtDenseLookaheadRejectToken.fetch_add(1, std::memory_order_relaxed); break; }\n");
+    emitBodyLock(4, "#else\n");
     emitBodyLock(4, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; break; }\n");
+    emitBodyLock(4, "#endif\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
     emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
     emitBodyLock(3, "mtDenseLookaheadFound.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(3, "{ const uint32_t mtDenseWinDisp = j - head; const uint32_t mtDenseWinBucket = mtDenseWinDisp <= 1 ? 0 : mtDenseWinDisp <= 4 ? 1 : mtDenseWinDisp <= 16 ? 2 : mtDenseWinDisp <= 64 ? 3 : mtDenseWinDisp <= 256 ? 4 : mtDenseWinDisp <= 512 ? 5 : 6; mtDenseLookaheadWinDisp[mtDenseWinBucket].fetch_add(1, std::memory_order_relaxed); }\n");
     emitBodyLock(3, "#endif\n");
     emitBodyLock(3, "(this->*mtDenseCandidate->fn)();\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseCandidate->storeBegin; mtDenseDispatchStore < mtDenseCandidate->storeEnd; ++mtDenseDispatchStore) {\n");
@@ -13280,6 +13298,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
+    emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
+    emitBodyLock(3, "mtDenseLookaheadTokenLoads.fetch_add(1, std::memory_order_relaxed);\n");
+    emitBodyLock(3, "#endif\n");
     emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
     emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
     emitBodyLock(2, "}\n");
@@ -15340,6 +15361,7 @@ void graph::cppEmitter() {
   }
   emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
   emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] calls=%%llu scanned=%%llu found=%%llu fullmiss=%%llu\\n\", (unsigned long long)mtDenseLookaheadTailCalls.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadScanned.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFound.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadFullMiss.load(std::memory_order_relaxed));\n");
+  emitBodyLock(1, "fprintf(stderr, \"[mt-lookahead-tail] doneSkips=%%llu rejectLocal=%%llu rejectToken=%%llu tokenLoads=%%llu prereqChecks=%%llu disp=[%%llu,%%llu,%%llu,%%llu,%%llu,%%llu,%%llu]\\n\", (unsigned long long)mtDenseLookaheadDoneSkips.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadRejectLocal.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadRejectToken.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadTokenLoads.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadPrereqChecks.load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[0].load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[1].load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[2].load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[3].load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[4].load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[5].load(std::memory_order_relaxed), (unsigned long long)mtDenseLookaheadWinDisp[6].load(std::memory_order_relaxed));\n");
   emitBodyLock(1, "#endif\n");
   emitBodyLock(1, "if (!mtProfileEnabled) return;\n");
   if (useMtHelpers) {
@@ -15559,6 +15581,8 @@ void graph::cppEmitter() {
   fprintf(header, "};\n"
                   "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n"
                   "inline std::atomic<uint64_t> mtDenseLookaheadTailCalls{0}, mtDenseLookaheadScanned{0}, mtDenseLookaheadFound{0}, mtDenseLookaheadFullMiss{0};\n"
+                  "inline std::atomic<uint64_t> mtDenseLookaheadDoneSkips{0}, mtDenseLookaheadRejectLocal{0}, mtDenseLookaheadRejectToken{0}, mtDenseLookaheadTokenLoads{0}, mtDenseLookaheadPrereqChecks{0};\n"
+                  "inline std::atomic<uint64_t> mtDenseLookaheadWinDisp[8] = {};\n"
                   "#endif\n"
                   "#endif\n");
   fclose(header);
