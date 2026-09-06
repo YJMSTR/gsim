@@ -64,8 +64,8 @@ def main() -> None:
     noshift = extract_function_body(text, "valInfo* ENode::instsBitsNoShift(Node* node")
     if "rangeMask(hi, lo)" not in noshift:
         fail("instsBitsNoShift lost the rangeMask path")
-    if re.search(r'rangeMask\(hi, lo\)[^)]*shiftBits\([^,]+, ShiftDir::Right\)', noshift):
-        fail("instsBitsNoShift now right-shifts after masking - position-preservation broken")
+    if "ShiftDir::Right" in noshift:
+        fail("instsBitsNoShift contains a right shift - position preservation broken")
     if "u_bits_noshift" not in noshift:
         fail("instsBitsNoShift lost the constant-fold u_bits_noshift path")
     if 'setConstantByStr("0")' not in noshift:
