@@ -370,6 +370,7 @@ inline std::set<int> alwaysActive;
 // emitUnitsParallel() snapshots the main-thread values into every worker.
 // Suppress sparse activation-event calls while emitting the optional dense executor body.
 inline thread_local bool mtActivationEventTraceSuppressed = false;
+// Codegen-time semantic source: admitted sparse mtTask cppId, or -1 for reset/external paths.
 inline thread_local int mtActivationEventTraceSourceCppId = -1;
 inline std::map<Node*, std::pair<int, int>> super2ResetId;  // uint & async reset
 inline std::map<Node*, std::pair<int, int>> super2DenseResetId;  // dense uint & async reset
