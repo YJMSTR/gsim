@@ -1431,6 +1431,50 @@ static bool mtDenseDutyCodegen() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Default-off per-task chrono for a selected MTask id list
+// (GSIM_MT_DENSE_TASKTIMING=<id-list-file>[:startCycle]). Two steady_clock reads
+// per listed task per cycle (~118 tasks => ~0.2% of a 106us cycle), scoped RAII so
+// early returns inside the MTask body are covered. Samples every cycle from
+// startCycle (default 0) up to kTaskTimeMaxSamples, then keeps calls/total only.
+static bool mtDenseTaskTimingCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_TASKTIMING");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// Parse "<path>[:startCycle]" (linux paths contain no ':'). Ids: one per line,
+// '#' comments allowed. Asserts on unreadable file / empty list / bad id.
+static void mtDenseTaskTimingParse(std::vector<int>& ids, uint64_t& startCycle) {
+  ids.clear();
+  startCycle = 0;
+  const char* env = std::getenv("GSIM_MT_DENSE_TASKTIMING");
+  if (!(env && *env && *env != '0')) return;
+  std::string spec(env);
+  size_t colon = spec.rfind(':');
+  if (colon != std::string::npos && colon + 1 < spec.size()) {
+    bool digits = spec.find_first_not_of("0123456789", colon + 1) == std::string::npos;
+    if (digits) {
+      startCycle = strtoull(spec.substr(colon + 1).c_str(), nullptr, 10);
+      spec = spec.substr(0, colon);
+    }
+  }
+  FILE* f = fopen(spec.c_str(), "r");
+  Assert(f != nullptr, "GSIM_MT_DENSE_TASKTIMING: cannot open id-list file '%s'", spec.c_str());
+  char line[256];
+  while (fgets(line, sizeof line, f)) {
+    char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == '\n' || *p == '#') continue;
+    char* end = nullptr;
+    long id = strtol(p, &end, 10);
+    Assert(end != p && id >= 0, "GSIM_MT_DENSE_TASKTIMING: bad id line '%s' in %s", p, spec.c_str());
+    ids.push_back((int)id);
+  }
+  fclose(f);
+  Assert(!ids.empty(), "GSIM_MT_DENSE_TASKTIMING: no ids parsed from %s", spec.c_str());
+  std::sort(ids.begin(), ids.end());
+  ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+}
+
 
 // Shared sparse-gate prefilter predicate builder (body R3 prefilter + hoisted call-site gate).
 // Returns false when the MTask must always run (any always-active member, or empty footprint);
@@ -12470,6 +12514,23 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseDuty || ownerReadyFlags,
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  const bool denseTaskTiming = mtDenseTaskTimingCodegen();
+  Assert(!denseTaskTiming || ownerReadyFlags,
+         "GSIM_MT_DENSE_TASKTIMING requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  std::vector<int> taskTimingIds;
+  uint64_t taskTimingStartCycle = 0;
+  std::vector<int> taskTimingIdxOf((size_t)nMTasks, -1);
+  if (denseTaskTiming) {
+    mtDenseTaskTimingParse(taskTimingIds, taskTimingStartCycle);
+    for (size_t i = 0; i < taskTimingIds.size(); i++) {
+      Assert(taskTimingIds[i] < nMTasks,
+             "GSIM_MT_DENSE_TASKTIMING: id %d >= nMTasks %d", taskTimingIds[i], nMTasks);
+      taskTimingIdxOf[(size_t)taskTimingIds[i]] = (int)i;
+    }
+    fprintf(stderr, "[mt-dense-tasktiming] instrumenting %d MTasks (startCycle=%llu) from %s\n",
+            (int)taskTimingIds.size(), (unsigned long long)taskTimingStartCycle,
+            std::getenv("GSIM_MT_DENSE_TASKTIMING"));
+  }
   Assert(!denseLookahead || !workSteal,
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
@@ -13108,6 +13169,18 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       // RAII span recorder: survives the early returns inside the worker switch cases.
       fprintf(header, "struct MtDenseDutyGuard { uint64_t* acc; std::chrono::steady_clock::time_point t0; MtDenseDutyGuard(uint64_t* a) : acc(a), t0(std::chrono::steady_clock::now()) {} ~MtDenseDutyGuard() { if (acc) *acc += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); } };\n");
     }
+    if (denseTaskTiming) {
+      fprintf(header, "static constexpr int kTaskTimeCount = %d;\n", (int)taskTimingIds.size());
+      fprintf(header, "static constexpr int kTaskTimeIds[kTaskTimeCount] = {");
+      for (size_t i = 0; i < taskTimingIds.size(); i++) fprintf(header, "%s%d", i ? "," : "", taskTimingIds[i]);
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr uint32_t kTaskTimeMaxSamples = 65536;\n");
+      fprintf(header, "static constexpr uint64_t kTaskTimeStartCycle = %llu;\n", (unsigned long long)taskTimingStartCycle);
+      fprintf(header, "struct alignas(64) MtTaskTimeRec { uint64_t calls; uint64_t totalNs; uint32_t nSamples; uint32_t pad; uint64_t samples[kTaskTimeMaxSamples]; };\n");
+      fprintf(header, "MtTaskTimeRec mtTaskTimeRecs[kTaskTimeCount];\n");
+      fprintf(header, "bool mtTaskTimeEnabled = false;\n");
+      fprintf(header, "struct MtTaskTimeGuard { MtTaskTimeRec* rec; bool collect; std::chrono::steady_clock::time_point t0; MtTaskTimeGuard(MtTaskTimeRec* r, bool c) : rec(r), collect(c), t0(r ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point()) {} ~MtTaskTimeGuard() { if (!rec) return; uint64_t ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count(); rec->calls += 1; rec->totalNs += ns; if (collect && rec->nSamples < kTaskTimeMaxSamples) rec->samples[rec->nSamples ++] = ns; } };\n");
+    }
     fprintf(header, "static_assert(sizeof(std::atomic<uint8_t>) == 1, \"owner-ready atomic must occupy one byte\");\n");
     fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"owner-ready atomic must be lock-free\");\n");
     fprintf(header, "static_assert(sizeof(MtDenseOwnerReadyToken) == 1, \"owner-ready slots must have one-byte extent\");\n");
@@ -13410,6 +13483,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
 
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
     emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
+    if (denseTaskTiming && taskTimingIdxOf[(size_t)mtaskId] >= 0)
+      emitBodyLock(1, "MtTaskTimeGuard mtTaskTimeGuard_(mtTaskTimeEnabled ? &mtTaskTimeRecs[%d] : nullptr, cycles >= kTaskTimeStartCycle);\n",
+                   taskTimingIdxOf[(size_t)mtaskId]);
     // Sparse-in-dense: emit members ASCENDING by cppId (proven valid topo order of intra-MTask
     // forward activation edges: 0 backward in cppId order). Gather then sort.
     std::vector<int> memberCppIds;
@@ -15307,6 +15383,10 @@ void graph::cppEmitter() {
     emitBodyLock(1, "const char *dutyEnv = getenv(\"GSIM_MT_DENSE_DUTY\");\n");
     emitBodyLock(1, "mtDutyEnabled = dutyEnv != nullptr && dutyEnv[0] != '\\0' && dutyEnv[0] != '0';\n");
   }
+  if (mtDenseTaskTimingCodegen()) {
+    emitBodyLock(1, "const char *taskTimeEnv = getenv(\"GSIM_MT_DENSE_TASKTIMING\");\n");
+    emitBodyLock(1, "mtTaskTimeEnabled = taskTimeEnv != nullptr && taskTimeEnv[0] != '\\0' && taskTimeEnv[0] != '0';\n");
+  }
   emitBodyLock(1, "int mtCoarseMinActiveBits = 0;\n");
   emitBodyLock(1, "const char *coarseMinActiveBitsEnv = getenv(\"GSIM_MT_COARSE_MIN_ACTIVE_BITS\");\n");
   emitBodyLock(1, "if (coarseMinActiveBitsEnv != nullptr) mtCoarseMinActiveBits = atoi(coarseMinActiveBitsEnv);\n");
@@ -15999,6 +16079,21 @@ void graph::cppEmitter() {
     emitBodyLock(2, "for (int i = 0; i <= kDenseDutyLaneMax; i++) {\n");
     emitBodyLock(3, "MtDenseDutyLane &L = mtDutyLanes[i];\n");
     emitBodyLock(3, "fprintf(stderr, \"[mt-duty] %%d %%.3f %%.3f %%.3f %%.3f %%.3f %%.3f %%.3f\\n\", i, L.spinNs/1e6, L.spanNs/1e6, L.tailNs/1e6, L.blockNs/1e6, L.resetNs/1e6, L.joinNs/1e6, L.stepWallNs/1e6);\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+  }
+  if (mtDenseTaskTimingCodegen()) {
+    // Per-task chrono for the selected MTask id list: calls/total across the whole
+    // run plus cycle-level quantiles from the sample buffer (startCycle-gated).
+    emitBodyLock(1, "if (mtTaskTimeEnabled) {\n");
+    emitBodyLock(2, "fprintf(stderr, \"[mt-tasktime] id calls totalNs meanNs p10Ns p50Ns p90Ns p99Ns nSamples\\n\");\n");
+    emitBodyLock(2, "for (int i = 0; i < kTaskTimeCount; i++) {\n");
+    emitBodyLock(3, "MtTaskTimeRec &R = mtTaskTimeRecs[i];\n");
+    emitBodyLock(3, "if (R.nSamples == 0) { fprintf(stderr, \"[mt-tasktime] %%d %%llu %%llu %%llu 0 0 0 0 0\\n\", kTaskTimeIds[i], (unsigned long long)R.calls, (unsigned long long)R.totalNs, (unsigned long long)(R.calls ? R.totalNs / R.calls : 0)); continue; }\n");
+    emitBodyLock(3, "std::vector<uint64_t> s(R.samples, R.samples + R.nSamples);\n");
+    emitBodyLock(3, "std::sort(s.begin(), s.end());\n");
+    emitBodyLock(3, "uint64_t q10 = s[(size_t)(0.10 * (double)(s.size() - 1))], q50 = s[(size_t)(0.50 * (double)(s.size() - 1))], q90 = s[(size_t)(0.90 * (double)(s.size() - 1))], q99 = s[(size_t)(0.99 * (double)(s.size() - 1))];\n");
+    emitBodyLock(3, "fprintf(stderr, \"[mt-tasktime] %%d %%llu %%llu %%llu %%llu %%llu %%llu %%llu %%u\\n\", kTaskTimeIds[i], (unsigned long long)R.calls, (unsigned long long)R.totalNs, (unsigned long long)(R.calls ? R.totalNs / R.calls : 0), (unsigned long long)q10, (unsigned long long)q50, (unsigned long long)q90, (unsigned long long)q99, R.nSamples);\n");
     emitBodyLock(2, "}\n");
     emitBodyLock(1, "}\n");
   }
