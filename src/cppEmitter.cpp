@@ -1386,7 +1386,6 @@ static bool mtUseDenseStaticEmptyElide() {
 
 // Diagnostics-only layout tables for the fixed-order dependency-counter executor
 // (identity vertex slots + per-mtask owner). Generation is default-off.
-
 static bool mtUseDenseOwnerBankCountersDiag() {
   const char* env = std::getenv("GSIM_MT_DENSE_OWNER_BANK_COUNTERS_DIAG");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -1533,17 +1532,6 @@ static bool mtUseDenseSplitWorker0MTasks() {
   const char* env = std::getenv("GSIM_MT_DENSE_SPLIT_WORKER0_MTASKS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
-
-
-// dense runtime work-stealing. Default-off. Replaces the fixed ascending-id per-thread
-// MTask execution (which spin-stalls on cross-thread deps) with owner-affine ready deques +
-// steal-from-tail: a worker runs any READY assigned MTask, steals when idle. Lifts scaling
-// past the ~3x cap of the fixed-order executor. See docs/codex-dense-direction.md.
-static bool mtUseDenseWorkSteal() {
-  const char* env = std::getenv("GSIM_MT_DENSE_WORKSTEAL");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
-
 
 // Default-on active-path optimization: when a clean coarse region's static
 // maximum active bits cannot exceed the runtime inline threshold, generated code
@@ -5562,10 +5550,9 @@ void graph::dumpMtDenseScheduleJson() {
       else denseMTaskCrossThreadEdgeCount ++;
     }
   }
-  bool denseWorkSteal = mtUseDenseWorkSteal();
-  bool denseXThreadDepsOnly = denseWorkSteal ? false : mtUseDenseXThreadDepsOnly();
-  bool denseTransitiveReduceEdges = denseWorkSteal ? false : mtUseDenseTransitiveReduceEdges();
-  bool denseStaticEmptyElide = !denseWorkSteal && mtUseDenseStaticEmptyElide();
+  bool denseXThreadDepsOnly = mtUseDenseXThreadDepsOnly();
+  bool denseTransitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
+  bool denseStaticEmptyElide = mtUseDenseStaticEmptyElide();
   int denseRuntimeSameThreadEdgeElidedCount = 0;
   std::vector<std::vector<int>> denseRuntimeSuccs = mtBuildDenseRuntimeSuccs(schedule.mtasks, schedule.mtaskThreadAssign, denseXThreadDepsOnly, &denseRuntimeSameThreadEdgeElidedCount);
   int denseRuntimeDependencyEdgeCountBeforeTransitiveReduce = mtDenseRuntimeEdgeCount(denseRuntimeSuccs);
@@ -6028,7 +6015,6 @@ void graph::dumpMtDenseScheduleJson() {
   fprintf(fp, "  \"codegen_enabled\": %s,\n", schedule.codegenEnabled ? "true" : "false");
   fprintf(fp, "  \"valid\": %s,\n", schedule.valid ? "true" : "false");
   fprintf(fp, "  \"fallback_reason\": \"%s\",\n", jsonEscape(schedule.fallbackReason).c_str());
-  fprintf(fp, "  \"dense_worksteal_enabled\": %s,\n", denseWorkSteal ? "true" : "false");
   fprintf(fp, "  \"dense_xthread_deps_only_enabled\": %s,\n", denseXThreadDepsOnly ? "true" : "false");
   fprintf(fp, "  \"dense_transitive_reduce_edges_enabled\": %s,\n", denseTransitiveReduceEdges ? "true" : "false");
   fprintf(fp, "  \"dense_split_worker0_mtasks_enabled\": %s,\n", mtUseDenseSplitWorker0MTasks() ? "true" : "false");
@@ -11460,10 +11446,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const char* threadsEnv = std::getenv("GSIM_THREADS");
   if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
   if (threadCount < 1) threadCount = 1;
-  bool workSteal = mtUseDenseWorkSteal();
-  bool xthreadDepsOnly = workSteal ? false : mtUseDenseXThreadDepsOnly();
-  bool transitiveReduceEdges = workSteal ? false : mtUseDenseTransitiveReduceEdges();
-  bool staticEmptyElide = !workSteal && mtUseDenseStaticEmptyElide();
+  bool xthreadDepsOnly = mtUseDenseXThreadDepsOnly();
+  bool transitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
+  bool staticEmptyElide = mtUseDenseStaticEmptyElide();
   bool ownerBankCountersDiag = mtUseDenseOwnerBankCountersDiag();
   bool ownerReadyFlags = mtUseDenseOwnerReadyFlags();
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
@@ -11480,8 +11465,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
            "GSIM_MT_DENSE_BREAKDOWN window requires at least 2 workers (got %d)", threadCount);
   }
   if (denseBreakdownProfileCodegen) {
-    Assert(!workSteal,
-           "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires fixed-owner execution without GSIM_MT_DENSE_WORKSTEAL");
     Assert(ownerReadyFlags,
            "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
     Assert(threadCount <= 16,
@@ -11489,8 +11472,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
 
   if (ownerReadyFlags) {
-    Assert(!workSteal,
-           "GSIM_MT_DENSE_OWNER_READY_FLAGS requires fixed-order execution without GSIM_MT_DENSE_WORKSTEAL");
     Assert(xthreadDepsOnly,
            "GSIM_MT_DENSE_OWNER_READY_FLAGS requires GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1");
     Assert(transitiveReduceEdges,
@@ -11518,8 +11499,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseDuty || ownerReadyFlags,
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
-  Assert(!denseLookahead || !workSteal,
-         "GSIM_MT_DENSE_LOOKAHEAD is incompatible with GSIM_MT_DENSE_WORKSTEAL");
   Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with dense breakdown codegen");
   struct MtActivityCommitField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
@@ -12286,25 +12265,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
     fprintf(header, "#endif\n");
   }
-  // workSteal already computed above.
-  if (workSteal) {
-    fprintf(header, "static constexpr bool kDenseMTaskW0[%d] = {", nMTasks);
-    for (int i = 0; i < nMTasks; i++) { if (i > 0) fprintf(header, ","); fprintf(header, "%s", denseSchedule.mtasks[(size_t)i].workerZeroOnly ? "true" : "false"); }
-    fprintf(header, "};\n");
-    // Per-thread ready deque (bounded to nMTasks) + spinlock; global remaining counter.
-    fprintf(header, "static constexpr int kDenseWorkStealThreads = %d;\n", threadCount);
-    fprintf(header, "int mtDenseDeque[%d][%d];\n", threadCount, nMTasks);
-    fprintf(header, "std::atomic<int> mtDenseDequeHead[%d];\n", threadCount); // pop point (LIFO top)
-    fprintf(header, "std::atomic<int> mtDenseDequeTail[%d];\n", threadCount); // steal point (bottom)
-    fprintf(header, "std::atomic_flag mtDenseDequeLock[%d];\n", threadCount);
-    fprintf(header, "std::atomic<int> mtDenseRemaining;\n");
-    fprintf(header, "void stepDenseMTaskById(int mtaskId);\n");
-  }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
   for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
   bool workerMajorText = mtUseDenseWorkerMajorText();
-  Assert(!workerMajorText || !workSteal,
-         "GSIM_MT_DENSE_WORKER_MAJOR_TEXT requires fixed-owner dense execution");
   std::vector<int> denseMTaskEmissionOrder;
   denseMTaskEmissionOrder.reserve((size_t)nMTasks);
   if (workerMajorText) {
@@ -12378,17 +12341,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   });
   }
 
-  if (workSteal) {
-    // Dispatch an MTask body by id (work-stealing runs MTasks in dynamic order).
-    emitFuncDecl(0, "void S%s::stepDenseMTaskById(int mtaskId) {\n", name.c_str());
-    emitBodyLock(1, "switch (mtaskId) {\n");
-    for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
-      emitBodyLock(2, "case %d: stepDenseMTask%d(); break;\n", mtaskId, mtaskId);
-    }
-    emitBodyLock(2, "default: break;\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
-  }
   auto emitFixedDenseThreadWorker = [&](const char* funcName) {
     emitFuncDecl(0, "void S%s::%s(int threadId) {\n", name.c_str(), funcName);
     if (denseBreakdownWindowCodegen) {
@@ -12778,69 +12730,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(0, "#endif\n");
   }
-  if (workSteal) {
-    emitFuncDecl(0, "void S%s::stepDenseThreadWorker(int threadId) {\n", name.c_str());
-    emitBodyLock(1, "bool evenCycle = (cycles & 1) == 0;\n");
-    // Owner-affine ready-deque work-stealing. A worker pops ready MTasks from its own deque
-    // (LIFO), steals from other deques' tails when idle, runs the body, and on each successor's
-    // LAST dependency (enqueue-on-last-dep, avoids double-run races) pushes it to its owner's
-    // deque. worker0-only MTasks are never stolen by nonzero workers. Exits when no MTask
-    // remains globally. Seeding of dep-0 MTasks is done in stepDense before workers start.
-    emitBodyLock(1, "const bool evenParity = evenCycle;\n");
-    emitBodyLock(1, "auto dqPush = [&](int owner, int mt) {\n");
-    emitBodyLock(2, "while (mtDenseDequeLock[owner].test_and_set(std::memory_order_acquire)) mtWorkerPoolPause();\n");
-    emitBodyLock(2, "int t = mtDenseDequeTail[owner].load(std::memory_order_relaxed);\n");
-    emitBodyLock(2, "mtDenseDeque[owner][t] = mt; mtDenseDequeTail[owner].store(t + 1, std::memory_order_release);\n");
-    emitBodyLock(2, "mtDenseDequeLock[owner].clear(std::memory_order_release);\n");
-    emitBodyLock(1, "};\n");
-    emitBodyLock(1, "auto dqPopLocal = [&](int owner) -> int {\n");
-    emitBodyLock(2, "int mt = -1;\n");
-    emitBodyLock(2, "while (mtDenseDequeLock[owner].test_and_set(std::memory_order_acquire)) mtWorkerPoolPause();\n");
-    emitBodyLock(2, "int h = mtDenseDequeHead[owner].load(std::memory_order_relaxed);\n");
-    emitBodyLock(2, "int t = mtDenseDequeTail[owner].load(std::memory_order_relaxed);\n");
-    emitBodyLock(2, "if (t > h) { t--; mt = mtDenseDeque[owner][t]; mtDenseDequeTail[owner].store(t, std::memory_order_relaxed); }\n");
-    emitBodyLock(2, "mtDenseDequeLock[owner].clear(std::memory_order_release);\n");
-    emitBodyLock(2, "return mt;\n");
-    emitBodyLock(1, "};\n");
-    emitBodyLock(1, "auto dqSteal = [&](int victim, int thief) -> int {\n");
-    emitBodyLock(2, "int mt = -1;\n");
-    emitBodyLock(2, "while (mtDenseDequeLock[victim].test_and_set(std::memory_order_acquire)) mtWorkerPoolPause();\n");
-    emitBodyLock(2, "int h = mtDenseDequeHead[victim].load(std::memory_order_relaxed);\n");
-    emitBodyLock(2, "int t = mtDenseDequeTail[victim].load(std::memory_order_relaxed);\n");
-    emitBodyLock(2, "if (t > h) { int cand = mtDenseDeque[victim][h]; if (!(kDenseMTaskW0[cand] && thief != 0)) { mtDenseDequeHead[victim].store(h + 1, std::memory_order_relaxed); mt = cand; } }\n");
-    emitBodyLock(2, "mtDenseDequeLock[victim].clear(std::memory_order_release);\n");
-    emitBodyLock(2, "return mt;\n");
-    emitBodyLock(1, "};\n");
-    emitBodyLock(1, "auto signalSuccs = [&](int mt) {\n");
-    emitBodyLock(2, "for (int j = kDenseMTaskSuccOffsets[mt]; j < kDenseMTaskSuccOffsets[mt + 1]; j++) {\n");
-    emitBodyLock(3, "int s = kDenseMTaskSuccList[j];\n");
-    emitBodyLock(3, "bool ready;\n");
-    emitBodyLock(3, "if (evenParity) { uint32_t old = mtDenseMTaskVertices[s].depsDone.fetch_add(1, std::memory_order_acq_rel); ready = (old + 1 == kDenseMTaskDepCount[s]); }\n");
-    emitBodyLock(3, "else { uint32_t old = mtDenseMTaskVertices[s].depsDone.fetch_sub(1, std::memory_order_acq_rel); ready = (old == 1); }\n");
-    emitBodyLock(3, "if (ready) { int owner = kDenseMTaskOwner[s]; dqPush(owner, s); }\n");
-    emitBodyLock(2, "}\n");
-    emitBodyLock(1, "};\n");
-    emitBodyLock(1, "uint64_t idleSpins = 0;\n");
-    emitBodyLock(1, "for (;;) {\n");
-    emitBodyLock(2, "int mt = dqPopLocal(threadId);\n");
-    emitBodyLock(2, "if (mt < 0) {\n");
-    emitBodyLock(3, "for (int v = 0; v < kDenseWorkStealThreads && mt < 0; v++) { if (v != threadId) mt = dqSteal(v, threadId); }\n");
-    emitBodyLock(2, "}\n");
-    emitBodyLock(2, "if (mt < 0) {\n");
-    emitBodyLock(3, "if (mtDenseRemaining.load(std::memory_order_acquire) <= 0) break;\n");
-    emitBodyLock(3, "if (++idleSpins > 200000000u) { fprintf(stderr, \"[mt-dense-worksteal] DEADLOCK thread %%d remaining=%%d\\n\", threadId, mtDenseRemaining.load(std::memory_order_acquire)); abort(); }\n");
-    emitBodyLock(3, "mtWorkerPoolPause(); continue;\n");
-    emitBodyLock(2, "}\n");
-    emitBodyLock(2, "idleSpins = 0;\n");
-    emitBodyLock(2, "stepDenseMTaskById(mt);\n");
-    emitBodyLock(2, "signalSuccs(mt);\n");
-    emitBodyLock(2, "mtDenseRemaining.fetch_sub(1, std::memory_order_acq_rel);\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(1, "return;\n");
-    emitBodyLock(0, "}\n");
-  } else {
-    emitFixedDenseThreadWorker("stepDenseThreadWorker");
-  }
+  emitFixedDenseThreadWorker("stepDenseThreadWorker");
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
   if (denseDuty) emitBodyLock(1, "MtDenseDutyGuard mtDutyStepGuard(mtDutyEnabled ? &mtDutyLanes[%d].stepWallNs : nullptr);\n", threadCount);
   if (denseBreakdownWindowCodegen) {
@@ -12869,17 +12759,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
   }
   // No counter reset needed — Verilator even/odd alternation handles it
-  if (workSteal) {
-    // Seed the work-stealing deques: reset head/tail, set remaining, and push every
-    // dependency-free MTask (depCount==0) to its owner's deque. depsDone counters keep the
-    // Verilator even/odd parity across cycles, so a dep-0 MTask is ready every cycle.
-    emitBodyLock(1, "if (mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
-    emitBodyLock(2, "for (int t = 0; t < kDenseWorkStealThreads; t++) { mtDenseDequeHead[t].store(0, std::memory_order_relaxed); mtDenseDequeTail[t].store(0, std::memory_order_relaxed); mtDenseDequeLock[t].clear(std::memory_order_relaxed); }\n");
-    emitBodyLock(2, "mtDenseRemaining.store(%d, std::memory_order_relaxed);\n", nMTasks);
-    emitBodyLock(2, "for (int mt = 0; mt < %d; mt++) { if (kDenseMTaskDepCount[mt] == 0) { int o = kDenseMTaskOwner[mt]; int tl = mtDenseDequeTail[o].load(std::memory_order_relaxed); mtDenseDeque[o][tl] = mt; mtDenseDequeTail[o].store(tl + 1, std::memory_order_relaxed); } }\n", nMTasks);
-    emitBodyLock(2, "std::atomic_thread_fence(std::memory_order_release);\n");
-    emitBodyLock(1, "}\n");
-  }
   if (ownerReadyFlags) {
     emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
     emitBodyLock(1, "if (mtConfiguredWorkerCount == kDenseOwnerReadyWorkerCount && mtConfiguredWorkerCount > 1 && mtWorkerPoolEnabled && mtWorkerPoolThreadCount + 1 >= mtConfiguredWorkerCount) {\n");
@@ -13531,9 +13410,8 @@ void graph::cppEmitter() {
   MtDenseOwnerReadyLayout denseBreakdownWindowReadyLayout;
   MtDenseBreakdownWindowWaitLayout denseBreakdownWindowWaitLayout;
   if (denseBreakdownWindowCodegen) {
-    const bool denseBreakdownWindowWorkSteal = mtUseDenseWorkSteal();
-    const bool denseBreakdownWindowXThreadDepsOnly = denseBreakdownWindowWorkSteal ? false : mtUseDenseXThreadDepsOnly();
-    const bool denseBreakdownWindowTransitiveReduce = denseBreakdownWindowWorkSteal ? false : mtUseDenseTransitiveReduceEdges();
+    const bool denseBreakdownWindowXThreadDepsOnly = mtUseDenseXThreadDepsOnly();
+    const bool denseBreakdownWindowTransitiveReduce = mtUseDenseTransitiveReduceEdges();
     std::vector<std::vector<int>> denseBreakdownWindowRuntimeSuccs = mtBuildDenseRuntimeSuccs(
         mtDenseSchedule.mtasks, mtDenseSchedule.mtaskThreadAssign, denseBreakdownWindowXThreadDepsOnly);
     if (denseBreakdownWindowTransitiveReduce) {
