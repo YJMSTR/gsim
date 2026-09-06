@@ -455,4 +455,61 @@ void includeLib(FILE* fp, std::string lib, bool isStd);
 void newLine(FILE* fp);
 int emitParallelThreadCount();
 
+
+// cppEmitterMtAnalysis.cpp - task classification, boundary collection,
+// state-update classification, cross-task edge memos
+void addCppIdsIfExecutable(std::set<int>& ids, const std::set<SuperNode*>& supers);
+bool nodeHasStateUpdate(Node* node);
+bool stateTargetNameForNode(Node* node, std::string& targetName);
+MtBoundaryInfo collectMtBoundaryInfo(SuperNode* super, int& candidateCost);
+std::map<int, MtTaskInfo> buildMtTaskInfoMap();
+bool hasWorker0OnlyReason(const std::vector<std::string>& reasons);
+bool hasWorker0OnlyReasonDense(const std::vector<std::string>& reasons);
+bool hasOnlyA44DirectFallbackReasons(const std::vector<std::string>& reasons);
+bool hasOnlyA73Worker0SafeReasons(const std::vector<std::string>& reasons);
+bool mtTaskCanEnterCoarseDispatch(const std::map<int, MtTaskInfo>& tasks, int cppId);
+bool mtTaskCanEnterPureBatch(const std::map<int, MtTaskInfo>& tasks, int cppId);
+bool mtTaskHasSameActiveWordHazard(const std::map<int, MtTaskInfo>& tasks, int cppId);
+bool mtTaskCanJoinPureBatch(const std::map<int, MtTaskInfo>& tasks,
+                                   const std::vector<int>& batch,
+                                   int cppId);
+int mtTaskEstimatedCost(const std::map<int, MtTaskInfo>& tasks, int cppId);
+int mtBatchEstimatedCost(const std::map<int, MtTaskInfo>& tasks, int beginCppId, int endCppId);
+int mtBatchMemberNodeCost(int beginCppId, int endCppId);
+bool mtActiveWordIsWhole(int beginCppId);
+int mtPureBatchShardCount();
+void mtAddCoarseBlocker(MtCoarseRegion& region, const std::string& blocker);
+bool mtTaskHasActiveEdgeTo(int fromCppId, int toCppId);
+bool mtTaskHasDependencyEdgeTo(int fromCppId, int toCppId);
+bool mtTaskHasOrderingEdgeTo(int fromCppId, int toCppId);
+bool mtStateUpdateHasMemoryOrDynamicArray(const MtBoundaryInfo& boundary);
+bool mtStateUpdateHasExternalOrSpecial(const MtBoundaryInfo& boundary);
+bool mtStateUpdateHasSameCycleTargetRead(const MtBoundaryInfo& boundary,
+                                                const std::set<std::string>& allStateTargetNames);
+std::string mtStateUpdateRhsTimingClass(const MtBoundaryInfo& boundary);
+std::string mtStateUpdateRhsTimingEvidence(const MtBoundaryInfo& boundary,
+                                                  const std::string& rhsTimingClass);
+bool mtStateUpdateActivationCanUseDelta(const MtBoundaryInfo& boundary);
+std::vector<std::string> mtStateUpdateBlockReasons(const MtBoundaryInfo& boundary,
+                                                          SuperNode* super,
+                                                          const std::string& rhsTimingClass,
+                                                          bool rhsReadsSameCycleTarget);
+std::string mtStateUpdateCandidateKind(const MtBoundaryInfo& boundary,
+                                              const std::vector<std::string>& blockReasons);
+MtStateTargetWriterUniverse
+collectMtStateTargetWriters(const std::map<int, MtTaskInfo>& mtTasks);
+MtStateTargetWriterInfo mtStateUpdateWriterInfo(
+    const MtBoundaryInfo& boundary,
+    const std::map<std::string, MtStateTargetWriterInfo>& targetWriters);
+std::string mtStateUpdateTargetWriterConflictKind(
+    const MtBoundaryInfo& boundary,
+    const MtStateTargetWriterInfo& writerInfo,
+    bool hasIncompleteWriterUniverse);
+std::string mtStateUpdateTargetWriterProof(const std::string& conflictKind);
+std::vector<std::string> mtStateUpdateRuntimeBlockReasons(
+    const std::string& stateUpdateCandidateKind,
+    const std::string& targetWriterConflictKind,
+    const MtStateTargetWriterInfo& writerInfo);
+std::set<std::string> collectAllMtStateTargetNames(const std::map<int, MtTaskInfo>& mtTasks);
+std::vector<MtStateUpdateTraceInfo> buildMtStateUpdateTraceInfo(const std::map<int, MtTaskInfo>& mtTasks);
 #endif  // CPPEMITTER_IMPL_H
