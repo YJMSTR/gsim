@@ -60,6 +60,50 @@ std::pair<int, uint64_t> setIdxMask(int cppId);
 #define ACTIVE_COMMENT(active) std::get<1>(active)
 #define ACTIVE_UNIQUE(active) std::get<2>(active)
 
+bool emitPhaseTimingEnabled();  // def: cppEmitterUtil.cpp (used by EmitPhaseTimer dtor below)
+
+// Final-phase breakdown instrumentation (GSIM_EMIT_PHASE_TIMING=1): wall time
+// per emission region, printed to stderr when the region scope closes. Pure
+// measurement - never changes emitted bytes.
+struct EmitPhaseTimer {
+  const char* phaseName;
+  std::chrono::steady_clock::time_point begin;
+  explicit EmitPhaseTimer(const char* n) : phaseName(n), begin(std::chrono::steady_clock::now()) {}
+  ~EmitPhaseTimer() {
+    if (emitPhaseTimingEnabled()) {
+      long ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - begin).count();
+      fprintf(stderr, "[emit-phase] %s = %ld ms\n", phaseName, ms);
+    }
+  }
+};
+
+// Accumulating variant for sub-phases invoked many times inside one region
+// (e.g. per-pass work inside a merge loop). Aggregates wall ns across calls;
+// the owning region prints totals via emitPhaseAccumReport(). Like
+// EmitPhaseTimer this is pure measurement - it never changes emitted bytes,
+// and costs two predictable branches when GSIM_EMIT_PHASE_TIMING is unset.
+struct EmitPhaseAccum {
+  const char* phaseName = "";
+  uint64_t ns = 0;
+  uint64_t calls = 0;
+};
+class EmitPhaseAccumScope {
+ public:
+  EmitPhaseAccumScope(EmitPhaseAccum& accum, bool enabled)
+      : accum_(enabled ? &accum : nullptr),
+        begin_(enabled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point()) {}
+  ~EmitPhaseAccumScope() {
+    if (accum_) {
+      accum_->ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - begin_).count();
+      accum_->calls ++;
+    }
+  }
+ private:
+  EmitPhaseAccum* accum_;
+  std::chrono::steady_clock::time_point begin_;
+};
+
 // ---- shared emitter struct definitions (moved verbatim from cppEmitter.cpp; 
 // single global type identity across all emitter TUs) ----
 struct MtBoundaryInfo {
@@ -339,5 +383,76 @@ inline MtContextCacheState mtContextCache;
 // second full vcontract pass. resetMtContextCache() invalidates it per generation.
 inline MtDenseSchedule mtDenseScheduleCache;
 inline bool mtDenseScheduleCacheValid = false;
+
+// ---- function declarations (added one module per commit; defs live in the
+// corresponding cppEmitter<Module>.cpp TU; default arguments live HERE only) ----
+
+// cppEmitterUtil.cpp - knob readers, shared helpers, name interning, bitmask helpers
+bool mtOldValueHistogramEnabled();
+bool emitPhaseTimingEnabled();
+void emitPhaseAccumReport(const EmitPhaseAccum& accum);
+bool isAlwaysActive(int cppId);
+bool hasCppId(const std::set<SuperNode*>& supers, int cppId);
+const char* nodeTypeName(NodeType type);
+bool isKnownNodeType(NodeType type);
+const char* superTypeName(SuperType type);
+std::string jsonEscape(const std::string& str);
+void dumpJsonIntArray(FILE* fp, const std::set<int>& values);
+void dumpJsonIntArray(FILE* fp, const std::vector<int>& values);
+void dumpJsonStringArray(FILE* fp, const std::set<std::string>& values);
+void dumpJsonStringArray(FILE* fp, const std::vector<std::string>& values);
+bool mtUseDenseMemberMetadata();
+bool mtUseDenseUnpinSpecial();
+bool mtUseDenseElideObservability();
+const std::set<Node*>& mtDenseObservabilityDroppableSet();
+bool mtDenseObservabilitySpansBalanced(const std::vector<InstInfo>& insts);
+bool mtUseDenseForwardActivationOnly();
+void dumpMtDenseMemberMetadataForTask(FILE* fp, SuperNode* super);
+void dumpMtDenseActivationOrigins(FILE* fp);
+bool mtIsLevelDispatchMode();
+bool mtUseDirectInlineFallback();
+bool mtUseDirectInlineSerialFallback();
+bool mtUseDirectInlineWorker0Fallback();
+bool mtUseProfileOffDirectSerialFallback();
+bool mtUseProfileOffActiveWordCount();
+bool mtUseInlineSmallPureBatches();
+bool mtUseInlineSmallPureBatchBodies();
+bool mtUseInlineSmallPureBatchMaskGuard();
+bool mtUseStepActiveWordGuard();
+bool mtUseSplitMixedStepGuards();
+bool mtUseCycleBatchReport();
+bool mtUseReadyBatchReport();
+bool mtUseEnvelopeLocalEvalDiagnostics();
+bool mtUseDynamicStateTraceCodegen();
+bool mtUseActivationEventTraceCodegen();
+bool mtUseDenseExecutorCodegen();
+bool mtUseDenseOnlyCodegen();
+bool mtUseDenseOnlyCodegenLevel2();
+bool mtUseDenseXThreadDepsOnly();
+bool mtUseDenseTransitiveReduceEdges();
+bool mtUseDenseStaticEmptyElide();
+bool mtUseDenseOwnerBankCountersDiag();
+bool mtUseDenseOwnerReadyFlags();
+bool mtUseWorkerPoolFlagJoinCodegen();
+bool mtUseOwnerCpuMapCodegen();
+bool mtUseDenseBreakdownProfileCodegen();
+bool mtUseDenseBreakdownWindowCodegen();
+bool mtUseDenseWorkerMajorText();
+int mtDenseLookaheadWindow();
+bool mtDenseDutyCodegen();
+void mtActivityCollectFromTree(ENode* root, MtActivityReads& out);
+bool mtUseDenseHybridEligibilityDiag();
+bool mtUseDenseSplitWorker0MTasks();
+bool mtUseStaticCoarseInlineBound();
+bool mtUseShortNames();
+const std::string* mtShortNameOrigOf(Node* node);
+std::pair<int, int> cppId2flagIdx(int cppId);
+std::pair<int, uint64_t>clearIdxMask(int cppId);
+ActiveType activeSet2bitMap(std::set<int>& activeId, std::map<uint64_t, ActiveType>& bitMapInfo, int curId);
+std::string updateActiveStr(int idx, uint64_t mask, const std::string& activeBufferName = "");
+std::string updateActiveStr(int idx, uint64_t mask, std::string& cond, int uniqueId, const std::string& activeBufferName = "");
+void includeLib(FILE* fp, std::string lib, bool isStd);
+void newLine(FILE* fp);
+int emitParallelThreadCount();
 
 #endif  // CPPEMITTER_IMPL_H
