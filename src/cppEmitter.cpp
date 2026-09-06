@@ -1384,12 +1384,8 @@ static bool mtUseDenseStaticEmptyElide() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
-// optionally emit compile-exclusive identity and owner-banked fixed-order dependency layouts.
-// Generation is default-off; one generated schedule can be compiled twice without a runtime branch.
-static bool mtUseDenseOwnerBankCounters() {
-  const char* env = std::getenv("GSIM_MT_DENSE_OWNER_BANK_COUNTERS");
-  return env != nullptr && env[0] != '\0' && env[0] != '0';
-}
+// Diagnostics-only layout tables for the fixed-order dependency-counter executor
+// (identity vertex slots + per-mtask owner). Generation is default-off.
 
 static bool mtUseDenseOwnerBankCountersDiag() {
   const char* env = std::getenv("GSIM_MT_DENSE_OWNER_BANK_COUNTERS_DIAG");
@@ -1397,7 +1393,7 @@ static bool mtUseDenseOwnerBankCountersDiag() {
 }
 
 // optionally emit compile-exclusive producer-owner ready flags beside the
-// fixed-order owner-banked and identity dependency-counter layouts.
+// fixed-order identity dependency-counter layouts.
 static bool mtUseDenseOwnerReadyFlags() {
   const char* env = std::getenv("GSIM_MT_DENSE_OWNER_READY_FLAGS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
@@ -2336,34 +2332,6 @@ static int mtDenseRuntimeEdgeCount(const std::vector<std::vector<int>>& runtimeS
   int edgeCount = 0;
   for (const std::vector<int>& succs : runtimeSuccs) edgeCount += static_cast<int>(succs.size());
   return edgeCount;
-}
-
-static std::vector<int> mtBuildDenseOwnerBankVertexSlots(const std::vector<int>& assignment,
-                                                         int threadCount,
-                                                         int* physicalSlotCount) {
-  Assert(threadCount > 0, "dense owner-bank layout requires at least one thread");
-  std::vector<int> slotByMTask(assignment.size(), -1);
-  int nextSlot = 0;
-  for (int worker = 0; worker < threadCount; worker ++) {
-    nextSlot = (nextSlot + 15) & ~15;
-    Assert((nextSlot & 15) == 0, "dense owner bank %d is not cache-line aligned", worker);
-    for (size_t mtaskId = 0; mtaskId < assignment.size(); mtaskId ++) {
-      int owner = assignment[mtaskId];
-      Assert(owner >= 0 && owner < threadCount,
-             "dense MTask %zu has invalid owner %d for %d threads", mtaskId, owner, threadCount);
-      if (owner != worker) continue;
-      Assert(slotByMTask[mtaskId] < 0, "dense MTask %zu received duplicate vertex slots", mtaskId);
-      slotByMTask[mtaskId] = nextSlot ++;
-    }
-    nextSlot = (nextSlot + 15) & ~15;
-  }
-  for (size_t mtaskId = 0; mtaskId < slotByMTask.size(); mtaskId ++) {
-    Assert(slotByMTask[mtaskId] >= 0, "dense MTask %zu has no owner-banked vertex slot", mtaskId);
-  }
-  Assert(nextSlot >= static_cast<int>(assignment.size()),
-         "dense owner-bank slot count %d is smaller than MTask count %zu", nextSlot, assignment.size());
-  if (physicalSlotCount) *physicalSlotCount = nextSlot;
-  return slotByMTask;
 }
 
 struct MtDenseOwnerReadyTokenProvenance {
@@ -11496,8 +11464,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   bool xthreadDepsOnly = workSteal ? false : mtUseDenseXThreadDepsOnly();
   bool transitiveReduceEdges = workSteal ? false : mtUseDenseTransitiveReduceEdges();
   bool staticEmptyElide = !workSteal && mtUseDenseStaticEmptyElide();
-  bool ownerBankCounters = !workSteal && mtUseDenseOwnerBankCounters();
-  bool ownerBankCountersDiag = ownerBankCounters && mtUseDenseOwnerBankCountersDiag();
+  bool ownerBankCountersDiag = mtUseDenseOwnerBankCountersDiag();
   bool ownerReadyFlags = mtUseDenseOwnerReadyFlags();
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
@@ -11524,8 +11491,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   if (ownerReadyFlags) {
     Assert(!workSteal,
            "GSIM_MT_DENSE_OWNER_READY_FLAGS requires fixed-order execution without GSIM_MT_DENSE_WORKSTEAL");
-    Assert(ownerBankCounters,
-           "GSIM_MT_DENSE_OWNER_READY_FLAGS requires GSIM_MT_DENSE_OWNER_BANK_COUNTERS=1");
     Assert(xthreadDepsOnly,
            "GSIM_MT_DENSE_OWNER_READY_FLAGS requires GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1");
     Assert(transitiveReduceEdges,
@@ -11986,16 +11951,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
   }
   if (totalSuccs == 0) totalSuccs = 1;
-  std::vector<int> denseMTaskVertexSlots((size_t)nMTasks, 0);
-  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) denseMTaskVertexSlots[(size_t)mtaskId] = mtaskId;
-  int denseMTaskPhysicalSlotCount = nMTasks;
-  if (ownerBankCounters) {
-    denseMTaskVertexSlots = mtBuildDenseOwnerBankVertexSlots(
-        denseSchedule.mtaskThreadAssign, threadCount, &denseMTaskPhysicalSlotCount);
-    fprintf(stderr, "[mt-dense-owner-bank] mtasks=%d slots=%d padding=%d threads=%d diag=%d\n",
-            nMTasks, denseMTaskPhysicalSlotCount, denseMTaskPhysicalSlotCount - nMTasks,
-            threadCount, ownerBankCountersDiag ? 1 : 0);
-  }
   if (emitPhaseTimingEnabled()) {
     fprintf(stderr, "[emit-phase] Final.densePrologue.depCounts = %ld ms\n",
             std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -12149,9 +12104,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   };
   auto emitDenseOwnerBankDiagnostics = [&]() {
     if (!ownerBankCountersDiag) return;
-    fprintf(header, "static constexpr int kDenseMTaskPhysicalSlotCount = %d;\n", denseMTaskPhysicalSlotCount);
+    fprintf(header, "static constexpr int kDenseMTaskPhysicalSlotCount = %d;\n", nMTasks);
     fprintf(header, "static constexpr int kDenseMTaskVertexSlot[%d] = {", nMTasks);
-    for (int i = 0; i < nMTasks; i ++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", denseMTaskVertexSlots[(size_t)i]); }
+    for (int i = 0; i < nMTasks; i ++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", i); }
     fprintf(header, "};\n");
     fprintf(header, "static constexpr int kDenseMTaskVertexOwner[%d] = {", nMTasks);
     for (int i = 0; i < nMTasks; i ++) { if (i > 0) fprintf(header, ","); fprintf(header, "%d", denseSchedule.mtaskThreadAssign[(size_t)i]); }
@@ -12167,13 +12122,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     fprintf(header, ",%d};\n", off);
   };
-  auto emitDenseSuccList = [&](bool ownerBanked) {
+  auto emitDenseSuccList = [&]() {
     fprintf(header, "static constexpr int kDenseMTaskSuccList[%d] = {", totalSuccs);
     bool firstSucc = true;
     for (const std::vector<int>& succs : denseRuntimeSuccs) {
       for (int succ : succs) {
         if (!firstSucc) fprintf(header, ",");
-        fprintf(header, "%d", ownerBanked ? denseMTaskVertexSlots[(size_t)succ] : succ);
+        fprintf(header, "%d", succ);
         firstSucc = false;
       }
     }
@@ -12189,26 +12144,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitDenseDepCounts();
     emitDenseOwnerBankDiagnostics();
     emitDenseSuccOffsets();
-    if (ownerBankCounters) {
-      fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-      emitDenseSuccList(true);
-      fprintf(header, "#else\n");
-    }
-    emitDenseSuccList(false);
-    if (ownerBankCounters) fprintf(header, "#endif\n");
+    emitDenseSuccList();
     fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
-    if (ownerBankCounters) {
-      fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-      fprintf(header, "static_assert(sizeof(MtDenseMTaskVertex) == 4, \"owner-bank layout requires four-byte dense vertices\");\n");
-      fprintf(header, "alignas(64) MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", denseMTaskPhysicalSlotCount);
-      fprintf(header, "#else\n");
-    }
     fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
-    if (ownerBankCounters) fprintf(header, "#endif\n");
   } else {
-    fprintf(header, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE && defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-    fprintf(header, "#error \"GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE and GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE are compile-exclusive\"\n");
-    fprintf(header, "#endif\n");
     if (denseBreakdownProfileCodegen) {
       fprintf(header, "#if !defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) || !GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
       fprintf(header, "#error \"GSIM_MT_DENSE_BREAKDOWN_PROFILE requires GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\"\n");
@@ -12338,19 +12277,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                 t, std::max(1, denseDispatchWorkerCounts[(size_t)t]));
       }
     }
-    fprintf(header, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-    emitDenseDepCounts();
-    emitDenseOwnerBankDiagnostics();
-    emitDenseSuccOffsets();
-    emitDenseSuccList(true);
-    fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
-    fprintf(header, "static_assert(sizeof(MtDenseMTaskVertex) == 4, \"owner-bank layout requires four-byte dense vertices\");\n");
-    fprintf(header, "alignas(64) MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", denseMTaskPhysicalSlotCount);
     fprintf(header, "#else\n");
     emitDenseDepCounts();
     emitDenseOwnerBankDiagnostics();
     emitDenseSuccOffsets();
-    emitDenseSuccList(false);
+    emitDenseSuccList();
     fprintf(header, "struct MtDenseMTaskVertex { std::atomic<uint32_t> depsDone{0}; };\n");
     fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
     fprintf(header, "#endif\n");
@@ -12527,13 +12458,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             // Fixed dependency-counter fallback keeps the historical 256-spin yield budget.
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
-            if (ownerBankCounters) {
-              emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-              emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
-              emitBodyLock(3, "#else\n");
-            }
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-            if (ownerBankCounters) emitBodyLock(3, "#endif\n");
             emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
             emitBodyLock(3, "}\n");
           }
@@ -12600,14 +12525,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(3, "}\n");
             }
 
-          }
-          emitBodyLock(3, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-          if (!skipDenseWait) {
-            emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
-            emitBodyLock(3, "  unsigned ct = 0;\n");
-            emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", denseMTaskVertexSlots[(size_t)mtaskId]);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
-            emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#else\n");
           if (!skipDenseWait) {
@@ -12689,16 +12606,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(5, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(uint8_t{0}, std::memory_order_release);\n");
             }
             emitBodyLock(4, "}\n");
-            emitBodyLock(3, "}\n");
-          }
-          emitBodyLock(3, "#elif defined(GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE) && GSIM_MT_DENSE_OWNER_BANK_COUNTERS_COMPILE\n");
-          if (!skipDenseSignal) {
-            emitBodyLock(3, "if (evenCycle) {\n");
-            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
-            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_add(1, std::memory_order_release);\n");
-            emitBodyLock(3, "} else {\n");
-            emitBodyLock(4, "for (int j = kDenseMTaskSuccOffsets[%d]; j < kDenseMTaskSuccOffsets[%d]; j++)\n", mtaskId, mtaskId + 1);
-            emitBodyLock(5, "mtDenseMTaskVertices[kDenseMTaskSuccList[j]].depsDone.fetch_sub(1, std::memory_order_release);\n");
             emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#else\n");
