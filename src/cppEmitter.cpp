@@ -2901,7 +2901,35 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
                                       std::vector<int>& outAssign, std::vector<int>& outOrder) {
   if (threadCount < 1) threadCount = 1;
   const int n = static_cast<int>(mtasks.size());
-  auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
+  // GSIM_MT_DENSE_MEASURED_COSTFILE=<path> (default off): profile-guided
+  // assignment. The file carries "mtaskId medianNs" lines from an
+  // allownerbody breakdown window of a SAME-CONTRACTION generation (same
+  // seed/knobs => same MTask ids; contraction keeps node-count costs).
+  // Only the assignment stage (here) consumes them. Measured on the champion
+  // stack this showed node-cost-balanced but real-cost-imbalanced workers
+  // (max/mean 1.223 vs 1.046), and an offline replay ceiling of ~20%.
+  std::vector<long long> measuredCost;
+  { const char* e = std::getenv("GSIM_MT_DENSE_MEASURED_COSTFILE");
+    if (e && e[0]) {
+      FILE* fp = fopen(e, "r");
+      Assert(fp != nullptr, "cannot open measured-cost file %s", e);
+      measuredCost.assign((size_t)n, 0);
+      int id; long long ns;
+      while (fscanf(fp, "%d %lld", &id, &ns) == 2) {
+        Assert(id >= 0 && id < n, "measured-cost id %d out of range %d", id, n);
+        measuredCost[(size_t)id] = ns;
+      }
+      fclose(fp);
+      fprintf(stderr, "[mt-dense-measured-cost] loaded %zu entries from %s\n", measuredCost.size(), e);
+    }
+  }
+  auto costOf = [&](const MtDenseMTask& m) -> long long {
+    if (!measuredCost.empty()) {
+      size_t idx = (size_t)(&m - mtasks.data());
+      if (idx < measuredCost.size() && measuredCost[idx] > 0) return measuredCost[idx];
+    }
+    return m.schedCost > 0 ? m.schedCost : m.staticCost;
+  };
   outAssign.assign((size_t)n, -1);
   outOrder.clear(); outOrder.reserve((size_t)n);
   std::vector<long long> completion((size_t)n, 0);
@@ -2973,7 +3001,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     }
     if (bestMTask < 0) break;
     outAssign[(size_t)bestMTask] = bestWorker;
-    completion[(size_t)bestMTask] = bestTime + std::max(1, costOf(mtasks[(size_t)bestMTask]));
+    completion[(size_t)bestMTask] = bestTime + std::max(1LL, costOf(mtasks[(size_t)bestMTask]));
     busyUntil[(size_t)bestWorker] = completion[(size_t)bestMTask];
     outOrder.push_back(bestMTask);
     ready[(size_t)bestReadyIndex] = ready.back(); ready.pop_back();
