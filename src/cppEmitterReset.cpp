@@ -96,10 +96,17 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
   // frontend is superlinear on million-statement functions (measured 1366s
   // for one 5MB subReset body, 2.8s stubbed); chunking restores linear cost.
   const long chunkSize = mtResetChunkSize();
-  const char* chunkCallArgs = traceSourceParam ? "(nextActive, traceSourceCppId)" : (buffered ? "(nextActive)" : "()");
+  // Call/parameter matrix must match the parent signature exactly
+  // (cppEmitterReset.cpp genResetDef): buffered parents have nextActive of
+  // activeSinkType (ActivationDelta or ActiveBuffer by helper mode); trace
+  // parents add traceSourceCppId. The old code hardcoded nextActive under
+  // trace, generating an undeclared-identifier call in unbuffered+trace.
+  const char* chunkCallArgs = traceSourceParam
+    ? (buffered ? "(nextActive, traceSourceCppId)" : "(traceSourceCppId)")
+    : (buffered ? "(nextActive)" : "()");
   const std::string chunkParamList = traceSourceParam
-    ? (std::string("(") + (buffered ? "ActivationDelta &nextActive, " : "") + "int32_t traceSourceCppId)")
-    : (buffered ? "(ActivationDelta &nextActive)" : "()");
+    ? ("(" + (buffered ? activeSinkType + " &nextActive, " : "") + "int32_t traceSourceCppId)")
+    : (buffered ? "(" + activeSinkType + " &nextActive)" : "()");
   // The statement stream typically nests entirely inside `if (reset) { ... }`
   // (depth 1 throughout), so a depth-0-only split would never fire. Instead we
   // track the open IF stack; on a split we close the open braces, chain into
