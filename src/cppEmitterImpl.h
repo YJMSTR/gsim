@@ -512,4 +512,27 @@ std::vector<std::string> mtStateUpdateRuntimeBlockReasons(
     const MtStateTargetWriterInfo& writerInfo);
 std::set<std::string> collectAllMtStateTargetNames(const std::map<int, MtTaskInfo>& mtTasks);
 std::vector<MtStateUpdateTraceInfo> buildMtStateUpdateTraceInfo(const std::map<int, MtTaskInfo>& mtTasks);
+
+// cppEmitterMtPlan.cpp - coarse/pure-batch planning, profitability, assignment,
+// context cache group (mtContextCache/mtDenseScheduleCache/edge caches + *ForInvocation memos)
+int mtCoarseStaticRecommendedWorkers(const MtCoarseRegion& region, int configuredWorkers);
+bool mtCoarseStaticAdmitsRegion(const MtCoarseRegion& region, int workerCount);
+int mtCoarseRecommendedWorkersForPolicy(const MtCoarseRegion& region,
+                                               int configuredWorkers,
+                                               const std::string& workerPolicy);
+bool mtCoarseAdmitsRegionForPolicy(const MtCoarseRegion& region,
+                                          int workerCount,
+                                          const std::string& workerPolicy);
+std::string mtJoinIntList(const std::vector<int>& values);
+MtCoarseMTaskAssignment mtBuildCoarseMTaskAssignment(const MtCoarseRegion& region,
+                                                            int configuredWorkers,
+                                                            const std::string& workerPolicy);
+MtCoarseProfileFacts mtComputeCoarseProfileFacts(const MtCoarseRegionPlan& coarsePlan);
+MtPureBatchPlan planMtPureBatchesActiveFrequency(const std::map<int, MtTaskInfo>& tasks);
+MtPureBatchPlan planMtPureBatches(const std::map<int, MtTaskInfo>& tasks);
+void resetMtContextCache();
+std::map<int, MtTaskInfo> buildMtTaskInfoMapForInvocation();
+MtCoarseRegionPlan planMtCoarseRegionsForInvocation();
+std::vector<MtStateUpdateTraceInfo> buildMtStateUpdateTraceInfoForInvocation(const std::map<int, MtTaskInfo>& tasks);
+void logMtReportTimer(const char* name, struct timeval start, struct timeval end);
 #endif  // CPPEMITTER_IMPL_H
