@@ -566,4 +566,9 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
 // super2ResetId/super2DenseResetId/resetFuncNum write side (header-inline state)
 const std::pair<int, int>& super2ResetIdLookup(Node* resetNode);
 std::vector<std::string>& mtResetChunkDecls();
+
+// cppEmitterEmitCore.cpp - header scaffolding + per-node/per-super emission core
+void emitActiveBufferDef(FILE* header, int activeWords);
+void emitActivationDeltaDef(FILE* header, int activeWords);
+void emitActivationEventTraceDef(FILE* header);
 #endif  // CPPEMITTER_IMPL_H
