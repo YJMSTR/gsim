@@ -1093,6 +1093,32 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     for (int succ : mtasks[(size_t)i].succMTasks) if (succ >= 0 && succ < n) best = std::max(best, priority[(size_t)succ]);
     priority[(size_t)i] = costOf(mtasks[(size_t)i]) + best;
   }
+  // GSIM_MT_DENSE_SCHED_PRIO_MODE=slack (default hlf, byte-identical): replace
+  // the highest-level-first tie-break priority with ASAP/ALAP slack computed
+  // from the same costOf domain (resource-free bounds). Lower slack wins ties.
+  bool prioSlack = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_PRIO_MODE"); if (e && std::strcmp(e, "slack") == 0) prioSlack = true; }
+  if (prioSlack) {
+    // ASAP earliest finish (no resource contention): est = max(pred est) + cost.
+    std::vector<long long> est((size_t)n, 0);
+    for (int i = 0; i < n; i ++) {
+      long long e0 = 0;
+      for (int pred : mtasks[(size_t)i].predMTasks) if (pred >= 0 && pred < n) e0 = std::max(e0, est[(size_t)pred]);
+      est[(size_t)i] = e0 + costOf(mtasks[(size_t)i]);
+    }
+    // ALAP latest start: lst = min(succ lst) - own cost; sinks: lst = est.
+    std::vector<long long> lst((size_t)n, 0);
+    for (int i = n - 1; i >= 0; i --) {
+      if (mtasks[(size_t)i].succMTasks.empty()) { lst[(size_t)i] = est[(size_t)i] - costOf(mtasks[(size_t)i]); continue; }
+      long long l = std::numeric_limits<long long>::max();
+      for (int succ : mtasks[(size_t)i].succMTasks) if (succ >= 0 && succ < n) l = std::min(l, lst[(size_t)succ]);
+      lst[(size_t)i] = l - costOf(mtasks[(size_t)i]);
+    }
+    for (int i = 0; i < n; i ++) {
+      long long slack = lst[(size_t)i] - (est[(size_t)i] - costOf(mtasks[(size_t)i]));
+      priority[(size_t)i] = -slack;  // smaller slack -> larger priority value
+    }
+  }
   std::vector<int> ready;
   for (int i = 0; i < n; i ++) if (remainingPreds[(size_t)i] == 0) ready.push_back(i);
   // GSIM_MT_DENSE_PACK_CCD_AFFINITY=<pct> (default 0 = off, byte-identical):
