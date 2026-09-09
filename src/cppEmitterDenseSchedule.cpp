@@ -1113,6 +1113,12 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   const int ccdSize = 8;
   while (!ready.empty()) {
     int bestReadyIndex = -1, bestMTask = -1, bestWorker = 0;
+  // GSIM_MT_DENSE_SCHED_W0_MERGE=1 (default off, byte-identical): let ordinary
+  // MTasks compete for worker 0 too (worker0-only tasks still pin to 0). The
+  // reservation avoids serializing pinned side-effect work, but under measured
+  // ns costs worker 0 carries the lightest T16 load; measure the tradeoff.
+  bool w0Merge = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_W0_MERGE"); if (e && e[0] && e[0] != '0') w0Merge = true; }
     long long bestTime = std::numeric_limits<long long>::max();
     for (int ri = 0; ri < static_cast<int>(ready.size()); ri ++) {
       int mtaskId = ready[(size_t)ri];
@@ -1120,7 +1126,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
       // Reserve thread 0 for worker0-only (pinned side-effect) MTasks: non-worker0 MTasks start
       // their thread search at 1 when threadCount>1, so the scheduler does not pile parallel work
       // onto thread 0 and then serialize the pinned load behind it (the 52x imbalance).
-      int workerStart = mtask.workerZeroOnly ? 0 : (threadCount > 1 ? 1 : 0);
+      int workerStart = mtask.workerZeroOnly || w0Merge ? 0 : (threadCount > 1 ? 1 : 0);
       int workerLimit = mtask.workerZeroOnly ? 1 : threadCount;
       for (int worker = workerStart; worker < workerLimit; worker ++) {
         long long timeBegin = busyUntil[(size_t)worker];
