@@ -592,6 +592,19 @@ bool mtUseDenseBreakdownWindowCodegen() {
   return true;
 }
 
+// Default-off lookahead-compatible body-only window sub-gate. Requires the
+// breakdown window knobs (GSIM_MT_DENSE_BREAKDOWN_PROFILE=1 plus
+// GSIM_MT_DENSE_BREAKDOWN_WINDOW_START/CYCLES) and GSIM_MT_DENSE_LOOKAHEAD>0.
+// When set, per-MTask body spans are recorded inside each stepDenseMTaskN()
+// body so all four lookahead dispatch sites (inline fast path plus the three
+// tail paths) are covered without touching dispatch tables, and allownerbody
+// becomes the only accepted runtime window mode. Unset keeps breakdown+
+// lookahead rejected and the emitted model byte-identical.
+bool mtUseDenseBreakdownWindowLaBodyCodegen() {
+  const char* env = std::getenv("GSIM_MT_DENSE_BREAKDOWN_WINDOW_LA_BODY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // reorder only dense MTask function emission by fixed owner so each worker's hot text is
 // contiguous. Logical IDs, bodies, owner call order, dependency protocol, and schedule are unchanged.

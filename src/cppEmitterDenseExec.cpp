@@ -67,7 +67,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseDuty || ownerReadyFlags,
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
-  Assert(!denseLookahead || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
+  const bool denseBreakdownWindowLaBodyCodegen =
+      denseBreakdownWindowCodegen && mtUseDenseBreakdownWindowLaBodyCodegen();
+  if (mtUseDenseBreakdownWindowLaBodyCodegen()) {
+    Assert(denseBreakdownWindowCodegen,
+           "GSIM_MT_DENSE_BREAKDOWN_WINDOW_LA_BODY requires GSIM_MT_DENSE_BREAKDOWN_PROFILE=1 with GSIM_MT_DENSE_BREAKDOWN_WINDOW_START and GSIM_MT_DENSE_BREAKDOWN_WINDOW_CYCLES");
+    Assert(denseLookahead,
+           "GSIM_MT_DENSE_BREAKDOWN_WINDOW_LA_BODY requires GSIM_MT_DENSE_LOOKAHEAD >= 1");
+  }
+  Assert(!denseLookahead || denseBreakdownWindowLaBodyCodegen
+             || (!denseBreakdownProfileCodegen && !denseBreakdownWindowCodegen),
          "GSIM_MT_DENSE_LOOKAHEAD is incompatible with dense breakdown codegen");
   struct MtActivityCommitField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
   struct MtActivityInputField { std::string name; uint64_t mask = 0; bool conservative = false; int shadowSlot = -1; int fanoutBegin = 0; int fanoutEnd = 0; };
@@ -881,11 +890,28 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // saved/restored around genSuperEval exactly as in the sequential loop).
   // Unit u renders denseMTaskEmissionOrder[u]; assembly replays buffers in
   // emission order, so output is byte-identical.
-  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder](size_t unit) {
+  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder, &ownerReadyLayout, denseBreakdownWindowLaBodyCodegen](size_t unit) {
     int mtaskId = denseMTaskEmissionOrder[unit];
 
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
     emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
+    if (denseBreakdownWindowLaBodyCodegen) {
+      // Body-only lookahead timing: one conditional steady_clock wrap inside the
+      // MTask body function covers every dispatch site (inline fast path plus all
+      // three tail paths) without duplicating the body. Ready waits, lookahead
+      // scan, and token stores stay outside because they live in the dispatch
+      // layer, not the body. mtaskId and owner are baked generation constants.
+      const int laBodyOwner = denseSchedule.mtaskThreadAssign[(size_t)mtaskId];
+      emitBodyLock(1, "const int mtDenseBreakdownWindowLaBodySlot = mtDenseBreakdownWindowAllOwnerBodyMode ? mtDenseBreakdownWindowCurrentSlot : -1;\n");
+      emitBodyLock(1, "const int mtDenseBreakdownWindowLaBodyRecord = kDenseBreakdownWindowAllOwnerMTaskRecordIndex[%d];\n", mtaskId);
+      emitBodyLock(1, "std::chrono::steady_clock::time_point mtDenseBreakdownWindowLaBodyBegin;\n");
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownWindowLaBodySlot >= 0)) {\n");
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowLaBodyRecord < 0 || mtDenseBreakdownWindowLaBodyRecord >= kDenseBreakdownWindowAllOwnerMTaskStorageCount || mtDenseBreakdownWindowLaBodySlot >= kDenseBreakdownWindowMaxCycles || cycles < mtDenseBreakdownWindowStart || cycles - mtDenseBreakdownWindowStart >= mtDenseBreakdownWindowCycles || cycles != mtDenseBreakdownWindowCycleNumbers[mtDenseBreakdownWindowLaBodySlot])) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] lookahead body window slot mismatch\\n\"); abort(); }\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyBegin = std::chrono::steady_clock::now();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "const int mtDenseBreakdownWindowLaBodyOwner = %d;\n", laBodyOwner);
+      emitBodyLock(1, "const int mtDenseBreakdownWindowLaBodyStoreCount = %d;\n", (int)ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].size());
+    }
     // Sparse-in-dense: emit members ASCENDING by cppId (proven valid topo order of intra-MTask
     // forward activation edges: 0 backward in cppId order). Gather then sort.
     std::vector<int> memberCppIds;
@@ -903,6 +929,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(2, "if (unlikely(mtProfileEnabled)) mtProfileDenseTaskBegin = std::chrono::steady_clock::now();\n");
       genSuperEval(super, "activeFlags[0]", "", 2, false);
       emitBodyLock(2, "if (unlikely(mtProfileEnabled)) recordMtProfileTask(%d, true, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtProfileDenseTaskBegin).count());\n", cppId);
+      emitBodyLock(1, "}\n");
+    }
+    if (denseBreakdownWindowLaBodyCodegen) {
+      emitBodyLock(1, "if (unlikely(mtDenseBreakdownWindowLaBodySlot >= 0)) {\n");
+      emitBodyLock(2, "const std::chrono::steady_clock::time_point mtDenseBreakdownWindowLaBodyEnd = std::chrono::steady_clock::now();\n");
+      emitBodyLock(2, "MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowLaBodyEntry = mtDenseBreakdownWindowAllOwnerMTasks[mtDenseBreakdownWindowLaBodySlot][mtDenseBreakdownWindowLaBodyRecord];\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.mtaskId = %d;\n", mtaskId);
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.ownerThreadId = (uint16_t)mtDenseBreakdownWindowLaBodyOwner;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.readyTokenStoreCount = (uint16_t)mtDenseBreakdownWindowLaBodyStoreCount;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.releaseEndOffsetNs = UINT64_MAX;\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.bodyStartOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowLaBodyBegin - mtDenseBreakdownWindowEpoch).count();\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.bodyEndOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowLaBodyEnd - mtDenseBreakdownWindowEpoch).count();\n");
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowLaBodyEntry.bodyEndOffsetNs < mtDenseBreakdownWindowLaBodyEntry.bodyStartOffsetNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] lookahead body timeline underflow\\n\"); abort(); }\n");
+      emitBodyLock(2, "mtDenseBreakdownWindowLaBodyEntry.bodyNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowLaBodyEnd - mtDenseBreakdownWindowLaBodyBegin).count();\n");
+      emitBodyLock(2, "const uint8_t mtDenseBreakdownWindowLaBodySeenCount = ++ mtDenseBreakdownWindowLaBodySeen[mtDenseBreakdownWindowLaBodySlot][mtDenseBreakdownWindowLaBodyRecord];\n");
+      emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowLaBodySeenCount != 1)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] lookahead body duplicate sample\\n\"); abort(); }\n");
       emitBodyLock(1, "}\n");
     }
     emitBodyLock(0, "}\n");

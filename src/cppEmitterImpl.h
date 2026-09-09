@@ -275,6 +275,27 @@ struct MtDenseSchedule {
   std::vector<int> worker0OnlyCppIds;
   std::vector<int> alwaysActiveCppIds;
 };
+// Immutable, renumber-invariant identity of an MTask: order-independent 64-bit
+// hash over its sorted member cppIds. Shared by the lookahead body-timing key
+// table (cppEmitter.cpp) and the measured-cost import (cppEmitterDenseSchedule.cpp).
+inline uint64_t mtDenseMTaskMemberKey(const MtDenseSchedule& schedule, int mtaskId) {
+  Assert(mtaskId >= 0 && mtaskId < static_cast<int>(schedule.mtasks.size()),
+         "dense MTask member key id %d out of range", mtaskId);
+  std::vector<int> memberCppIds;
+  for (int sccId : schedule.mtasks[(size_t)mtaskId].sccIds) {
+    Assert(sccId >= 0 && sccId < static_cast<int>(schedule.sccs.size()),
+           "dense MTask member key has invalid SCC %d", sccId);
+    const std::vector<int>& cppIds = schedule.sccs[(size_t)sccId].cppIds;
+    memberCppIds.insert(memberCppIds.end(), cppIds.begin(), cppIds.end());
+  }
+  std::sort(memberCppIds.begin(), memberCppIds.end());
+  uint64_t key = UINT64_C(1469598103934665603);
+  for (int cppId : memberCppIds) {
+    key ^= static_cast<uint64_t>(static_cast<uint32_t>(cppId)) + UINT64_C(0x9e3779b97f4a7c15);
+    key *= UINT64_C(1099511628211);
+  }
+  return key;
+}
 
 struct MtCoarseMTaskAssignment {
   int requestedWorkers = 1;
@@ -438,6 +459,7 @@ bool mtUseWorkerPoolFlagJoinCodegen();
 bool mtUseOwnerCpuMapCodegen();
 bool mtUseDenseBreakdownProfileCodegen();
 bool mtUseDenseBreakdownWindowCodegen();
+bool mtUseDenseBreakdownWindowLaBodyCodegen();
 bool mtUseDenseWorkerMajorText();
 int mtDenseLookaheadWindow();
 bool mtDenseDutyCodegen();

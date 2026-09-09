@@ -3,6 +3,7 @@
 // -> mtBuildDenseScheduleOrder -> owner-ready/breakdown layouts -> buildMtDenseSchedule.
 // gVcAutoPass two-pass control travels WITH vcontract as TU-local state.
 #include "cppEmitterImpl.h"
+#include <cstring>
 
 static void mtDenseAddEdge(MtDenseSchedule& schedule,
                            std::vector<std::set<int>>& succSets,
@@ -1632,6 +1633,62 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
       }
     } else {
       schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
+    }
+    // GSIM_MT_DENSE_SCHED_COSTFILE (default off): import measured per-MTask
+    // body costs keyed by the immutable member key (mtDenseMTaskMemberKey),
+    // applied AFTER contraction/membership is frozen and BEFORE the
+    // SCHED_ORDER list scheduler + renumber. Keyed by membership, never by
+    // emitted id — the rejected 706ba67 importer's pre/post-renumber
+    // miskeying is the failure this avoids (measured-cost-identity-correction).
+    // File format: first line "# firSha256 <hex> mtasks <n>", then
+    // "0x<memberKeyHex> <costNs>" per MTask. Full coverage and positive costs
+    // required; any mismatch aborts generation.
+    {
+      const char* costFileEnv = std::getenv("GSIM_MT_DENSE_SCHED_COSTFILE");
+      if (costFileEnv && costFileEnv[0] && costFileEnv[0] != '0') {
+        const char* policyEnv = std::getenv("GSIM_MT_DENSE_VCONTRACT_POLICY");
+        const char* autoEnv = std::getenv("GSIM_MT_DENSE_VCONTRACT_MAXMT_AUTO");
+        Assert(!(policyEnv && std::strncmp(policyEnv, "auto", 4) == 0)
+                   && !(autoEnv && autoEnv[0] && autoEnv[0] != '0'),
+               "GSIM_MT_DENSE_SCHED_COSTFILE is incompatible with vcontract auto probes (probe/final cost domains would diverge)");
+        FILE* fp = fopen(costFileEnv, "r");
+        Assert(fp != nullptr, "cannot open GSIM_MT_DENSE_SCHED_COSTFILE %s", costFileEnv);
+        if (fp == nullptr) abort();
+        char hashTag[64]; char countTag[64]; char firSha[128]; int fileMTasks = -1;
+        Assert(fscanf(fp, "%*63s %63s %127s %63s %d", hashTag, firSha, countTag, &fileMTasks) == 4
+                   && std::strcmp(countTag, "mtasks") == 0,
+               "dense sched cost file %s missing lineage header", costFileEnv);
+        Assert(fileMTasks == static_cast<int>(schedule.mtasks.size()),
+               "dense sched cost file %s covers %d MTasks but schedule has %zu",
+               costFileEnv, fileMTasks, schedule.mtasks.size());
+        std::map<uint64_t, long long> costByKey;
+        unsigned long long key = 0; long long cost = 0;
+        while (fscanf(fp, " 0x%llx %lld", &key, &cost) == 2) {
+          Assert(costByKey.insert({key, cost}).second,
+                 "dense sched cost file %s has duplicate memberKey 0x%llx", costFileEnv, key);
+        }
+        fclose(fp);
+        Assert(static_cast<int>(costByKey.size()) == fileMTasks,
+               "dense sched cost file %s has %zu entries, header claims %d",
+               costFileEnv, costByKey.size(), fileMTasks);
+        int matched = 0;
+        for (int mtaskId = 0; mtaskId < static_cast<int>(schedule.mtasks.size()); ++mtaskId) {
+          const uint64_t mkey = mtDenseMTaskMemberKey(schedule, mtaskId);
+          auto it = costByKey.find(mkey);
+          Assert(it != costByKey.end(),
+                 "dense sched cost file %s lacks memberKey 0x%llx for MTask %d",
+                 costFileEnv, (unsigned long long)mkey, mtaskId);
+          if (it == costByKey.end()) abort();
+          // costOf falls back to staticCost on schedCost<=0; never import a zero.
+          schedule.mtasks[(size_t)mtaskId].schedCost =
+              static_cast<int>(std::max<long long>(1, std::min<long long>(it->second, INT32_MAX)));
+          ++matched;
+        }
+        Assert(matched == fileMTasks,
+               "dense sched cost coverage mismatch: matched %d of %d", matched, fileMTasks);
+        fprintf(stderr, "[mt-dense-sched-cost] imported %d measured MTask costs (memberKey-keyed) from %s\n",
+                matched, costFileEnv);
+      }
     }
     // Executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
     // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.

@@ -918,6 +918,8 @@ void graph::cppEmitter() {
   bool denseExecutorValid = useDenseExecutorCodegen && mtDenseSchedule.valid;
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
+  bool denseBreakdownWindowLaBodyCodegen =
+      denseBreakdownWindowCodegen && mtUseDenseBreakdownWindowLaBodyCodegen();
   int denseBreakdownWindowWorker0MTaskCount = 0;
   int denseBreakdownWindowAllOwnerMTaskCount = 0;
   int denseBreakdownWindowThreadCount = 8;
@@ -932,6 +934,12 @@ void graph::cppEmitter() {
   if (denseBreakdownProfileCodegen) {
     Assert(denseExecutorValid,
            "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires a valid dense executor");
+  }
+  if (mtUseDenseBreakdownWindowLaBodyCodegen()) {
+    Assert(denseBreakdownWindowCodegen,
+           "GSIM_MT_DENSE_BREAKDOWN_WINDOW_LA_BODY requires GSIM_MT_DENSE_BREAKDOWN_PROFILE=1 with GSIM_MT_DENSE_BREAKDOWN_WINDOW_START and GSIM_MT_DENSE_BREAKDOWN_WINDOW_CYCLES");
+    Assert(mtDenseLookaheadWindow() > 0,
+           "GSIM_MT_DENSE_BREAKDOWN_WINDOW_LA_BODY requires GSIM_MT_DENSE_LOOKAHEAD >= 1");
   }
   if (denseBreakdownWindowCodegen) {
     for (int mtaskId = 0; mtaskId < static_cast<int>(mtDenseSchedule.mtaskThreadAssign.size()); mtaskId ++) {
@@ -1127,6 +1135,44 @@ void graph::cppEmitter() {
         fprintf(header, "%d", denseBreakdownWindowAllOwnerLayout.recordIndexByMTask[(size_t)mtaskId]);
       }
       fprintf(header, "};\n");
+      if (denseBreakdownWindowLaBodyCodegen) {
+        std::vector<uint8_t> denseBreakdownWindowLaBodyRecordIsLogical(
+            (size_t)denseBreakdownWindowAllOwnerMTaskStorageCount, 0);
+        for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {
+          const int denseBreakdownWindowLaBodyRecord =
+              denseBreakdownWindowAllOwnerLayout.recordIndexByMTask[(size_t)mtaskId];
+          Assert(denseBreakdownWindowLaBodyRecord >= 0
+                     && denseBreakdownWindowLaBodyRecord < denseBreakdownWindowAllOwnerMTaskStorageCount,
+                 "dense breakdown LA-body record index out of range for MTask %d", mtaskId);
+          denseBreakdownWindowLaBodyRecordIsLogical[(size_t)denseBreakdownWindowLaBodyRecord] = 1;
+        }
+        fprintf(header, "static constexpr uint8_t kDenseBreakdownWindowLaBodyRecordIsLogical[kDenseBreakdownWindowAllOwnerMTaskStorageCount] = {");
+        for (int i = 0; i < denseBreakdownWindowAllOwnerMTaskStorageCount; i ++) {
+          if (i != 0) fprintf(header, ",");
+          fprintf(header, "%u", (unsigned)denseBreakdownWindowLaBodyRecordIsLogical[(size_t)i]);
+        }
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr int kDenseBreakdownWindowLaBodyMTaskOwner[kDenseBreakdownWindowAllOwnerMTaskCount] = {");
+        for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {
+          if (mtaskId != 0) fprintf(header, ",");
+          fprintf(header, "%d", mtDenseSchedule.mtaskThreadAssign[(size_t)mtaskId]);
+        }
+        fprintf(header, "};\n");
+        std::vector<uint64_t> denseBreakdownWindowLaBodyMTaskKeys;
+        std::set<uint64_t> denseBreakdownWindowLaBodyUniqueKeys;
+        for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; ++mtaskId) {
+          const uint64_t key = mtDenseMTaskMemberKey(mtDenseSchedule, mtaskId);
+          Assert(denseBreakdownWindowLaBodyUniqueKeys.insert(key).second,
+                 "dense breakdown LA-body MTask member key collision at MTask %d", mtaskId);
+          denseBreakdownWindowLaBodyMTaskKeys.push_back(key);
+        }
+        fprintf(header, "static constexpr uint64_t kDenseBreakdownWindowLaBodyMTaskMemberKey[kDenseBreakdownWindowAllOwnerMTaskCount] = {");
+        for (int mtaskId = 0; mtaskId < denseBreakdownWindowAllOwnerMTaskCount; ++mtaskId) {
+          if (mtaskId != 0) fprintf(header, ",");
+          fprintf(header, "UINT64_C(%llu)", (unsigned long long)denseBreakdownWindowLaBodyMTaskKeys[(size_t)mtaskId]);
+        }
+        fprintf(header, "};\n");
+      }
       // Fixed workers traverse their assigned logical MTask ids in ascending order after
       // SCHED_ORDER has renumbered the schedule. This map is deliberately logical-sized:
       // all-owner storage padding is not a causal same-owner vertex.
@@ -1213,6 +1259,13 @@ void graph::cppEmitter() {
       fprintf(header, "uint32_t mtDenseBreakdownWindowWaitCounts[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowThreadCount];\n");
       fprintf(header, "MtDenseBreakdownWindowWait mtDenseBreakdownWindowWaits[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowWaitRecordStorageCount];\n");
       fprintf(header, "alignas(64) MtDenseBreakdownWindowAllOwnerMTask mtDenseBreakdownWindowAllOwnerMTasks[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowAllOwnerMTaskStorageCount];\n");
+      if (denseBreakdownWindowLaBodyCodegen) {
+        // Exactly-once latch for lookahead body-only samples: 0 untouched,
+        // 1 recorded exactly once this window slot, anything else is a
+        // duplicate dispatch and aborts. Zeroed in initMtDenseBreakdownProfile
+        // before the window is enabled.
+        fprintf(header, "uint8_t mtDenseBreakdownWindowLaBodySeen[kDenseBreakdownWindowMaxCycles][kDenseBreakdownWindowAllOwnerMTaskStorageCount];\n");
+      }
       fprintf(header, "MtDenseBreakdownWindowReadyToken mtDenseBreakdownWindowReadyTokens[kDenseBreakdownWindowMaxCycles][%d];\n", denseBreakdownWindowCausalTokenStorageCount);
       fprintf(header, "MtDenseBreakdownWindowCausalSummary mtDenseBreakdownWindowCausalSummaries[kDenseBreakdownWindowMaxCycles];\n");
       fprintf(header, "static_assert(kDenseBreakdownWindowCausalTokenCount <= kDenseBreakdownWindowCausalTokenStorageCount, \"dense breakdown causal token storage cap\");\n");
@@ -1842,6 +1895,13 @@ void graph::cppEmitter() {
       emitBodyLock(1, "gAssert(mtDenseBreakdownWindowStartValid && mtDenseBreakdownWindowCyclesValid && mtDenseBreakdownWindowCycles >= 1 && mtDenseBreakdownWindowCycles <= kDenseBreakdownWindowMaxCycles, \"GSIM_MT_DENSE_BREAKDOWN window requires an unsigned start and 1..%%d cycles\", kDenseBreakdownWindowMaxCycles);\n");
       emitBodyLock(1, "if (!mtDenseBreakdownWindowStartValid || !mtDenseBreakdownWindowCyclesValid || mtDenseBreakdownWindowCycles < 1 || mtDenseBreakdownWindowCycles > kDenseBreakdownWindowMaxCycles) abort();\n");
       emitBodyLock(1, "const char *mtDenseBreakdownWindowModeEnv = getenv(\"GSIM_MT_DENSE_BREAKDOWN_WINDOW_MODE\");\n");
+      if (denseBreakdownWindowLaBodyCodegen) {
+        emitBodyLock(1, "gAssert(mtDenseBreakdownWindowModeEnv != nullptr && strcmp(mtDenseBreakdownWindowModeEnv, \"allownerbody\") == 0, \"GSIM_MT_DENSE_BREAKDOWN_WINDOW_LA_BODY requires GSIM_MT_DENSE_BREAKDOWN_WINDOW_MODE=allownerbody; other window modes are incompatible with lookahead\");\n");
+        emitBodyLock(1, "if (mtDenseBreakdownWindowModeEnv == nullptr || strcmp(mtDenseBreakdownWindowModeEnv, \"allownerbody\") != 0) abort();\n");
+        emitBodyLock(1, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
+        emitBodyLock(1, "mtDenseBreakdownWindowAllOwnerBodyMode = true;\n");
+        emitBodyLock(1, "mtDenseBreakdownWindowFinishOnlyMode = false;\n");
+      } else {
       emitBodyLock(1, "if (mtDenseBreakdownWindowModeEnv == nullptr || mtDenseBreakdownWindowModeEnv[0] == '\\0' || strcmp(mtDenseBreakdownWindowModeEnv, \"criticality\") == 0) {\n");
       emitBodyLock(2, "mtDenseBreakdownWindowWorker0BodyMode = false;\n");
       emitBodyLock(2, "mtDenseBreakdownWindowAllOwnerBodyMode = false;\n");
@@ -1884,11 +1944,15 @@ void graph::cppEmitter() {
       emitBodyLock(2, "gAssert(false, \"GSIM_MT_DENSE_BREAKDOWN_WINDOW_MODE must be finishonly, criticality, worker0body, allownerbody, causalchain, or causalhotspots\");\n");
       emitBodyLock(2, "abort();\n");
       emitBodyLock(1, "}\n");
+      }
       emitBodyLock(1, "static const char mtDenseBreakdownWindowSuffix[] = \".window.json\";\n");
       emitBodyLock(1, "gAssert(mtDenseBreakdownProfileOutPathLen + sizeof(mtDenseBreakdownWindowSuffix) <= sizeof(mtDenseBreakdownWindowOutPath), \"GSIM_MT_DENSE_BREAKDOWN_OUT path is too long for window sibling\");\n");
       emitBodyLock(1, "if (mtDenseBreakdownProfileOutPathLen + sizeof(mtDenseBreakdownWindowSuffix) > sizeof(mtDenseBreakdownWindowOutPath)) abort();\n");
       emitBodyLock(1, "memcpy(mtDenseBreakdownWindowOutPath, mtDenseBreakdownProfileOutPath, mtDenseBreakdownProfileOutPathLen);\n");
       emitBodyLock(1, "memcpy(mtDenseBreakdownWindowOutPath + mtDenseBreakdownProfileOutPathLen, mtDenseBreakdownWindowSuffix, sizeof(mtDenseBreakdownWindowSuffix));\n");
+      if (denseBreakdownWindowLaBodyCodegen) {
+        emitBodyLock(1, "for (int c = 0; c < kDenseBreakdownWindowMaxCycles; c ++) { for (int i = 0; i < kDenseBreakdownWindowAllOwnerMTaskStorageCount; i ++) mtDenseBreakdownWindowLaBodySeen[c][i] = 0; }\n");
+      }
       emitBodyLock(1, "mtDenseBreakdownWindowEnabled = true;\n");
     }
     emitBodyLock(1, "mtDenseBreakdownProfileEnabled = true;\n");
@@ -1922,6 +1986,41 @@ void graph::cppEmitter() {
       emitBodyLock(2, "const bool mtDenseBreakdownWindowOverflowed = mtDenseBreakdownWindowOverflow.load(std::memory_order_relaxed);\n");
       emitBodyLock(2, "const bool mtDenseBreakdownWindowComplete = !mtDenseBreakdownWindowOverflowed && mtDenseBreakdownWindowRecordedCycles == mtDenseBreakdownWindowCycles;\n");
       emitBodyLock(2, "const char *mtDenseBreakdownWindowMode = mtDenseBreakdownWindowCausalHotspotsMode ? \"causalhotspots\" : (mtDenseBreakdownWindowCausalChainMode ? \"causalchain\" : (mtDenseBreakdownWindowFinishOnlyMode ? \"finishonly\" : (mtDenseBreakdownWindowAllOwnerBodyMode ? \"allownerbody\" : (mtDenseBreakdownWindowWorker0BodyMode ? \"worker0body\" : \"criticality\"))));\n");
+      if (denseBreakdownWindowLaBodyCodegen) {
+        // Lookahead body-only dump. Reads ONLY the body records written inside
+        // stepDenseMTaskN(): no worker spans, no waits, no release endpoints
+        // (the LA tail's early return skips the worker epilogue, and the
+        // release-end recorder is dead text under lookahead codegen, so those
+        // cycle recorded and every task sampled exactly once per cycle.
+        emitBodyLock(2, "for (int c = 0; c < kDenseBreakdownWindowMaxCycles; c ++) {\n");
+        emitBodyLock(3, "for (int i = 0; i < kDenseBreakdownWindowAllOwnerMTaskStorageCount; i ++) {\n");
+        emitBodyLock(4, "const uint8_t mtDenseBreakdownWindowLaBodySeenCount = mtDenseBreakdownWindowLaBodySeen[c][i];\n");
+        emitBodyLock(4, "if (c < (int)mtDenseBreakdownWindowRecordedCycles) {\n");
+        emitBodyLock(5, "if (kDenseBreakdownWindowLaBodyRecordIsLogical[i] == 0) {\n");
+        emitBodyLock(6, "if (unlikely(mtDenseBreakdownWindowLaBodySeenCount != 0)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] lookahead body sample in padding record\\n\"); abort(); }\n");
+        emitBodyLock(5, "} else if (unlikely(mtDenseBreakdownWindowLaBodySeenCount != 1)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] lookahead body sample count is not exactly one\\n\"); abort(); }\n");
+        emitBodyLock(4, "} else if (unlikely(mtDenseBreakdownWindowLaBodySeenCount != 0)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] lookahead body sample outside the recorded window\\n\"); abort(); }\n");
+        emitBodyLock(3, "}\n");
+        emitBodyLock(2, "}\n");
+        emitBodyLock(2, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) {\n");
+        emitBodyLock(3, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {\n");
+        emitBodyLock(4, "const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowLaBodyRecord = mtDenseBreakdownWindowAllOwnerMTasks[c][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtaskId]];\n");
+        emitBodyLock(4, "if (unlikely(mtDenseBreakdownWindowLaBodyRecord.mtaskId != (uint32_t)mtaskId || mtDenseBreakdownWindowLaBodyRecord.ownerThreadId != (uint16_t)kDenseBreakdownWindowLaBodyMTaskOwner[mtaskId] || mtDenseBreakdownWindowLaBodyRecord.ownerThreadId >= (uint16_t)mtDenseBreakdownProfileWorkerCount || mtDenseBreakdownWindowLaBodyRecord.bodyEndOffsetNs < mtDenseBreakdownWindowLaBodyRecord.bodyStartOffsetNs)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fclose(mtDenseBreakdownWindowFile); fprintf(stderr, \"[mt-dense-breakdown] corrupt lookahead body MTask record\\n\"); abort(); }\n");
+        emitBodyLock(3, "}\n");
+        emitBodyLock(2, "}\n");
+        emitBodyLock(2, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"magic\\\":\\\"GSIM_MT_DENSE_LOOKAHEAD_BODY_WINDOW\\\",\\\"version\\\":1,\\\"window_start\\\":%%llu,\\\"window_cycles\\\":%%llu,\\\"accepted_cycles\\\":%%llu,\\\"threadCount\\\":%%d,\\\"mode\\\":\\\"%%s\\\",\\\"allowner_mtask_count\\\":%%d,\\\"overflow\\\":%%s,\\\"complete\\\":%%s,\\\"cycles\\\":[\", (unsigned long long)mtDenseBreakdownWindowStart, (unsigned long long)mtDenseBreakdownWindowCycles, (unsigned long long)mtDenseBreakdownWindowRecordedCycles, mtDenseBreakdownProfileWorkerCount, mtDenseBreakdownWindowMode, kDenseBreakdownWindowAllOwnerMTaskCount, mtDenseBreakdownWindowOverflowed ? \"true\" : \"false\", mtDenseBreakdownWindowComplete ? \"true\" : \"false\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+        emitBodyLock(2, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) {\n");
+        emitBodyLock(3, "if (c != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+        emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"cycle\\\":%%llu,\\\"mtasks\\\":[\", (unsigned long long)mtDenseBreakdownWindowCycleNumbers[c]) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+        emitBodyLock(3, "for (int mtaskId = 0; mtaskId < kDenseBreakdownWindowAllOwnerMTaskCount; mtaskId ++) {\n");
+        emitBodyLock(4, "if (mtaskId != 0 && fputc(',', mtDenseBreakdownWindowFile) == EOF) mtDenseBreakdownWindowWriteError = 1;\n");
+        emitBodyLock(4, "const MtDenseBreakdownWindowAllOwnerMTask &mtDenseBreakdownWindowLaBodyRecord = mtDenseBreakdownWindowAllOwnerMTasks[c][kDenseBreakdownWindowAllOwnerMTaskRecordIndex[mtaskId]];\n");
+        emitBodyLock(4, "if (fprintf(mtDenseBreakdownWindowFile, \"{\\\"mtaskId\\\":%%u,\\\"memberKey\\\":\\\"0x%%016llx\\\",\\\"ownerThreadId\\\":%%u,\\\"bodyStartOffsetNs\\\":%%llu,\\\"bodyEndOffsetNs\\\":%%llu,\\\"bodyNs\\\":%%llu}\", mtDenseBreakdownWindowLaBodyRecord.mtaskId, (unsigned long long)kDenseBreakdownWindowLaBodyMTaskMemberKey[mtaskId], (unsigned)mtDenseBreakdownWindowLaBodyRecord.ownerThreadId, (unsigned long long)mtDenseBreakdownWindowLaBodyRecord.bodyStartOffsetNs, (unsigned long long)mtDenseBreakdownWindowLaBodyRecord.bodyEndOffsetNs, (unsigned long long)mtDenseBreakdownWindowLaBodyRecord.bodyNs) < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+        emitBodyLock(3, "}\n");
+        emitBodyLock(3, "if (fprintf(mtDenseBreakdownWindowFile, \"]}\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+        emitBodyLock(2, "}\n");
+        emitBodyLock(2, "if (fprintf(mtDenseBreakdownWindowFile, \"]}\\n\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
+      } else {
       emitBodyLock(2, "if (mtDenseBreakdownWindowCausalHotspotsMode) {\n");
       emitBodyLock(3, "bool mtDenseBreakdownWindowCausalMappingComplete = !mtDenseBreakdownWindowOverflowed && !mtDenseBreakdownWindowCausalClockRegression && mtDenseBreakdownWindowRecordedCycles == mtDenseBreakdownWindowCycles;\n");
       emitBodyLock(3, "for (uint64_t c = 0; c < mtDenseBreakdownWindowRecordedCycles; c ++) { const MtDenseBreakdownWindowCausalSummary &mtDenseBreakdownWindowCausalSummary = mtDenseBreakdownWindowCausalSummaries[c]; if (!mtDenseBreakdownWindowCausalSummary.complete || mtDenseBreakdownWindowCausalSummary.incompleteMapping || mtDenseBreakdownWindowCausalSummary.clockRegression || mtDenseBreakdownWindowCausalSummary.overflow) mtDenseBreakdownWindowCausalMappingComplete = false; }\n");
@@ -1998,6 +2097,7 @@ void graph::cppEmitter() {
       emitBodyLock(2, "}\n");
       emitBodyLock(2, "if (fprintf(mtDenseBreakdownWindowFile, \"]}\\n\") < 0) mtDenseBreakdownWindowWriteError = 1;\n");
       emitBodyLock(2, "}\n");
+      }
       emitBodyLock(2, "if (fflush(mtDenseBreakdownWindowFile) != 0) mtDenseBreakdownWindowWriteError = 1;\n");
       emitBodyLock(2, "if (fclose(mtDenseBreakdownWindowFile) != 0) mtDenseBreakdownWindowWriteError = 1;\n");
       emitBodyLock(2, "if (mtDenseBreakdownWindowWriteError) { fprintf(stderr, \"[mt-dense-breakdown] failed to write window output path=%%s\\n\", mtDenseBreakdownWindowOutPath); abort(); }\n");
