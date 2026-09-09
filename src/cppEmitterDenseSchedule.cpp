@@ -1104,6 +1104,12 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   // uses (the PackThreads variant of the term sits in its own builder).
   int ccdExtra = 0;
   { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+  // GSIM_MT_DENSE_SCHED_XSYNC_PCT=<pct> (default 30, byte-identical): the
+  // cross-thread handoff penalty as a percentage of the producer's cost. It
+  // was calibrated in the static node-count domain; measured ns costs change
+  // its physical meaning, so the value is swept under SCHED_COSTFILE.
+  int xsyncPct = 30;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_XSYNC_PCT"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) xsyncPct = v; } }
   const int ccdSize = 8;
   while (!ready.empty()) {
     int bestReadyIndex = -1, bestMTask = -1, bestWorker = 0;
@@ -1123,7 +1129,7 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           long long predEnd = completion[(size_t)pred];
           int predWorker = outAssign[(size_t)pred];
           if (predWorker >= 0 && predWorker != worker) {
-            predEnd += (long long)(costOf(mtasks[(size_t)pred])) * 30 / 100;
+            predEnd += (long long)(costOf(mtasks[(size_t)pred])) * xsyncPct / 100;
             if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
               predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
           }
