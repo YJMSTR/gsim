@@ -35,8 +35,11 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   if (denseBreakdownProfileCodegen) {
     Assert(ownerReadyFlags,
            "GSIM_MT_DENSE_BREAKDOWN_PROFILE requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
-    Assert(threadCount <= 16,
-           "GSIM_MT_DENSE_BREAKDOWN_PROFILE supports at most 16 workers (got %d)", threadCount);
+    const int denseBreakdownMaxWorkers =
+        mtUseDenseBreakdownWindowLaBodyCodegen() ? 32 : 16;
+    Assert(threadCount <= denseBreakdownMaxWorkers,
+           "GSIM_MT_DENSE_BREAKDOWN_PROFILE supports at most %d workers (got %d)",
+           denseBreakdownMaxWorkers, threadCount);
   }
 
   if (ownerReadyFlags) {

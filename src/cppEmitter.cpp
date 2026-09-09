@@ -927,9 +927,14 @@ void graph::cppEmitter() {
     const char* denseBreakdownWindowThreadsEnv = std::getenv("GSIM_THREADS");
     if (denseBreakdownWindowThreadsEnv != nullptr && denseBreakdownWindowThreadsEnv[0] != '\0') denseBreakdownWindowThreadCount = std::atoi(denseBreakdownWindowThreadsEnv);
     if (denseBreakdownWindowThreadCount < 1) denseBreakdownWindowThreadCount = 1;
-    Assert(denseBreakdownWindowThreadCount >= 2 && denseBreakdownWindowThreadCount <= 16,
-           "GSIM_MT_DENSE_BREAKDOWN window requires 2..16 workers (got %d)",
-           denseBreakdownWindowThreadCount);
+    // Body-only lookahead timing never records worker lanes; allow up to 32
+    // there so T32 labels are capturable. Other window modes keep 2..16.
+    const int denseBreakdownWindowMaxWorkers =
+        mtUseDenseBreakdownWindowLaBodyCodegen() ? 32 : 16;
+    Assert(denseBreakdownWindowThreadCount >= 2
+               && denseBreakdownWindowThreadCount <= denseBreakdownWindowMaxWorkers,
+           "GSIM_MT_DENSE_BREAKDOWN window requires 2..%d workers (got %d)",
+           denseBreakdownWindowMaxWorkers, denseBreakdownWindowThreadCount);
   }
   if (denseBreakdownProfileCodegen) {
     Assert(denseExecutorValid,
@@ -1064,7 +1069,8 @@ void graph::cppEmitter() {
   if (denseExecutorValid) fprintf(header, "bool mtUseDenseExecutor;\n");
   fprintf(header, "bool mtProfileEnabled;\n");
   if (denseBreakdownProfileCodegen) {
-    fprintf(header, "static constexpr int kDenseBreakdownProfileWorkerCount = 16;\n");
+    fprintf(header, "static constexpr int kDenseBreakdownProfileWorkerCount = %d;\n",
+            mtUseDenseBreakdownWindowLaBodyCodegen() ? 32 : 16);
     fprintf(header, "struct alignas(64) MtDenseBreakdownWorker {\n");
     fprintf(header, "  uint64_t dispatchSpanNs;\n");
     fprintf(header, "  uint64_t blockedWaitNs;\n");
