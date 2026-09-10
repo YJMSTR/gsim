@@ -470,6 +470,7 @@ bool mtUseDensePushReady();
 bool mtUseDensePushReadyDebug();
 bool mtUseDensePushReadyDirectTable();
 bool mtUseDensePushReadyBitmap();
+bool mtUseDensePushReadyHint();
 int mtDenseSpinYieldEvery();
 int mtDenseLookaheadWindow();
 bool mtDenseDutyCodegen();

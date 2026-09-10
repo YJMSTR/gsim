@@ -163,6 +163,20 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // the emitted v1 runtime byte-identical.
   const bool pushReadyBitmapKnob = mtUseDensePushReadyBitmap();
   bool pushReadyBitmap = pushReady && pushReadyBitmapKnob;
+  // GSIM_MT_DENSE_PUSH_READY_HINT (default off): queue-free pull-hint variant
+  // of the push protocol. Reuses the exact 13,378-edge fan-in CSR the shadow
+  // knob validated, but keeps the existing pull/lookahead worker control flow
+  // and direct `entry->fn` body calls: producers push one per-task ready byte
+  // (atomic uint8, release-stored by the final fan-in decrement) and workers
+  // 1..N-1 replace only their readiness decisions (inline head test, tail
+  // head test, candidate admission, tail fallback spin) with one acquire load
+  // of that byte instead of loading each remote token wait list. Worker0
+  // stays fully original pull for its pinned side effects. No queues, no
+  // enqueue/dequeue, no dynamic worker assignment, no repeated full-table
+  // scan. Mutually exclusive with the actual push protocol (v1/BITMAP/
+  // DIRECT_TABLE) and every diagnostic knob to isolate the probe. Unset
+  // keeps every emitted byte identical.
+  const bool pushReadyHint = mtUseDensePushReadyHint();
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
   int denseBreakdownWindowWorker0MTaskCount = 0;
@@ -216,6 +230,20 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_PUSH_READY is mutually exclusive with GSIM_MT_DENSE_EDGE_TIMING");
   Assert(!(pushReady && denseBreakdownProfileCodegen),
          "GSIM_MT_DENSE_PUSH_READY is mutually exclusive with GSIM_MT_DENSE_BREAKDOWN_PROFILE");
+  Assert(!pushReadyHint || ownerReadyFlags,
+         "GSIM_MT_DENSE_PUSH_READY_HINT requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!(pushReadyHint && pushReady),
+         "GSIM_MT_DENSE_PUSH_READY_HINT is mutually exclusive with GSIM_MT_DENSE_PUSH_READY");
+  Assert(!(pushReadyHint && (pushReadyDirectTableKnob || pushReadyBitmapKnob)),
+         "GSIM_MT_DENSE_PUSH_READY_HINT is mutually exclusive with GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE and GSIM_MT_DENSE_PUSH_READY_BITMAP");
+  Assert(!(pushReadyHint && pushShadow),
+         "GSIM_MT_DENSE_PUSH_READY_HINT is mutually exclusive with GSIM_MT_DENSE_PUSH_READY_SHADOW");
+  Assert(!(pushReadyHint && pscdBits),
+         "GSIM_MT_DENSE_PUSH_READY_HINT is mutually exclusive with GSIM_EMIT_PSCD_BITS");
+  Assert(!(pushReadyHint && edgeTiming),
+         "GSIM_MT_DENSE_PUSH_READY_HINT is mutually exclusive with GSIM_MT_DENSE_EDGE_TIMING");
+  Assert(!(pushReadyHint && denseBreakdownProfileCodegen),
+         "GSIM_MT_DENSE_PUSH_READY_HINT is mutually exclusive with GSIM_MT_DENSE_BREAKDOWN_PROFILE");
   const std::chrono::steady_clock::time_point densePrologueBegin = std::chrono::steady_clock::now();
   std::vector<std::vector<int>> denseRuntimeSuccs;
   int transitiveElidedEdges = 0;
@@ -244,6 +272,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_DUTY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!pushReady || denseLookahead,
          "GSIM_MT_DENSE_PUSH_READY requires GSIM_MT_DENSE_LOOKAHEAD >= 1");
+  Assert(!pushReadyHint || denseLookahead,
+         "GSIM_MT_DENSE_PUSH_READY_HINT requires GSIM_MT_DENSE_LOOKAHEAD >= 1");
   const bool denseBreakdownWindowLaBodyCodegen =
       denseBreakdownWindowCodegen && mtUseDenseBreakdownWindowLaBodyCodegen();
   if (mtUseDenseBreakdownWindowLaBodyCodegen()) {
@@ -854,7 +884,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   int pushShadowTokenEdges = 0, pushShadowDirectEdges = 0, pushShadowSiblingEdges = 0;
   int pushShadowTokenEdgesKept = 0, pushShadowDirectEdgesKept = 0, pushShadowSiblingEdgesKept = 0;
   int pushShadowMaxFanin = 0, pushShadowZeroFaninMTasks = 0;
-  if (pushShadow || pushReady) {
+  if (pushShadow || pushReady || pushReadyHint) {
     if (denseLookahead) {
       pushShadowDagOnlySuccs = denseLookaheadDagOnlySuccs;
     } else {
@@ -1005,6 +1035,27 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(stderr, "[push-ready] dispatch=%s\n",
             pushReadyBitmap ? "ready-byte"
                             : (pushReadyDirectTable ? "direct-table" : "switch"));
+  }
+  // ---- Push-ready hint layout (GSIM_MT_DENSE_PUSH_READY_HINT, default off) ----
+  // No arrival structures at all: one ready byte per MTask is the whole
+  // layout, consumed in place by the existing pull/lookahead control flow of
+  // workers 1..N-1 (worker0 keeps the original token wait lists). The fan-in
+  // CSR above (pending counters re-armed per cycle, one decrement per
+  // deduplicated producer edge, final decrement release-stores the byte) is
+  // identical to the one the shadow knob validated.
+  if (pushReadyHint) {
+    int pushReadyHintRootCount = 0;
+    for (int m = 0; m < nMTasks; ++m) {
+      if (pushShadowFanin[(size_t)m] != 0u) continue;
+      if (denseSchedule.mtaskThreadAssign[(size_t)m] == 0) continue;
+      pushReadyHintRootCount++;
+    }
+    fprintf(stderr,
+            "[push-ready] mtasks=%d fanin_edges=%zu token_edges=%d direct_edges=%d sibling_edges=%d hints=%d roots=%d worker0_pull=1 threads=%d lookahead=%d\n",
+            nMTasks, pushShadowNotifyList.size(),
+            pushShadowTokenEdges, pushShadowDirectEdges, pushShadowSiblingEdges,
+            nMTasks, pushReadyHintRootCount, threadCount, denseLookahead ? 1 : 0);
+    fprintf(stderr, "[push-ready] dispatch=hint\n");
   }
   // ---- PSCD slice 1 analysis (GSIM_EMIT_PSCD_BITS, default off) ----
   // Derives, per owner-ready token, the scalar register-state fields crossing
@@ -1661,6 +1712,39 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         fprintf(header, "void stepDensePushReadyBitmapWorker(int threadId);\n");
       }
     }
+    if (pushReadyHint) {
+      // GSIM_MT_DENSE_PUSH_READY_HINT runtime state (default off, inside the
+      // owner-ready compile guard). Same deduplicated fan-in CSR the shadow
+      // validated: pending[d] is re-armed to fan-in before every dispatch and
+      // decremented once per producer edge at completion; the decrementer that
+      // observes old==1 release-stores the dependent's ready byte. The byte is
+      // the entire arrival state - no queues, no dispatch switch; workers
+      // 1..N-1 acquire-load it in place of their remote token wait lists, and
+      // it is never cleared mid-cycle (each assigned task executes exactly
+      // once, so a set byte cannot authorize a second execution).
+      fprintf(header, "// GSIM_MT_DENSE_PUSH_READY_HINT: queue-free pull-hint state (default off)\n");
+      fprintf(header, "static constexpr int kDensePushReadyHintMTaskCount = %d;\n", nMTasks);
+      fprintf(header, "static constexpr uint32_t kDensePushReadyHintFanin[%d] = {", nMTasks);
+      for (int m = 0; m < nMTasks; m++)
+        fprintf(header, "%s%u", m ? "," : "", pushShadowFanin[(size_t)m]);
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr uint32_t kDensePushReadyHintNotifyOffsets[%d] = {", nMTasks + 1);
+      for (int p = 0; p <= nMTasks; p++)
+        fprintf(header, "%s%u", p ? "," : "", pushShadowNotifyOffsets[(size_t)p]);
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr uint32_t kDensePushReadyHintNotifyList[%zu] = {",
+              std::max<size_t>(1, pushShadowNotifyList.size()));
+      for (size_t i = 0; i < pushShadowNotifyList.size(); ++i)
+        fprintf(header, "%s%u", i ? "," : "", pushShadowNotifyList[i]);
+      if (pushShadowNotifyList.empty()) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static_assert(std::atomic<uint32_t>::is_always_lock_free, \"push-ready hint pending must be lock-free\");\n");
+      fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"push-ready hint byte must be lock-free\");\n");
+      fprintf(header, "std::atomic<uint32_t> mtDensePushReadyHintPending[%d];\n", nMTasks);
+      fprintf(header, "std::atomic<uint8_t> mtDensePushReadyHint[%d];\n", nMTasks);
+      fprintf(header, "void mtDensePushReadyHintPrepare();\n");
+      fprintf(header, "void mtDensePushReadyHintNotify(uint32_t mtaskId);\n");
+    }
     if (denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
               std::max(1, (int)denseDispatchWaitTotal));
@@ -1726,15 +1810,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         if (firstSource) fprintf(header, "0");
         fprintf(header, "};\n");
         fprintf(header, "struct MtDenseDispatchEntry { void (S%s::*fn)(); uint32_t waitBegin; uint32_t waitEnd; uint32_t storeBegin; uint32_t storeEnd; uint32_t localBegin; uint32_t localEnd;%s };\n",
-                name.c_str(), (pushShadow || pushReady) ? " uint32_t mtaskId;" : "");
+                name.c_str(), (pushShadow || pushReady || pushReadyHint) ? " uint32_t mtaskId;" : "");
         // GSIM_MT_DENSE_PUSH_READY_SHADOW threads the notifying worker's lane
         // through the tail so its sole-writer accounting stays atomic-free.
         if (denseDuty && pushShadow) {
           fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane, uint32_t mtPushShadowLane);\n");
+        } else if (denseDuty && pushReadyHint) {
+          fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane, uint32_t mtPushReadyHintLane);\n");
         } else if (denseDuty) {
           fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane);\n");
         } else if (pushShadow) {
           fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtPushShadowLane);\n");
+        } else if (pushReadyHint) {
+          fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtPushReadyHintLane);\n");
         } else {
           fprintf(header, "void stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target);\n");
         }
@@ -2113,16 +2201,31 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           for (int mtaskId = 0; mtaskId < nMTasks; ++mtaskId) {
             if (denseSchedule.mtaskThreadAssign[(size_t)mtaskId] != t) continue;
             emitBodyLock(4, "{ bool mtDenseInlineReady = true;\n");
-            for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
-              emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
+            if (pushReadyHint && t != 0) {
+              // GSIM_MT_DENSE_PUSH_READY_HINT: workers 1..N-1 replace the
+              // whole wait-list conjunction with one acquire of the per-task
+              // ready byte (armed only after every mapped producer edge has
+              // been paid this cycle). Worker0's case keeps the original
+              // token checks below - its lane stays fully original pull.
+              emitBodyLock(5, "mtDenseInlineReady = (mtDensePushReadyHint[%d].load(std::memory_order_acquire) != 0u);\n", mtaskId);
+            } else {
+              for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
+                emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
+              }
             }
             if (denseDuty && pushShadow) {
+              emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du, %du); return; }\n",
+                           t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t, t);
+            } else if (denseDuty && pushReadyHint) {
               emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du, %du); return; }\n",
                            t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t, t);
             } else if (denseDuty) {
               emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
                            t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
             } else if (pushShadow) {
+              emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
+                           t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
+            } else if (pushReadyHint) {
               emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
                            t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
             } else {
@@ -2134,6 +2237,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(5, "mtDensePushShadowNotify(%d, (uint32_t)threadId);\n", mtaskId);
             if (pushReady)
               emitBodyLock(5, "mtDensePushReadyNotify(%d);\n", mtaskId);
+            if (pushReadyHint)
+              emitBodyLock(5, "mtDensePushReadyHintNotify(%d);\n", mtaskId);
             if (pscdBits)
               emitBodyLock(5, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
             for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
@@ -2324,6 +2429,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
           emitBodyLock(3, "mtDensePushReadyNotify(%d);\n", mtaskId);
           emitBodyLock(3, "#endif\n");
         }
+        if (pushReadyHint) {
+          // Push-ready hint notify on the strict dispatch path (macro-off
+          // builds compile it out together with all hint state): same
+          // position - after the body, before the token release stores.
+          emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+          emitBodyLock(3, "mtDensePushReadyHintNotify(%d);\n", mtaskId);
+          emitBodyLock(3, "#endif\n");
+        }
         const bool skipDenseSignal = staticEmptyElide && denseRuntimeSuccs[(size_t)mtaskId].empty();
         if (!ownerReadyFlags) {
           if (!skipDenseSignal) {
@@ -2425,10 +2538,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // SimTop1210 began with the body -> #endif without #if at MAXMT=800).
     if (denseDuty && pushShadow) {
       emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane, uint32_t mtPushShadowLane) {\n", name.c_str());
+    } else if (denseDuty && pushReadyHint) {
+      emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane, uint32_t mtPushReadyHintLane) {\n", name.c_str());
     } else if (denseDuty) {
       emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtDutyLane) {\n", name.c_str());
     } else if (pushShadow) {
       emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtPushShadowLane) {\n", name.c_str());
+    } else if (pushReadyHint) {
+      emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target, uint32_t mtPushReadyHintLane) {\n", name.c_str());
     } else {
       emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::stepDenseLookaheadTail(const MtDenseDispatchEntry* mtDenseDispatchBegin, const MtDenseDispatchEntry* mtDenseDispatchEnd, uint32_t startHead, uint8_t target) {\n", name.c_str());
     }
@@ -2440,9 +2557,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "while (head < mtDenseDispatchCount) {\n");
     emitBodyLock(2, "const MtDenseDispatchEntry* mtDenseDispatchEntry = mtDenseDispatchBegin + head;\n");
     emitBodyLock(2, "bool mtDenseEntryReady = true;\n");
-    emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
-    emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
-    emitBodyLock(2, "}\n");
+    if (pushReadyHint) {
+      // GSIM_MT_DENSE_PUSH_READY_HINT: lanes >0 gate the head entry on the
+      // single per-task ready byte instead of the token wait list; lane 0
+      // (worker0) keeps the original pull conjunction unchanged.
+      emitBodyLock(2, "if (mtPushReadyHintLane != 0u) {\n");
+      emitBodyLock(3, "mtDenseEntryReady = (mtDensePushReadyHint[mtDenseDispatchEntry->mtaskId].load(std::memory_order_acquire) != 0u);\n");
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(3, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+      emitBodyLock(4, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(2, "}\n");
+    } else {
+      emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+      emitBodyLock(3, "mtDenseEntryReady &= (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) == target);\n");
+      emitBodyLock(2, "}\n");
+    }
     // Tail-scan instrumentation (E3): zero-cost unless the stats compile macro is set.
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
     emitBodyLock(2, "if (!mtDenseEntryReady) mtDenseLookaheadTailCalls.fetch_add(1, std::memory_order_relaxed);\n");
@@ -2453,6 +2583,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(3, "mtDensePushShadowNotify(mtDenseDispatchEntry->mtaskId, mtPushShadowLane);\n");
     if (pushReady)
       emitBodyLock(3, "mtDensePushReadyNotify(mtDenseDispatchEntry->mtaskId);\n");
+    if (pushReadyHint)
+      emitBodyLock(3, "mtDensePushReadyHintNotify(mtDenseDispatchEntry->mtaskId);\n");
     if (pscdBits)
       emitBodyLock(3, "mtDensePscdRelease(mtDenseDispatchEntry->storeBegin, mtDenseDispatchEntry->storeEnd);\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
@@ -2498,9 +2630,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(4, "if (!(mtDensePredPosition < head || (anyOutOfOrder && (mtDenseDoneBits[mtDensePredPosition >> 6] & (uint64_t{1} << (mtDensePredPosition & 63))) != 0))) { mtDenseCandidateReady = false; break; }\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
-    emitBodyLock(3, "for (uint32_t mtDenseDispatchWait = mtDenseCandidate->waitBegin; mtDenseDispatchWait < mtDenseCandidate->waitEnd; ++mtDenseDispatchWait) {\n");
-    emitBodyLock(4, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; break; }\n");
-    emitBodyLock(3, "}\n");
+    if (pushReadyHint) {
+      // GSIM_MT_DENSE_PUSH_READY_HINT: candidate admission for lanes >0 is
+      // the same single acquire (local-prereq positions above are unchanged
+      // same-worker control flow); lane 0 keeps the original token loop.
+      emitBodyLock(3, "if (mtPushReadyHintLane != 0u) {\n");
+      emitBodyLock(4, "if (mtDensePushReadyHint[mtDenseCandidate->mtaskId].load(std::memory_order_acquire) == 0u) { mtDenseCandidateReady = false; }\n");
+      emitBodyLock(3, "} else {\n");
+      emitBodyLock(4, "for (uint32_t mtDenseDispatchWait = mtDenseCandidate->waitBegin; mtDenseDispatchWait < mtDenseCandidate->waitEnd; ++mtDenseDispatchWait) {\n");
+      emitBodyLock(5, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; break; }\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(3, "}\n");
+    } else {
+      emitBodyLock(3, "for (uint32_t mtDenseDispatchWait = mtDenseCandidate->waitBegin; mtDenseDispatchWait < mtDenseCandidate->waitEnd; ++mtDenseDispatchWait) {\n");
+      emitBodyLock(4, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) { mtDenseCandidateReady = false; break; }\n");
+      emitBodyLock(3, "}\n");
+    }
     emitBodyLock(3, "if (!mtDenseCandidateReady) continue;\n");
     emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
     emitBodyLock(3, "mtDenseLookaheadFound.fetch_add(1, std::memory_order_relaxed);\n");
@@ -2510,6 +2655,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(3, "mtDensePushShadowNotify(mtDenseCandidate->mtaskId, mtPushShadowLane);\n");
     if (pushReady)
       emitBodyLock(3, "mtDensePushReadyNotify(mtDenseCandidate->mtaskId);\n");
+    if (pushReadyHint)
+      emitBodyLock(3, "mtDensePushReadyHintNotify(mtDenseCandidate->mtaskId);\n");
     if (pscdBits)
       emitBodyLock(3, "mtDensePscdRelease(mtDenseCandidate->storeBegin, mtDenseCandidate->storeEnd);\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseCandidate->storeBegin; mtDenseDispatchStore < mtDenseCandidate->storeEnd; ++mtDenseDispatchStore) {\n");
@@ -2536,7 +2683,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(2, "if (progressed) continue;\n");
     }
     if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
-    emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+    if (!pushReadyHint)
+      emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     if (edgeTiming) {
       emitBodyLock(3, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
       emitBodyLock(4, "const uint64_t mtEdgeT0 = mtEdgeTimingRdtsc(); unsigned ct = 0;\n");
@@ -2546,19 +2694,40 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(4, "} while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target);\n");
       emitBodyLock(4, "mtDenseEdgeBlockedNs[mtDenseDispatchWait] += mtEdgeTimingRdtsc() - mtEdgeT0; mtDenseEdgeWaits[mtDenseDispatchWait] ++;\n");
       emitBodyLock(3, "}\n");
+    } else if (pushReadyHint) {
+      // GSIM_MT_DENSE_PUSH_READY_HINT: the tail fallback spin for lanes >0
+      // waits on the single ready byte (armed exactly once per cycle by the
+      // final mapped producer edge); lane 0 keeps the original per-slot token
+      // spin. edgeTiming is asserted off with the hint knob.
+      emitBodyLock(2, "if (mtPushReadyHintLane != 0u) {\n");
+      emitBodyLock(3, "unsigned ct = 0;\n");
+      emitBodyLock(3, "while (mtDensePushReadyHint[mtDenseDispatchEntry->mtaskId].load(std::memory_order_acquire) == 0u) {\n");
+      if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+      else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(3, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
+      emitBodyLock(4, "unsigned ct = 0;\n");
+      emitBodyLock(4, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
+      if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause(); }\n");
+      else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
+      emitBodyLock(3, "}\n");
+      emitBodyLock(2, "}\n");
     } else {
       emitBodyLock(3, "unsigned ct = 0;\n");
       emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
       if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
       else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
     }
-    emitBodyLock(2, "}\n");
+    if (!pushReadyHint)
+      emitBodyLock(2, "}\n");
     if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
     if (pushShadow)
       emitBodyLock(2, "mtDensePushShadowNotify(mtDenseDispatchEntry->mtaskId, mtPushShadowLane);\n");
     if (pushReady)
       emitBodyLock(2, "mtDensePushReadyNotify(mtDenseDispatchEntry->mtaskId);\n");
+    if (pushReadyHint)
+      emitBodyLock(2, "mtDensePushReadyHintNotify(mtDenseDispatchEntry->mtaskId);\n");
     if (pscdBits)
       emitBodyLock(2, "mtDensePscdRelease(mtDenseDispatchEntry->storeBegin, mtDenseDispatchEntry->storeEnd);\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
@@ -2585,12 +2754,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(0, "const S%s::MtDenseDispatchEntry S%s::kDenseDispatchTableW%d[%d] = {\n",
                    name.c_str(), name.c_str(), t, std::max(1, cnt));
       if (cnt == 0) {
-        emitBodyLock(0, (pushShadow || pushReady) ? "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u, 0u}\n"
+        emitBodyLock(0, (pushShadow || pushReady || pushReadyHint) ? "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u, 0u}\n"
                                                   : "{nullptr, 0u, 0u, 0u, 0u, 0u, 0u}\n");
       } else {
         for (int m = 0; m < nMTasks; m++) {
           if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
-          if (pushShadow || pushReady) {
+          if (pushShadow || pushReady || pushReadyHint) {
             emitBodyLock(0, "{&S%s::stepDenseMTask%d, %uu, %uu, %uu, %uu, %uu, %uu, %uu},\n",
                          name.c_str(), m,
                          denseDispatchWaitBegin[(size_t)m], denseDispatchWaitEnd[(size_t)m],
@@ -3004,6 +3173,60 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(0, "#endif\n");
   }
+  if (pushReadyHint) {
+    // ---- GSIM_MT_DENSE_PUSH_READY_HINT runtime (default off; whole block
+    // inside the owner-ready compile guard so a macro-off build keeps pure
+    // pull for every worker and no hint state is referenced) ----
+    // Queue-free pull-hint protocol: every producer completion decrements
+    // each dependent's per-cycle pending counter once (the deduplicated CSR
+    // the shadow knob validated) and the decrementer that observes old==1
+    // release-stores the dependent's ready byte - the whole arrival
+    // mechanism. Workers 1..N-1 acquire-load that byte in place of their
+    // remote token wait lists inside the unchanged pull/lookahead control
+    // flow; worker0 never reads it and stays fully original pull. The byte
+    // is never cleared mid-cycle: each assigned task executes exactly once,
+    // so a set byte cannot authorize a second execution.
+    emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::mtDensePushReadyHintNotify(uint32_t mtaskId) {\n", name.c_str());
+    emitBodyLock(1, "// Exactly one decrement per deduplicated CSR edge. fetch_sub(acq_rel)\n");
+    emitBodyLock(1, "// makes the decrementer that observes old==1 synchronize with every\n");
+    emitBodyLock(1, "// earlier producer on the same counter, so its release store of the\n");
+    emitBodyLock(1, "// ready byte publishes all producers' body writes to the consumer's\n");
+    emitBodyLock(1, "// acquire. Worker0-owned dependents are decremented too (their pending\n");
+    emitBodyLock(1, "// accounting must stay exact) but their byte is never read: worker0\n");
+    emitBodyLock(1, "// keeps pull discovery.\n");
+    emitBodyLock(1, "for (uint32_t j = kDensePushReadyHintNotifyOffsets[mtaskId]; j < kDensePushReadyHintNotifyOffsets[mtaskId + 1u]; ++j) {\n");
+    emitBodyLock(2, "const uint32_t mtPushReadyHintDependent = kDensePushReadyHintNotifyList[j];\n");
+    emitBodyLock(2, "const uint32_t mtPushReadyHintPrevious = mtDensePushReadyHintPending[mtPushReadyHintDependent].fetch_sub(1u, std::memory_order_acq_rel);\n");
+    emitBodyLock(2, "if (unlikely(mtPushReadyHintPrevious == 0u || mtPushReadyHintPrevious > kDensePushReadyHintFanin[mtPushReadyHintDependent])) {\n");
+    emitBodyLock(3, "fprintf(stderr, \"[push-ready] hint fan-in underflow dependent=%%u producer=%%u cycle=%%lu previous=%%u fanin=%%u\\n\", mtPushReadyHintDependent, mtaskId, (unsigned long) cycles, mtPushReadyHintPrevious, kDensePushReadyHintFanin[mtPushReadyHintDependent]);\n");
+    emitBodyLock(3, "abort();\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(2, "if (mtPushReadyHintPrevious == 1u) mtDensePushReadyHint[mtPushReadyHintDependent].store(1u, std::memory_order_release);\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+
+    emitFuncDecl(0, "void S%s::mtDensePushReadyHintPrepare() {\n", name.c_str());
+    emitBodyLock(1, "// Coordinator-only, between the previous cycle's worker-pool join and\n");
+    emitBodyLock(1, "// mtWorkerPoolPost()'s generation release: the relaxed stores below\n");
+    emitBodyLock(1, "// are published to every worker by the generation acquire, and the join\n");
+    emitBodyLock(1, "// barrier guarantees no producer or consumer still runs from the\n");
+    emitBodyLock(1, "// previous cycle (parity/epoch reset happens here, every cycle).\n");
+    emitBodyLock(1, "for (int m = 0; m < kDensePushReadyHintMTaskCount; ++m)\n");
+    emitBodyLock(2, "mtDensePushReadyHintPending[m].store(kDensePushReadyHintFanin[m], std::memory_order_relaxed);\n");
+    emitBodyLock(1, "// Fresh ready bytes: cleared globally here, armed for the zero-fan-in\n");
+    emitBodyLock(1, "// roots below; producers arm the rest through notify. The byte stays\n");
+    emitBodyLock(1, "// set for the whole cycle after arming - no consumer-side clear.\n");
+    emitBodyLock(1, "for (int m = 0; m < kDensePushReadyHintMTaskCount; ++m)\n");
+    emitBodyLock(2, "mtDensePushReadyHint[m].store(0u, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "// Zero-fan-in roots arm immediately; worker0's roots are never read\n");
+    emitBodyLock(1, "// (its pull path authorizes them itself) but arming keeps the rule\n");
+    emitBodyLock(1, "// uniform: ready==1 iff every mapped producer edge has been paid.\n");
+    emitBodyLock(1, "for (int m = 0; m < kDensePushReadyHintMTaskCount; ++m) {\n");
+    emitBodyLock(2, "if (kDensePushReadyHintFanin[m] == 0u) mtDensePushReadyHint[m].store(1u, std::memory_order_relaxed);\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+    emitBodyLock(0, "#endif\n");
+  }
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
   if (denseDuty) emitBodyLock(1, "MtDenseDutyGuard mtDutyStepGuard(mtDutyEnabled ? &mtDutyLanes[%d].stepWallNs : nullptr);\n", threadCount);
   if (denseBreakdownWindowCodegen) {
@@ -3092,6 +3315,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // release, so the whole reset is publish-before-dispatch.
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
     emitBodyLock(2, "mtDensePushReadyPrepare();\n");
+    emitBodyLock(2, "#endif\n");
+  }
+  if (pushReadyHint) {
+    // Push-ready hint per-cycle setup: re-arm every pending counter to its
+    // fan-in, clear every ready byte and arm the zero-fan-in roots. Runs
+    // after the previous cycle's mtWorkerPoolWaitForDone join and before
+    // mtWorkerPoolPost()'s generation release, so the whole reset is
+    // publish-before-dispatch.
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(2, "mtDensePushReadyHintPrepare();\n");
     emitBodyLock(2, "#endif\n");
   }
   emitBodyLock(2, "mtWorkerPoolPost();\n");
@@ -3279,6 +3512,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "mtDensePushReadyPrepare();\n");
     emitBodyLock(2, "#endif\n");
   }
+  if (pushReadyHint) {
+    // Push-ready hint serial fallback setup: same re-arm/clear/root-arm as
+    // the pool path (single thread, program order publishes everything).
+    emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(2, "mtDensePushReadyHintPrepare();\n");
+    emitBodyLock(2, "#endif\n");
+  }
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
     emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
     if (pushShadow) {
@@ -3303,6 +3543,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       // preserves producer-before-consumer visibility for the verify shadow).
       emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
       emitBodyLock(2, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
+      emitBodyLock(2, "#endif\n");
+    }
+    if (pushReadyHint) {
+      // Push-ready hint serial notify: keeps pending counters and the notify
+      // CSR exercised exactly once per body on the fallback lane (fixed
+      // ascending order is a valid topological order of the census), so the
+      // accounting stays identical to the parallel path.
+      emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(2, "mtDensePushReadyHintNotify(%d);\n", mtaskId);
       emitBodyLock(2, "#endif\n");
     }
   }

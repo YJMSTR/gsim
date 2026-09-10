@@ -718,6 +718,23 @@ bool mtUseDensePushReadyBitmap() {
   const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_BITMAP");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+// GSIM_MT_DENSE_PUSH_READY_HINT (default off): queue-free pull-hint variant
+// of the push protocol. Reuses the exact fan-in/notify CSR the shadow knob
+// validated, but keeps the existing pull/lookahead worker control flow and
+// direct body calls: producers push one per-task ready byte (final
+// fan-in-decrement release store), and pool workers 1..N-1 replace only
+// their readiness decisions (inline head test, tail head test, candidate
+// admission, tail fallback spin) with one acquire load of that byte instead
+// of loading each remote token wait list. Worker0 stays fully original pull.
+// No queues, no enqueue/dequeue, no dynamic worker assignment. Mutually
+// exclusive with GSIM_MT_DENSE_PUSH_READY (and its BITMAP/DIRECT_TABLE
+// refinements), GSIM_MT_DENSE_PUSH_READY_SHADOW, GSIM_EMIT_PSCD_BITS,
+// GSIM_MT_DENSE_EDGE_TIMING and GSIM_MT_DENSE_BREAKDOWN_PROFILE so the probe
+// stays isolated. Unset keeps every emitted byte identical.
+bool mtUseDensePushReadyHint() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_HINT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where
