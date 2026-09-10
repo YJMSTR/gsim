@@ -121,6 +121,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   bool staticEmptyElide = mtUseDenseStaticEmptyElide();
   bool ownerBankCountersDiag = mtUseDenseOwnerBankCountersDiag();
   bool ownerReadyFlags = mtUseDenseOwnerReadyFlags();
+  // PSCD slice 1 (default off): producer change-bits + optional consumer
+  // shadow cross-check. All PSCD emission is generation-gated on pscdBits and
+  // compile-gated on GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE, so both knobs
+  // unset keep every emitted byte identical.
+  bool pscdBits = mtUseEmitPscdBits();
+  bool pscdVerify = mtUsePscdVerify();
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
   int denseBreakdownWindowWorker0MTaskCount = 0;
@@ -150,6 +156,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     Assert(transitiveReduceEdges,
            "GSIM_MT_DENSE_OWNER_READY_FLAGS experiment requires GSIM_MT_DENSE_TRANSITIVE_REDUCE_EDGES=1");
   }
+  Assert(!pscdBits || ownerReadyFlags,
+         "GSIM_EMIT_PSCD_BITS requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!pscdVerify || pscdBits,
+         "GSIM_PSCD_VERIFY requires GSIM_EMIT_PSCD_BITS=1");
   const std::chrono::steady_clock::time_point densePrologueBegin = std::chrono::steady_clock::now();
   std::vector<std::vector<int>> denseRuntimeSuccs;
   int transitiveElidedEdges = 0;
@@ -761,6 +771,290 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             denseLookaheadPublisherConstrainedEntryCount,
             denseLookaheadPublisherSiblingPositionCount);
   }
+  // ---- PSCD slice 1 analysis (GSIM_EMIT_PSCD_BITS, default off) ----
+  // Derives, per owner-ready token, the scalar register-state fields crossing
+  // that edge: single-writer committed fields of the token sources intersected
+  // with the consumer's read set. Producers snapshot those fields at body
+  // entry and compute per-field change verdicts at body exit; each store phase
+  // folds the verdicts into one epoch-tagged change byte per token slot,
+  // stored before the ready-token release store. The optional verify shadow
+  // (GSIM_PSCD_VERIFY) re-derives the consumer OR-compare (inputs vs previous
+  // entry snapshots) and cross-checks it against the OR of input change bits.
+  struct MtPscdFieldRef { int slot = -1; std::string name; };
+  std::vector<std::vector<MtPscdFieldRef>> pscdProducerFields((size_t)nMTasks);
+  std::vector<std::vector<MtPscdFieldRef>> pscdConsumerShadow((size_t)nMTasks);
+  std::vector<std::vector<int>> pscdConsumerTokenSlots((size_t)nMTasks);
+  int pscdFieldsDroppedReset = 0;
+  int pscdWaitSlotsWithoutStoreEntry = 0;
+  std::vector<std::vector<int>> pscdStoreFieldSlots;
+  std::vector<char> pscdStoreConservative;
+  int pscdFieldSlotCount = 0;
+  int pscdShadowSlotCount = 0;
+  int pscdProducersInstrumented = 0;
+  int pscdConsumersShadowed = 0;
+  int pscdExcludedTotal = 0, pscdExcludedWorker0 = 0, pscdExcludedElided = 0,
+      pscdExcludedExt = 0, pscdExcludedSpecial = 0, pscdExcludedReset = 0,
+      pscdExcludedArray = 0, pscdExcludedAmbiguous = 0;
+  int pscdTokensChecked = 0, pscdTokensConservative = 0, pscdTokensZeroField = 0;
+  int pscdFieldsDroppedMultiWriter = 0, pscdFieldsDroppedWide = 0, pscdFieldsDroppedOther = 0;
+  if (pscdBits) {
+    std::vector<std::set<std::string>> pscdCommitFields((size_t)nMTasks);
+    std::vector<std::set<std::string>> pscdReadFields((size_t)nMTasks);
+    std::vector<char> pscdTaskExcluded((size_t)nMTasks, 0);
+    std::vector<char> pscdTaskArrayish((size_t)nMTasks, 0);
+    std::vector<char> pscdTaskReset((size_t)nMTasks, 0);
+    std::map<std::string, Node*> pscdFieldNode;
+    std::map<std::string, std::set<int>> pscdFieldWriters;
+    // Task classification. Hard exclusions (never eligible as producer or
+    // consumer; their tokens are conservatively marked): worker0-only tasks,
+    // elided tasks, SUPER_EXTMOD/DPI, printf/assert/exit, reset machinery,
+    // ambiguous-state producers. Reset machinery = membership in a reset
+    // super (SUPER_ASYNC_RESET / SUPER_UINT_RESET, the subReset/subResetDense
+    // paths) or writing through the reset port (a NODE_REG_RESET member);
+    // NOT a hazard for output change detection (reset-window writes are
+    // neutralized at runtime by mtDensePscdResetHit marking every change
+    // byte changed plus the consumer verify skip). Array /
+    // dynamic-index producers are NOT excluded: they keep eligibility as
+    // consumers, and every token they source gets conservative whole-region
+    // change marking instead of a summarized field list.
+    for (int m = 0; m < nMTasks; m++) {
+      const int owner = m < static_cast<int>(denseSchedule.mtaskThreadAssign.size())
+                            ? denseSchedule.mtaskThreadAssign[(size_t)m] : -1;
+      int excludeCode = -1;
+      bool arrayishTask = false;
+      bool resetMachineryTask = false;
+      if (owner < 0) excludeCode = 1;
+      else if (owner == 0) excludeCode = 0;
+      for (int sccId : denseSchedule.mtasks[(size_t)m].sccIds) {
+        if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+        for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+          auto superIter = cppId2Super.find(cppId);
+          if (superIter == cppId2Super.end() || !superIter->second) continue;
+          SuperNode* super = superIter->second;
+          int dummyCost = 0;
+          MtBoundaryInfo b = collectMtBoundaryInfo(super, dummyCost);
+          bool superIsResetMachinery = super->superType == SUPER_ASYNC_RESET
+                                     || super->superType == SUPER_UINT_RESET;
+          for (Node* member : super->member)
+            if (member->type == NODE_REG_RESET) superIsResetMachinery = true;
+          if (excludeCode < 0) {
+            if (b.hasExternal) excludeCode = 2;
+            else if (b.hasSpecial) excludeCode = 3;
+            else if (superIsResetMachinery) excludeCode = 4;
+            else if (b.hasStateUpdate && b.hasAmbiguousStateTarget) excludeCode = 6;
+          }
+          if (superIsResetMachinery) resetMachineryTask = true;
+          if (b.hasMemoryWrite || b.hasArrayOrDynamicIndex) arrayishTask = true;
+          if (b.stateSourceCommitCount > 0 || b.stateResetUpdateCount > 0)
+            pscdCommitFields[(size_t)m].insert(b.stateTargetNames.begin(), b.stateTargetNames.end());
+          for (Node* member : super->member) {
+            if (nodeHasStateUpdate(member)) {
+              std::string tn;
+              if (stateTargetNameForNode(member, tn)) {
+                Node* target = member->type == NODE_REG_SRC ? member
+                             : (member->type == NODE_REG_DST ? member->getSrc() : member->getResetSrc());
+                if (target != nullptr) pscdFieldNode[tn] = target;
+              }
+            }
+            for (ExpTree* tree : member->assignTree) {
+              MtActivityReads tr;
+              mtActivityCollectFromTree(tree->getRoot(), tr);
+              pscdReadFields[(size_t)m].insert(tr.src.begin(), tr.src.end());
+            }
+          }
+        }
+      }
+      pscdTaskArrayish[(size_t)m] = arrayishTask ? 1 : 0;
+      pscdTaskReset[(size_t)m] = resetMachineryTask ? 1 : 0;
+      if (excludeCode >= 0) {
+        pscdTaskExcluded[(size_t)m] = 1;
+        pscdExcludedTotal++;
+        switch (excludeCode) {
+          case 0: pscdExcludedWorker0++; break;
+          case 1: pscdExcludedElided++; break;
+          case 2: pscdExcludedExt++; break;
+          case 3: pscdExcludedSpecial++; break;
+          case 4: pscdExcludedReset++; break;
+          default: pscdExcludedAmbiguous++; break;
+        }
+      } else if (arrayishTask) {
+        // Never summarized as a producer (conservative whole-region marking),
+        // still counted in the never-summarized total, still an eligible
+        // consumer for the shadow check.
+        pscdExcludedArray++;
+        pscdExcludedTotal++;
+      }
+    }
+    // Writer universe over tasks that actually run (elided tasks never
+    // execute) and are NOT reset machinery. Reset-supers fire only inside
+    // reset windows; their writes are neutralized at runtime by the reset-hit
+    // mark-all plus the verify skip (mtDensePscdResetHit), so a field with
+    // exactly one non-reset writer plus any number of reset-supers stays
+    // ELIGIBLE. Excluded-but-running tasks (worker0/ext/...) still count:
+    // their writes are real steady-state writes, so a field they co-write is
+    // multi-writer and drops out.
+    for (int m = 0; m < nMTasks; m++) {
+      if (denseSchedule.mtaskThreadAssign[(size_t)m] < 0) continue;
+      if (pscdTaskReset[(size_t)m]) continue;
+      for (const std::string& f : pscdCommitFields[(size_t)m]) pscdFieldWriters[f].insert(m);
+    }
+    auto pscdWriterOf = [&](const std::string& f) -> int {
+      auto w = pscdFieldWriters.find(f);
+      if (w == pscdFieldWriters.end() || w->second.size() != 1) return -1;
+      return *w->second.begin();
+    };
+    // Per store entry (same j numbering as kDenseOwnerReadyStoreOffsets /
+    // kDenseOwnerReadyStoreList): the entry's compare-field slots and a
+    // conservative flag. Conservative entries — any excluded source
+    // (worker0/elided/ext/special/reset/ambiguous) or any array /
+    // dynamic-index source — mark their whole token region changed every
+    // cycle and are skipped by the verify shadow.
+    pscdStoreFieldSlots.assign((size_t)std::max(1, ownerReadyLayout.tokenCount), {});
+    pscdStoreConservative.assign((size_t)std::max(1, ownerReadyLayout.tokenCount), 1);
+    std::map<std::string, int> pscdFieldSlotOf;
+    std::vector<std::string> pscdFieldSlotName;
+    std::vector<int> pscdStoreEntryOfSlot((size_t)std::max(1, ownerReadyLayout.physicalSlotCount), -1);
+    {
+      int j = 0;
+      for (int m = 0; m < nMTasks; m++) {
+        for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)m]) {
+          Assert(j < ownerReadyLayout.tokenCount,
+                 "PSCD store list overruns dense owner-ready token count");
+          Assert(slot >= 0 && slot < ownerReadyLayout.physicalSlotCount,
+                 "PSCD store slot %d outside dense owner-ready slot range", slot);
+          pscdStoreEntryOfSlot[(size_t)slot] = j;
+          const int token = ownerReadyLayout.logicalTokenByPhysicalSlot[(size_t)slot];
+          Assert(token >= 0 && token < ownerReadyLayout.tokenCount,
+                 "PSCD store slot %d has no logical token", slot);
+          const MtDenseOwnerReadyTokenProvenance& prov =
+              ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)token];
+          const std::vector<int>& sources = ownerReadyLayout.sourceMTasksByLogicalToken[(size_t)token];
+          const bool consumerValid = prov.consumerMTask >= 0 && prov.consumerMTask < nMTasks;
+          const std::set<std::string>& consumerReads =
+              consumerValid ? pscdReadFields[(size_t)prov.consumerMTask] : pscdReadFields[0];
+          // An out-of-range consumer is unreachable for layouts the builder
+          // produces; stay conservative rather than indexing blindly.
+          bool tokenConservative = !consumerValid;
+          std::set<std::string> crossing;
+          for (int s : sources) {
+            if (s < 0 || s >= nMTasks || pscdTaskExcluded[(size_t)s] || pscdTaskArrayish[(size_t)s]) { tokenConservative = true; continue; }
+            for (const std::string& f : pscdCommitFields[(size_t)s])
+              if (consumerReads.count(f)) crossing.insert(f);
+          }
+          std::vector<int> eligibleSlots;
+          if (!tokenConservative) {
+            for (const std::string& f : crossing) {
+              const int writer = pscdWriterOf(f);
+              if (writer < 0 || pscdTaskExcluded[(size_t)writer]) {
+                if (writer < 0) pscdFieldsDroppedMultiWriter++;
+                else pscdFieldsDroppedOther++;
+                continue;
+              }
+              Node* node = nullptr;
+              auto nodeIter = pscdFieldNode.find(f);
+              if (nodeIter != pscdFieldNode.end()) node = nodeIter->second;
+              if (node == nullptr || node->isArray() || node->type == NODE_MEMORY ||
+                  node->width <= 0 || node->width > 64) {
+                pscdFieldsDroppedWide++;
+                continue;
+              }
+              auto slotIter = pscdFieldSlotOf.find(f);
+              int fieldSlot = -1;
+              if (slotIter != pscdFieldSlotOf.end()) {
+                fieldSlot = slotIter->second;
+              } else {
+                fieldSlot = pscdFieldSlotCount++;
+                pscdFieldSlotOf.emplace(f, fieldSlot);
+                pscdFieldSlotName.push_back(f);
+              }
+              eligibleSlots.push_back(fieldSlot);
+            }
+          }
+          pscdStoreFieldSlots[(size_t)j] = eligibleSlots;
+          pscdStoreConservative[(size_t)j] = tokenConservative ? 1 : 0;
+          if (tokenConservative) pscdTokensConservative++;
+          else if (eligibleSlots.empty()) pscdTokensZeroField++;
+          j++;
+        }
+      }
+      Assert(j == ownerReadyLayout.tokenCount,
+             "PSCD store list has %d entries for %d dense owner-ready tokens",
+             j, ownerReadyLayout.tokenCount);
+    }
+    // Producer snapshot/verdict lists: each compare field is owned by its
+    // single writer, whose body snapshots it at entry and computes the
+    // post-body change verdict at exit.
+    for (int j = 0; j < ownerReadyLayout.tokenCount; j++) {
+      for (int fieldSlot : pscdStoreFieldSlots[(size_t)j]) {
+        const int writer = pscdWriterOf(pscdFieldSlotName[(size_t)fieldSlot]);
+        Assert(writer >= 0 && !pscdTaskExcluded[(size_t)writer],
+               "PSCD field slot %d has no eligible writer", fieldSlot);
+        auto& list = pscdProducerFields[(size_t)writer];
+        bool present = false;
+        for (const MtPscdFieldRef& fr : list)
+          if (fr.slot == fieldSlot) { present = true; break; }
+        if (!present) list.push_back(MtPscdFieldRef{fieldSlot, pscdFieldSlotName[(size_t)fieldSlot]});
+      }
+    }
+    for (int m = 0; m < nMTasks; m++)
+      if (!pscdProducerFields[(size_t)m].empty()) pscdProducersInstrumented++;
+    // Consumer verify lists: shadow fields and checked token slots per
+    // eligible consumer. Tokens with conservative or zero-field entries are
+    // skipped on both sides of the equality, keeping it self-consistent.
+    if (pscdVerify) {
+      int shadowBase = 0;
+      for (int c = 0; c < nMTasks; c++) {
+        if (pscdTaskExcluded[(size_t)c]) continue;
+        std::set<int> shadowFieldSlots;
+        std::vector<int> tokenSlots;
+        for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)c]) {
+          Assert(slot >= 0 && slot < ownerReadyLayout.physicalSlotCount,
+                 "PSCD wait slot %d outside dense owner-ready slot range", slot);
+          // Defensive: a wait slot with no store entry is treated as
+          // NOT-SUMMARIZED — it contributes to neither side of the shadow
+          // equality (no summary read, no shadow field), so the consumer's
+          // activation for that input group keeps its original ready-token
+          // path untouched. The layout builder guarantees wait and store
+          // slot sets are identical, so this path is unreachable; it exists
+          // so a future layout change degrades coverage instead of aborting
+          // generation. Counted and reported on a separate stderr line when
+          // nonzero (the [pscd] format line stays stable).
+          const int j = pscdStoreEntryOfSlot[(size_t)slot];
+          if (j < 0) {
+            pscdWaitSlotsWithoutStoreEntry++;
+            continue;
+          }
+          if (pscdStoreConservative[(size_t)j]) continue;
+          if (pscdStoreFieldSlots[(size_t)j].empty()) continue;
+          tokenSlots.push_back(slot);
+          for (int fieldSlot : pscdStoreFieldSlots[(size_t)j]) shadowFieldSlots.insert(fieldSlot);
+        }
+        if (tokenSlots.empty() || shadowFieldSlots.empty()) continue;
+        for (int fieldSlot : shadowFieldSlots)
+          pscdConsumerShadow[(size_t)c].push_back(
+              MtPscdFieldRef{shadowBase++, pscdFieldSlotName[(size_t)fieldSlot]});
+        pscdShadowSlotCount = shadowBase;
+        pscdConsumerTokenSlots[(size_t)c] = tokenSlots;
+        pscdTokensChecked += (int)tokenSlots.size();
+        pscdConsumersShadowed++;
+      }
+    }
+    fprintf(stderr,
+            "[pscd] producers_instrumented=%d consumers_shadowed=%d excluded=%d "
+            "(worker0=%d elided=%d ext=%d special=%d reset=%d array=%d ambiguous=%d) "
+            "tokens=%d checked=%d conservative=%d zero_field=%d fields=%d "
+            "dropped=(multi_writer=%d reset=%d wide_or_array=%d excluded_writer=%d) shadow_slots=%d verify=%d\n",
+            pscdProducersInstrumented, pscdConsumersShadowed, pscdExcludedTotal,
+            pscdExcludedWorker0, pscdExcludedElided, pscdExcludedExt, pscdExcludedSpecial,
+            pscdExcludedReset, pscdExcludedArray, pscdExcludedAmbiguous,
+            ownerReadyLayout.tokenCount, pscdTokensChecked, pscdTokensConservative,
+            pscdTokensZeroField, pscdFieldSlotCount, pscdFieldsDroppedMultiWriter,
+            pscdFieldsDroppedReset, pscdFieldsDroppedWide, pscdFieldsDroppedOther,
+            pscdShadowSlotCount, pscdVerify ? 1 : 0);
+    if (pscdWaitSlotsWithoutStoreEntry > 0)
+      fprintf(stderr, "[pscd] wait_slots_without_store_entry=%d (treated as not-summarized; excluded from both sides of the shadow equality)\n",
+              pscdWaitSlotsWithoutStoreEntry);
+  }
 
   auto emitDenseDepCounts = [&]() {
     fprintf(header, "static constexpr uint32_t kDenseMTaskDepCount[%d] = {", nMTasks);
@@ -866,6 +1160,61 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "alignas(64) MtDenseOwnerReadyToken mtDenseOwnerReadyTokens[%d];\n",
             ownerReadyLayout.physicalSlotCount);
     fprintf(header, "bool mtDenseOwnerReadyTokensPrimed = false;\n");
+    if (pscdBits) {
+      // PSCD slice 1 runtime state. mtDenseChangeEpoch is slot-indexed and
+      // parallel to mtDenseOwnerReadyTokens; mtDenseCycleEpoch flips 1/2 with
+      // cycle parity, so a byte equals mtDenseCycleEpoch iff its producer
+      // changed the token's fields this cycle (unchanged entries store the
+      // opposite phase, 3 - epoch, avoiding any per-cycle clear pass).
+      fprintf(header, "// GSIM_EMIT_PSCD_BITS: producer change detection (slice 1)\n");
+      fprintf(header, "static constexpr int kDensePscdFieldSlotCount = %d;\n", pscdFieldSlotCount);
+      fprintf(header, "uint64_t mtDensePscdOldVal[%d];\n", std::max(1, pscdFieldSlotCount));
+      fprintf(header, "uint8_t mtDensePscdFieldChanged[%d];\n", std::max(1, pscdFieldSlotCount));
+      fprintf(header, "uint8_t mtDenseChangeEpoch[%d];\n", ownerReadyLayout.physicalSlotCount);
+      fprintf(header, "uint8_t mtDenseCycleEpoch = 0;\n");
+      fprintf(header, "static constexpr uint8_t kDensePscdStoreConservative[%d] = {",
+              std::max(1, ownerReadyLayout.tokenCount));
+      for (int j = 0; j < ownerReadyLayout.tokenCount; j++)
+        fprintf(header, "%s%u", j ? "," : "", (unsigned)pscdStoreConservative[(size_t)j]);
+      if (ownerReadyLayout.tokenCount == 0) fprintf(header, "0");
+      fprintf(header, "};\n");
+      {
+        int fieldListTotal = 0;
+        for (const std::vector<int>& slots : pscdStoreFieldSlots) fieldListTotal += (int)slots.size();
+        fprintf(header, "static constexpr int kDensePscdStoreFieldOffsets[%d] = {",
+                ownerReadyLayout.tokenCount + 1);
+        int off = 0;
+        for (int j = 0; j < ownerReadyLayout.tokenCount; j++) {
+          fprintf(header, "%s%d", j ? "," : "", off);
+          off += (int)pscdStoreFieldSlots[(size_t)j].size();
+        }
+        fprintf(header, ",%d};\n", off);
+        fprintf(header, "static constexpr int kDensePscdStoreFieldList[%d] = {", std::max(1, fieldListTotal));
+        bool firstSlot = true;
+        for (const std::vector<int>& slots : pscdStoreFieldSlots)
+          for (int fieldSlot : slots) {
+            fprintf(header, "%s%d", firstSlot ? "" : ",", fieldSlot);
+            firstSlot = false;
+          }
+        if (firstSlot) fprintf(header, "0");
+        fprintf(header, "};\n");
+      }
+      fprintf(header, "void mtDensePscdRelease(uint32_t pscdStoreBegin, uint32_t pscdStoreEnd);\n");
+      // Reset-window handling: subResetDenseN calls mtDensePscdResetHit()
+      // under their reset guard, which marks every change byte changed for
+      // the cycle; the consumer verify skips cross-checks in any cycle whose
+      // window may contain a reset application (this or previous cycle).
+      fprintf(header, "uint8_t mtDensePscdResetActive = 0;\n");
+      fprintf(header, "uint8_t mtDensePscdResetActivePrev = 0;\n");
+      fprintf(header, "void mtDensePscdResetHit();\n");
+      if (pscdVerify) {
+        fprintf(header, "// GSIM_PSCD_VERIFY: consumer shadow cross-check state\n");
+        fprintf(header, "uint64_t mtDensePscdShadowPrev[%d];\n", std::max(1, pscdShadowSlotCount));
+        fprintf(header, "uint8_t mtDensePscdConsumerPrimed[%d] = {0};\n", nMTasks);
+        fprintf(header, "uint8_t mtPscdMismatchReported[%d] = {0};\n", nMTasks);
+        fprintf(header, "std::atomic<uint64_t> mtPscdMismatchCount{};\n");
+      }
+    }
     if (denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
               std::max(1, (int)denseDispatchWaitTotal));
@@ -1027,7 +1376,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // saved/restored around genSuperEval exactly as in the sequential loop).
   // Unit u renders denseMTaskEmissionOrder[u]; assembly replays buffers in
   // emission order, so output is byte-identical.
-  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder, &ownerReadyLayout, denseBreakdownWindowLaBodyCodegen, emitTaskLocals, &denseAsyncResetReferenced, &taskLocalsLocalizedTasks, &taskLocalsWorker0Excluded, &taskLocalsExtExcluded, &taskLocalsAsyncHelperTasks, &taskLocalsLoads, &taskLocalsStores, &taskLocalsCandidates, &taskLocalsResetExcluded, &taskLocalsArrayClassNames](size_t unit) {
+  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder, &ownerReadyLayout, denseBreakdownWindowLaBodyCodegen, emitTaskLocals, &denseAsyncResetReferenced, &taskLocalsLocalizedTasks, &taskLocalsWorker0Excluded, &taskLocalsExtExcluded, &taskLocalsAsyncHelperTasks, &taskLocalsLoads, &taskLocalsStores, &taskLocalsCandidates, &taskLocalsResetExcluded, &taskLocalsArrayClassNames, pscdBits, pscdVerify, &pscdProducerFields, &pscdConsumerShadow, &pscdConsumerTokenSlots](size_t unit) {
     int mtaskId = denseMTaskEmissionOrder[unit];
 
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
@@ -1100,6 +1449,57 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         }
       }
     }
+    if (pscdBits && !pscdProducerFields[(size_t)mtaskId].empty()) {
+      // GSIM_EMIT_PSCD_BITS: pre-body snapshots of the committed outputs this
+      // producer owns (before any body statement writes them).
+      emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(1, "{ // GSIM_EMIT_PSCD_BITS: pre-body output snapshots\n");
+      for (const MtPscdFieldRef& fr : pscdProducerFields[(size_t)mtaskId]) {
+        emitBodyLock(2, "mtDensePscdOldVal[%d] = (uint64_t)(%s);\n", fr.slot, fr.name.c_str());
+      }
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "#endif\n");
+    }
+    if (pscdVerify && !pscdConsumerShadow[(size_t)mtaskId].empty()) {
+      // GSIM_PSCD_VERIFY: shadow cross-check at body entry. The original
+      // consumer OR-compare is re-derived from previous-entry snapshots of the
+      // inputs crossing this task's tokens and compared against the OR of the
+      // producers' change bytes. Read-only shadow — the body itself is
+      // unchanged. The first entry only primes the snapshots.
+      emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(1, "{ // GSIM_PSCD_VERIFY: shadow cross-check (change-bits == consumer OR-compare)\n");
+      emitBodyLock(2, "if (!mtDensePscdConsumerPrimed[%d]) {\n", mtaskId);
+      for (const MtPscdFieldRef& fr : pscdConsumerShadow[(size_t)mtaskId]) {
+        emitBodyLock(3, "mtDensePscdShadowPrev[%d] = (uint64_t)(%s);\n", fr.slot, fr.name.c_str());
+      }
+      emitBodyLock(3, "mtDensePscdConsumerPrimed[%d] = 1;\n", mtaskId);
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(3, "bool pscdOrig = false;\n");
+      for (const MtPscdFieldRef& fr : pscdConsumerShadow[(size_t)mtaskId]) {
+        emitBodyLock(3, "{ const uint64_t pscdNow = (uint64_t)(%s); if (pscdNow != mtDensePscdShadowPrev[%d]) pscdOrig = true; mtDensePscdShadowPrev[%d] = pscdNow; }\n",
+                     fr.name.c_str(), fr.slot, fr.slot);
+      }
+      emitBodyLock(3, "// Reset-window cycles (a reset application fired this or the previous\n");
+      emitBodyLock(3, "// cycle): reset-supers may have written inputs outside any producer\n");
+      emitBodyLock(3, "// compare, so the cross-check is vacuously skipped. Snapshots are\n");
+      emitBodyLock(3, "// still updated, keeping the next window clean.\n");
+      emitBodyLock(3, "if (!(mtDensePscdResetActive || mtDensePscdResetActivePrev)) {\n");
+      emitBodyLock(4, "bool pscdSummary = false;\n");
+      for (int slot : pscdConsumerTokenSlots[(size_t)mtaskId]) {
+        emitBodyLock(4, "if (mtDenseChangeEpoch[%d] == mtDenseCycleEpoch) pscdSummary = true;\n", slot);
+      }
+      emitBodyLock(4, "if (pscdOrig != pscdSummary) {\n");
+      emitBodyLock(5, "mtPscdMismatchCount.fetch_add(1, std::memory_order_relaxed);\n");
+      emitBodyLock(5, "if (!mtPscdMismatchReported[%d]) {\n", mtaskId);
+      emitBodyLock(6, "mtPscdMismatchReported[%d] = 1;\n", mtaskId);
+      emitBodyLock(6, "fprintf(stderr, \"[pscd-verify] mismatch mtask=%%d cycle=%%lu orig=%%d summary=%%d\\n\", %d, (unsigned long) cycles, (int) pscdOrig, (int) pscdSummary);\n", mtaskId);
+      emitBodyLock(5, "}\n");
+      emitBodyLock(4, "}\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "#endif\n");
+    }
     if (denseBreakdownWindowLaBodyCodegen) {
       // Body-only lookahead timing: one conditional steady_clock wrap inside the
       // MTask body function covers every dispatch site (inline fast path plus all
@@ -1157,6 +1557,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       for (const std::string& taskLocalName : taskLocalStores) {
         emitBodyLock(1, "this->%s = %s;\n", taskLocalName.c_str(), taskLocalName.c_str());
       }
+    }
+    if (pscdBits && !pscdProducerFields[(size_t)mtaskId].empty()) {
+      // GSIM_EMIT_PSCD_BITS: post-body change verdicts per committed output
+      // (after task-locals write-backs, before the dispatcher's store phase
+      // folds them into token change bytes).
+      emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(1, "{ // GSIM_EMIT_PSCD_BITS: change verdicts (post-body vs pre-body)\n");
+      for (const MtPscdFieldRef& fr : pscdProducerFields[(size_t)mtaskId]) {
+        emitBodyLock(2, "mtDensePscdFieldChanged[%d] = (uint8_t)((uint64_t)(%s) != mtDensePscdOldVal[%d]);\n",
+                     fr.slot, fr.name.c_str(), fr.slot);
+      }
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "#endif\n");
     }
     emitBodyLock(0, "}\n");
   });
@@ -1228,6 +1641,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                            t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
             }
             emitBodyLock(5, "stepDenseMTask%d();\n", mtaskId);
+            if (pscdBits)
+              emitBodyLock(5, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
             for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
               emitBodyLock(5, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
             }
@@ -1380,6 +1795,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         } else {
           emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
           if (!ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId].empty()) {
+            if (pscdBits)
+              emitBodyLock(4, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
             emitBodyLock(3, "if (evenCycle) {\n");
             emitBodyLock(4, "for (int j = kDenseOwnerReadyStoreOffsets[%d]; j < kDenseOwnerReadyStoreOffsets[%d]; j++) {\n", mtaskId, mtaskId + 1);
             if (denseBreakdownProfileCodegen) {
@@ -1480,6 +1897,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "#endif\n");
     emitBodyLock(2, "if (mtDenseEntryReady) {\n");
     emitBodyLock(3, "(this->*mtDenseDispatchEntry->fn)();\n");
+    if (pscdBits)
+      emitBodyLock(3, "mtDensePscdRelease(mtDenseDispatchEntry->storeBegin, mtDenseDispatchEntry->storeEnd);\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(3, "}\n");
@@ -1529,6 +1948,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(3, "mtDenseLookaheadFound.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(3, "#endif\n");
     emitBodyLock(3, "(this->*mtDenseCandidate->fn)();\n");
+    if (pscdBits)
+      emitBodyLock(3, "mtDensePscdRelease(mtDenseCandidate->storeBegin, mtDenseCandidate->storeEnd);\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseCandidate->storeBegin; mtDenseDispatchStore < mtDenseCandidate->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(3, "}\n");
@@ -1559,6 +1980,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "}\n");
     if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
+    if (pscdBits)
+      emitBodyLock(2, "mtDensePscdRelease(mtDenseDispatchEntry->storeBegin, mtDenseDispatchEntry->storeEnd);\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(2, "}\n");
@@ -1596,6 +2019,44 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(0, "#endif\n");
   }
+  if (pscdBits) {
+    // PSCD store-phase helper: folds per-field change verdicts into one
+    // epoch-tagged change byte per token slot. Called at every owner-ready
+    // release site (inline fast path, strict dispatch store loops, all three
+    // lookahead tail paths, and the serial fallback) BEFORE the ready-token
+    // release stores, so the release/acquire token pairing publishes the
+    // change bytes to consumers. Conservative entries (worker0/ext/reset/
+    // array/ambiguous producers) mark their whole token region changed.
+    emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::mtDensePscdRelease(uint32_t pscdStoreBegin, uint32_t pscdStoreEnd) {\n", name.c_str());
+    emitBodyLock(1, "for (uint32_t j = pscdStoreBegin; j < pscdStoreEnd; ++j) {\n");
+    emitBodyLock(2, "const int pscdSlot = kDenseOwnerReadyStoreList[j];\n");
+    emitBodyLock(2, "if (kDensePscdStoreConservative[j]) {\n");
+    emitBodyLock(3, "mtDenseChangeEpoch[pscdSlot] = mtDenseCycleEpoch;\n");
+    emitBodyLock(2, "} else {\n");
+    emitBodyLock(3, "uint8_t pscdVerdict = 0;\n");
+    emitBodyLock(3, "for (int k = kDensePscdStoreFieldOffsets[j]; k < kDensePscdStoreFieldOffsets[j + 1]; ++k)\n");
+    emitBodyLock(4, "if (mtDensePscdFieldChanged[kDensePscdStoreFieldList[k]]) { pscdVerdict = 1; break; }\n");
+    emitBodyLock(3, "mtDenseChangeEpoch[pscdSlot] = pscdVerdict ? mtDenseCycleEpoch : (uint8_t)(3u - mtDenseCycleEpoch);\n");
+    emitBodyLock(2, "}\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(0, "}\n");
+    emitBodyLock(0, "#endif\n");
+    // Reset-window helper: called by subResetDenseN bodies under their reset
+    // guard (generation-gated in genResetDef) whenever a reset application
+    // actually fires — cycle-start uint resets from resetAllDense() and
+    // mid-cycle async resets from SUPER_ASYNC_RESET MTask bodies. Marks the
+    // cycle's flag and every change byte changed (conservative), and the
+    // consumer verify skips cross-checks in any cycle whose window may span
+    // a reset application. Reset windows are rare, so the O(slots) pass is
+    // negligible.
+    emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::mtDensePscdResetHit() {\n", name.c_str());
+    emitBodyLock(1, "mtDensePscdResetActive = 1;\n");
+    emitBodyLock(1, "const uint8_t pscdEpoch = mtDenseCycleEpoch;\n");
+    emitBodyLock(1, "for (int s = 0; s < kDenseOwnerReadyPhysicalSlotCount; ++s)\n");
+    emitBodyLock(2, "mtDenseChangeEpoch[s] = pscdEpoch;\n");
+    emitBodyLock(0, "}\n");
+    emitBodyLock(0, "#endif\n");
+  }
   emitFixedDenseThreadWorker("stepDenseThreadWorker");
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
   if (denseDuty) emitBodyLock(1, "MtDenseDutyGuard mtDutyStepGuard(mtDutyEnabled ? &mtDutyLanes[%d].stepWallNs : nullptr);\n", threadCount);
@@ -1615,6 +2076,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   emitBodyLock(1, "std::chrono::steady_clock::time_point mtProfileStepBegin;\n");
   emitBodyLock(1, "if (unlikely(mtProfileEnabled)) mtProfileStepBegin = std::chrono::steady_clock::now();\n");
   if (denseDuty) emitBodyLock(1, "std::chrono::steady_clock::time_point mtDutyResetBegin; if (mtDutyEnabled) mtDutyResetBegin = std::chrono::steady_clock::now();\n");
+  if (pscdBits) {
+    // PSCD per-cycle epoch (flips 1/2 with cycle parity) and reset-window
+    // flags, both emitted BEFORE resetAllDense(): subResetDenseN may fire
+    // under its reset guard there (and mid-cycle from async reset supers),
+    // calling mtDensePscdResetHit(), which needs the fresh epoch and the
+    // cleared per-cycle flag. ResetActivePrev keeps the previous cycle's
+    // verdict so consumer windows spanning a reset application are skipped.
+    emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(1, "mtDenseCycleEpoch = (cycles & 1) == 0 ? uint8_t{1} : uint8_t{2};\n");
+    emitBodyLock(1, "mtDensePscdResetActivePrev = mtDensePscdResetActive;\n");
+    emitBodyLock(1, "mtDensePscdResetActive = 0;\n");
+    emitBodyLock(1, "#endif\n");
+  }
   emitBodyLock(1, "resetAllDense();\n");
   if (denseDuty) emitBodyLock(1, "if (mtDutyEnabled) mtDutyLanes[%d].resetNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyResetBegin).count();\n", threadCount);
   for (SuperNode* super : sortedSuper) {
@@ -1824,6 +2298,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
     emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
+    if (pscdBits) {
+      // Serial fallback: no ready tokens exist on this path, but the change
+      // bytes are still released after each producer body (sequential order
+      // preserves producer-before-consumer visibility for the verify shadow).
+      emitBodyLock(2, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(2, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
+      emitBodyLock(2, "#endif\n");
+    }
   }
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");

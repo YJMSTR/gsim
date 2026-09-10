@@ -51,6 +51,16 @@ void graph::genResetDef(SuperNode* super, bool isUIntReset, bool buffered, int r
   std::string resetName = super->resetNode->type == NODE_REG_SRC ? RESET_NAME(super->resetNode).c_str() : super->resetNode->name.c_str();
   if (!emitActivation) {
     emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());
+    if (nameSuffix == "Dense" && mtUseEmitPscdBits()) {
+      // GSIM_EMIT_PSCD_BITS (slice 1): a reset application is firing —
+      // mark the cycle's change bytes conservative (mtDensePscdResetHit,
+      // emitted by genDenseExecutor) so the consumer verify shadow skips
+      // this cycle's cross-checks. Generation-gated + compile-gated: unset
+      // knob keeps every emitted byte identical.
+      emitBodyLock(indent, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+      emitBodyLock(indent, "mtDensePscdResetHit();\n");
+      emitBodyLock(indent, "#endif\n");
+    }
   }
   if (emitActivation) {
     emitBodyLock(indent ++, "if(unlikely(%s)) {\n", resetName.c_str());

@@ -462,6 +462,8 @@ bool mtUseDenseBreakdownWindowCodegen();
 bool mtUseDenseBreakdownWindowLaBodyCodegen();
 bool mtUseDenseWorkerMajorText();
 bool mtUseEmitTaskLocals();
+bool mtUseEmitPscdBits();
+bool mtUsePscdVerify();
 int mtDenseSpinYieldEvery();
 int mtDenseLookaheadWindow();
 bool mtDenseDutyCodegen();

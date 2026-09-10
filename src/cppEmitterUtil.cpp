@@ -621,6 +621,28 @@ bool mtUseEmitTaskLocals() {
   const char* env = std::getenv("GSIM_EMIT_TASK_LOCALS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+
+// Default-off PSCD slice 1 (shadow-verify oracle, docs/pscd-protocol-redesign.md).
+// GSIM_EMIT_PSCD_BITS=1 (requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1): every
+// dense MTask store phase additionally emits producer-side change detection —
+// each committed scalar register-state output is compared against its pre-body
+// snapshot and an epoch-tagged change byte is stored per owner-ready token slot
+// BEFORE the ready-token release store (release/acquire ordering carries it).
+// Consumer behavior is untouched. Unset keeps every emitted byte identical.
+bool mtUseEmitPscdBits() {
+  const char* env = std::getenv("GSIM_EMIT_PSCD_BITS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// GSIM_PSCD_VERIFY=1 (requires GSIM_EMIT_PSCD_BITS=1): each eligible dense
+// MTask body entry shadow-computes the original consumer OR-compare (inputs vs
+// previous-entry snapshots) AND the PSCD summary (OR of input change bytes);
+// a disagreement increments a mismatch counter and prints stderr once per
+// mtask id. Original behavior is unchanged — shadow check only.
+bool mtUsePscdVerify() {
+  const char* env = std::getenv("GSIM_PSCD_VERIFY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where
