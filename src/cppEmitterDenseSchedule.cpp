@@ -1296,12 +1296,193 @@ static void mtDenseScheduleOrderImpl(const std::vector<MtDenseMTask>& mtasks, in
   }
 }
 
+// ---- GSIM_MT_DENSE_SCHED_HEFT (default off, byte-identical when unset) ----
+// Heterogeneous-Earliest-Finish-Time list scheduling over the dense MTask DAG
+// (profile/heft/DESIGN.md): upward-rank priorities over the FULL compile-time
+// MTask DAG (mtasks[i].succMTasks — every dependency edge, never a cross-thread
+// projection), then earliest-finish-time placement with a measured communication
+// model (24.5ns same-CCD / 300ns cross-CCD, worker->CCD = worker/8). The comm model
+// REPLACES the GSIM_MT_DENSE_PACK_CCD_AFFINITY gamma here (gamma is irrelevant
+// under HEFT; the greedy's other knobs — XSYNC/W0_MERGE/ABS_LAT — belong to
+// the reference greedy and do not apply). UNIT CONVENTION: identical to how
+// GSIM_MT_DENSE_SCHED_ABS_LAT mixes machine constants with costOf — the ns
+// comm constants are added RAW next to the costs: measured costfile values
+// (GSIM_MT_DENSE_SCHED_COSTFILE) are ns-domain so the constants line up
+// directly; without the costfile the static member-node costs are used as-is
+// in the same mixed convention (ranku priorities are scale-invariant to a
+// common cost scale; absolute makespan units are then node-count-ish).
+static void mtDenseScheduleHeft(const std::vector<MtDenseMTask>& mtasks, int threadCount,
+                                std::vector<int>& outAssign, std::vector<int>& outOrder) {
+  if (threadCount < 1) threadCount = 1;
+  const int n = static_cast<int>(mtasks.size());
+  outAssign.assign((size_t)n, -1);
+  outOrder.clear(); outOrder.reserve((size_t)n);
+  auto costOf = [](const MtDenseMTask& m) -> double { return m.schedCost > 0 ? (double)m.schedCost : (double)m.staticCost; };
+  const double commSameCcd = 24.5, commCrossCcd = 300.0;
+  auto commCost = [&](int w1, int w2) -> double {
+    if (w1 == w2) return 0.0;
+    return (w1 / 8) == (w2 / 8) ? commSameCcd : commCrossCcd;
+  };
+  // Reference greedy placement — DIAGNOSTIC ONLY: it feeds the modeled-makespan
+  // comparison reported below and nothing else; the HEFT ranks do NOT depend
+  // on it. (An earlier revision computed ranku over a cross-thread projection
+  // of the DAG derived from this reference placement; edges the projection
+  // dropped — same-reference-thread edges and transitive-reduction survivors —
+  // could leave ranku(pred) < ranku(succ), so descending-rank placement
+  // reached consumers whose predecessors were still unplaced and silently
+  // skipped them, emitting an invalid schedule: generator modeled 280890 vs
+  // reference 238638, runtime +60%. ranku is now computed over the full DAG
+  // and an unplaced predecessor fails loudly in the placement loop below.)
+  std::vector<int> refAssign, refOrder;
+  mtDenseScheduleOrderImpl(mtasks, threadCount, refAssign, refOrder, nullptr);
+  // commMean: the mean cross-worker comm penalty over the unordered worker
+  // pairs of this run (the "gamma-scaled mean" replacement).
+  double commMean = 0.0;
+  {
+    int pairs = 0;
+    double sum = 0.0;
+    for (int w1 = 0; w1 < threadCount; w1++)
+      for (int w2 = w1 + 1; w2 < threadCount; w2++) { sum += commCost(w1, w2); pairs++; }
+    commMean = pairs > 0 ? sum / (double)pairs : 0.0;
+  }
+  // Upward rank over the FULL compile-time MTask DAG: ranku(m) = cost(m) +
+  // max over ALL succMTasks of (commMean + ranku(succ)). commMean is a
+  // placement-independent heuristic edge weight — the true per-edge commCost
+  // needs both owners, which the rank pass cannot know before placement.
+  // For every full-DAG edge (p -> m): ranku(p) >= cost(p) + commMean +
+  // ranku(m) >= ranku(m) (the max includes m's own term; adding non-negative
+  // terms is fp-monotone), strictly greater when commMean > 0 (threadCount >=
+  // 2); at threadCount == 1, or if rounding ever collapses the gap to
+  // equality, the ascending-id tie-break still orders p first because MTask
+  // ids are topo-monotone (pred id < succ id). Descending-rank placement is
+  // therefore a valid topological order of the full DAG. Ids are topo-monotone
+  // (succ > pred, asserted when the schedule is built), so one descending pass
+  // settles every successor first.
+  std::vector<double> ranku((size_t)n, 0.0);
+  for (int m = n - 1; m >= 0; m--) {
+    double bestSucc = 0.0;
+    bool hasSucc = false;
+    for (int succ : mtasks[(size_t)m].succMTasks) {
+      if (succ < 0 || succ >= n) continue;
+      const double v = commMean + ranku[(size_t)succ];
+      if (!hasSucc || v > bestSucc) { bestSucc = v; hasSucc = true; }
+    }
+    ranku[(size_t)m] = costOf(mtasks[(size_t)m]) + (hasSucc ? bestSucc : 0.0);
+  }
+  // EFT list scheduling in descending ranku order — a valid topological order
+  // of the FULL DAG (derivation above): every predecessor of the MTask being
+  // placed is already assigned, and a violation is a hard Assert, never a
+  // silent skip. No gap insertion: appended at workerAvail (keep it simple).
+  std::vector<int> rankOrder((size_t)n);
+  for (int m = 0; m < n; m++) rankOrder[(size_t)m] = m;
+  std::sort(rankOrder.begin(), rankOrder.end(), [&](int a, int b) {
+    if (ranku[(size_t)a] != ranku[(size_t)b]) return ranku[(size_t)a] > ranku[(size_t)b];
+    return a < b;
+  });
+  bool w0Merge = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_W0_MERGE"); if (e && e[0] && e[0] != '0') w0Merge = true; }
+  std::vector<double> workerAvail((size_t)threadCount, 0.0);
+  std::vector<double> finishAt((size_t)n, 0.0);
+  std::vector<double> startAt((size_t)n, 0.0);
+  double heftMakespan = 0.0;
+  for (int m : rankOrder) {
+    const int workerStart = mtasks[(size_t)m].workerZeroOnly || w0Merge ? 0 : (threadCount > 1 ? 1 : 0);
+    const int workerLimit = mtasks[(size_t)m].workerZeroOnly ? 1 : threadCount;
+    int bestWorker = -1;
+    double bestEft = 0.0, bestReady = 0.0;
+    for (int w = workerStart; w < workerLimit; w++) {
+      double ready = workerAvail[(size_t)w];
+      for (int pred : mtasks[(size_t)m].predMTasks) {
+        if (pred < 0 || pred >= n) continue;
+        const int pw = outAssign[(size_t)pred];
+        Assert(pw >= 0,
+               "heft full-DAG placement: predecessor %d of MTask %d is unplaced "
+               "(descending-ranku order is no longer topological over the full DAG)",
+               pred, m);
+        const double t = finishAt[(size_t)pred] + commCost(pw, w);
+        if (t > ready) ready = t;
+      }
+      const double eft = ready + costOf(mtasks[(size_t)m]);
+      if (bestWorker < 0 || eft < bestEft) { bestWorker = w; bestEft = eft; bestReady = ready; }
+    }
+    if (bestWorker < 0) bestWorker = 0;  // defensive; workerLimit >= 1 always
+    outAssign[(size_t)m] = bestWorker;
+    startAt[(size_t)m] = bestReady;
+    finishAt[(size_t)m] = bestEft;
+    workerAvail[(size_t)bestWorker] = bestEft;
+    if (bestEft > heftMakespan) heftMakespan = bestEft;
+  }
+  // Reference makespan under the same internal model: the greedy's placement
+  // executed per-worker sequentially in its own schedule order (a valid topo
+  // order), with ready propagation over the FULL pred set and the same comm.
+  double refMakespan = 0.0;
+  {
+    std::vector<double> avail((size_t)threadCount, 0.0);
+    std::vector<double> fin((size_t)n, 0.0);
+    for (int m : refOrder) {
+      const int w = refAssign[(size_t)m];
+      double ready = (w >= 0 && w < threadCount) ? avail[(size_t)w] : 0.0;
+      for (int pred : mtasks[(size_t)m].predMTasks) {
+        if (pred < 0 || pred >= n) continue;
+        const int pw = refAssign[(size_t)pred];
+        const double t = fin[(size_t)pred] + commCost(pw, w);
+        if (t > ready) ready = t;
+      }
+      fin[(size_t)m] = ready + costOf(mtasks[(size_t)m]);
+      if (w >= 0 && w < threadCount) avail[(size_t)w] = fin[(size_t)m];
+      if (fin[(size_t)m] > refMakespan) refMakespan = fin[(size_t)m];
+    }
+  }
+  // outOrder: a valid topological order that honors the new assignment — each
+  // worker's MTasks appear in HEFT start-time order (Kahn's algorithm picking
+  // the ready MTask with the smallest (start, worker, id)). Per-worker id
+  // order in the renumber therefore equals HEFT start order; the token
+  // protocol's forward-edge requirement stays satisfied because the order is
+  // topological by construction.
+  {
+    std::vector<int> remaining((size_t)n, 0);
+    for (int m = 0; m < n; m++) remaining[(size_t)m] = static_cast<int>(mtasks[(size_t)m].predMTasks.size());
+    std::set<std::tuple<double, int, int>> ready;  // (start, worker, id)
+    for (int m = 0; m < n; m++) if (remaining[(size_t)m] == 0)
+      ready.insert(std::make_tuple(startAt[(size_t)m], outAssign[(size_t)m], m));
+    while (!ready.empty()) {
+      const int m = std::get<2>(*ready.begin());
+      ready.erase(ready.begin());
+      outOrder.push_back(m);
+      for (int succ : mtasks[(size_t)m].succMTasks) {
+        if (succ < 0 || succ >= n) continue;
+        if (-- remaining[(size_t)succ] == 0)
+          ready.insert(std::make_tuple(startAt[(size_t)succ], outAssign[(size_t)succ], succ));
+      }
+    }
+    // Any unscheduled (shouldn't happen for a DAG) appended in id order.
+    if (static_cast<int>(outOrder.size()) != n) {
+      std::vector<char> seen((size_t)n, 0);
+      for (int m : outOrder) seen[(size_t)m] = 1;
+      for (int i = 0; i < n; i++) if (!seen[(size_t)i]) outOrder.push_back(i);
+    }
+  }
+  long long heftFullDagEdges = 0;
+  for (int m = 0; m < n; m++) heftFullDagEdges += (long long)mtasks[(size_t)m].succMTasks.size();
+  fprintf(stderr, "[heft] ranku over full DAG (%lld edges); heft_unplaced_preds=0 (Assert-backed); "
+          "modeled_makespan_units=%.0f vs reference_greedy_units=%.0f\n",
+          heftFullDagEdges, heftMakespan, refMakespan);
+}
+
 static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount,
                                       std::vector<int>& outAssign, std::vector<int>& outOrder) {
+  const char* heftEnv = std::getenv("GSIM_MT_DENSE_SCHED_HEFT");
+  const bool heftOn = heftEnv != nullptr && heftEnv[0] != '\0' && heftEnv[0] != '0';
   const char* hotPath = std::getenv("GSIM_MT_DENSE_SCHED_HOTEDGE");
   const char* chainPath = std::getenv("GSIM_MT_DENSE_SCHED_CHAINPIN");
   const bool hotedgeOn = hotPath != nullptr && hotPath[0] != '\0';
   const bool chainpinOn = chainPath != nullptr && chainPath[0] != '\0';
+  Assert(!(heftOn && (hotedgeOn || chainpinOn)),
+         "GSIM_MT_DENSE_SCHED_HEFT replaces the greedy objective and is incompatible with GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN");
+  if (heftOn) {
+    mtDenseScheduleHeft(mtasks, threadCount, outAssign, outOrder);
+    return;
+  }
   if (!hotedgeOn && !chainpinOn) {
     mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, nullptr);
     return;
