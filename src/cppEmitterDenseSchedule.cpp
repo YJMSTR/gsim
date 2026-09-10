@@ -1145,6 +1145,13 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   // ns costs worker 0 carries the lightest T16 load; measure the tradeoff.
   bool w0Merge = false;
   { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_W0_MERGE"); if (e && e[0] && e[0] != '0') w0Merge = true; }
+  // GSIM_MT_DENSE_SCHED_ABS_LAT=1 (default off, byte-identical): replace the
+  // percentage handoff penalties with measured machine constants in the same
+  // ns domain as imported body costs: 24ns same-CCD token handoff, 290ns
+  // cross-CCD (from the recorded census). Percentage penalties scale with the
+  // producer's body time, which double-counts size; absolute latency does not.
+  bool absLatency = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_ABS_LAT"); if (e && e[0] && e[0] != '0') absLatency = true; }
     long long bestTime = std::numeric_limits<long long>::max();
     for (int ri = 0; ri < static_cast<int>(ready.size()); ri ++) {
       int mtaskId = ready[(size_t)ri];
@@ -1161,9 +1168,13 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
           long long predEnd = completion[(size_t)pred];
           int predWorker = outAssign[(size_t)pred];
           if (predWorker >= 0 && predWorker != worker) {
-            predEnd += (long long)(costOf(mtasks[(size_t)pred])) * xsyncPct / 100;
-            if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
-              predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
+            if (absLatency) {
+              predEnd += ((predWorker / ccdSize) != (worker / ccdSize)) ? 290 : 24;
+            } else {
+              predEnd += (long long)(costOf(mtasks[(size_t)pred])) * xsyncPct / 100;
+              if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
+                predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
+            }
           }
           if (predEnd > timeBegin) timeBegin = predEnd;
         }
