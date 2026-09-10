@@ -390,14 +390,14 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
 
   std::map<uint64_t, ActiveType> bitMapInfo;
   ActiveType curMask;
-  // GSIM_EMIT_ALWAYS_ACTIVATE=1 (BOUND PROBE ONLY, default off): drop the
-  // old-vs-new compare and activate unconditionally. Conservative semantics
-  // (downstream recompute is idempotent) but the probe is measured as a cost
-  // bound for WP2' batched-activation surgery; it is never a promotion path.
+  // Default-off overactivation experiment, not an upper bound on comparison
+  // cost: it removes comparisons and changes downstream evaluation work.
+  // Async-reset guards retain their semantics (activateAll is not a local OR).
   const bool alwaysActivate = []{
     const char* e = std::getenv("GSIM_EMIT_ALWAYS_ACTIVATE");
     return e && e[0] && e[0] != '0';
   }();
+  const bool emitCompareGuard = node->isAsyncReset() || !alwaysActivate;
   if (node->isAsyncReset()) {
     emitBodyLock(indent ++, "if (%s || (%s != %s)) {\n", oldName.c_str(), nodeName.c_str(), oldName.c_str());
   } else {
@@ -408,7 +408,7 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
       if (node->width == 1) emitBodyLock(indent, "bool %s = %s ^ %s;\n", condName.c_str(), nodeName.c_str(), oldName.c_str());
       else emitBodyLock(indent, "bool %s = %s != %s;\n", condName.c_str(), nodeName.c_str(), oldName.c_str());
     }
-    else if (!alwaysActivate) {
+    else if (emitCompareGuard) {
       emitBodyLock(indent ++, "if (%s != %s) {\n", nodeName.c_str(), oldName.c_str());
     }
   }
@@ -469,9 +469,8 @@ void graph::activateNext(Node* node, std::set<int>& nextNodeId, std::string oldN
     if (inStep && node->type != NODE_EXT_OUT) emitBodyLock(indent, "isActivateValid = true;\n");
   #endif
   }
-  // asyncReset nodes still emit their own if-block above; only skip the close
-  // when the probe actually suppressed the compare guard (non-async path).
-  if (!opt && !(alwaysActivate && !node->isAsyncReset())) emitBodyLock(-- indent, "}\n");
+  // Close exactly the guard emitted above, including async-reset guards.
+  if (!opt && emitCompareGuard) emitBodyLock(-- indent, "}\n");
 }
 void graph::activateUncondNext(Node* node, std::set<int>& activateId, bool inStep, std::string flagName,
                                std::string activeBufferName, int indent, bool emitActivation) {
