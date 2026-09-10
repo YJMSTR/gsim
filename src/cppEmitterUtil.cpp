@@ -613,6 +613,15 @@ bool mtUseDenseWorkerMajorText() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+// Default-off per-task register-state value localization (WP1). Each dense
+// stepDenseMTaskN body shadows the eligible scalar register-state members it
+// reads or writes with same-name value locals (loaded once at entry, written
+// back before return when written). Unset keeps every emitted byte identical.
+bool mtUseEmitTaskLocals() {
+  const char* env = std::getenv("GSIM_EMIT_TASK_LOCALS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 
 // Default-off bounded lookahead.  A positive value is the candidate window;
 // unset, empty, and zero retain the strict-order dispatch path byte-for-byte.

@@ -461,6 +461,7 @@ bool mtUseDenseBreakdownProfileCodegen();
 bool mtUseDenseBreakdownWindowCodegen();
 bool mtUseDenseBreakdownWindowLaBodyCodegen();
 bool mtUseDenseWorkerMajorText();
+bool mtUseEmitTaskLocals();
 int mtDenseLookaheadWindow();
 bool mtDenseDutyCodegen();
 void mtActivityCollectFromTree(ENode* root, MtActivityReads& out);

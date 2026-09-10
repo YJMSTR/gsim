@@ -4,6 +4,108 @@
 // entry points and stepDense().
 #include "cppEmitterImpl.h"
 
+// ---- GSIM_EMIT_TASK_LOCALS (WP1): per-task register-state value localization ----
+// The dense MTask bodies evaluate statements that repeatedly load/store class
+// members (register current values `foo` and next-state buffers `foo$NEXT`);
+// that intra-body memory-mediated state flow is the measured 2.85x instruction
+// tax vs the classic serial emitter. When the knob is on, each stepDenseMTaskN
+// shadows the eligible scalar register-state members it touches with same-name
+// value locals loaded once at body entry and writes the written ones back
+// before returning. Token release stores live in the dispatcher after the
+// return, so cross-worker visibility is unchanged; same-worker chains see the
+// predecessor's write-backs by program order.
+//
+// The collector derives the read/write member sets from the same structure the
+// statement generator consumes (StmtNode::compute): every member reference in
+// the emitted text comes from an ENode nodePtr (allocNodeInfo emits node->name),
+// assignment leaves carry the write target as the lvalue root, WHEN conditions
+// and RHS subtrees are reads. Node classification follows the activity
+// collector (mtActivityCollectFromTree): REG_SRC/REG_DST references are
+// register state, REG_RESET references and the subResetDense helpers invoked
+// around SUPER_ASYNC_RESET supers must stay member-resident, arrays/memories
+// (the dynamic-index boundary) keep direct member access. Unlike the activity
+// collector it does NOT recurse into shared wires' assignTrees: the emitted
+// body text names the wire itself, and its computation is emitted in its own
+// super, so recursion would only overapproximate this body's reads.
+namespace {
+class MtTaskLocalCollector {
+ public:
+  std::set<std::string> reads;            // scalar register-state names read
+  std::set<std::string> writes;           // scalar register-state names written
+  std::map<std::string, Node*> typeNode;  // name -> representative node (width/type)
+  std::set<std::string> resetTouched;     // names referenced through NODE_REG_RESET nodes
+  std::set<std::string> nonRegNames;      // array/memory-class or undeclared names
+
+  void walkSuper(SuperNode* super) {
+    if (super == nullptr || super->stmtTree == nullptr || super->stmtTree->root == nullptr) return;
+    walkStmt(super->stmtTree->root);
+  }
+
+ private:
+  std::set<ENode*> seen;
+
+  void classify(Node* n, bool isWrite) {
+    if (n == nullptr || n->name.empty()) return;
+    if (n->type == NODE_REG_SRC || n->type == NODE_REG_DST) {
+      const bool declared = n->status == VALID_NODE && (n->type == NODE_REG_SRC || n->regSplit);
+      if (!declared || n->isArray() || n->width <= 0) {
+        nonRegNames.insert(n->name);
+        return;
+      }
+      typeNode.emplace(n->name, n);
+      if (isWrite) writes.insert(n->name);
+      else reads.insert(n->name);
+      return;
+    }
+    if (n->type == NODE_REG_RESET) {
+      resetTouched.insert(n->name);
+      return;
+    }
+    if (n->type == NODE_MEMORY || n->type == NODE_READER || n->type == NODE_READWRITER || n->type == NODE_WRITER) {
+      if (n->parent != nullptr) nonRegNames.insert(n->parent->name);
+      nonRegNames.insert(n->name);
+      return;
+    }
+    // NODE_INP / NODE_OUT / NODE_OTHERS / NODE_SPECIAL: wires, inputs and
+    // observability text - not register state, no localization decision.
+  }
+
+  void walkExp(ENode* e) {
+    if (e == nullptr || seen.count(e)) return;
+    seen.insert(e);
+    for (ENode* c : e->child) walkExp(c);
+    if (e->memoryNode != nullptr) classify(e->memoryNode, false);
+    classify(e->nodePtr, false);
+  }
+
+  void walkStmt(StmtNode* s) {
+    if (s == nullptr) return;
+    if (s->type == OP_STMT_SEQ) {
+      for (StmtNode* c : s->child) walkStmt(c);
+      return;
+    }
+    if (s->type == OP_STMT_WHEN) {
+      if (!s->child.empty() && s->child[0]->isENode) walkExp(s->child[0]->enode);
+      if (s->child.size() > 1) walkStmt(s->child[1]);
+      if (s->child.size() > 2) walkStmt(s->child[2]);
+      return;
+    }
+    if (s->isENode) {
+      walkExp(s->enode);
+      return;
+    }
+    if (s->tree == nullptr) return;
+    ENode* lval = s->tree->getlval();
+    if (lval != nullptr) {
+      classify(lval->getNode(), true);  // assignment target, classified outside the seen-dedup
+      for (ENode* c : lval->child) walkExp(c);
+      seen.insert(lval);                // root already handled; skip re-classifying it as a read
+    }
+    walkExp(s->tree->getRoot());
+  }
+};
+}  // namespace
+
 void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header) {
   Assert(denseSchedule.valid, "cannot emit dense executor for invalid schedule: %s", denseSchedule.fallbackReason.c_str());
   Assert(!denseSchedule.mtasks.empty(), "dense executor requires MTask partitioning");
@@ -890,6 +992,33 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                           std::chrono::steady_clock::now() - densePrologueBegin).count();
     fprintf(stderr, "[emit-phase] Final.densePrologue.total = %ld ms\n", prologueMs);
   }
+  // GSIM_EMIT_TASK_LOCALS=1 (default off): freeze the reset machinery's member
+  // footprint before the parallel body emission. SUPER_ASYNC_RESET supers
+  // evaluate with subResetDense<id>() calls at their start AND end; those
+  // helpers read/write class members directly (invisible to same-name body
+  // locals), so every name they reference is excluded from localization in the
+  // calling task.
+  const bool emitTaskLocals = mtUseEmitTaskLocals();
+  std::map<Node*, std::set<std::string>> denseAsyncResetReferenced;
+  if (emitTaskLocals) {
+    for (SuperNode* resetSuper : allReset) {
+      if (resetSuper->superType != SUPER_ASYNC_RESET) continue;
+      MtTaskLocalCollector collect;
+      collect.walkSuper(resetSuper);
+      std::set<std::string>& names = denseAsyncResetReferenced[resetSuper->resetNode];
+      for (const std::string& name : collect.reads) names.insert(name);
+      for (const std::string& name : collect.writes) names.insert(name);
+      for (const std::string& name : collect.resetTouched) names.insert(name);
+      for (const std::string& name : collect.nonRegNames) names.insert(name);
+      for (const auto& kv : collect.typeNode) names.insert(kv.first);
+    }
+  }
+  // Report counters only; order-independent sums, so relaxed atomics suffice
+  // for the parallel emission units below.
+  std::atomic<uint64_t> taskLocalsLocalizedTasks{0}, taskLocalsWorker0Excluded{0},
+      taskLocalsExtExcluded{0}, taskLocalsAsyncHelperTasks{0}, taskLocalsLoads{0},
+      taskLocalsStores{0}, taskLocalsCandidates{0}, taskLocalsResetExcluded{0},
+      taskLocalsArrayClassNames{0};
   {
   EmitPhaseTimer denseBodyTimer("Final.denseMTaskBodies");
   // Each stepDenseMTaskN body is an independent emission unit (reads frozen
@@ -897,11 +1026,79 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // saved/restored around genSuperEval exactly as in the sequential loop).
   // Unit u renders denseMTaskEmissionOrder[u]; assembly replays buffers in
   // emission order, so output is byte-identical.
-  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder, &ownerReadyLayout, denseBreakdownWindowLaBodyCodegen](size_t unit) {
+  emitUnitsParallel(denseMTaskEmissionOrder.size(), [this, &denseSchedule, &denseMTaskEmissionOrder, &ownerReadyLayout, denseBreakdownWindowLaBodyCodegen, emitTaskLocals, &denseAsyncResetReferenced, &taskLocalsLocalizedTasks, &taskLocalsWorker0Excluded, &taskLocalsExtExcluded, &taskLocalsAsyncHelperTasks, &taskLocalsLoads, &taskLocalsStores, &taskLocalsCandidates, &taskLocalsResetExcluded, &taskLocalsArrayClassNames](size_t unit) {
     int mtaskId = denseMTaskEmissionOrder[unit];
 
     const MtDenseMTask& mtask = denseSchedule.mtasks[mtaskId];
     emitFuncDecl(0, "void S%s::stepDenseMTask%d() {\n", name.c_str(), mtaskId);
+    // GSIM_EMIT_TASK_LOCALS=1 (default off): value-typed locals shadowing the
+    // eligible scalar register-state members this body reads or writes. The
+    // loads happen once at body entry; every in-body reference (including the
+    // dead $old$ snapshots the dense path still computes) resolves to the
+    // local; written members are stored back before the body returns, ahead of
+    // the dispatcher's token release stores. Exclusions: worker0-owned tasks,
+    // external/DPI tasks, members referenced by the subResetDense helpers
+    // called around SUPER_ASYNC_RESET supers, REG_RESET-referenced names, and
+    // arrays/memories (which keep direct member access).
+    std::vector<std::pair<std::string, Node*>> taskLocalLoads;
+    std::vector<std::string> taskLocalStores;
+    if (emitTaskLocals) {
+      bool taskExcluded = false;
+      bool asyncHelperTask = false;
+      MtTaskLocalCollector collect;
+      std::set<std::string> excluded;
+      const int taskLocalOwner = mtaskId < static_cast<int>(denseSchedule.mtaskThreadAssign.size())
+                                   ? denseSchedule.mtaskThreadAssign[(size_t)mtaskId] : -1;
+      if (taskLocalOwner == 0) taskExcluded = true;  // worker0-only tasks stay direct-member
+      for (int sccId : mtask.sccIds) {
+        if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+        for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+          auto superIter = cppId2Super.find(cppId);
+          if (superIter == cppId2Super.end() || !superIter->second) continue;
+          SuperNode* super = superIter->second;
+          if (super->superType == SUPER_EXTMOD) taskExcluded = true;  // external/DPI side effects
+          if (super->superType == SUPER_ASYNC_RESET) {
+            asyncHelperTask = true;
+            auto helperNames = denseAsyncResetReferenced.find(super->resetNode);
+            if (helperNames != denseAsyncResetReferenced.end())
+              excluded.insert(helperNames->second.begin(), helperNames->second.end());
+          }
+          for (Node* member : super->member) {
+            if (member->isExt()) taskExcluded = true;  // DPI boundary: members passed by reference
+          }
+          collect.walkSuper(super);
+        }
+      }
+      taskLocalsArrayClassNames.fetch_add(collect.nonRegNames.size(), std::memory_order_relaxed);
+      taskLocalsCandidates.fetch_add(collect.typeNode.size(), std::memory_order_relaxed);
+      if (asyncHelperTask) taskLocalsAsyncHelperTasks.fetch_add(1, std::memory_order_relaxed);
+      if (taskExcluded) {
+        if (taskLocalOwner == 0) taskLocalsWorker0Excluded.fetch_add(1, std::memory_order_relaxed);
+        else taskLocalsExtExcluded.fetch_add(1, std::memory_order_relaxed);
+      } else {
+        excluded.insert(collect.resetTouched.begin(), collect.resetTouched.end());
+        excluded.insert(collect.nonRegNames.begin(), collect.nonRegNames.end());
+        for (const auto& kv : collect.typeNode) {
+          if (excluded.count(kv.first)) {
+            taskLocalsResetExcluded.fetch_add(1, std::memory_order_relaxed);
+            continue;
+          }
+          taskLocalLoads.push_back(kv);
+          if (collect.writes.count(kv.first)) taskLocalStores.push_back(kv.first);
+        }
+      }
+      taskLocalsLocalizedTasks.fetch_add(taskLocalLoads.empty() ? 0 : 1, std::memory_order_relaxed);
+      taskLocalsLoads.fetch_add(taskLocalLoads.size(), std::memory_order_relaxed);
+      taskLocalsStores.fetch_add(taskLocalStores.size(), std::memory_order_relaxed);
+      if (!taskLocalLoads.empty()) {
+        emitBodyLock(1, "// task-locals: %zu loaded, %zu written back (GSIM_EMIT_TASK_LOCALS)\n",
+                     taskLocalLoads.size(), taskLocalStores.size());
+        for (const auto& kv : taskLocalLoads) {
+          emitBodyLock(1, "%s %s = this->%s;\n", widthUType(kv.second->width).c_str(),
+                       kv.first.c_str(), kv.first.c_str());
+        }
+      }
+    }
     if (denseBreakdownWindowLaBodyCodegen) {
       // Body-only lookahead timing: one conditional steady_clock wrap inside the
       // MTask body function covers every dispatch site (inline fast path plus all
@@ -954,8 +1151,28 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowLaBodySeenCount != 1)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] lookahead body duplicate sample\\n\"); abort(); }\n");
       emitBodyLock(1, "}\n");
     }
+    if (!taskLocalStores.empty()) {
+      emitBodyLock(1, "// task-locals write-back before return (GSIM_EMIT_TASK_LOCALS)\n");
+      for (const std::string& taskLocalName : taskLocalStores) {
+        emitBodyLock(1, "this->%s = %s;\n", taskLocalName.c_str(), taskLocalName.c_str());
+      }
+    }
     emitBodyLock(0, "}\n");
   });
+  }
+  if (emitTaskLocals) {
+    fprintf(stderr,
+            "[mt-dense-task-locals] mtasks=%d localized_tasks=%llu worker0_excluded=%llu ext_excluded=%llu async_helper_tasks=%llu loads=%llu stores=%llu candidates=%llu reset_excluded=%llu array_class_names=%llu\n",
+            nMTasks,
+            (unsigned long long)taskLocalsLocalizedTasks.load(),
+            (unsigned long long)taskLocalsWorker0Excluded.load(),
+            (unsigned long long)taskLocalsExtExcluded.load(),
+            (unsigned long long)taskLocalsAsyncHelperTasks.load(),
+            (unsigned long long)taskLocalsLoads.load(),
+            (unsigned long long)taskLocalsStores.load(),
+            (unsigned long long)taskLocalsCandidates.load(),
+            (unsigned long long)taskLocalsResetExcluded.load(),
+            (unsigned long long)taskLocalsArrayClassNames.load());
   }
 
   auto emitFixedDenseThreadWorker = [&](const char* funcName) {
