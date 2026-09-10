@@ -643,6 +643,18 @@ bool mtUsePscdVerify() {
   const char* env = std::getenv("GSIM_PSCD_VERIFY");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+
+// GSIM_MT_DENSE_EDGE_TIMING (default off): per-edge wait-latency
+// instrumentation for the dense owner-ready executor. Each token release
+// site records an rdtsc fire timestamp into a sole-writer slot array; each
+// wait-list entry accumulates spin time and a spin count only on the
+// actually-blocked path (pre-check load replaces the spin loop's first
+// condition load, so the ready path pays no extra load). A JSON report is
+// written from the teardown path. Unset keeps every emitted byte identical.
+bool mtUseDenseEdgeTiming() {
+  const char* env = std::getenv("GSIM_MT_DENSE_EDGE_TIMING");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where

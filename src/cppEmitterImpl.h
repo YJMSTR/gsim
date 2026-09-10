@@ -464,6 +464,7 @@ bool mtUseDenseWorkerMajorText();
 bool mtUseEmitTaskLocals();
 bool mtUseEmitPscdBits();
 bool mtUsePscdVerify();
+bool mtUseDenseEdgeTiming();
 int mtDenseSpinYieldEvery();
 int mtDenseLookaheadWindow();
 bool mtDenseDutyCodegen();

@@ -1076,8 +1076,80 @@ std::pair<std::vector<int>, int> mtBuildDensePackThreadsAssignment(const std::ve
 // earliest-start schedule order -- Verilator's static per-worker chain behavior -- with no
 // runtime change. The order is a valid topological order (only ready MTasks are scheduled), so
 // ids stay topo-monotone (succ>from) as the runtime protocol / transitive reduction require.
-static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount,
-                                      std::vector<int>& outAssign, std::vector<int>& outOrder) {
+// ---- GSIM_MT_DENSE_SCHED_HOTEDGE (default off, byte-identical when unset) ----
+// J-aware CCD penalty (WP2 realization with measured J). Loads a
+// SimTop_edge_timing.json (GSIM_MT_DENSE_EDGE_TIMING output) and generalizes
+// the GSIM_MT_DENSE_PACK_CCD_AFFINITY flat-gamma cross-CCD penalty in the
+// greedy below: a MEASURED producer->consumer edge pays gamma scaled by its
+// normalized blocked time (J/maxJ, integer milli-units 0..1000) INSTEAD of
+// the flat gamma; UNMEASURED edges keep the flat gamma unchanged. The scale
+// still comes entirely from GSIM_MT_DENSE_PACK_CCD_AFFINITY (gamma=0 disables
+// both terms), and the term only applies in the percentage-penalty branch --
+// GSIM_MT_DENSE_SCHED_ABS_LAT replaces the whole xsync/ccd term family with
+// machine constants and is left untouched.
+struct MtDenseHotedgeEntry {
+  int waitIndex = -1;
+  int consumerMtaskId = -1;
+  int tokenSlot = -1;
+  unsigned long long waits = 0;
+  unsigned long long blockedNs = 0;
+};
+
+static bool mtHotedgeJsonField(const std::string& rec, const char* key, long long* out) {
+  size_t at = rec.find(key);
+  if (at == std::string::npos) return false;
+  const char* p = rec.c_str() + at + std::strlen(key);
+  while (*p == ' ' || *p == '\t') p++;
+  bool neg = false;
+  if (*p == '-') { neg = true; p++; }
+  if (*p < '0' || *p > '9') return false;
+  unsigned long long v = 0;
+  while (*p >= '0' && *p <= '9') { v = v * 10 + (unsigned long long)(*p - '0'); p++; }
+  *out = neg ? -(long long)v : (long long)v;
+  return true;
+}
+
+// Minimal reader for the machine-generated dump (flat records, no nesting):
+// locate "wait_entries", then split on '{'...'}' and pull the five fields.
+static bool mtLoadHotedgeJson(const char* path, std::vector<MtDenseHotedgeEntry>& out) {
+  FILE* fp = std::fopen(path, "r");
+  if (fp == nullptr) return false;
+  std::string data;
+  char buf[65536];
+  size_t got;
+  while ((got = std::fread(buf, 1, sizeof(buf), fp)) > 0) data.append(buf, got);
+  std::fclose(fp);
+  const char* entries = std::strstr(data.c_str(), "\"wait_entries\"");
+  if (entries == nullptr) return false;
+  const char* p = std::strchr(entries, '[');
+  if (p == nullptr) return false;
+  p++;
+  while (true) {
+    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') p++;
+    if (*p == ']' || *p == '\0') break;
+    if (*p != '{') return false;
+    const char* recEnd = std::strchr(p, '}');
+    if (recEnd == nullptr) return false;
+    std::string rec(p, (size_t)(recEnd - p + 1));
+    MtDenseHotedgeEntry e;
+    long long v = 0;
+    if (mtHotedgeJsonField(rec, "\"waitIndex\":", &v)) e.waitIndex = (int)v;
+    if (mtHotedgeJsonField(rec, "\"consumerMtaskId\":", &v)) e.consumerMtaskId = (int)v;
+    if (mtHotedgeJsonField(rec, "\"tokenSlot\":", &v)) e.tokenSlot = (int)v;
+    if (mtHotedgeJsonField(rec, "\"waits\":", &v)) e.waits = (unsigned long long)v;
+    if (mtHotedgeJsonField(rec, "\"blockedNs\":", &v)) e.blockedNs = (unsigned long long)v;
+    out.push_back(e);
+    p = recEnd + 1;
+  }
+  return true;
+}
+
+// The greedy itself. hotPctByConsumer == nullptr reproduces the historical
+// behavior byte-for-byte; when set, [consumer][producer] holds the measured
+// edge weight in milli-units (0..1000, J/maxJ) that scales the flat gamma.
+static void mtDenseScheduleOrderImpl(const std::vector<MtDenseMTask>& mtasks, int threadCount,
+                                     std::vector<int>& outAssign, std::vector<int>& outOrder,
+                                     const std::vector<std::map<int, int>>* hotPctByConsumer) {
   if (threadCount < 1) threadCount = 1;
   const int n = static_cast<int>(mtasks.size());
   auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
@@ -1172,8 +1244,28 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
               predEnd += ((predWorker / ccdSize) != (worker / ccdSize)) ? 290 : 24;
             } else {
               predEnd += (long long)(costOf(mtasks[(size_t)pred])) * xsyncPct / 100;
-              if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize))
-                predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
+              if (ccdExtra > 0 && (predWorker / ccdSize) != (worker / ccdSize)) {
+                // Flat gamma (GSIM_MT_DENSE_PACK_CCD_AFFINITY) for cross-CCD
+                // edges; worker->CCD mapping is worker/8, identical to the
+                // PackThreads variant of the term. GSIM_MT_DENSE_SCHED_HOTEDGE
+                // replaces the flat gamma ONLY on measured edges, scaling it
+                // by the normalized blocked time (J/maxJ in 0..1000
+                // milli-units, per (consumer, producer) summed over the
+                // consumer's measured tokens and capped at 1000, so the
+                // max-edge penalty stays ~= the flat gamma):
+                //   penalty = costOf(pred) * ccdExtra * hotPct / 100000
+                // (hotPct = 1000 reproduces costOf(pred) * ccdExtra / 100).
+                // Unmeasured edges keep the flat gamma unchanged.
+                int hotPctEdge = -1;
+                if (hotPctByConsumer != nullptr) {
+                  auto hotIt = (*hotPctByConsumer)[(size_t)mtaskId].find(pred);
+                  if (hotIt != (*hotPctByConsumer)[(size_t)mtaskId].end()) hotPctEdge = hotIt->second;
+                }
+                if (hotPctEdge < 0)
+                  predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra / 100;
+                else if (hotPctEdge > 0)
+                  predEnd += (long long)(costOf(mtasks[(size_t)pred])) * ccdExtra * hotPctEdge / 100000;
+              }
             }
           }
           if (predEnd > timeBegin) timeBegin = predEnd;
@@ -1202,6 +1294,132 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     for (int m : outOrder) seen[(size_t)m] = 1;
     for (int i = 0; i < n; i ++) if (!seen[(size_t)i]) { outOrder.push_back(i); if (outAssign[(size_t)i] < 0) outAssign[(size_t)i] = mtasks[(size_t)i].workerZeroOnly ? 0 : 0; }
   }
+}
+
+static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount,
+                                      std::vector<int>& outAssign, std::vector<int>& outOrder) {
+  const char* hotPath = std::getenv("GSIM_MT_DENSE_SCHED_HOTEDGE");
+  if (hotPath == nullptr || hotPath[0] == '\0') {
+    mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, nullptr);
+    return;
+  }
+  std::vector<MtDenseHotedgeEntry> entries;
+  bool loaded = mtLoadHotedgeJson(hotPath, entries);
+  (void)loaded;
+  const int n = static_cast<int>(mtasks.size());
+  bool xthreadDepsOnly = mtUseDenseXThreadDepsOnly();
+  Assert(xthreadDepsOnly,
+         "GSIM_MT_DENSE_SCHED_HOTEDGE requires GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1 (the edge-timing capture and its owner-ready slot numbering exist only under it)");
+  bool transitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
+  // Reference pass (hotedge off) reproduces the placement the timing file was
+  // captured on. CRITICAL id-space detail: the timing file's ids are FINAL
+  // (executor) MTask ids, but this function runs BEFORE the SCHED_ORDER
+  // renumber, so its ids are PRE-renumber. The renumber in buildMtDenseSchedule
+  // assigns final id = position in the order (newId[order[newPos]] = newPos),
+  // and the owner-ready layout's group ordering (pair banks keyed by
+  // (destination id, producer owner)) is id-dependent — so the preview layout
+  // must be built over a FINAL-id-space replica of the graph: finalMtasks[k] =
+  // mtasks[refOrder[k]] with succ/pred ids remapped through the inverse
+  // permutation. With GSIM_MT_DENSE_SCHED_ORDER off the permutation is the
+  // identity (no renumber happens).
+  std::vector<int> refAssign, refOrder;
+  mtDenseScheduleOrderImpl(mtasks, threadCount, refAssign, refOrder, nullptr);
+  bool schedOrder = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_ORDER"); if (e) schedOrder = e[0] && e[0] != '0'; }
+  std::vector<int> preOfFinal((size_t)n, -1);
+  if (schedOrder && static_cast<int>(refOrder.size()) == n)
+    for (int k = 0; k < n; k++) preOfFinal[(size_t)k] = refOrder[(size_t)k];
+  else
+    for (int k = 0; k < n; k++) preOfFinal[(size_t)k] = k;
+  std::vector<int> finalOfPre((size_t)n, -1);
+  for (int k = 0; k < n; k++) finalOfPre[(size_t)preOfFinal[(size_t)k]] = k;
+  std::vector<MtDenseMTask> finalMtasks((size_t)n);
+  std::vector<int> finalAssign((size_t)n, -1);
+  for (int k = 0; k < n; k++) {
+    const MtDenseMTask& pre = mtasks[(size_t)preOfFinal[(size_t)k]];
+    MtDenseMTask fin = pre;
+    fin.succMTasks.clear();
+    fin.predMTasks.clear();
+    for (int succ : pre.succMTasks)
+      if (succ >= 0 && succ < n && finalOfPre[(size_t)succ] >= 0) fin.succMTasks.push_back(finalOfPre[(size_t)succ]);
+    for (int pred : pre.predMTasks)
+      if (pred >= 0 && pred < n && finalOfPre[(size_t)pred] >= 0) fin.predMTasks.push_back(finalOfPre[(size_t)pred]);
+    finalMtasks[(size_t)k] = fin;
+    finalAssign[(size_t)k] = refAssign[(size_t)preOfFinal[(size_t)k]];
+  }
+  // Same layout derivation the executor emission uses. NOTE: with
+  // GSIM_MT_DENSE_LOOKAHEAD >= 1 the executor REPLACES this layout with one
+  // built from the transitive-reduced DAG-only cross-worker succ graph
+  // (injectWorkerChains=false), so the preview must replicate that branch or
+  // the slot numbering diverges on lookahead recipes.
+  std::vector<std::vector<int>> refSuccs;
+  if (mtDenseLookaheadWindow() > 0) {
+    std::vector<std::vector<int>> dagOnlySuccs = mtBuildDenseRuntimeSuccs(finalMtasks, finalAssign, false);
+    mtReduceDenseRuntimeSuccsTransitive(dagOnlySuccs, finalAssign, false);
+    refSuccs.assign((size_t)n, {});
+    for (int pred = 0; pred < n; pred++)
+      for (int succ : dagOnlySuccs[(size_t)pred])
+        if (finalAssign[(size_t)pred] != finalAssign[(size_t)succ])
+          refSuccs[(size_t)pred].push_back(succ);
+  } else {
+    refSuccs = mtBuildDenseRuntimeSuccs(finalMtasks, finalAssign, xthreadDepsOnly);
+    if (transitiveReduceEdges) mtReduceDenseRuntimeSuccsTransitive(refSuccs, finalAssign);
+  }
+  MtDenseOwnerReadyLayout refLayout = mtBuildDenseOwnerReadyLayout(refSuccs, finalAssign, threadCount);
+  struct MtHotedgeMapped { int consumer; unsigned long long blockedNs; std::vector<int> producers; };
+  std::vector<MtHotedgeMapped> mapped;
+  unsigned long long maxJ = 0;
+  int hotedgeSkipStale = 0, hotedgeSkipNoSlot = 0, hotedgeSkipNoProducer = 0;
+  for (const MtDenseHotedgeEntry& e : entries) {
+    if (e.consumerMtaskId < 0 || e.consumerMtaskId >= n) { hotedgeSkipStale++; continue; }
+    if (e.tokenSlot < 0 || e.tokenSlot >= refLayout.physicalSlotCount) { hotedgeSkipNoSlot++; continue; }
+    const int token = refLayout.logicalTokenByPhysicalSlot[(size_t)e.tokenSlot];
+    if (token < 0 || token >= refLayout.tokenCount) { hotedgeSkipNoSlot++; continue; }
+    if (refLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerMTask != e.consumerMtaskId) {
+      hotedgeSkipStale++;  // stale slot map (layout drifted from the captured build)
+      continue;
+    }
+    MtHotedgeMapped me;
+    me.consumer = preOfFinal[(size_t)e.consumerMtaskId];  // hotPct keyed in PRE ids (greedy's space)
+    me.blockedNs = e.blockedNs;
+    for (int source : refLayout.sourceMTasksByLogicalToken[(size_t)token]) {
+      if (source < 0 || source >= n) continue;
+      const int preProducer = preOfFinal[(size_t)source];
+      if (preProducer < 0) continue;
+      me.producers.push_back(preProducer);  // hotPct is keyed in PRE ids (this function's space)
+    }
+    if (me.producers.empty()) { hotedgeSkipNoProducer++; continue; }
+    mapped.push_back(me);
+    if (me.blockedNs > maxJ) maxJ = me.blockedNs;
+  }
+  // Per (consumer, producer) weight in 0..1000 milli-units of J/maxJ, summed
+  // over the consumer's measured tokens and capped at 1000 so the hottest
+  // edge pays at most ~= the flat gamma.
+  std::vector<std::map<int, int>> hotPct((size_t)n);
+  if (maxJ > 0) {
+    for (const MtHotedgeMapped& me : mapped) {
+      if (me.blockedNs == 0) continue;
+      const int pct = (int)(me.blockedNs * 1000ULL / maxJ);
+      for (int producer : me.producers) {
+        int& acc = hotPct[(size_t)me.consumer][producer];
+        acc = acc + pct > 1000 ? 1000 : acc + pct;
+      }
+    }
+  }
+  int appliedEdges = 0, maxPct = 0;
+  for (const std::map<int, int>& byProducer : hotPct)
+    for (const auto& kv : byProducer)
+      if (kv.second > 0) { appliedEdges++; if (kv.second > maxPct) maxPct = kv.second; }
+  int ccdExtra = 0;
+  { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+  // max_penalty is the hottest edge's penalty in percent-of-producer-cost
+  // units (J-normalized gamma); 0 when GSIM_MT_DENSE_PACK_CCD_AFFINITY is 0.
+  fprintf(stderr, "[hotedge] loaded=%d applied_edges=%d max_penalty=%f\n",
+          static_cast<int>(entries.size()), appliedEdges,
+          (double)maxPct * (double)ccdExtra / 1000.0);
+  fprintf(stderr, "[hotedge] debug skip_reasons=(stale=%d noslot=%d noproducer=%d)\n",
+          hotedgeSkipStale, hotedgeSkipNoSlot, hotedgeSkipNoProducer);
+  mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, &hotPct);
 }
 
 MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {

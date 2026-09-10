@@ -127,6 +127,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // unset keep every emitted byte identical.
   bool pscdBits = mtUseEmitPscdBits();
   bool pscdVerify = mtUsePscdVerify();
+  // Per-edge wait-latency instrumentation (default off), same gating
+  // discipline as PSCD: generation-gated here, compile-gated on the
+  // owner-ready macro, byte-identical when unset.
+  bool edgeTiming = mtUseDenseEdgeTiming();
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
   int denseBreakdownWindowWorker0MTaskCount = 0;
@@ -160,6 +164,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_EMIT_PSCD_BITS requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!pscdVerify || pscdBits,
          "GSIM_PSCD_VERIFY requires GSIM_EMIT_PSCD_BITS=1");
+  Assert(!edgeTiming || ownerReadyFlags,
+         "GSIM_MT_DENSE_EDGE_TIMING requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   const std::chrono::steady_clock::time_point densePrologueBegin = std::chrono::steady_clock::now();
   std::vector<std::vector<int>> denseRuntimeSuccs;
   int transitiveElidedEdges = 0;
@@ -1054,6 +1060,72 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     if (pscdWaitSlotsWithoutStoreEntry > 0)
       fprintf(stderr, "[pscd] wait_slots_without_store_entry=%d (treated as not-summarized; excluded from both sides of the shadow equality)\n",
               pscdWaitSlotsWithoutStoreEntry);
+    // Per-consumer precision dump: a consumer is "all-precise" iff every wait
+    // slot resolves to a store entry that is not conservative. Used offline to
+    // join against per-mtask profile samples (slice-2 benefit analysis).
+    {
+      std::string dumpPath = globalConfig.OutputDir + "/" + name + "_pscd_consumers.json";
+      FILE* dump = fopen(dumpPath.c_str(), "w");
+      if (dump != nullptr) {
+        fprintf(dump, "{\"all_precise\":[");
+        bool first = true;
+        int allPreciseCount = 0;
+        for (int c = 0; c < nMTasks; c++) {
+          const auto& waits = ownerReadyLayout.waitSlotsByMTask[(size_t)c];
+          if (waits.empty()) continue;
+          bool allPrecise = true;
+          for (int slot : waits) {
+            int j = (slot >= 0 && slot < (int)pscdStoreEntryOfSlot.size())
+                        ? pscdStoreEntryOfSlot[(size_t)slot] : -1;
+            if (j < 0 || pscdStoreConservative[(size_t)j]) { allPrecise = false; break; }
+          }
+          if (allPrecise) {
+            fprintf(dump, "%s%d", first ? "" : ",", c);
+            first = false;
+            allPreciseCount++;
+          }
+        }
+        fprintf(dump, "],\"all_precise_count\":%d,\"consumers_with_waits\":%d}\n",
+                allPreciseCount, nMTasks);
+        fclose(dump);
+        fprintf(stderr, "[pscd] all_precise_consumers=%d wrote %s\n", allPreciseCount, dumpPath.c_str());
+      }
+    }
+  }
+  // ---- GSIM_MT_DENSE_EDGE_TIMING (default off): per-edge wait latency ----
+  // Canonical wait-entry numbering: identical to kDenseOwnerReadyWaitList's
+  // construction (worker ascending, MTask ascending within worker, per-task
+  // slot order with GSIM_EMIT_SORTED_WAITS honored), so the lookahead tail's
+  // dispatch-wait loop variable IS this index, and the strict dispatch's
+  // literal-slot wait loops look their indices up from this map. Each entry
+  // has exactly one consumer worker, so the accumulators are sole-writer
+  // plain uint64s — no atomics in the hot path.
+  std::map<int, int> edgeTimingWaitIndexOfSlot;
+  std::vector<int> edgeTimingWaitSlotList;
+  std::vector<int> edgeTimingWaitConsumerList;
+  int edgeTimingWaitTotal = 0;
+  if (edgeTiming) {
+    bool edgeSortWaits = false;
+    { const char* e = std::getenv("GSIM_EMIT_SORTED_WAITS"); edgeSortWaits = e && e[0] && e[0] != '0'; }
+    for (int t = 0; t < threadCount; t++) {
+      for (int m = 0; m < nMTasks; m++) {
+        if (denseSchedule.mtaskThreadAssign[(size_t)m] != t) continue;
+        std::vector<int> slots = ownerReadyLayout.waitSlotsByMTask[(size_t)m];
+        if (edgeSortWaits && slots.size() > 1) std::sort(slots.begin(), slots.end());
+        for (int slot : slots) {
+          Assert(slot >= 0 && slot < ownerReadyLayout.physicalSlotCount,
+                 "edge-timing wait slot %d outside dense owner-ready slot range", slot);
+          edgeTimingWaitIndexOfSlot[slot] = edgeTimingWaitTotal++;
+          edgeTimingWaitSlotList.push_back(slot);
+          edgeTimingWaitConsumerList.push_back(m);
+        }
+      }
+    }
+    Assert(!denseLookahead || edgeTimingWaitTotal == (int)denseDispatchWaitTotal,
+           "edge-timing wait numbering (%d) diverged from kDenseOwnerReadyWaitList (%u)",
+           edgeTimingWaitTotal, denseDispatchWaitTotal);
+    fprintf(stderr, "[edge-timing] slots=%d waits=%d\n",
+            ownerReadyLayout.physicalSlotCount, edgeTimingWaitTotal);
   }
 
   auto emitDenseDepCounts = [&]() {
@@ -1214,6 +1286,30 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         fprintf(header, "uint8_t mtPscdMismatchReported[%d] = {0};\n", nMTasks);
         fprintf(header, "std::atomic<uint64_t> mtPscdMismatchCount{};\n");
       }
+    }
+    if (edgeTiming) {
+      // GSIM_MT_DENSE_EDGE_TIMING: per-edge wait latency state. The fire
+      // timestamp array is slot-indexed (sole writer = the releasing owner
+      // worker); the blocked accumulators are wait-entry indexed (sole writer
+      // = the consuming worker). Plain uint64s — no atomics in hot paths.
+      // rdtsc idiom reused from the wallfrac audit emitter.
+      fprintf(header, "// GSIM_MT_DENSE_EDGE_TIMING: per-edge wait latency (rdtsc ticks)\n");
+      fprintf(header, "static uint64_t mtEdgeTimingRdtsc() { uint32_t __edgeLo, __edgeHi; __asm__ __volatile__(\"rdtsc\":\"=a\"(__edgeLo),\"=d\"(__edgeHi)); return ((uint64_t)__edgeHi << 32) | __edgeLo; }\n");
+      fprintf(header, "uint64_t mtDenseEdgeFireRdtsc[%d];\n", std::max(1, ownerReadyLayout.physicalSlotCount));
+      fprintf(header, "static constexpr int kDenseEdgeTimingWaitEntryCount = %d;\n", edgeTimingWaitTotal);
+      fprintf(header, "uint64_t mtDenseEdgeBlockedNs[%d];\n", std::max(1, edgeTimingWaitTotal));
+      fprintf(header, "uint64_t mtDenseEdgeWaits[%d];\n", std::max(1, edgeTimingWaitTotal));
+      fprintf(header, "static constexpr int kDenseEdgeTimingWaitSlot[%d] = {", std::max(1, edgeTimingWaitTotal));
+      for (size_t w = 0; w < edgeTimingWaitSlotList.size(); w++)
+        fprintf(header, "%s%d", w ? "," : "", edgeTimingWaitSlotList[w]);
+      if (edgeTimingWaitSlotList.empty()) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "static constexpr int kDenseEdgeTimingWaitConsumer[%d] = {", std::max(1, edgeTimingWaitTotal));
+      for (size_t w = 0; w < edgeTimingWaitConsumerList.size(); w++)
+        fprintf(header, "%s%d", w ? "," : "", edgeTimingWaitConsumerList[w]);
+      if (edgeTimingWaitConsumerList.empty()) fprintf(header, "0");
+      fprintf(header, "};\n");
+      fprintf(header, "void dumpDenseEdgeTiming();\n");
     }
     if (denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
@@ -1644,6 +1740,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             if (pscdBits)
               emitBodyLock(5, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
             for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
+              if (edgeTiming)
+                emitBodyLock(5, "mtDenseEdgeFireRdtsc[%d] = mtEdgeTimingRdtsc();\n", slot);
               emitBodyLock(5, "mtDenseOwnerReadyTokens[%d].ready.store(target, std::memory_order_release);\n", slot);
             }
             emitBodyLock(4, "}\n");
@@ -1668,6 +1766,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         } else {
           emitBodyLock(3, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
           for (int slot : ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId]) {
+            int edgeWidx = -1;
+            if (edgeTiming) {
+              auto edgeWidxIt = edgeTimingWaitIndexOfSlot.find(slot);
+              Assert(edgeWidxIt != edgeTimingWaitIndexOfSlot.end(),
+                     "edge-timing wait slot %d missing from canonical numbering", slot);
+              edgeWidx = edgeWidxIt->second;
+            }
             if (denseBreakdownProfileCodegen) {
               emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
               if (denseBreakdownWindowCodegen) {
@@ -1677,13 +1782,17 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               }
               emitBodyLock(4, "bool mtDenseBreakdownBlocked = false;\n");
               emitBodyLock(4, "std::chrono::steady_clock::time_point mtDenseBreakdownBlockedBegin;\n");
+              if (edgeTiming) emitBodyLock(4, "uint64_t mtEdgeBlockedT0 = 0;\n");
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
               emitBodyLock(5, "if (!mtDenseBreakdownBlocked) { mtDenseBreakdownBlocked = true; mtDenseBreakdownBlockedBegin = std::chrono::steady_clock::now(); }\n");
+              if (edgeTiming) emitBodyLock(5, "if (mtEdgeBlockedT0 == 0) mtEdgeBlockedT0 = mtEdgeTimingRdtsc();\n");
               if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
               else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
               emitBodyLock(4, "}\n");
               emitBodyLock(4, "if (mtDenseBreakdownBlocked) {\n");
+              if (edgeTiming)
+                emitBodyLock(5, "mtDenseEdgeBlockedNs[%d] += mtEdgeTimingRdtsc() - mtEdgeBlockedT0; mtDenseEdgeWaits[%d] ++;\n", edgeWidx, edgeWidx);
               emitBodyLock(5, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
               if (denseBreakdownWindowCodegen) {
                 emitBodyLock(5, "const std::chrono::steady_clock::time_point mtDenseBreakdownBlockedEnd = std::chrono::steady_clock::now();\n");
@@ -1715,19 +1824,41 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                 emitBodyLock(4, "}\n");
               }
               emitBodyLock(3, "  } else {\n");
-              emitBodyLock(4, "unsigned ct = 0;\n");
-              emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
-              else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
-              emitBodyLock(4, "}\n");
+              if (edgeTiming) {
+                emitBodyLock(4, "if (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+                emitBodyLock(5, "const uint64_t mtEdgeT0 = mtEdgeTimingRdtsc(); unsigned ct = 0;\n");
+                emitBodyLock(5, "do {\n");
+                if (spinYieldEvery == 0) emitBodyLock(6, "mtWorkerPoolPause();\n");
+                else emitBodyLock(6, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
+                emitBodyLock(5, "} while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target);\n", slot);
+                emitBodyLock(5, "mtDenseEdgeBlockedNs[%d] += mtEdgeTimingRdtsc() - mtEdgeT0; mtDenseEdgeWaits[%d] ++;\n", edgeWidx, edgeWidx);
+                emitBodyLock(4, "}\n");
+              } else {
+                emitBodyLock(4, "unsigned ct = 0;\n");
+                emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+                if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
+                else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
+                emitBodyLock(4, "}\n");
+              }
               emitBodyLock(3, "  }\n");
               emitBodyLock(3, "}\n");
             } else {
               emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
-              emitBodyLock(3, "  unsigned ct = 0;\n");
-              emitBodyLock(3, "  while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
-              else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
+              if (edgeTiming) {
+                emitBodyLock(3, "  if (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+                emitBodyLock(4, "const uint64_t mtEdgeT0 = mtEdgeTimingRdtsc(); unsigned ct = 0;\n");
+                emitBodyLock(4, "do {\n");
+                if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
+                else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
+                emitBodyLock(4, "} while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target);\n", slot);
+                emitBodyLock(4, "mtDenseEdgeBlockedNs[%d] += mtEdgeTimingRdtsc() - mtEdgeT0; mtDenseEdgeWaits[%d] ++;\n", edgeWidx, edgeWidx);
+                emitBodyLock(3, "  }\n");
+              } else {
+                emitBodyLock(3, "  unsigned ct = 0;\n");
+                emitBodyLock(3, "  while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
+                if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+                else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
+              }
               emitBodyLock(3, "}\n");
             }
 
@@ -1799,6 +1930,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(4, "mtDensePscdRelease(kDenseOwnerReadyStoreOffsets[%d], kDenseOwnerReadyStoreOffsets[%d]);\n", mtaskId, mtaskId + 1);
             emitBodyLock(3, "if (evenCycle) {\n");
             emitBodyLock(4, "for (int j = kDenseOwnerReadyStoreOffsets[%d]; j < kDenseOwnerReadyStoreOffsets[%d]; j++) {\n", mtaskId, mtaskId + 1);
+            if (edgeTiming)
+              emitBodyLock(5, "mtDenseEdgeFireRdtsc[kDenseOwnerReadyStoreList[j]] = mtEdgeTimingRdtsc();\n");
             if (denseBreakdownProfileCodegen) {
               emitBodyLock(5, "const int mtDenseBreakdownWindowReadySlot = kDenseOwnerReadyStoreList[j];\n");
               emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow && mtDenseBreakdownWindowCausalChainMode)) { const int mtDenseBreakdownWindowLogicalToken = kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowReadySlot]; if (unlikely(mtDenseBreakdownWindowLogicalToken < 0 || mtDenseBreakdownWindowLogicalToken >= kDenseBreakdownWindowCausalTokenCount || kDenseBreakdownWindowCausalTokenReadySlot[mtDenseBreakdownWindowLogicalToken] != mtDenseBreakdownWindowReadySlot || kDenseBreakdownWindowCausalTokenProducerMTask[mtDenseBreakdownWindowLogicalToken] != %d || kDenseBreakdownWindowCausalTokenProducerOwner[mtDenseBreakdownWindowLogicalToken] != threadId)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token provenance mismatch\\n\"); abort(); } MtDenseBreakdownWindowReadyToken &mtDenseBreakdownWindowTokenRelease = mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowSlot][mtDenseBreakdownWindowLogicalToken]; const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseBefore = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseBefore < mtDenseBreakdownWindowEpoch || mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs != UINT64_MAX)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-before invalid\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseBefore - mtDenseBreakdownWindowEpoch).count(); mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{1}, std::memory_order_release); const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseAfter = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseAfter < mtDenseBreakdownWindowReleaseBefore)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-after clock regression\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseAfter - mtDenseBreakdownWindowEpoch).count(); } else { mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{1}, std::memory_order_release); }\n", mtaskId);
@@ -1808,6 +1941,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(4, "}\n");
             emitBodyLock(3, "} else {\n");
             emitBodyLock(4, "for (int j = kDenseOwnerReadyStoreOffsets[%d]; j < kDenseOwnerReadyStoreOffsets[%d]; j++) {\n", mtaskId, mtaskId + 1);
+            if (edgeTiming)
+              emitBodyLock(5, "mtDenseEdgeFireRdtsc[kDenseOwnerReadyStoreList[j]] = mtEdgeTimingRdtsc();\n");
             if (denseBreakdownProfileCodegen) {
               emitBodyLock(5, "const int mtDenseBreakdownWindowReadySlot = kDenseOwnerReadyStoreList[j];\n");
               emitBodyLock(5, "if (unlikely(mtDenseBreakdownWindow && mtDenseBreakdownWindowCausalChainMode)) { const int mtDenseBreakdownWindowLogicalToken = kDenseBreakdownWindowCausalLogicalTokenByReadySlot[mtDenseBreakdownWindowReadySlot]; if (unlikely(mtDenseBreakdownWindowLogicalToken < 0 || mtDenseBreakdownWindowLogicalToken >= kDenseBreakdownWindowCausalTokenCount || kDenseBreakdownWindowCausalTokenReadySlot[mtDenseBreakdownWindowLogicalToken] != mtDenseBreakdownWindowReadySlot || kDenseBreakdownWindowCausalTokenProducerMTask[mtDenseBreakdownWindowLogicalToken] != %d || kDenseBreakdownWindowCausalTokenProducerOwner[mtDenseBreakdownWindowLogicalToken] != threadId)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token provenance mismatch\\n\"); abort(); } MtDenseBreakdownWindowReadyToken &mtDenseBreakdownWindowTokenRelease = mtDenseBreakdownWindowReadyTokens[mtDenseBreakdownWindowSlot][mtDenseBreakdownWindowLogicalToken]; const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseBefore = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseBefore < mtDenseBreakdownWindowEpoch || mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs != UINT64_MAX)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-before invalid\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseBeforeOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseBefore - mtDenseBreakdownWindowEpoch).count(); mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{0}, std::memory_order_release); const std::chrono::steady_clock::time_point mtDenseBreakdownWindowReleaseAfter = std::chrono::steady_clock::now(); if (unlikely(mtDenseBreakdownWindowReleaseAfter < mtDenseBreakdownWindowReleaseBefore)) { mtDenseBreakdownWindowCausalClockRegression = true; mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] causal token release-after clock regression\\n\"); abort(); } mtDenseBreakdownWindowTokenRelease.releaseAfterOffsetNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(mtDenseBreakdownWindowReleaseAfter - mtDenseBreakdownWindowEpoch).count(); } else { mtDenseOwnerReadyTokens[mtDenseBreakdownWindowReadySlot].ready.store(uint8_t{0}, std::memory_order_release); }\n", mtaskId);
@@ -1900,6 +2035,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     if (pscdBits)
       emitBodyLock(3, "mtDensePscdRelease(mtDenseDispatchEntry->storeBegin, mtDenseDispatchEntry->storeEnd);\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
+    if (edgeTiming)
+      emitBodyLock(4, "mtDenseEdgeFireRdtsc[kDenseOwnerReadyStoreList[mtDenseDispatchStore]] = mtEdgeTimingRdtsc();\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(3, "++head;\n");
@@ -1951,6 +2088,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     if (pscdBits)
       emitBodyLock(3, "mtDensePscdRelease(mtDenseCandidate->storeBegin, mtDenseCandidate->storeEnd);\n");
     emitBodyLock(3, "for (uint32_t mtDenseDispatchStore = mtDenseCandidate->storeBegin; mtDenseDispatchStore < mtDenseCandidate->storeEnd; ++mtDenseDispatchStore) {\n");
+    if (edgeTiming)
+      emitBodyLock(4, "mtDenseEdgeFireRdtsc[kDenseOwnerReadyStoreList[mtDenseDispatchStore]] = mtEdgeTimingRdtsc();\n");
     emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(3, "}\n");
     emitBodyLock(3, "mtDenseDoneBits[j >> 6] |= uint64_t{1} << (j & 63);\n");
@@ -1973,16 +2112,29 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
-    emitBodyLock(3, "unsigned ct = 0;\n");
-    emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
-    if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
-    else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
+    if (edgeTiming) {
+      emitBodyLock(3, "if (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
+      emitBodyLock(4, "const uint64_t mtEdgeT0 = mtEdgeTimingRdtsc(); unsigned ct = 0;\n");
+      emitBodyLock(4, "do {\n");
+      if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
+      else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
+      emitBodyLock(4, "} while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target);\n");
+      emitBodyLock(4, "mtDenseEdgeBlockedNs[mtDenseDispatchWait] += mtEdgeTimingRdtsc() - mtEdgeT0; mtDenseEdgeWaits[mtDenseDispatchWait] ++;\n");
+      emitBodyLock(3, "}\n");
+    } else {
+      emitBodyLock(3, "unsigned ct = 0;\n");
+      emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
+      if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+      else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
+    }
     emitBodyLock(2, "}\n");
     if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");
     if (pscdBits)
       emitBodyLock(2, "mtDensePscdRelease(mtDenseDispatchEntry->storeBegin, mtDenseDispatchEntry->storeEnd);\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchStore = mtDenseDispatchEntry->storeBegin; mtDenseDispatchStore < mtDenseDispatchEntry->storeEnd; ++mtDenseDispatchStore) {\n");
+    if (edgeTiming)
+      emitBodyLock(3, "mtDenseEdgeFireRdtsc[kDenseOwnerReadyStoreList[mtDenseDispatchStore]] = mtEdgeTimingRdtsc();\n");
     emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[mtDenseDispatchStore]].ready.store(target, std::memory_order_release);\n");
     emitBodyLock(2, "}\n");
     emitBodyLock(2, "++head;\n");
@@ -2054,6 +2206,23 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "const uint8_t pscdEpoch = mtDenseCycleEpoch;\n");
     emitBodyLock(1, "for (int s = 0; s < kDenseOwnerReadyPhysicalSlotCount; ++s)\n");
     emitBodyLock(2, "mtDenseChangeEpoch[s] = pscdEpoch;\n");
+    emitBodyLock(0, "}\n");
+    emitBodyLock(0, "#endif\n");
+  }
+  if (edgeTiming) {
+    // Teardown dump for GSIM_MT_DENSE_EDGE_TIMING: one JSON record per wait
+    // entry (sole-writer accumulators, safe to read after the worker pool
+    // has joined). blockedNs values are rdtsc ticks (see mtEdgeTimingRdtsc).
+    emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::dumpDenseEdgeTiming() {\n", name.c_str());
+    emitBodyLock(1, "FILE *mtEdgeTimingFile = fopen(\"SimTop_edge_timing.json\", \"w\");\n");
+    emitBodyLock(1, "if (mtEdgeTimingFile == nullptr) { fprintf(stderr, \"[edge-timing] failed to open SimTop_edge_timing.json\\n\"); return; }\n");
+    emitBodyLock(1, "fprintf(mtEdgeTimingFile, \"{\\n\\\"format\\\": \\\"gsim.dense-edge-timing.v1\\\",\\n\\\"wait_entries\\\": [\\n\");\n");
+    emitBodyLock(1, "for (int w = 0; w < kDenseEdgeTimingWaitEntryCount; ++w) {\n");
+    emitBodyLock(2, "if (w > 0) fprintf(mtEdgeTimingFile, \",\\n\");\n");
+    emitBodyLock(2, "fprintf(mtEdgeTimingFile, \"  {\\\"waitIndex\\\": %%d, \\\"consumerMtaskId\\\": %%d, \\\"tokenSlot\\\": %%d, \\\"waits\\\": %%lu, \\\"blockedNs\\\": %%lu}\", w, kDenseEdgeTimingWaitConsumer[w], kDenseEdgeTimingWaitSlot[w], (unsigned long) mtDenseEdgeWaits[w], (unsigned long) mtDenseEdgeBlockedNs[w]);\n");
+    emitBodyLock(1, "}\n");
+    emitBodyLock(1, "fprintf(mtEdgeTimingFile, \"\\n]}\\n\");\n");
+    emitBodyLock(1, "fclose(mtEdgeTimingFile);\n");
     emitBodyLock(0, "}\n");
     emitBodyLock(0, "#endif\n");
   }

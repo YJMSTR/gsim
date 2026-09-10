@@ -2235,6 +2235,11 @@ void graph::cppEmitter() {
     emitBodyLock(1, "#endif\n");
   }
   if (denseBreakdownProfileCodegen) emitBodyLock(1, "dumpMtDenseBreakdownProfile();\n");
+  if (denseExecutorValid && mtUseDenseEdgeTiming()) {
+    emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
+    emitBodyLock(1, "dumpDenseEdgeTiming();\n");
+    emitBodyLock(1, "#endif\n");
+  }
   emitBodyLock(1, "if (wallfracCommitBrackets + wallfracCombBrackets > 0) {\n");
   emitBodyLock(2, "uint64_t __wf_tot = wallfracCommitCycles + wallfracCombCycles;\n");
   emitBodyLock(2, "fprintf(stderr, \"[wallfrac] commit_cycles=%%lu comb_cycles=%%lu commit_brackets=%%lu comb_brackets=%%lu commit_frac=%%.4f comb_frac=%%.4f\\n\", wallfracCommitCycles, wallfracCombCycles, wallfracCommitBrackets, wallfracCombBrackets, __wf_tot? (double)wallfracCommitCycles/__wf_tot : 0.0, __wf_tot? (double)wallfracCombCycles/__wf_tot : 0.0);\n");
