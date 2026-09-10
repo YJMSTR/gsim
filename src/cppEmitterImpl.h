@@ -468,6 +468,7 @@ bool mtUseDenseEdgeTiming();
 bool mtUseDensePushReadyShadow();
 bool mtUseDensePushReady();
 bool mtUseDensePushReadyDebug();
+bool mtUseDensePushReadyDirectTable();
 int mtDenseSpinYieldEvery();
 int mtDenseLookaheadWindow();
 bool mtDenseDutyCodegen();

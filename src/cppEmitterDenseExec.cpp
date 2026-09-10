@@ -144,6 +144,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // mapping; running it alongside would double-count every edge).
   bool pushReady = mtUseDensePushReady();
   bool pushReadyDebug = pushReady && mtUseDensePushReadyDebug();
+  // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE (default off): refinement of the
+  // push protocol's dispatch only - replaces stepDensePushReadyRun's
+  // generated all-MTask switch with a static member-function pointer table
+  // (same bodies, same id mapping, same invalid-id abort). Requires
+  // GSIM_MT_DENSE_PUSH_READY=1; unset keeps the emitted switch identical.
+  const bool pushReadyDirectTableKnob = mtUseDensePushReadyDirectTable();
+  bool pushReadyDirectTable = pushReady && pushReadyDirectTableKnob;
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
   int denseBreakdownWindowWorker0MTaskCount = 0;
@@ -183,6 +190,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_PSCD_VERIFY requires GSIM_EMIT_PSCD_BITS=1");
   Assert(!pushReady || ownerReadyFlags,
          "GSIM_MT_DENSE_PUSH_READY requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  Assert(!pushReadyDirectTableKnob || pushReady,
+         "GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE requires GSIM_MT_DENSE_PUSH_READY=1");
   Assert(!(pushReady && pushShadow),
          "GSIM_MT_DENSE_PUSH_READY is mutually exclusive with GSIM_MT_DENSE_PUSH_READY_SHADOW");
   Assert(!(pushReady && pscdBits),
@@ -977,6 +986,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             "[push-ready] mtasks=%d fanin_edges=%zu queues=%d capacity=%d worker0_hybrid=1 roots=%d slots=%d threads=%d\n",
             nMTasks, pushShadowNotifyList.size(), std::max(0, threadCount - 1),
             pushReadyMaxCapacity, pushReadyRootCount, pushReadySlotTotal, threadCount);
+    fprintf(stderr, "[push-ready] dispatch=%s\n",
+            pushReadyDirectTable ? "direct-table" : "switch");
   }
   // ---- PSCD slice 1 analysis (GSIM_EMIT_PSCD_BITS, default off) ----
   // Derives, per owner-ready token, the scalar register-state fields crossing
@@ -1602,6 +1613,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       fprintf(header, "bool mtDensePushReadyDequeue(uint32_t worker, uint32_t &mtaskId);\n");
       fprintf(header, "void stepDensePushReadyRun(uint32_t mtaskId);\n");
       fprintf(header, "void stepDensePushThreadWorker(int threadId);\n");
+      if (pushReadyDirectTable) {
+        // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: flat dispatch table indexed
+        // by mtask ID replacing the generated switch. Same gating discipline
+        // as kDenseDispatchTableW: declaration here (inside the owner-ready
+        // compile guard), definition next to stepDensePushReadyRun.
+        fprintf(header, "// GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: member-fn dispatch table (default off)\n");
+        fprintf(header, "typedef void (S%s::*MtDensePushReadyDispatchFn)();\n", name.c_str());
+        fprintf(header, "static const MtDensePushReadyDispatchFn kDensePushReadyDispatchTable[kDensePushReadyMTaskCount];\n");
+      }
     }
     if (denseLookahead) {
       fprintf(header, "static constexpr int kDenseOwnerReadyWaitList[%d] = {",
@@ -2758,16 +2778,39 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "}\n");
     emitBodyLock(0, "}\n");
 
-    emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
-    emitBodyLock(1, "switch (mtaskId) {\n");
-    for (int m = 0; m < nMTasks; m++) {
-      emitBodyLock(2, "case %d: stepDenseMTask%d(); break;\n", m, m);
+    if (pushReadyDirectTable) {
+      // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: the generated switch over
+      // every MTask id compiles to an N-case jump table re-entered on every
+      // dispatch (65.86% of worker time in the v1 perf report); a flat const
+      // member-pointer table keeps the exact same id -> body mapping with one
+      // bounds check and one indirect member call. Definition follows the
+      // kDenseDispatchTableW discipline: qualified nested typedef, static
+      // const array, inside the owner-ready compile guard so a macro-off
+      // build never sees an undefined declaration.
+      emitBodyLock(0, "const S%s::MtDensePushReadyDispatchFn S%s::kDensePushReadyDispatchTable[kDensePushReadyMTaskCount] = {\n",
+                   name.c_str(), name.c_str());
+      for (int m = 0; m < nMTasks; m++)
+        emitBodyLock(0, "&S%s::stepDenseMTask%d,\n", name.c_str(), m);
+      emitBodyLock(0, "};\n");
+      emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
+      emitBodyLock(1, "if (unlikely(mtaskId >= (uint32_t)kDensePushReadyMTaskCount)) {\n");
+      emitBodyLock(2, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "(this->*kDensePushReadyDispatchTable[mtaskId])();\n");
+      emitBodyLock(0, "}\n");
+    } else {
+      emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
+      emitBodyLock(1, "switch (mtaskId) {\n");
+      for (int m = 0; m < nMTasks; m++) {
+        emitBodyLock(2, "case %d: stepDenseMTask%d(); break;\n", m, m);
+      }
+      emitBodyLock(2, "default:\n");
+      emitBodyLock(3, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
+      emitBodyLock(3, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(0, "}\n");
     }
-    emitBodyLock(2, "default:\n");
-    emitBodyLock(3, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
-    emitBodyLock(3, "abort();\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
 
     emitFuncDecl(0, "void S%s::stepDensePushThreadWorker(int threadId) {\n", name.c_str());
     emitBodyLock(1, "if (unlikely(threadId <= 0 || threadId >= kDensePushReadyWorkerCount)) {\n");

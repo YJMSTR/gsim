@@ -690,6 +690,17 @@ bool mtUseDensePushReadyDebug() {
   const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_DEBUG");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+
+// GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE (default off, requires
+// GSIM_MT_DENSE_PUSH_READY=1): replaces stepDensePushReadyRun's generated
+// all-MTask switch with a flat static member-function pointer table indexed
+// by mtask ID - same bodies, same id mapping, same invalid-id abort; one
+// bounds check plus one indirect member call instead of the N-case jump
+// table. Unset keeps the emitted switch byte-identical to v1.
+bool mtUseDensePushReadyDirectTable() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where
