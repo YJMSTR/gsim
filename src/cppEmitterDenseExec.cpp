@@ -999,6 +999,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // locals), so every name they reference is excluded from localization in the
   // calling task.
   const bool emitTaskLocals = mtUseEmitTaskLocals();
+  const int spinYieldEvery = mtDenseSpinYieldEvery();
   std::map<Node*, std::set<std::string>> denseAsyncResetReferenced;
   if (emitTaskLocals) {
     for (SuperNode* resetSuper : allReset) {
@@ -1245,7 +1246,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+            else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
             emitBodyLock(3, "}\n");
           }
         } else {
@@ -1263,7 +1265,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
               emitBodyLock(5, "if (!mtDenseBreakdownBlocked) { mtDenseBreakdownBlocked = true; mtDenseBreakdownBlockedBegin = std::chrono::steady_clock::now(); }\n");
-              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
+              if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
+              else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
               emitBodyLock(4, "}\n");
               emitBodyLock(4, "if (mtDenseBreakdownBlocked) {\n");
               emitBodyLock(5, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
@@ -1299,7 +1302,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(3, "  } else {\n");
               emitBodyLock(4, "unsigned ct = 0;\n");
               emitBodyLock(4, "while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); }\n");
+              if (spinYieldEvery == 0) emitBodyLock(5, "mtWorkerPoolPause();\n");
+              else emitBodyLock(5, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); }\n", spinYieldEvery);
               emitBodyLock(4, "}\n");
               emitBodyLock(3, "  }\n");
               emitBodyLock(3, "}\n");
@@ -1307,7 +1311,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(3, "{ const uint8_t target = evenCycle ? uint8_t{1} : uint8_t{0};\n");
               emitBodyLock(3, "  unsigned ct = 0;\n");
               emitBodyLock(3, "  while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) {\n", slot);
-              emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+              if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+              else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
               emitBodyLock(3, "}\n");
             }
 
@@ -1317,7 +1322,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             emitBodyLock(3, "{ const uint32_t target = evenCycle ? kDenseMTaskDepCount[%d] : 0u;\n", mtaskId);
             emitBodyLock(3, "  unsigned ct = 0;\n");
             emitBodyLock(3, "  while (mtDenseMTaskVertices[%d].depsDone.load(std::memory_order_acquire) != target) {\n", mtaskId);
-            emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+            if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+            else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
             emitBodyLock(3, "}\n");
           }
           emitBodyLock(3, "#endif\n");
@@ -1548,7 +1554,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
     emitBodyLock(3, "while (mtDenseOwnerReadyTokens[kDenseOwnerReadyWaitList[mtDenseDispatchWait]].ready.load(std::memory_order_acquire) != target) {\n");
-    emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > 256) { ct = 0; std::this_thread::yield(); } }\n");
+    if (spinYieldEvery == 0) emitBodyLock(4, "mtWorkerPoolPause(); }\n");
+    else emitBodyLock(4, "mtWorkerPoolPause(); if (++ct > %d) { ct = 0; std::this_thread::yield(); } }\n", spinYieldEvery);
     emitBodyLock(2, "}\n");
     if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[mtDutyLane].blockNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyBlockBegin).count();\n");
     emitBodyLock(2, "(this->*mtDenseDispatchEntry->fn)();\n");

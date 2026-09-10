@@ -621,6 +621,21 @@ bool mtUseEmitTaskLocals() {
   const char* env = std::getenv("GSIM_EMIT_TASK_LOCALS");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+// Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
+// historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
+// pure-pause loop (no counter, no yield) for exclusive pinned machines where
+// the yield syscall only adds wake latency. Any other positive N changes the
+// yield threshold.
+int mtDenseSpinYieldEvery() {
+  const char* env = std::getenv("GSIM_MT_DENSE_SPIN_YIELD_EVERY");
+  if (env == nullptr || env[0] == '\0') return 256;
+  char* end = nullptr;
+  const long v = std::strtol(env, &end, 10);
+  Assert(end != env && end != nullptr && *end == '\0' && v >= 0
+             && v <= std::numeric_limits<int>::max(),
+         "GSIM_MT_DENSE_SPIN_YIELD_EVERY must be an integer >= 0 (got %s)", env);
+  return static_cast<int>(v);
+}
 
 
 // Default-off bounded lookahead.  A positive value is the candidate window;
