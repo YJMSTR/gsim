@@ -66,6 +66,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const int denseLookaheadWindow = mtDenseLookaheadWindow();
   const bool denseLookahead = denseLookaheadWindow > 0;
   const bool denseDuty = mtDenseDutyCodegen();
+  const char* adaptiveScanEnv = std::getenv("GSIM_MT_DENSE_ADAPTIVE_SCAN");
+  const bool adaptiveScan = adaptiveScanEnv && adaptiveScanEnv[0] && adaptiveScanEnv[0] != '0';
+  Assert(!adaptiveScan || denseLookahead,
+         "GSIM_MT_DENSE_ADAPTIVE_SCAN requires GSIM_MT_DENSE_LOOKAHEAD >= 1");
   Assert(!denseLookahead || ownerReadyFlags,
          "GSIM_MT_DENSE_LOOKAHEAD requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!denseDuty || ownerReadyFlags,
@@ -1264,9 +1268,25 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(3, "continue;\n");
     emitBodyLock(2, "}\n");
     emitBodyLock(2, "bool progressed = false;\n");
-    emitBodyLock(2, "uint32_t mtDenseScanEnd = head + 1u + kDenseLookaheadWindow;\n");
-    emitBodyLock(2, "if (mtDenseScanEnd > mtDenseDispatchCount) mtDenseScanEnd = mtDenseDispatchCount;\n");
-    emitBodyLock(2, "for (uint32_t j = head + 1u; j < mtDenseScanEnd; ++j) {\n");
+    if (adaptiveScan) {
+      // Adaptive scan depth: start at a small window, double on full miss,
+      // never re-scan a range (ascending order within each range preserved).
+      // Legal-order relaxation: a candidate that becomes ready between the
+      // narrow scan and the widened continuation may dispatch one outer
+      // iteration later than the full-window baseline; both orders are legal
+      // under the same dependency/token protocol.
+      emitBodyLock(2, "uint32_t mtDenseScanFrom = head + 1u;\n");
+      emitBodyLock(2, "uint32_t mtDenseScanWindow = 64u;\n");
+      emitBodyLock(2, "while (true) {\n");
+      emitBodyLock(3, "uint32_t mtDenseScanEnd = mtDenseScanFrom + mtDenseScanWindow;\n");
+      emitBodyLock(3, "if (mtDenseScanEnd > mtDenseDispatchCount) mtDenseScanEnd = mtDenseDispatchCount;\n");
+      emitBodyLock(3, "if (mtDenseScanEnd > head + 1u + kDenseLookaheadWindow) mtDenseScanEnd = head + 1u + kDenseLookaheadWindow;\n");
+      emitBodyLock(3, "if (mtDenseScanEnd > mtDenseDispatchCount) mtDenseScanEnd = mtDenseDispatchCount;\n");
+    } else {
+      emitBodyLock(2, "uint32_t mtDenseScanEnd = head + 1u + kDenseLookaheadWindow;\n");
+      emitBodyLock(2, "if (mtDenseScanEnd > mtDenseDispatchCount) mtDenseScanEnd = mtDenseDispatchCount;\n");
+    }
+    emitBodyLock(2, "for (uint32_t j = %s; j < mtDenseScanEnd; ++j) {\n", adaptiveScan ? "mtDenseScanFrom" : "head + 1u");
     emitBodyLock(3, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
     emitBodyLock(3, "mtDenseLookaheadScanned.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(3, "#endif\n");
@@ -1297,7 +1317,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "#if defined(GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE) && GSIM_MT_DENSE_LOOKAHEAD_TAIL_STATS_COMPILE\n");
     emitBodyLock(2, "if (!progressed) mtDenseLookaheadFullMiss.fetch_add(1, std::memory_order_relaxed);\n");
     emitBodyLock(2, "#endif\n");
-    emitBodyLock(2, "if (progressed) continue;\n");
+    if (adaptiveScan) {
+      emitBodyLock(3, "if (progressed) break;\n");
+      emitBodyLock(3, "if (mtDenseScanEnd >= mtDenseDispatchCount || mtDenseScanWindow >= kDenseLookaheadWindow) break;\n");
+      emitBodyLock(3, "mtDenseScanFrom = mtDenseScanEnd;\n");
+      emitBodyLock(3, "mtDenseScanWindow = mtDenseScanWindow >= kDenseLookaheadWindow / 2u ? kDenseLookaheadWindow : mtDenseScanWindow * 2u;\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(2, "if (progressed) continue;\n");
+    } else {
+      emitBodyLock(2, "if (progressed) continue;\n");
+    }
     if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyBlockBegin; if (mtDutyEnabled) mtDutyBlockBegin = std::chrono::steady_clock::now();\n");
     emitBodyLock(2, "for (uint32_t mtDenseDispatchWait = mtDenseDispatchEntry->waitBegin; mtDenseDispatchWait < mtDenseDispatchEntry->waitEnd; ++mtDenseDispatchWait) {\n");
     emitBodyLock(3, "unsigned ct = 0;\n");
