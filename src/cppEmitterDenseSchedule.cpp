@@ -1299,17 +1299,27 @@ static void mtDenseScheduleOrderImpl(const std::vector<MtDenseMTask>& mtasks, in
 static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, int threadCount,
                                       std::vector<int>& outAssign, std::vector<int>& outOrder) {
   const char* hotPath = std::getenv("GSIM_MT_DENSE_SCHED_HOTEDGE");
-  if (hotPath == nullptr || hotPath[0] == '\0') {
+  const char* chainPath = std::getenv("GSIM_MT_DENSE_SCHED_CHAINPIN");
+  const bool hotedgeOn = hotPath != nullptr && hotPath[0] != '\0';
+  const bool chainpinOn = chainPath != nullptr && chainPath[0] != '\0';
+  if (!hotedgeOn && !chainpinOn) {
     mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, nullptr);
     return;
   }
   std::vector<MtDenseHotedgeEntry> entries;
-  bool loaded = mtLoadHotedgeJson(hotPath, entries);
-  (void)loaded;
+  if (hotedgeOn) {
+    bool loaded = mtLoadHotedgeJson(hotPath, entries);
+    (void)loaded;
+  }
+  std::vector<MtDenseHotedgeEntry> chainEntries;
+  if (chainpinOn) {
+    bool loaded = mtLoadHotedgeJson(chainPath, chainEntries);
+    (void)loaded;
+  }
   const int n = static_cast<int>(mtasks.size());
   bool xthreadDepsOnly = mtUseDenseXThreadDepsOnly();
   Assert(xthreadDepsOnly,
-         "GSIM_MT_DENSE_SCHED_HOTEDGE requires GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1 (the edge-timing capture and its owner-ready slot numbering exist only under it)");
+         "GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN require GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1 (the edge-timing capture and its owner-ready slot numbering exist only under it)");
   bool transitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
   // Reference pass (hotedge off) reproduces the placement the timing file was
   // captured on. CRITICAL id-space detail: the timing file's ids are FINAL
@@ -1367,59 +1377,188 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   }
   MtDenseOwnerReadyLayout refLayout = mtBuildDenseOwnerReadyLayout(refSuccs, finalAssign, threadCount);
   struct MtHotedgeMapped { int consumer; unsigned long long blockedNs; std::vector<int> producers; };
+  // Resolve (consumerMtaskId, tokenSlot) entries to (consumer, producers) in
+  // PRE id space via the final-id replica layout. Shared by the HOTEDGE
+  // penalty map and the CHAINPIN post-pass.
+  auto mapEntries = [&](const std::vector<MtDenseHotedgeEntry>& in, std::vector<MtHotedgeMapped>& out,
+                        int& skipStale, int& skipNoSlot, int& skipNoProducer) {
+    for (const MtDenseHotedgeEntry& e : in) {
+      if (e.consumerMtaskId < 0 || e.consumerMtaskId >= n) { skipStale++; continue; }
+      if (e.tokenSlot < 0 || e.tokenSlot >= refLayout.physicalSlotCount) { skipNoSlot++; continue; }
+      const int token = refLayout.logicalTokenByPhysicalSlot[(size_t)e.tokenSlot];
+      if (token < 0 || token >= refLayout.tokenCount) { skipNoSlot++; continue; }
+      if (refLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerMTask != e.consumerMtaskId) {
+        skipStale++;  // stale slot map (layout drifted from the captured build)
+        continue;
+      }
+      MtHotedgeMapped me;
+      me.consumer = preOfFinal[(size_t)e.consumerMtaskId];  // keyed in PRE ids (this function's space)
+      me.blockedNs = e.blockedNs;
+      for (int source : refLayout.sourceMTasksByLogicalToken[(size_t)token]) {
+        if (source < 0 || source >= n) continue;
+        const int preProducer = preOfFinal[(size_t)source];
+        if (preProducer < 0) continue;
+        me.producers.push_back(preProducer);
+      }
+      if (me.producers.empty()) { skipNoProducer++; continue; }
+      out.push_back(me);
+    }
+  };
   std::vector<MtHotedgeMapped> mapped;
-  unsigned long long maxJ = 0;
   int hotedgeSkipStale = 0, hotedgeSkipNoSlot = 0, hotedgeSkipNoProducer = 0;
-  for (const MtDenseHotedgeEntry& e : entries) {
-    if (e.consumerMtaskId < 0 || e.consumerMtaskId >= n) { hotedgeSkipStale++; continue; }
-    if (e.tokenSlot < 0 || e.tokenSlot >= refLayout.physicalSlotCount) { hotedgeSkipNoSlot++; continue; }
-    const int token = refLayout.logicalTokenByPhysicalSlot[(size_t)e.tokenSlot];
-    if (token < 0 || token >= refLayout.tokenCount) { hotedgeSkipNoSlot++; continue; }
-    if (refLayout.tokenProvenanceByLogicalToken[(size_t)token].consumerMTask != e.consumerMtaskId) {
-      hotedgeSkipStale++;  // stale slot map (layout drifted from the captured build)
-      continue;
-    }
-    MtHotedgeMapped me;
-    me.consumer = preOfFinal[(size_t)e.consumerMtaskId];  // hotPct keyed in PRE ids (greedy's space)
-    me.blockedNs = e.blockedNs;
-    for (int source : refLayout.sourceMTasksByLogicalToken[(size_t)token]) {
-      if (source < 0 || source >= n) continue;
-      const int preProducer = preOfFinal[(size_t)source];
-      if (preProducer < 0) continue;
-      me.producers.push_back(preProducer);  // hotPct is keyed in PRE ids (this function's space)
-    }
-    if (me.producers.empty()) { hotedgeSkipNoProducer++; continue; }
-    mapped.push_back(me);
-    if (me.blockedNs > maxJ) maxJ = me.blockedNs;
-  }
-  // Per (consumer, producer) weight in 0..1000 milli-units of J/maxJ, summed
-  // over the consumer's measured tokens and capped at 1000 so the hottest
-  // edge pays at most ~= the flat gamma.
+  if (hotedgeOn) mapEntries(entries, mapped, hotedgeSkipStale, hotedgeSkipNoSlot, hotedgeSkipNoProducer);
+  unsigned long long maxJ = 0;
+  for (const MtHotedgeMapped& me : mapped) if (me.blockedNs > maxJ) maxJ = me.blockedNs;
   std::vector<std::map<int, int>> hotPct((size_t)n);
-  if (maxJ > 0) {
-    for (const MtHotedgeMapped& me : mapped) {
-      if (me.blockedNs == 0) continue;
-      const int pct = (int)(me.blockedNs * 1000ULL / maxJ);
-      for (int producer : me.producers) {
-        int& acc = hotPct[(size_t)me.consumer][producer];
-        acc = acc + pct > 1000 ? 1000 : acc + pct;
+  if (hotedgeOn) {
+    // Per (consumer, producer) weight in 0..1000 milli-units of J/maxJ, summed
+    // over the consumer's measured tokens and capped at 1000 so the hottest
+    // edge pays at most ~= the flat gamma.
+    if (maxJ > 0) {
+      for (const MtHotedgeMapped& me : mapped) {
+        if (me.blockedNs == 0) continue;
+        const int pct = (int)(me.blockedNs * 1000ULL / maxJ);
+        for (int producer : me.producers) {
+          int& acc = hotPct[(size_t)me.consumer][producer];
+          acc = acc + pct > 1000 ? 1000 : acc + pct;
+        }
       }
     }
+    int appliedEdges = 0, maxPct = 0;
+    for (const std::map<int, int>& byProducer : hotPct)
+      for (const auto& kv : byProducer)
+        if (kv.second > 0) { appliedEdges++; if (kv.second > maxPct) maxPct = kv.second; }
+    int ccdExtra = 0;
+    { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
+    // max_penalty is the hottest edge's penalty in percent-of-producer-cost
+    // units (J-normalized gamma); 0 when GSIM_MT_DENSE_PACK_CCD_AFFINITY is 0.
+    fprintf(stderr, "[hotedge] loaded=%d applied_edges=%d max_penalty=%f\n",
+            static_cast<int>(entries.size()), appliedEdges,
+            (double)maxPct * (double)ccdExtra / 1000.0);
+    fprintf(stderr, "[hotedge] debug skip_reasons=(stale=%d noslot=%d noproducer=%d)\n",
+            hotedgeSkipStale, hotedgeSkipNoSlot, hotedgeSkipNoProducer);
   }
-  int appliedEdges = 0, maxPct = 0;
-  for (const std::map<int, int>& byProducer : hotPct)
-    for (const auto& kv : byProducer)
-      if (kv.second > 0) { appliedEdges++; if (kv.second > maxPct) maxPct = kv.second; }
-  int ccdExtra = 0;
-  { const char* e = std::getenv("GSIM_MT_DENSE_PACK_CCD_AFFINITY"); if (e && e[0]) { int v = std::atoi(e); if (v >= 0) ccdExtra = v; } }
-  // max_penalty is the hottest edge's penalty in percent-of-producer-cost
-  // units (J-normalized gamma); 0 when GSIM_MT_DENSE_PACK_CCD_AFFINITY is 0.
-  fprintf(stderr, "[hotedge] loaded=%d applied_edges=%d max_penalty=%f\n",
-          static_cast<int>(entries.size()), appliedEdges,
-          (double)maxPct * (double)ccdExtra / 1000.0);
-  fprintf(stderr, "[hotedge] debug skip_reasons=(stale=%d noslot=%d noproducer=%d)\n",
-          hotedgeSkipStale, hotedgeSkipNoSlot, hotedgeSkipNoProducer);
-  mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, &hotPct);
+  mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, hotedgeOn ? &hotPct : nullptr);
+  if (!chainpinOn) return;
+  // ---- GSIM_MT_DENSE_SCHED_CHAINPIN post-pass ----
+  // Rationale: a serial dependency chain loses no parallelism when pinned to
+  // one core (its links are serial by definition) and pays zero cross-core
+  // token latency; the balance cost is bounded by the hard constraint below.
+  // Applied AFTER the greedy (including an optional HOTEDGE penalized pass) as
+  // a pure relocation of outAssign; the schedule order stays a valid
+  // topological order and is untouched.
+  int cpSkipStale = 0, cpSkipNoSlot = 0, cpSkipNoProducer = 0;
+  std::vector<MtHotedgeMapped> chainMapped;
+  mapEntries(chainEntries, chainMapped, cpSkipStale, cpSkipNoSlot, cpSkipNoProducer);
+  // Hot set: entries sorted by blockedNs desc covering cumulative 50% of the
+  // total blocked time (the prefix that crosses the 50% mark is included).
+  std::sort(chainMapped.begin(), chainMapped.end(),
+            [](const MtHotedgeMapped& a, const MtHotedgeMapped& b) { return a.blockedNs > b.blockedNs; });
+  unsigned long long chainTotalJ = 0;
+  for (const MtHotedgeMapped& me : chainMapped) chainTotalJ += me.blockedNs;
+  size_t hotCount = 0;
+  unsigned long long chainCum = 0;
+  while (hotCount < chainMapped.size() && chainTotalJ > 0 && chainCum * 2 < chainTotalJ) {
+    chainCum += chainMapped[hotCount].blockedNs;
+    hotCount++;
+  }
+  // Fan-out heads: a producer with >1 distinct hot consumer is deliberate
+  // parallelism -- exclude that producer and its edges from relocation.
+  std::map<int, std::set<int>> hotConsumersOf;
+  for (size_t i = 0; i < hotCount; i++)
+    for (int producer : chainMapped[i].producers)
+      hotConsumersOf[producer].insert(chainMapped[i].consumer);
+  std::set<int> fanoutHeadProducers;
+  for (const auto& kv : hotConsumersOf)
+    if (kv.second.size() > 1) fanoutHeadProducers.insert(kv.first);
+  struct MtChainLink { int producer; int consumer; unsigned long long blockedNs; };
+  std::vector<MtChainLink> links;
+  for (size_t i = 0; i < hotCount; i++) {
+    const MtHotedgeMapped& me = chainMapped[i];
+    for (int producer : me.producers)
+      if (fanoutHeadProducers.count(producer) == 0)
+        links.push_back(MtChainLink{producer, me.consumer, me.blockedNs});
+  }
+  // Chain segments: connected components over the remaining links (union-find).
+  std::vector<int> parent((size_t)n, -1);
+  auto chainFind = [&](int x) {
+    while (parent[(size_t)x] != x) {
+      parent[(size_t)x] = parent[(size_t)parent[(size_t)x]];
+      x = parent[(size_t)x];
+    }
+    return x;
+  };
+  for (const MtChainLink& link : links) {
+    if (parent[(size_t)link.producer] < 0) parent[(size_t)link.producer] = link.producer;
+    if (parent[(size_t)link.consumer] < 0) parent[(size_t)link.consumer] = link.consumer;
+    parent[chainFind(link.producer)] = chainFind(link.consumer);
+  }
+  std::map<int, std::set<int>> segmentMemberSet;
+  std::map<int, unsigned long long> segmentWeight;
+  std::set<int> linkProducers;
+  for (const MtChainLink& link : links) {
+    linkProducers.insert(link.producer);
+    const int root = chainFind(link.producer);
+    segmentMemberSet[root].insert(link.producer);
+    segmentMemberSet[root].insert(link.consumer);
+    segmentWeight[root] += link.blockedNs;
+  }
+  // Balance state: per-worker measured cost of the current assignment, with
+  // the hard cap that no worker may exceed mean*1.03 after a pin.
+  auto costOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
+  std::vector<long long> chainLoad((size_t)threadCount, 0);
+  long long chainTotalCost = 0;
+  for (int m = 0; m < n; m++) {
+    const int w = outAssign[(size_t)m];
+    if (w < 0 || w >= threadCount) continue;
+    chainLoad[(size_t)w] += costOf(mtasks[(size_t)m]);
+    chainTotalCost += costOf(mtasks[(size_t)m]);
+  }
+  const double chainLoadCap = (double)chainTotalCost / (double)threadCount * 1.03;
+  // Hottest segments first (deterministic tie-break: smaller root id).
+  std::vector<std::pair<unsigned long long, int>> segmentOrder;
+  for (const auto& kv : segmentWeight) segmentOrder.push_back({kv.second, kv.first});
+  std::sort(segmentOrder.begin(), segmentOrder.end(),
+            [](const std::pair<unsigned long long, int>& a, const std::pair<unsigned long long, int>& b) {
+              return a.first != b.first ? a.first > b.first : a.second < b.second;
+            });
+  int chainSegments = (int)segmentOrder.size();
+  int chainRelocated = 0, chainSkippedBalance = 0;
+  for (const auto& seg : segmentOrder) {
+    std::vector<int> members(segmentMemberSet[seg.second].begin(), segmentMemberSet[seg.second].end());
+    // First producer = the segment's smallest-id member that produces one of
+    // its links; the segment pins onto that producer's current worker.
+    int firstProducer = -1;
+    for (int m : members)
+      if (linkProducers.count(m) && (firstProducer < 0 || m < firstProducer)) firstProducer = m;
+    if (firstProducer < 0) { chainSkippedBalance++; continue; }
+    // Worker 0 keeps its reservation: never pin onto worker 0.
+    int target = outAssign[(size_t)firstProducer];
+    if (target == 0) target = 1;
+    if (target < 0 || target >= threadCount) { chainSkippedBalance++; continue; }
+    // workerZeroOnly members cannot leave worker 0; pinning the rest would
+    // leave the chain split across the boundary -- skip the whole segment.
+    bool hasPinned = false;
+    for (int m : members)
+      if (mtasks[(size_t)m].workerZeroOnly) { hasPinned = true; break; }
+    if (hasPinned) { chainSkippedBalance++; continue; }
+    std::vector<long long> delta((size_t)threadCount, 0);
+    // HARD balance constraint (advisory): no worker may end above mean*1.03
+    // because of the pin. Pre-existing overloads (indivisible large MTasks the
+    // greedy itself cannot split) are tolerated -- only workers that GAIN load
+    // are checked, so the constraint bounds the pin's added imbalance without
+    // letting one oversized MTask veto every segment.
+    bool fits = true;
+    for (int w = 0; w < threadCount; w++)
+      if (delta[(size_t)w] > 0 && (double)(chainLoad[(size_t)w] + delta[(size_t)w]) > chainLoadCap) { fits = false; break; }
+    if (!fits) { chainSkippedBalance++; continue; }
+    for (int w = 0; w < threadCount; w++) chainLoad[(size_t)w] += delta[(size_t)w];
+    for (int m : members) outAssign[(size_t)m] = target;
+    chainRelocated++;
+  }
+  fprintf(stderr, "[chainpin] segments=%d relocated=%d skipped_balance=%d fanout_heads_kept=%d\n",
+          chainSegments, chainRelocated, chainSkippedBalance, (int)fanoutHeadProducers.size());
+  (void)cpSkipStale; (void)cpSkipNoSlot; (void)cpSkipNoProducer;
 }
 
 MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, bool codegenEnabled) {
