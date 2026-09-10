@@ -655,6 +655,41 @@ bool mtUseDenseEdgeTiming() {
   const char* env = std::getenv("GSIM_MT_DENSE_EDGE_TIMING");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+
+// GSIM_MT_DENSE_PUSH_READY_SHADOW (default off): behavior-preserving
+// full-model fan-in oracle for the proposed push-ready protocol. Generation
+// derives the exact producer->dependent edge census from the same three
+// dependency classes the pull executor consumes (owner-ready tokens, direct
+// same-worker predecessors, publisher-sibling constraints, deduplicated per
+// pair) and emits per-cycle pending counters plus a notify-before-release
+// decrement at every task completion. The original pull readiness stays
+// authoritative: the shadow only checks pending==0 at body entry and reports
+// mismatches. Unset keeps every emitted byte identical.
+bool mtUseDensePushReadyShadow() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_SHADOW");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+// GSIM_MT_DENSE_PUSH_READY (default off): the hybrid push protocol itself,
+// built on the census the shadow knob validated. Requires the owner-ready
+// token layout (GSIM_MT_DENSE_OWNER_READY_FLAGS=1) plus lookahead
+// (GSIM_MT_DENSE_LOOKAHEAD>=1): worker0 keeps the full pull lane (token
+// waits, lookahead tail, release stores), while pool workers 1..N-1 execute
+// exactly their assigned MTask count from per-owner bounded sequence queues
+// driven by per-cycle pending fan-in counters re-armed before each dispatch.
+// Mutually exclusive with the shadow/PSCD/edge-timing/breakdown diagnostic
+// knobs. Unset keeps every emitted byte identical.
+bool mtUseDensePushReady() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+// GSIM_MT_DENSE_PUSH_READY_DEBUG (default off, requires
+// GSIM_MT_DENSE_PUSH_READY=1): emits queue-owner validation and
+// exactly-once execution counters on the push lanes. Diagnostic only.
+bool mtUseDensePushReadyDebug() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_DEBUG");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where
