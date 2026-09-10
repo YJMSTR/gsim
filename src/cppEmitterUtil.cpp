@@ -735,6 +735,30 @@ bool mtUseDensePushReadyHint() {
   const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_HINT");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+// GSIM_MT_DENSE_TOKEN_MASK_HINT (default off): queue-free, counter-free
+// readiness-hint variant that keeps the existing pull/lookahead worker
+// control flow and direct body calls. Instead of the full fan-in pending
+// counters the exact ready-hint used (13,378 fetch_sub RMWs per cycle,
+// +44.23%), each producer release fetch_ors one bit of its consumer's
+// per-cycle uint16 token mask (one bit per cross-token wait slot; a token's
+// single publisher writes exactly its own bit, so producers only touch
+// distinct bits of the same atomic word). Pool workers 1..N-1 replace their
+// remote-token wait conjunction (inline head test, tail head test, candidate
+// admission, tail fallback spin) with one acquire load comparing the mask to
+// the generated expected value; worker0 stays fully original pull. No
+// pending counters, no local/sibling notifications, no queues, no dynamic
+// worker assignment. Requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1 and
+// GSIM_MT_DENSE_LOOKAHEAD >= 1; mutually exclusive with
+// GSIM_MT_DENSE_PUSH_READY (and its BITMAP/DIRECT_TABLE refinements),
+// GSIM_MT_DENSE_PUSH_READY_HINT, GSIM_MT_DENSE_PUSH_READY_SHADOW,
+// GSIM_EMIT_PSCD_BITS, GSIM_MT_DENSE_EDGE_TIMING and
+// GSIM_MT_DENSE_BREAKDOWN_PROFILE so the probe stays isolated. Masks are
+// cleared once per cycle at the global pool barrier, never mid-cycle.
+// Unset keeps every emitted byte identical.
+bool mtUseDenseTokenMaskHint() {
+  const char* env = std::getenv("GSIM_MT_DENSE_TOKEN_MASK_HINT");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where
