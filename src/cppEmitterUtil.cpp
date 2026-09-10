@@ -701,6 +701,23 @@ bool mtUseDensePushReadyDirectTable() {
   const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE");
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
+
+// GSIM_MT_DENSE_PUSH_READY_BITMAP (default off, requires
+// GSIM_MT_DENSE_PUSH_READY=1): queue-free refinement of the push protocol's
+// arrival mechanics. Both measured push regressions (v1 +218.78%,
+// direct-table +222.79%) localize to the MPMC queue machinery - empty-queue
+// arrival waits plus the Vyukov tail CAS - not the fan-in mapping. This knob
+// keeps the exact pending-counter CSR, worker0 hybrid pull lane and
+// owner-ready token stores, and replaces each push worker's bounded sequence
+// ring with one lock-free ready byte per MTask: notify release-stores the
+// byte on the final fan-in decrement and the owner worker acquire-scans its
+// own kDenseDispatchTableW slice. Mutually exclusive with
+// GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE so the comparison stays isolated.
+// Unset keeps the emitted v1 runtime byte-identical.
+bool mtUseDensePushReadyBitmap() {
+  const char* env = std::getenv("GSIM_MT_DENSE_PUSH_READY_BITMAP");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 // Spin-wait yield budget for dense executor wait loops. Default 256 keeps the
 // historical `pause; if (++ct > 256) yield();` form byte-for-byte. 0 emits a
 // pure-pause loop (no counter, no yield) for exclusive pinned machines where

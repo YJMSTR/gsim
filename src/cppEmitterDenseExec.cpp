@@ -151,6 +151,18 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   // GSIM_MT_DENSE_PUSH_READY=1; unset keeps the emitted switch identical.
   const bool pushReadyDirectTableKnob = mtUseDensePushReadyDirectTable();
   bool pushReadyDirectTable = pushReady && pushReadyDirectTableKnob;
+  // GSIM_MT_DENSE_PUSH_READY_BITMAP (default off): queue-free refinement of
+  // the push protocol's arrival mechanics, consuming the exact same fan-in
+  // CSR, pending counters, worker0 hybrid pull lane and owner-ready token
+  // stores as v1. Each push worker's MPMC sequence ring is replaced by one
+  // lock-free ready byte per MTask: notify release-stores the byte on the
+  // final fan-in decrement and the owner worker acquire-scans its own
+  // kDenseDispatchTableW slice until its exact assigned count has fired.
+  // Requires GSIM_MT_DENSE_PUSH_READY=1 and is mutually exclusive with the
+  // direct-table refinement so the comparison stays isolated. Unset keeps
+  // the emitted v1 runtime byte-identical.
+  const bool pushReadyBitmapKnob = mtUseDensePushReadyBitmap();
+  bool pushReadyBitmap = pushReady && pushReadyBitmapKnob;
   bool denseBreakdownProfileCodegen = mtUseDenseBreakdownProfileCodegen();
   bool denseBreakdownWindowCodegen = denseBreakdownProfileCodegen && mtUseDenseBreakdownWindowCodegen();
   int denseBreakdownWindowWorker0MTaskCount = 0;
@@ -196,6 +208,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_PUSH_READY is mutually exclusive with GSIM_MT_DENSE_PUSH_READY_SHADOW");
   Assert(!(pushReady && pscdBits),
          "GSIM_MT_DENSE_PUSH_READY is mutually exclusive with GSIM_EMIT_PSCD_BITS");
+  Assert(!pushReadyBitmapKnob || pushReady,
+         "GSIM_MT_DENSE_PUSH_READY_BITMAP requires GSIM_MT_DENSE_PUSH_READY=1");
+  Assert(!(pushReadyBitmap && pushReadyDirectTable),
+         "GSIM_MT_DENSE_PUSH_READY_BITMAP is mutually exclusive with GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE");
   Assert(!(pushReady && edgeTiming),
          "GSIM_MT_DENSE_PUSH_READY is mutually exclusive with GSIM_MT_DENSE_EDGE_TIMING");
   Assert(!(pushReady && denseBreakdownProfileCodegen),
@@ -987,7 +1003,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             nMTasks, pushShadowNotifyList.size(), std::max(0, threadCount - 1),
             pushReadyMaxCapacity, pushReadyRootCount, pushReadySlotTotal, threadCount);
     fprintf(stderr, "[push-ready] dispatch=%s\n",
-            pushReadyDirectTable ? "direct-table" : "switch");
+            pushReadyBitmap ? "ready-byte"
+                            : (pushReadyDirectTable ? "direct-table" : "switch"));
   }
   // ---- PSCD slice 1 analysis (GSIM_EMIT_PSCD_BITS, default off) ----
   // Derives, per owner-ready token, the scalar register-state fields crossing
@@ -1560,10 +1577,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       // GSIM_MT_DENSE_PUSH_READY runtime state (default off, inside the
       // owner-ready compile guard). pending[d] is re-armed to the deduplicated
       // fan-in census before every dispatch and decremented once per producer
-      // edge at completion. The queues are Vyukov sequence rings: per-slot
-      // sequence numbers (not the tail index) gate consumer visibility, so a
-      // consumer that acquires a slot always sees the producer's data plus
-      // every write its release-store ordered before it.
+      // edge at completion. Arrival state depends on the refinement knob: v1
+      // emits Vyukov sequence rings (per-slot sequence numbers - not the tail
+      // index - gate consumer visibility, so a consumer that acquires a slot
+      // always sees the producer's data plus every write its release-store
+      // ordered before it); the bitmap refinement replaces them with one
+      // lock-free ready byte per MTask and drops the queue state entirely so
+      // the generated comparison stays isolated.
       fprintf(header, "// GSIM_MT_DENSE_PUSH_READY: hybrid push executor state (default off)\n");
       fprintf(header, "static constexpr int kDensePushReadyMTaskCount = %d;\n", nMTasks);
       fprintf(header, "static constexpr int kDensePushReadyWorkerCount = %d;\n", threadCount);
@@ -1590,37 +1610,55 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       for (int w = 0; w < threadCount; w++)
         fprintf(header, "%s%u", w ? "," : "", pushReadyAssigned[(size_t)w]);
       fprintf(header, "};\n");
-      fprintf(header, "static constexpr uint32_t kDensePushReadyQueueCapacity[%d] = {", threadCount);
-      for (int w = 0; w < threadCount; w++)
-        fprintf(header, "%s%u", w ? "," : "", pushReadyQueueCapacity[(size_t)w]);
-      fprintf(header, "};\n");
-      fprintf(header, "static constexpr uint32_t kDensePushReadyQueueOffset[%d] = {", threadCount + 1);
-      for (int w = 0; w <= threadCount; w++)
-        fprintf(header, "%s%u", w ? "," : "", pushReadyQueueOffset[(size_t)w]);
-      fprintf(header, "};\n");
-      fprintf(header, "static constexpr int kDensePushReadySlotTotal = %d;\n", pushReadySlotTotal);
+      if (!pushReadyBitmap) {
+        fprintf(header, "static constexpr uint32_t kDensePushReadyQueueCapacity[%d] = {", threadCount);
+        for (int w = 0; w < threadCount; w++)
+          fprintf(header, "%s%u", w ? "," : "", pushReadyQueueCapacity[(size_t)w]);
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr uint32_t kDensePushReadyQueueOffset[%d] = {", threadCount + 1);
+        for (int w = 0; w <= threadCount; w++)
+          fprintf(header, "%s%u", w ? "," : "", pushReadyQueueOffset[(size_t)w]);
+        fprintf(header, "};\n");
+        fprintf(header, "static constexpr int kDensePushReadySlotTotal = %d;\n", pushReadySlotTotal);
+      }
       fprintf(header, "static_assert(std::atomic<uint32_t>::is_always_lock_free, \"push-ready pending must be lock-free\");\n");
       fprintf(header, "std::atomic<uint32_t> mtDensePushReadyPending[%d];\n", nMTasks);
-      fprintf(header, "std::atomic<uint64_t> mtDensePushReadyHead[%d];\n", threadCount);
-      fprintf(header, "std::atomic<uint64_t> mtDensePushReadyTail[%d];\n", threadCount);
-      fprintf(header, "struct MtDensePushReadySlot { std::atomic<uint32_t> seq; uint32_t mtaskId; };\n");
-      fprintf(header, "MtDensePushReadySlot mtDensePushReadySlots[%d];\n", std::max(1, pushReadySlotTotal));
+      if (!pushReadyBitmap) {
+        fprintf(header, "std::atomic<uint64_t> mtDensePushReadyHead[%d];\n", threadCount);
+        fprintf(header, "std::atomic<uint64_t> mtDensePushReadyTail[%d];\n", threadCount);
+        fprintf(header, "struct MtDensePushReadySlot { std::atomic<uint32_t> seq; uint32_t mtaskId; };\n");
+        fprintf(header, "MtDensePushReadySlot mtDensePushReadySlots[%d];\n", std::max(1, pushReadySlotTotal));
+      } else {
+        // GSIM_MT_DENSE_PUSH_READY_BITMAP arrival state: one lock-free byte
+        // per MTask. Set (release) by the final fan-in decrement in notify or
+        // by prepare for zero-fan-in roots; cleared by the owner worker, the
+        // byte's single consumer, before it runs the body. No queue state.
+        fprintf(header, "// GSIM_MT_DENSE_PUSH_READY_BITMAP: ready-byte arrival state (default off)\n");
+        fprintf(header, "static_assert(std::atomic<uint8_t>::is_always_lock_free, \"push-ready ready byte must be lock-free\");\n");
+        fprintf(header, "std::atomic<uint8_t> mtDensePushReadyReady[%d];\n", nMTasks);
+      }
       if (pushReadyDebug)
         fprintf(header, "uint8_t mtDensePushReadyExecCount[%d] = {0};\n", nMTasks);
       fprintf(header, "void mtDensePushReadyPrepare();\n");
       fprintf(header, "void mtDensePushReadyNotify(uint32_t mtaskId);\n");
-      fprintf(header, "void mtDensePushReadyEnqueue(uint32_t worker, uint32_t mtaskId);\n");
-      fprintf(header, "bool mtDensePushReadyDequeue(uint32_t worker, uint32_t &mtaskId);\n");
-      fprintf(header, "void stepDensePushReadyRun(uint32_t mtaskId);\n");
-      fprintf(header, "void stepDensePushThreadWorker(int threadId);\n");
-      if (pushReadyDirectTable) {
-        // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: flat dispatch table indexed
-        // by mtask ID replacing the generated switch. Same gating discipline
-        // as kDenseDispatchTableW: declaration here (inside the owner-ready
-        // compile guard), definition next to stepDensePushReadyRun.
-        fprintf(header, "// GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: member-fn dispatch table (default off)\n");
-        fprintf(header, "typedef void (S%s::*MtDensePushReadyDispatchFn)();\n", name.c_str());
-        fprintf(header, "static const MtDensePushReadyDispatchFn kDensePushReadyDispatchTable[kDensePushReadyMTaskCount];\n");
+      if (!pushReadyBitmap) {
+        fprintf(header, "void mtDensePushReadyEnqueue(uint32_t worker, uint32_t mtaskId);\n");
+        fprintf(header, "bool mtDensePushReadyDequeue(uint32_t worker, uint32_t &mtaskId);\n");
+        fprintf(header, "void stepDensePushReadyRun(uint32_t mtaskId);\n");
+        fprintf(header, "void stepDensePushThreadWorker(int threadId);\n");
+        if (pushReadyDirectTable) {
+          // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: flat dispatch table indexed
+          // by mtask ID replacing the generated switch. Same gating discipline
+          // as kDenseDispatchTableW: declaration here (inside the owner-ready
+          // compile guard), definition next to stepDensePushReadyRun.
+          fprintf(header, "// GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: member-fn dispatch table (default off)\n");
+          fprintf(header, "typedef void (S%s::*MtDensePushReadyDispatchFn)();\n", name.c_str());
+          fprintf(header, "static const MtDensePushReadyDispatchFn kDensePushReadyDispatchTable[kDensePushReadyMTaskCount];\n");
+        }
+      } else {
+        // GSIM_MT_DENSE_PUSH_READY_BITMAP: the queue-free push worker. Same
+        // gating discipline as the v1 queue worker it replaces.
+        fprintf(header, "void stepDensePushReadyBitmapWorker(int threadId);\n");
       }
     }
     if (denseLookahead) {
@@ -2032,7 +2070,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       // original pull path below, token waits included. Compile-gated so a
       // macro-off build falls back to pure pull for every worker.
       emitBodyLock(1, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\n");
-      emitBodyLock(1, "if (threadId != 0) { stepDensePushThreadWorker(threadId); return; }\n");
+      emitBodyLock(1, "if (threadId != 0) { %s(threadId); return; }\n",
+                   pushReadyBitmap ? "stepDensePushReadyBitmapWorker" : "stepDensePushThreadWorker");
       emitBodyLock(1, "#endif\n");
     }
     if (denseBreakdownWindowCodegen) {
@@ -2659,78 +2698,88 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     // the owner-ready compile guard so a macro-off build keeps pure pull for
     // every worker and no push state is referenced) ----
     // Hybrid protocol: worker0 keeps the pull lane; pool workers 1..N-1
-    // execute exactly their assigned MTask count from owner queues.
-    // Notification is the deduplicated producer->dependent CSR: each producer
-    // completion decrements every dependent's per-cycle pending counter once
-    // and the decrementer that observes old==1 enqueues the dependent on its
-    // owner queue - never queue 0, so worker0 roots and dependents stay
-    // pull-discovered.
-    emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::mtDensePushReadyEnqueue(uint32_t mtPushReadyWorker, uint32_t mtaskId) {\n", name.c_str());
-    emitBodyLock(1, "const uint32_t mtPushReadyCapacity = kDensePushReadyQueueCapacity[mtPushReadyWorker];\n");
-    emitBodyLock(1, "if (unlikely(mtPushReadyCapacity == 0u)) {\n");
-    emitBodyLock(2, "fprintf(stderr, \"[push-ready] enqueue on capacity-zero queue worker=%%u mtask=%%u cycle=%%lu\\n\", mtPushReadyWorker, mtaskId, (unsigned long) cycles);\n");
-    emitBodyLock(2, "abort();\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(1, "// Vyukov sequence ring: the slot's sequence number - not the tail\n");
-    emitBodyLock(1, "// index - gates consumer visibility, so a consumer that acquires a\n");
-    emitBodyLock(1, "// slot's data always sees the producer's release-store and everything\n");
-    emitBodyLock(1, "// it ordered before it. Producers race only the tail claim (CAS); the\n");
-    emitBodyLock(1, "// loser reloads the tail and retries at the fresh position.\n");
-    emitBodyLock(1, "MtDensePushReadySlot *mtPushReadySlots = mtDensePushReadySlots + kDensePushReadyQueueOffset[mtPushReadyWorker];\n");
-    emitBodyLock(1, "const uint64_t mtPushReadyMask = (uint64_t)mtPushReadyCapacity - 1u;\n");
-    emitBodyLock(1, "uint64_t mtPushReadyPosition = mtDensePushReadyTail[mtPushReadyWorker].load(std::memory_order_relaxed);\n");
-    emitBodyLock(1, "while (true) {\n");
-    emitBodyLock(2, "MtDensePushReadySlot &mtPushReadySlot = mtPushReadySlots[mtPushReadyPosition & mtPushReadyMask];\n");
-    emitBodyLock(2, "const uint64_t mtPushReadySequence = mtPushReadySlot.seq.load(std::memory_order_acquire);\n");
-    emitBodyLock(2, "const int64_t mtPushReadyDifference = (int64_t)mtPushReadySequence - (int64_t)mtPushReadyPosition;\n");
-    emitBodyLock(2, "if (mtPushReadyDifference == 0) {\n");
-    emitBodyLock(3, "if (mtDensePushReadyTail[mtPushReadyWorker].compare_exchange_weak(mtPushReadyPosition, mtPushReadyPosition + 1u, std::memory_order_relaxed, std::memory_order_relaxed)) {\n");
-    emitBodyLock(4, "mtPushReadySlot.mtaskId = mtaskId;\n");
-    emitBodyLock(4, "mtPushReadySlot.seq.store((uint32_t)(mtPushReadyPosition + 1u), std::memory_order_release);\n");
-    emitBodyLock(4, "return;\n");
-    emitBodyLock(3, "}\n");
-    emitBodyLock(2, "} else if (mtPushReadyDifference < 0) {\n");
-    emitBodyLock(3, "// Ring full: impossible while capacity >= the owner's assigned count\n");
-    emitBodyLock(3, "// (each task is enqueued at most once per cycle and every queue is\n");
-    emitBodyLock(3, "// reset before dispatch), so this is a loud capacity failure.\n");
-    emitBodyLock(3, "fprintf(stderr, \"[push-ready] queue overflow worker=%%u mtask=%%u cycle=%%lu capacity=%%u\\n\", mtPushReadyWorker, mtaskId, (unsigned long) cycles, mtPushReadyCapacity);\n");
-    emitBodyLock(3, "abort();\n");
-    emitBodyLock(2, "} else {\n");
-    emitBodyLock(3, "mtPushReadyPosition = mtDensePushReadyTail[mtPushReadyWorker].load(std::memory_order_relaxed);\n");
-    emitBodyLock(2, "}\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
+    // execute exactly their assigned MTask count. Notification is the
+    // deduplicated producer->dependent CSR: each producer completion
+    // decrements every dependent's per-cycle pending counter once and the
+    // decrementer that observes old==1 hands the dependent to its owner's
+    // arrival mechanism - never worker0, whose roots and dependents stay
+    // pull-discovered. v1 arrival is the per-owner bounded sequence queues
+    // (enqueue/dequeue below, consumed by stepDensePushThreadWorker);
+    // GSIM_MT_DENSE_PUSH_READY_BITMAP replaces them with one ready byte per
+    // MTask - notify arms the byte directly and the bitmap worker at the end
+    // of this block acquire-scans its own dispatch-table slice - so the
+    // queue helpers are not emitted at all in bitmap mode.
+    if (!pushReadyBitmap) {
+      emitFuncDecl(0, "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::mtDensePushReadyEnqueue(uint32_t mtPushReadyWorker, uint32_t mtaskId) {\n", name.c_str());
+      emitBodyLock(1, "const uint32_t mtPushReadyCapacity = kDensePushReadyQueueCapacity[mtPushReadyWorker];\n");
+      emitBodyLock(1, "if (unlikely(mtPushReadyCapacity == 0u)) {\n");
+      emitBodyLock(2, "fprintf(stderr, \"[push-ready] enqueue on capacity-zero queue worker=%%u mtask=%%u cycle=%%lu\\n\", mtPushReadyWorker, mtaskId, (unsigned long) cycles);\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "// Vyukov sequence ring: the slot's sequence number - not the tail\n");
+      emitBodyLock(1, "// index - gates consumer visibility, so a consumer that acquires a\n");
+      emitBodyLock(1, "// slot's data always sees the producer's release-store and everything\n");
+      emitBodyLock(1, "// it ordered before it. Producers race only the tail claim (CAS); the\n");
+      emitBodyLock(1, "// loser reloads the tail and retries at the fresh position.\n");
+      emitBodyLock(1, "MtDensePushReadySlot *mtPushReadySlots = mtDensePushReadySlots + kDensePushReadyQueueOffset[mtPushReadyWorker];\n");
+      emitBodyLock(1, "const uint64_t mtPushReadyMask = (uint64_t)mtPushReadyCapacity - 1u;\n");
+      emitBodyLock(1, "uint64_t mtPushReadyPosition = mtDensePushReadyTail[mtPushReadyWorker].load(std::memory_order_relaxed);\n");
+      emitBodyLock(1, "while (true) {\n");
+      emitBodyLock(2, "MtDensePushReadySlot &mtPushReadySlot = mtPushReadySlots[mtPushReadyPosition & mtPushReadyMask];\n");
+      emitBodyLock(2, "const uint64_t mtPushReadySequence = mtPushReadySlot.seq.load(std::memory_order_acquire);\n");
+      emitBodyLock(2, "const int64_t mtPushReadyDifference = (int64_t)mtPushReadySequence - (int64_t)mtPushReadyPosition;\n");
+      emitBodyLock(2, "if (mtPushReadyDifference == 0) {\n");
+      emitBodyLock(3, "if (mtDensePushReadyTail[mtPushReadyWorker].compare_exchange_weak(mtPushReadyPosition, mtPushReadyPosition + 1u, std::memory_order_relaxed, std::memory_order_relaxed)) {\n");
+      emitBodyLock(4, "mtPushReadySlot.mtaskId = mtaskId;\n");
+      emitBodyLock(4, "mtPushReadySlot.seq.store((uint32_t)(mtPushReadyPosition + 1u), std::memory_order_release);\n");
+      emitBodyLock(4, "return;\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(2, "} else if (mtPushReadyDifference < 0) {\n");
+      emitBodyLock(3, "// Ring full: impossible while capacity >= the owner's assigned count\n");
+      emitBodyLock(3, "// (each task is enqueued at most once per cycle and every queue is\n");
+      emitBodyLock(3, "// reset before dispatch), so this is a loud capacity failure.\n");
+      emitBodyLock(3, "fprintf(stderr, \"[push-ready] queue overflow worker=%%u mtask=%%u cycle=%%lu capacity=%%u\\n\", mtPushReadyWorker, mtaskId, (unsigned long) cycles, mtPushReadyCapacity);\n");
+      emitBodyLock(3, "abort();\n");
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(3, "mtPushReadyPosition = mtDensePushReadyTail[mtPushReadyWorker].load(std::memory_order_relaxed);\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(0, "}\n");
 
-    emitFuncDecl(0, "bool S%s::mtDensePushReadyDequeue(uint32_t mtPushReadyWorker, uint32_t &mtaskId) {\n", name.c_str());
-    emitBodyLock(1, "const uint32_t mtPushReadyCapacity = kDensePushReadyQueueCapacity[mtPushReadyWorker];\n");
-    emitBodyLock(1, "if (unlikely(mtPushReadyCapacity == 0u)) return false;\n");
-    emitBodyLock(1, "MtDensePushReadySlot *mtPushReadySlots = mtDensePushReadySlots + kDensePushReadyQueueOffset[mtPushReadyWorker];\n");
-    emitBodyLock(1, "const uint64_t mtPushReadyMask = (uint64_t)mtPushReadyCapacity - 1u;\n");
-    emitBodyLock(1, "// Sole consumer: head is private to this worker, so a relaxed\n");
-    emitBodyLock(1, "// load/store pair is sufficient; the slot sequence carries ordering.\n");
-    emitBodyLock(1, "const uint64_t mtPushReadyPosition = mtDensePushReadyHead[mtPushReadyWorker].load(std::memory_order_relaxed);\n");
-    emitBodyLock(1, "MtDensePushReadySlot &mtPushReadySlot = mtPushReadySlots[mtPushReadyPosition & mtPushReadyMask];\n");
-    emitBodyLock(1, "const uint64_t mtPushReadySequence = mtPushReadySlot.seq.load(std::memory_order_acquire);\n");
-    emitBodyLock(1, "const int64_t mtPushReadyDifference = (int64_t)mtPushReadySequence - (int64_t)(mtPushReadyPosition + 1u);\n");
-    emitBodyLock(1, "if (mtPushReadyDifference == 0) {\n");
-    emitBodyLock(2, "mtDensePushReadyHead[mtPushReadyWorker].store(mtPushReadyPosition + 1u, std::memory_order_relaxed);\n");
-    emitBodyLock(2, "mtaskId = mtPushReadySlot.mtaskId;\n");
-    emitBodyLock(2, "mtPushReadySlot.seq.store((uint32_t)(mtPushReadyPosition + mtPushReadyCapacity), std::memory_order_release);\n");
-    emitBodyLock(2, "return true;\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(1, "if (unlikely(mtPushReadyDifference > 0)) {\n");
-    emitBodyLock(2, "// Unreachable with a sole consumer (head never advances past a\n");
-    emitBodyLock(2, "// slot's published sequence): abort loudly, never report empty.\n");
-    emitBodyLock(2, "fprintf(stderr, \"[push-ready] dequeue sequence corruption worker=%%u cycle=%%lu\\n\", mtPushReadyWorker, (unsigned long) cycles);\n");
-    emitBodyLock(2, "abort();\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(1, "return false;\n");
-    emitBodyLock(0, "}\n");
-
-    emitFuncDecl(0, "void S%s::mtDensePushReadyNotify(uint32_t mtaskId) {\n", name.c_str());
+      emitFuncDecl(0, "bool S%s::mtDensePushReadyDequeue(uint32_t mtPushReadyWorker, uint32_t &mtaskId) {\n", name.c_str());
+      emitBodyLock(1, "const uint32_t mtPushReadyCapacity = kDensePushReadyQueueCapacity[mtPushReadyWorker];\n");
+      emitBodyLock(1, "if (unlikely(mtPushReadyCapacity == 0u)) return false;\n");
+      emitBodyLock(1, "MtDensePushReadySlot *mtPushReadySlots = mtDensePushReadySlots + kDensePushReadyQueueOffset[mtPushReadyWorker];\n");
+      emitBodyLock(1, "const uint64_t mtPushReadyMask = (uint64_t)mtPushReadyCapacity - 1u;\n");
+      emitBodyLock(1, "// Sole consumer: head is private to this worker, so a relaxed\n");
+      emitBodyLock(1, "// load/store pair is sufficient; the slot sequence carries ordering.\n");
+      emitBodyLock(1, "const uint64_t mtPushReadyPosition = mtDensePushReadyHead[mtPushReadyWorker].load(std::memory_order_relaxed);\n");
+      emitBodyLock(1, "MtDensePushReadySlot &mtPushReadySlot = mtPushReadySlots[mtPushReadyPosition & mtPushReadyMask];\n");
+      emitBodyLock(1, "const uint64_t mtPushReadySequence = mtPushReadySlot.seq.load(std::memory_order_acquire);\n");
+      emitBodyLock(1, "const int64_t mtPushReadyDifference = (int64_t)mtPushReadySequence - (int64_t)(mtPushReadyPosition + 1u);\n");
+      emitBodyLock(1, "if (mtPushReadyDifference == 0) {\n");
+      emitBodyLock(2, "mtDensePushReadyHead[mtPushReadyWorker].store(mtPushReadyPosition + 1u, std::memory_order_relaxed);\n");
+      emitBodyLock(2, "mtaskId = mtPushReadySlot.mtaskId;\n");
+      emitBodyLock(2, "mtPushReadySlot.seq.store((uint32_t)(mtPushReadyPosition + mtPushReadyCapacity), std::memory_order_release);\n");
+      emitBodyLock(2, "return true;\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "if (unlikely(mtPushReadyDifference > 0)) {\n");
+      emitBodyLock(2, "// Unreachable with a sole consumer (head never advances past a\n");
+      emitBodyLock(2, "// slot's published sequence): abort loudly, never report empty.\n");
+      emitBodyLock(2, "fprintf(stderr, \"[push-ready] dequeue sequence corruption worker=%%u cycle=%%lu\\n\", mtPushReadyWorker, (unsigned long) cycles);\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "return false;\n");
+      emitBodyLock(0, "}\n");
+    }
+    emitFuncDecl(0, pushReadyBitmap
+                     ? "#if defined(GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE) && GSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE\nvoid S%s::mtDensePushReadyNotify(uint32_t mtaskId) {\n"
+                     : "void S%s::mtDensePushReadyNotify(uint32_t mtaskId) {\n",
+                 name.c_str());
     emitBodyLock(1, "// Exactly one decrement per deduplicated CSR edge. fetch_sub(acq_rel)\n");
     emitBodyLock(1, "// makes the decrementer that observes old==1 synchronize with every\n");
-    emitBodyLock(1, "// earlier producer on the same counter, so its release-ordered enqueue\n");
+    emitBodyLock(1, "// earlier producer on the same counter, so its release-ordered %s\n",
+                 pushReadyBitmap ? "arrival store" : "enqueue");
     emitBodyLock(1, "// publishes all producers' body writes to the consumer's acquire.\n");
     emitBodyLock(1, "for (uint32_t j = kDensePushReadyNotifyOffsets[mtaskId]; j < kDensePushReadyNotifyOffsets[mtaskId + 1u]; ++j) {\n");
     emitBodyLock(2, "const uint32_t mtPushReadyDependent = kDensePushReadyNotifyList[j];\n");
@@ -2742,7 +2791,14 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "if (mtPushReadyPrevious == 1u) {\n");
     emitBodyLock(3, "const uint32_t mtPushReadyOwner = kDensePushReadyOwner[mtPushReadyDependent];\n");
     emitBodyLock(3, "// Worker0-owned dependents stay pull-discovered: decrement only.\n");
-    emitBodyLock(3, "if (mtPushReadyOwner != 0u) mtDensePushReadyEnqueue(mtPushReadyOwner, mtPushReadyDependent);\n");
+    if (pushReadyBitmap) {
+      emitBodyLock(3, "// GSIM_MT_DENSE_PUSH_READY_BITMAP: queue-free arrival - the release\n");
+      emitBodyLock(3, "// store of the owner's ready byte is the whole handoff; the owner\n");
+      emitBodyLock(3, "// worker's acquire scan consumes it. No queue operation.\n");
+      emitBodyLock(3, "if (mtPushReadyOwner != 0u) mtDensePushReadyReady[mtPushReadyDependent].store(1u, std::memory_order_release);\n");
+    } else {
+      emitBodyLock(3, "if (mtPushReadyOwner != 0u) mtDensePushReadyEnqueue(mtPushReadyOwner, mtPushReadyDependent);\n");
+    }
     emitBodyLock(2, "}\n");
     emitBodyLock(1, "}\n");
     emitBodyLock(0, "}\n");
@@ -2755,15 +2811,22 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(1, "// previous cycle (parity/epoch reset happens here, every cycle).\n");
     emitBodyLock(1, "for (int m = 0; m < kDensePushReadyMTaskCount; ++m)\n");
     emitBodyLock(2, "mtDensePushReadyPending[m].store(kDensePushReadyFanin[m], std::memory_order_relaxed);\n");
-    emitBodyLock(1, "for (int mtPushReadyWorker = 0; mtPushReadyWorker < kDensePushReadyWorkerCount; ++mtPushReadyWorker) {\n");
-    emitBodyLock(2, "mtDensePushReadyHead[mtPushReadyWorker].store(0u, std::memory_order_relaxed);\n");
-    emitBodyLock(2, "mtDensePushReadyTail[mtPushReadyWorker].store(0u, std::memory_order_relaxed);\n");
-    emitBodyLock(2, "const uint32_t mtPushReadySlotBegin = kDensePushReadyQueueOffset[mtPushReadyWorker];\n");
-    emitBodyLock(2, "const uint32_t mtPushReadySlotEnd = kDensePushReadyQueueOffset[mtPushReadyWorker + 1];\n");
-    emitBodyLock(2, "// Fresh Vyukov invariant: slot i's sequence equals i, positions 0.\n");
-    emitBodyLock(2, "for (uint32_t i = 0; i < mtPushReadySlotEnd - mtPushReadySlotBegin; ++i)\n");
-    emitBodyLock(3, "mtDensePushReadySlots[mtPushReadySlotBegin + i].seq.store(i, std::memory_order_relaxed);\n");
-    emitBodyLock(1, "}\n");
+    if (pushReadyBitmap) {
+      emitBodyLock(1, "// Fresh ready bytes: cleared globally here, then armed for the\n");
+      emitBodyLock(1, "// zero-fan-in roots below; producers arm the rest through notify.\n");
+      emitBodyLock(1, "for (int m = 0; m < kDensePushReadyMTaskCount; ++m)\n");
+      emitBodyLock(2, "mtDensePushReadyReady[m].store(0u, std::memory_order_relaxed);\n");
+    } else {
+      emitBodyLock(1, "for (int mtPushReadyWorker = 0; mtPushReadyWorker < kDensePushReadyWorkerCount; ++mtPushReadyWorker) {\n");
+      emitBodyLock(2, "mtDensePushReadyHead[mtPushReadyWorker].store(0u, std::memory_order_relaxed);\n");
+      emitBodyLock(2, "mtDensePushReadyTail[mtPushReadyWorker].store(0u, std::memory_order_relaxed);\n");
+      emitBodyLock(2, "const uint32_t mtPushReadySlotBegin = kDensePushReadyQueueOffset[mtPushReadyWorker];\n");
+      emitBodyLock(2, "const uint32_t mtPushReadySlotEnd = kDensePushReadyQueueOffset[mtPushReadyWorker + 1];\n");
+      emitBodyLock(2, "// Fresh Vyukov invariant: slot i's sequence equals i, positions 0.\n");
+      emitBodyLock(2, "for (uint32_t i = 0; i < mtPushReadySlotEnd - mtPushReadySlotBegin; ++i)\n");
+      emitBodyLock(3, "mtDensePushReadySlots[mtPushReadySlotBegin + i].seq.store(i, std::memory_order_relaxed);\n");
+      emitBodyLock(1, "}\n");
+    }
     if (pushReadyDebug) {
       emitBodyLock(1, "for (int m = 0; m < kDensePushReadyMTaskCount; ++m)\n");
       emitBodyLock(2, "mtDensePushReadyExecCount[m] = 0;\n");
@@ -2774,94 +2837,171 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "if (kDensePushReadyFanin[m] != 0u) continue;\n");
     emitBodyLock(2, "const uint32_t mtPushReadyOwner = kDensePushReadyOwner[m];\n");
     emitBodyLock(2, "if (mtPushReadyOwner == 0u) continue;\n");
-    emitBodyLock(2, "mtDensePushReadyEnqueue(mtPushReadyOwner, (uint32_t)m);\n");
+    if (pushReadyBitmap)
+      emitBodyLock(2, "mtDensePushReadyReady[m].store(1u, std::memory_order_relaxed);\n");
+    else
+      emitBodyLock(2, "mtDensePushReadyEnqueue(mtPushReadyOwner, (uint32_t)m);\n");
     emitBodyLock(1, "}\n");
     emitBodyLock(0, "}\n");
 
-    if (pushReadyDirectTable) {
-      // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: the generated switch over
-      // every MTask id compiles to an N-case jump table re-entered on every
-      // dispatch (65.86% of worker time in the v1 perf report); a flat const
-      // member-pointer table keeps the exact same id -> body mapping with one
-      // bounds check and one indirect member call. Definition follows the
-      // kDenseDispatchTableW discipline: qualified nested typedef, static
-      // const array, inside the owner-ready compile guard so a macro-off
-      // build never sees an undefined declaration.
-      emitBodyLock(0, "const S%s::MtDensePushReadyDispatchFn S%s::kDensePushReadyDispatchTable[kDensePushReadyMTaskCount] = {\n",
-                   name.c_str(), name.c_str());
-      for (int m = 0; m < nMTasks; m++)
-        emitBodyLock(0, "&S%s::stepDenseMTask%d,\n", name.c_str(), m);
-      emitBodyLock(0, "};\n");
-      emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
-      emitBodyLock(1, "if (unlikely(mtaskId >= (uint32_t)kDensePushReadyMTaskCount)) {\n");
-      emitBodyLock(2, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
+    if (!pushReadyBitmap) {
+      if (pushReadyDirectTable) {
+        // GSIM_MT_DENSE_PUSH_READY_DIRECT_TABLE: the generated switch over
+        // every MTask id compiles to an N-case jump table re-entered on every
+        // dispatch (65.86% of worker time in the v1 perf report); a flat const
+        // member-pointer table keeps the exact same id -> body mapping with one
+        // bounds check and one indirect member call. Definition follows the
+        // kDenseDispatchTableW discipline: qualified nested typedef, static
+        // const array, inside the owner-ready compile guard so a macro-off
+        // build never sees an undefined declaration.
+        emitBodyLock(0, "const S%s::MtDensePushReadyDispatchFn S%s::kDensePushReadyDispatchTable[kDensePushReadyMTaskCount] = {\n",
+                     name.c_str(), name.c_str());
+        for (int m = 0; m < nMTasks; m++)
+          emitBodyLock(0, "&S%s::stepDenseMTask%d,\n", name.c_str(), m);
+        emitBodyLock(0, "};\n");
+        emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
+        emitBodyLock(1, "if (unlikely(mtaskId >= (uint32_t)kDensePushReadyMTaskCount)) {\n");
+        emitBodyLock(2, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
+        emitBodyLock(2, "abort();\n");
+        emitBodyLock(1, "}\n");
+        emitBodyLock(1, "(this->*kDensePushReadyDispatchTable[mtaskId])();\n");
+        emitBodyLock(0, "}\n");
+      } else {
+        emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
+        emitBodyLock(1, "switch (mtaskId) {\n");
+        for (int m = 0; m < nMTasks; m++) {
+          emitBodyLock(2, "case %d: stepDenseMTask%d(); break;\n", m, m);
+        }
+        emitBodyLock(2, "default:\n");
+        emitBodyLock(3, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
+        emitBodyLock(3, "abort();\n");
+        emitBodyLock(1, "}\n");
+        emitBodyLock(0, "}\n");
+      }
+
+      emitFuncDecl(0, "void S%s::stepDensePushThreadWorker(int threadId) {\n", name.c_str());
+      emitBodyLock(1, "if (unlikely(threadId <= 0 || threadId >= kDensePushReadyWorkerCount)) {\n");
+      emitBodyLock(2, "fprintf(stderr, \"[push-ready] push worker invoked with invalid id %%d\\n\", threadId);\n");
       emitBodyLock(2, "abort();\n");
       emitBodyLock(1, "}\n");
-      emitBodyLock(1, "(this->*kDensePushReadyDispatchTable[mtaskId])();\n");
+      emitBodyLock(1, "const uint8_t mtPushReadyTarget = (cycles & 1) == 0 ? uint8_t{1} : uint8_t{0};\n");
+      emitBodyLock(1, "const uint32_t mtPushReadyAssigned = kDensePushReadyAssigned[threadId];\n");
+      emitBodyLock(1, "uint32_t mtPushReadyExecuted = 0;\n");
+      emitBodyLock(1, "// Termination is the exact assigned count - never queue emptiness:\n");
+      emitBodyLock(1, "// an empty queue only means producers elsewhere have not fired yet.\n");
+      emitBodyLock(1, "unsigned mtPushReadySpin = 0;\n");
+      emitBodyLock(1, "while (mtPushReadyExecuted < mtPushReadyAssigned) {\n");
+      emitBodyLock(2, "uint32_t mtPushReadyMTask = 0;\n");
+      emitBodyLock(2, "if (!mtDensePushReadyDequeue((uint32_t)threadId, mtPushReadyMTask)) {\n");
+      if (spinYieldEvery == 0) {
+        emitBodyLock(3, "mtWorkerPoolPause();\n");
+      } else {
+        emitBodyLock(3, "mtWorkerPoolPause(); if (++mtPushReadySpin > %d) { mtPushReadySpin = 0; std::this_thread::yield(); }\n", spinYieldEvery);
+      }
+      emitBodyLock(3, "continue;\n");
+      emitBodyLock(2, "}\n");
+      if (pushReadyDebug) {
+        emitBodyLock(2, "// GSIM_MT_DENSE_PUSH_READY_DEBUG: owner + exactly-once validation.\n");
+        emitBodyLock(2, "if (unlikely(kDensePushReadyOwner[mtPushReadyMTask] != (uint32_t)threadId)) {\n");
+        emitBodyLock(3, "fprintf(stderr, \"[push-ready] owner mismatch mtask=%%u worker=%%d cycle=%%lu\\n\", mtPushReadyMTask, threadId, (unsigned long) cycles);\n");
+        emitBodyLock(3, "abort();\n");
+        emitBodyLock(2, "}\n");
+        emitBodyLock(2, "if (unlikely(++mtDensePushReadyExecCount[mtPushReadyMTask] != 1u)) {\n");
+        emitBodyLock(3, "fprintf(stderr, \"[push-ready] duplicate execution mtask=%%u worker=%%d cycle=%%lu\\n\", mtPushReadyMTask, threadId, (unsigned long) cycles);\n");
+        emitBodyLock(3, "abort();\n");
+        emitBodyLock(2, "}\n");
+      }
+      emitBodyLock(2, "stepDensePushReadyRun(mtPushReadyMTask);\n");
+      emitBodyLock(2, "// Notify after all body state writes and before the token release\n");
+      emitBodyLock(2, "// stores below: the pending-decrement chain (release) plus the queue\n");
+      emitBodyLock(2, "// slot acquire carries the body writes to the dependent's owner.\n");
+      emitBodyLock(2, "mtDensePushReadyNotify(mtPushReadyMTask);\n");
+      emitBodyLock(2, "// Owner-ready release stores remain: worker0's pull lane still\n");
+      emitBodyLock(2, "// consumes tokens published by push-lane producers.\n");
+      emitBodyLock(2, "for (int j = kDenseOwnerReadyStoreOffsets[mtPushReadyMTask]; j < kDenseOwnerReadyStoreOffsets[mtPushReadyMTask + 1u]; ++j)\n");
+      emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(mtPushReadyTarget, std::memory_order_release);\n");
+      emitBodyLock(2, "++mtPushReadyExecuted;\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "// Queue drain before done acknowledgment: executed == assigned and\n");
+      emitBodyLock(1, "// exactly one enqueue per task per cycle imply head == tail here.\n");
+      emitBodyLock(1, "if (unlikely(mtDensePushReadyHead[threadId].load(std::memory_order_relaxed) != mtDensePushReadyTail[threadId].load(std::memory_order_relaxed))) {\n");
+      emitBodyLock(2, "fprintf(stderr, \"[push-ready] worker %%d exited with a non-drained queue cycle=%%lu\\n\", threadId, (unsigned long) cycles);\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(1, "}\n");
       emitBodyLock(0, "}\n");
     } else {
-      emitFuncDecl(0, "void S%s::stepDensePushReadyRun(uint32_t mtaskId) {\n", name.c_str());
-      emitBodyLock(1, "switch (mtaskId) {\n");
-      for (int m = 0; m < nMTasks; m++) {
-        emitBodyLock(2, "case %d: stepDenseMTask%d(); break;\n", m, m);
+      // ---- GSIM_MT_DENSE_PUSH_READY_BITMAP worker (default off) ----
+      // Queue-free push lane: each pool worker 1..N-1 selects its own slice
+      // of the existing per-worker dispatch table (same entries the pull
+      // lane's lookahead tail consumes) and scans only those entries; one
+      // fires when its ready byte is set. The acquire load pairs with the
+      // notify's release store, and the byte is cleared by its single
+      // consumer before the body runs, so one scan visit executes a task at
+      // most once per cycle and a set byte can never be consumed twice. No
+      // MPMC sequence/tail CAS and no all-MTask switch: dispatch is the
+      // entry's direct member pointer. Termination stays the exact assigned
+      // count; an empty scan only pauses, it never terminates.
+      emitFuncDecl(0, "void S%s::stepDensePushReadyBitmapWorker(int threadId) {\n", name.c_str());
+      emitBodyLock(1, "if (unlikely(threadId <= 0 || threadId >= kDensePushReadyWorkerCount)) {\n");
+      emitBodyLock(2, "fprintf(stderr, \"[push-ready] bitmap worker invoked with invalid id %%d\\n\", threadId);\n");
+      emitBodyLock(2, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "const uint8_t mtPushReadyTarget = (cycles & 1) == 0 ? uint8_t{1} : uint8_t{0};\n");
+      emitBodyLock(1, "const uint32_t mtPushReadyAssigned = kDensePushReadyAssigned[threadId];\n");
+      emitBodyLock(1, "const MtDenseDispatchEntry *mtPushReadyTableBegin = nullptr;\n");
+      emitBodyLock(1, "const MtDenseDispatchEntry *mtPushReadyTableEnd = nullptr;\n");
+      emitBodyLock(1, "switch (threadId) {\n");
+      for (int t = 1; t < threadCount; t++) {
+        emitBodyLock(2, "case %d:\n", t);
+        emitBodyLock(3, "mtPushReadyTableBegin = kDenseDispatchTableW%d;\n", t);
+        emitBodyLock(3, "mtPushReadyTableEnd = kDenseDispatchTableW%d + %d;\n", t, denseDispatchWorkerCounts[(size_t)t]);
+        emitBodyLock(3, "break;\n");
       }
-      emitBodyLock(2, "default:\n");
-      emitBodyLock(3, "fprintf(stderr, \"[push-ready] invalid mtask id %%u cycle=%%lu\\n\", mtaskId, (unsigned long) cycles);\n");
-      emitBodyLock(3, "abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "uint32_t mtPushReadyExecuted = 0;\n");
+      emitBodyLock(1, "// Termination is the exact assigned count - never scan emptiness:\n");
+      emitBodyLock(1, "// an empty scan only means producers elsewhere have not fired yet.\n");
+      emitBodyLock(1, "unsigned mtPushReadySpin = 0;\n");
+      emitBodyLock(1, "while (mtPushReadyExecuted < mtPushReadyAssigned) {\n");
+      emitBodyLock(2, "bool mtPushReadyFired = false;\n");
+      emitBodyLock(2, "for (const MtDenseDispatchEntry *mtPushReadyEntry = mtPushReadyTableBegin; mtPushReadyEntry != mtPushReadyTableEnd; ++mtPushReadyEntry) {\n");
+      emitBodyLock(3, "const uint32_t mtPushReadyMTask = mtPushReadyEntry->mtaskId;\n");
+      emitBodyLock(3, "if (mtDensePushReadyReady[mtPushReadyMTask].load(std::memory_order_acquire) == 0u) continue;\n");
+      emitBodyLock(3, "// Sole consumer of this byte: clear before the body so one scan\n");
+      emitBodyLock(3, "// visit executes the task at most once per cycle.\n");
+      emitBodyLock(3, "mtDensePushReadyReady[mtPushReadyMTask].store(0u, std::memory_order_relaxed);\n");
+      if (pushReadyDebug) {
+        emitBodyLock(3, "// GSIM_MT_DENSE_PUSH_READY_DEBUG: owner + exactly-once validation.\n");
+        emitBodyLock(3, "if (unlikely(kDensePushReadyOwner[mtPushReadyMTask] != (uint32_t)threadId)) {\n");
+        emitBodyLock(4, "fprintf(stderr, \"[push-ready] owner mismatch mtask=%%u worker=%%d cycle=%%lu\\n\", mtPushReadyMTask, threadId, (unsigned long) cycles);\n");
+        emitBodyLock(4, "abort();\n");
+        emitBodyLock(3, "}\n");
+        emitBodyLock(3, "if (unlikely(++mtDensePushReadyExecCount[mtPushReadyMTask] != 1u)) {\n");
+        emitBodyLock(4, "fprintf(stderr, \"[push-ready] duplicate execution mtask=%%u worker=%%d cycle=%%lu\\n\", mtPushReadyMTask, threadId, (unsigned long) cycles);\n");
+        emitBodyLock(4, "abort();\n");
+        emitBodyLock(3, "}\n");
+      }
+      emitBodyLock(3, "(this->*mtPushReadyEntry->fn)();\n");
+      emitBodyLock(3, "// Notify after all body state writes and before the token release\n");
+      emitBodyLock(3, "// stores below: the pending-decrement chain (release) plus the ready\n");
+      emitBodyLock(3, "// byte acquire carries the body writes to the dependent's owner.\n");
+      emitBodyLock(3, "mtDensePushReadyNotify(mtPushReadyMTask);\n");
+      emitBodyLock(3, "// Owner-ready release stores remain: worker0's pull lane still\n");
+      emitBodyLock(3, "// consumes tokens published by push-lane producers.\n");
+      emitBodyLock(3, "for (uint32_t j = mtPushReadyEntry->storeBegin; j < mtPushReadyEntry->storeEnd; ++j)\n");
+      emitBodyLock(4, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(mtPushReadyTarget, std::memory_order_release);\n");
+      emitBodyLock(3, "++mtPushReadyExecuted;\n");
+      emitBodyLock(3, "mtPushReadyFired = true;\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(2, "if (mtPushReadyFired) continue;\n");
+      if (spinYieldEvery == 0) {
+        emitBodyLock(2, "mtWorkerPoolPause();\n");
+      } else {
+        emitBodyLock(2, "mtWorkerPoolPause(); if (++mtPushReadySpin > %d) { mtPushReadySpin = 0; std::this_thread::yield(); }\n", spinYieldEvery);
+      }
       emitBodyLock(1, "}\n");
       emitBodyLock(0, "}\n");
     }
-
-    emitFuncDecl(0, "void S%s::stepDensePushThreadWorker(int threadId) {\n", name.c_str());
-    emitBodyLock(1, "if (unlikely(threadId <= 0 || threadId >= kDensePushReadyWorkerCount)) {\n");
-    emitBodyLock(2, "fprintf(stderr, \"[push-ready] push worker invoked with invalid id %%d\\n\", threadId);\n");
-    emitBodyLock(2, "abort();\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(1, "const uint8_t mtPushReadyTarget = (cycles & 1) == 0 ? uint8_t{1} : uint8_t{0};\n");
-    emitBodyLock(1, "const uint32_t mtPushReadyAssigned = kDensePushReadyAssigned[threadId];\n");
-    emitBodyLock(1, "uint32_t mtPushReadyExecuted = 0;\n");
-    emitBodyLock(1, "// Termination is the exact assigned count - never queue emptiness:\n");
-    emitBodyLock(1, "// an empty queue only means producers elsewhere have not fired yet.\n");
-    emitBodyLock(1, "unsigned mtPushReadySpin = 0;\n");
-    emitBodyLock(1, "while (mtPushReadyExecuted < mtPushReadyAssigned) {\n");
-    emitBodyLock(2, "uint32_t mtPushReadyMTask = 0;\n");
-    emitBodyLock(2, "if (!mtDensePushReadyDequeue((uint32_t)threadId, mtPushReadyMTask)) {\n");
-    if (spinYieldEvery == 0) {
-      emitBodyLock(3, "mtWorkerPoolPause();\n");
-    } else {
-      emitBodyLock(3, "mtWorkerPoolPause(); if (++mtPushReadySpin > %d) { mtPushReadySpin = 0; std::this_thread::yield(); }\n", spinYieldEvery);
-    }
-    emitBodyLock(3, "continue;\n");
-    emitBodyLock(2, "}\n");
-    if (pushReadyDebug) {
-      emitBodyLock(2, "// GSIM_MT_DENSE_PUSH_READY_DEBUG: owner + exactly-once validation.\n");
-      emitBodyLock(2, "if (unlikely(kDensePushReadyOwner[mtPushReadyMTask] != (uint32_t)threadId)) {\n");
-      emitBodyLock(3, "fprintf(stderr, \"[push-ready] owner mismatch mtask=%%u worker=%%d cycle=%%lu\\n\", mtPushReadyMTask, threadId, (unsigned long) cycles);\n");
-      emitBodyLock(3, "abort();\n");
-      emitBodyLock(2, "}\n");
-      emitBodyLock(2, "if (unlikely(++mtDensePushReadyExecCount[mtPushReadyMTask] != 1u)) {\n");
-      emitBodyLock(3, "fprintf(stderr, \"[push-ready] duplicate execution mtask=%%u worker=%%d cycle=%%lu\\n\", mtPushReadyMTask, threadId, (unsigned long) cycles);\n");
-      emitBodyLock(3, "abort();\n");
-      emitBodyLock(2, "}\n");
-    }
-    emitBodyLock(2, "stepDensePushReadyRun(mtPushReadyMTask);\n");
-    emitBodyLock(2, "// Notify after all body state writes and before the token release\n");
-    emitBodyLock(2, "// stores below: the pending-decrement chain (release) plus the queue\n");
-    emitBodyLock(2, "// slot acquire carries the body writes to the dependent's owner.\n");
-    emitBodyLock(2, "mtDensePushReadyNotify(mtPushReadyMTask);\n");
-    emitBodyLock(2, "// Owner-ready release stores remain: worker0's pull lane still\n");
-    emitBodyLock(2, "// consumes tokens published by push-lane producers.\n");
-    emitBodyLock(2, "for (int j = kDenseOwnerReadyStoreOffsets[mtPushReadyMTask]; j < kDenseOwnerReadyStoreOffsets[mtPushReadyMTask + 1u]; ++j)\n");
-    emitBodyLock(3, "mtDenseOwnerReadyTokens[kDenseOwnerReadyStoreList[j]].ready.store(mtPushReadyTarget, std::memory_order_release);\n");
-    emitBodyLock(2, "++mtPushReadyExecuted;\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(1, "// Queue drain before done acknowledgment: executed == assigned and\n");
-    emitBodyLock(1, "// exactly one enqueue per task per cycle imply head == tail here.\n");
-    emitBodyLock(1, "if (unlikely(mtDensePushReadyHead[threadId].load(std::memory_order_relaxed) != mtDensePushReadyTail[threadId].load(std::memory_order_relaxed))) {\n");
-    emitBodyLock(2, "fprintf(stderr, \"[push-ready] worker %%d exited with a non-drained queue cycle=%%lu\\n\", threadId, (unsigned long) cycles);\n");
-    emitBodyLock(2, "abort();\n");
-    emitBodyLock(1, "}\n");
-    emitBodyLock(0, "}\n");
     emitBodyLock(0, "#endif\n");
   }
   emitFuncDecl(0, "void S%s::stepDense() {\n", name.c_str());
