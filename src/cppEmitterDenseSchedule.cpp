@@ -1483,6 +1483,16 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
          "GSIM_MT_DENSE_SCHED_HEFT replaces the greedy objective and is incompatible with GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE");
   Assert(!(rebalanceOn && (hotedgeOn || chainpinOn)),
          "GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE is mutually exclusive with GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN");
+  // GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE_MOVABLE=1 (default off): variant of
+  // the rebalance pass that relocates ONLY the maximal connected subsegments
+  // with no workerZeroOnly member; links touching a pinned endpoint are
+  // dropped and act as separators, so mixed segments split instead of being
+  // skipped wholesale (the L2 chain hosts 17 pinned MTasks but has movable
+  // hot neighbors).
+  bool rebalanceMovable = false;
+  { const char* e = std::getenv("GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE_MOVABLE"); if (e && e[0] && e[0] != '0') rebalanceMovable = true; }
+  Assert(!(rebalanceMovable && !rebalanceOn),
+         "GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE_MOVABLE=1 requires GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE=<SimTop_edge_timing.json>");
   Assert(!(heftOn && (hotedgeOn || chainpinOn)),
          "GSIM_MT_DENSE_SCHED_HEFT replaces the greedy objective and is incompatible with GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN");
   if (heftOn) {
@@ -1694,7 +1704,17 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
       }
       return x;
     };
+    // A link may only relocate when neither endpoint is pinned. The MOVABLE
+    // variant drops pinned-touching links from BOTH the union-find and the
+    // member sets, so workerZeroOnly nodes act as separators and segments
+    // become the maximal connected subsegments of movable nodes; without it
+    // a single pinned member still vetoes its whole segment.
+    auto rbLinkMovable = [&](const MtRebalLink& link) {
+      return !rebalanceMovable ||
+             (!mtasks[(size_t)link.producer].workerZeroOnly && !mtasks[(size_t)link.consumer].workerZeroOnly);
+    };
     for (const MtRebalLink& link : rbLinks) {
+      if (!rbLinkMovable(link)) continue;
       if (rbParent[(size_t)link.producer] < 0) rbParent[(size_t)link.producer] = link.producer;
       if (rbParent[(size_t)link.consumer] < 0) rbParent[(size_t)link.consumer] = link.consumer;
       rbParent[rbFind(link.producer)] = rbFind(link.consumer);
@@ -1703,8 +1723,20 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     std::map<int, unsigned long long> rbSegmentWeight;
     std::set<int> rbLinkProducers;
     std::set<int> rbAnySegmentMember;
+    int rbMovableLinks = 0, rbPinnedLinks = 0;
+    unsigned long long rbMovableLinkNs = 0, rbPinnedLinkNs = 0;
+    std::set<int> rbPinnedMembers;
     for (const MtRebalLink& link : rbLinks) {
       rbLinkProducers.insert(link.producer);
+      if (!rbLinkMovable(link)) {
+        rbPinnedLinks++;
+        rbPinnedLinkNs += link.blockedNs;
+        if (mtasks[(size_t)link.producer].workerZeroOnly) rbPinnedMembers.insert(link.producer);
+        if (mtasks[(size_t)link.consumer].workerZeroOnly) rbPinnedMembers.insert(link.consumer);
+        continue;
+      }
+      rbMovableLinks++;
+      rbMovableLinkNs += link.blockedNs;
       const int root = rbFind(link.producer);
       rbSegmentMembers[root].insert(link.producer);
       rbSegmentMembers[root].insert(link.consumer);
@@ -1847,6 +1879,16 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
             rbSegments, rbRelocated, rbCompensated, rbSkippedBalance,
             (int)rbFanoutHeads.size(), rbMovedOffloads,
             rbMean > 0 ? (double)rbMaxLoad * 100.0 / rbMean : 0.0);
+    if (rebalanceMovable) {
+      int rbMovableMembers = 0;
+      for (const auto& kv : rbSegmentMembers) rbMovableMembers += (int)kv.second.size();
+      const unsigned long long rbAllLinkNs = rbMovableLinkNs + rbPinnedLinkNs;
+      fprintf(stderr, "[chain-rebalance-movable] links=%d movable_links=%d pinned_links=%d "
+                      "movable_members=%d pinned_members=%d movable_blocked_pct=%.2f\n",
+              (int)rbLinks.size(), rbMovableLinks, rbPinnedLinks,
+              rbMovableMembers, (int)rbPinnedMembers.size(),
+              rbAllLinkNs > 0 ? (double)rbMovableLinkNs * 100.0 / (double)rbAllLinkNs : 0.0);
+    }
     (void)rbSkipStale; (void)rbSkipNoSlot; (void)rbSkipNoProducer;
     return;
   }
