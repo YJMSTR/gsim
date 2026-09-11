@@ -1477,13 +1477,19 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
   const char* chainPath = std::getenv("GSIM_MT_DENSE_SCHED_CHAINPIN");
   const bool hotedgeOn = hotPath != nullptr && hotPath[0] != '\0';
   const bool chainpinOn = chainPath != nullptr && chainPath[0] != '\0';
+  const char* rebalPath = std::getenv("GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE");
+  const bool rebalanceOn = rebalPath != nullptr && rebalPath[0] != '\0';
+  Assert(!(heftOn && rebalanceOn),
+         "GSIM_MT_DENSE_SCHED_HEFT replaces the greedy objective and is incompatible with GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE");
+  Assert(!(rebalanceOn && (hotedgeOn || chainpinOn)),
+         "GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE is mutually exclusive with GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN");
   Assert(!(heftOn && (hotedgeOn || chainpinOn)),
          "GSIM_MT_DENSE_SCHED_HEFT replaces the greedy objective and is incompatible with GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN");
   if (heftOn) {
     mtDenseScheduleHeft(mtasks, threadCount, outAssign, outOrder);
     return;
   }
-  if (!hotedgeOn && !chainpinOn) {
+  if (!hotedgeOn && !chainpinOn && !rebalanceOn) {
     mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, nullptr);
     return;
   }
@@ -1497,10 +1503,15 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
     bool loaded = mtLoadHotedgeJson(chainPath, chainEntries);
     (void)loaded;
   }
+  std::vector<MtDenseHotedgeEntry> rebalEntries;
+  if (rebalanceOn) {
+    bool loaded = mtLoadHotedgeJson(rebalPath, rebalEntries);
+    (void)loaded;
+  }
   const int n = static_cast<int>(mtasks.size());
   bool xthreadDepsOnly = mtUseDenseXThreadDepsOnly();
   Assert(xthreadDepsOnly,
-         "GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN require GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1 (the edge-timing capture and its owner-ready slot numbering exist only under it)");
+         "GSIM_MT_DENSE_SCHED_HOTEDGE / GSIM_MT_DENSE_SCHED_CHAINPIN / GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE require GSIM_MT_DENSE_XTHREAD_DEPS_ONLY=1 (the edge-timing capture and its owner-ready slot numbering exist only under it)");
   bool transitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
   // Reference pass (hotedge off) reproduces the placement the timing file was
   // captured on. CRITICAL id-space detail: the timing file's ids are FINAL
@@ -1620,6 +1631,225 @@ static void mtBuildDenseScheduleOrder(const std::vector<MtDenseMTask>& mtasks, i
             hotedgeSkipStale, hotedgeSkipNoSlot, hotedgeSkipNoProducer);
   }
   mtDenseScheduleOrderImpl(mtasks, threadCount, outAssign, outOrder, hotedgeOn ? &hotPct : nullptr);
+  // ---- GSIM_MT_DENSE_SCHED_CHAIN_REBALANCE (default off, byte-identical when unset) ----
+  // Balance-compensated chain co-location. Identical segment construction to
+  // the CHAINPIN post-pass below (hot blocked-edge prefix -> fan-out head
+  // exclusion -> union-find segments), but CHAINPIN's pin was balance-
+  // infeasible at mean*1.03: the greedy baseline itself can already sit well
+  // above mean (measured worker0-split skew ~1.24x mean), so a flat
+  // mean*1.03 target cap rejects every hot segment before any relocation.
+  // Cap semantics here tolerate preexisting skew: hardCap = max(baseline
+  // maxWorkerCost, mean*1.03) -- a pin/offload may never RAISE the max above
+  // that. The target is chosen by a min-max objective over post-placement
+  // worker cost; when the segment would push the target above hardCap,
+  // NON-segment tasks are offloaded off the target first (smallest overload
+  // contribution first, into non-target workers that stay under mean*1.03);
+  // a candidate is accepted only if the final max stays <= hardCap, and
+  // segments that cannot be placed under it are skipped and counted.
+  // Mutually exclusive with HOTEDGE / CHAINPIN /
+  // HEFT. Pure outAssign rewrite after the greedy: outOrder, ids and the
+  // topological order are untouched, and this runs before the caller's
+  // SCHED_ORDER renumber. Same-worker dependency ordering stays valid for
+  // any assignment because MTask ids are topo-monotone (producer id <
+  // consumer id); the offload path re-checks that invariant per moved task.
+  if (rebalanceOn) {
+    int rbSkipStale = 0, rbSkipNoSlot = 0, rbSkipNoProducer = 0;
+    std::vector<MtHotedgeMapped> rebMapped;
+    mapEntries(rebalEntries, rebMapped, rbSkipStale, rbSkipNoSlot, rbSkipNoProducer);
+    // Hot set: entries sorted by blockedNs desc covering cumulative 50% of
+    // the total blocked time (the crossing entry is included), as CHAINPIN.
+    std::sort(rebMapped.begin(), rebMapped.end(),
+              [](const MtHotedgeMapped& a, const MtHotedgeMapped& b) { return a.blockedNs > b.blockedNs; });
+    unsigned long long rbTotalJ = 0;
+    for (const MtHotedgeMapped& me : rebMapped) rbTotalJ += me.blockedNs;
+    size_t rbHotCount = 0;
+    unsigned long long rbCum = 0;
+    while (rbHotCount < rebMapped.size() && rbTotalJ > 0 && rbCum * 2 < rbTotalJ) {
+      rbCum += rebMapped[rbHotCount].blockedNs;
+      rbHotCount++;
+    }
+    // Fan-out heads: a producer with >1 distinct hot consumer is deliberate
+    // parallelism -- it never relocates and never offloads.
+    std::map<int, std::set<int>> rbHotConsumersOf;
+    for (size_t i = 0; i < rbHotCount; i++)
+      for (int producer : rebMapped[i].producers)
+        rbHotConsumersOf[producer].insert(rebMapped[i].consumer);
+    std::set<int> rbFanoutHeads;
+    for (const auto& kv : rbHotConsumersOf)
+      if (kv.second.size() > 1) rbFanoutHeads.insert(kv.first);
+    struct MtRebalLink { int producer; int consumer; unsigned long long blockedNs; };
+    std::vector<MtRebalLink> rbLinks;
+    for (size_t i = 0; i < rbHotCount; i++) {
+      const MtHotedgeMapped& me = rebMapped[i];
+      for (int producer : me.producers)
+        if (rbFanoutHeads.count(producer) == 0)
+          rbLinks.push_back(MtRebalLink{producer, me.consumer, me.blockedNs});
+    }
+    // Segments: connected components over the remaining links (union-find).
+    std::vector<int> rbParent((size_t)n, -1);
+    auto rbFind = [&](int x) {
+      while (rbParent[(size_t)x] != x) {
+        rbParent[(size_t)x] = rbParent[(size_t)rbParent[(size_t)x]];
+        x = rbParent[(size_t)x];
+      }
+      return x;
+    };
+    for (const MtRebalLink& link : rbLinks) {
+      if (rbParent[(size_t)link.producer] < 0) rbParent[(size_t)link.producer] = link.producer;
+      if (rbParent[(size_t)link.consumer] < 0) rbParent[(size_t)link.consumer] = link.consumer;
+      rbParent[rbFind(link.producer)] = rbFind(link.consumer);
+    }
+    std::map<int, std::set<int>> rbSegmentMembers;
+    std::map<int, unsigned long long> rbSegmentWeight;
+    std::set<int> rbLinkProducers;
+    std::set<int> rbAnySegmentMember;
+    for (const MtRebalLink& link : rbLinks) {
+      rbLinkProducers.insert(link.producer);
+      const int root = rbFind(link.producer);
+      rbSegmentMembers[root].insert(link.producer);
+      rbSegmentMembers[root].insert(link.consumer);
+      rbSegmentWeight[root] += link.blockedNs;
+      rbAnySegmentMember.insert(link.producer);
+      rbAnySegmentMember.insert(link.consumer);
+    }
+    // Balance state over the greedy assignment; cost domain identical to the
+    // greedy and CHAINPIN (measured schedCost when present, else staticCost).
+    auto rbCostOf = [](const MtDenseMTask& m) -> int { return m.schedCost > 0 ? m.schedCost : m.staticCost; };
+    std::vector<long long> rbLoad((size_t)threadCount, 0);
+    long long rbTotalCost = 0;
+    for (int m = 0; m < n; m++) {
+      const int w = outAssign[(size_t)m];
+      if (w < 0 || w >= threadCount) continue;
+      rbLoad[(size_t)w] += rbCostOf(mtasks[(size_t)m]);
+      rbTotalCost += rbCostOf(mtasks[(size_t)m]);
+    }
+    const double rbMean = (double)rbTotalCost / (double)threadCount;
+    const double rbCap = rbMean * 1.03;  // ceiling for workers that only GAIN load
+    // Preexisting-skew allowance: the baseline (pre-relocation) max anchors
+    // the hard cap; the final max may never exceed max(baseline, mean*1.03).
+    long long rbBaseMax = 0;
+    for (int w = 0; w < threadCount; w++) rbBaseMax = std::max(rbBaseMax, rbLoad[(size_t)w]);
+    const double rbHardCap = std::max((double)rbBaseMax, rbCap);
+    // Hottest segments first (deterministic tie-break: smaller root id).
+    std::vector<std::pair<unsigned long long, int>> rbSegmentOrder;
+    for (const auto& kv : rbSegmentWeight) rbSegmentOrder.push_back({kv.second, kv.first});
+    std::sort(rbSegmentOrder.begin(), rbSegmentOrder.end(),
+              [](const std::pair<unsigned long long, int>& a, const std::pair<unsigned long long, int>& b) {
+                return a.first != b.first ? a.first > b.first : a.second < b.second;
+              });
+    int rbSegments = (int)rbSegmentOrder.size();
+    int rbRelocated = 0, rbCompensated = 0, rbSkippedBalance = 0, rbMovedOffloads = 0;
+    for (const auto& seg : rbSegmentOrder) {
+      std::vector<int> members(rbSegmentMembers[seg.second].begin(), rbSegmentMembers[seg.second].end());
+      // First producer = the segment's smallest-id member that produces one
+      // of its links; ties among equal-max targets prefer its worker.
+      int firstProducer = -1;
+      for (int m : members)
+        if (rbLinkProducers.count(m) && (firstProducer < 0 || m < firstProducer)) firstProducer = m;
+      // Skip guards: no link producer; or a workerZeroOnly member (pinned
+      // to worker 0, immovable). A member currently OWNED by worker 0 is an
+      // ordinary dense body -- the reservation is only a greedy placement
+      // preference (chainpin likewise remapped a worker-0 pin target to 1)
+      // -- and may relocate off it. Targets stay in 1..N-1 and offloads
+      // never land on worker 0, so worker 0 only ever sheds load here.
+      bool rbSkip = firstProducer < 0;
+      for (int m : members) {
+        const int w = outAssign[(size_t)m];
+        if (mtasks[(size_t)m].workerZeroOnly || w < 0 || w >= threadCount) { rbSkip = true; break; }
+      }
+      if (rbSkip) { rbSkippedBalance++; continue; }
+      const int preferWorker = outAssign[(size_t)firstProducer];
+      // (a worker-0 owner is not a valid target, so that tie preference
+      // simply never matches and equal-max ties keep the smallest target)
+      // Candidate targets: workers 1..N-1 (never worker 0). For each: place
+      // the whole segment, then -- only if the target ends above hardCap --
+      // greedily offload non-segment tasks off it until it fits.
+      int bestTarget = -1;
+      long long bestMax = 0;
+      std::vector<long long> bestPost;
+      std::vector<std::pair<int, int>> bestMoves;  // (mtask, destination)
+      for (int target = 1; target < threadCount; target++) {
+        std::vector<long long> post = rbLoad;
+        std::vector<int> virt = outAssign;  // trial assignment for this target
+        for (int m : members) {
+          const long long c = rbCostOf(mtasks[(size_t)m]);
+          post[(size_t)virt[(size_t)m]] -= c;
+          virt[(size_t)m] = target;
+          post[(size_t)target] += c;
+        }
+        std::vector<std::pair<int, int>> moves;
+        if ((double)post[(size_t)target] > rbHardCap) {
+          // Offload candidates: tasks on the target, excluding any segment
+          // member (any segment), fanout-head producers and workerZeroOnly
+          // tasks; sorted by increasing contribution to the overload.
+          std::vector<std::pair<long long, int>> cands;  // (cost, id)
+          for (int t = 0; t < n; t++) {
+            if (virt[(size_t)t] != target) continue;
+            if (rbAnySegmentMember.count(t)) continue;
+            if (mtasks[(size_t)t].workerZeroOnly) continue;
+            if (rbFanoutHeads.count(t)) continue;
+            cands.push_back({rbCostOf(mtasks[(size_t)t]), t});
+          }
+          std::sort(cands.begin(), cands.end());
+          for (const auto& cand : cands) {
+            if ((double)post[(size_t)target] <= rbHardCap) break;
+            const int t = cand.second;
+            const long long c = cand.first;
+            if (c <= 0) continue;  // zero-cost tasks contribute no overload
+            // Destination: least-loaded other worker (never worker 0, and
+            // never one that would land above mean*1.03 by taking the task).
+            int dest = -1; long long destLoad = 0;
+            for (int w2 = 1; w2 < threadCount; w2++) {
+              if (w2 == target) continue;
+              const long long after = post[(size_t)w2] + c;
+              if ((double)after > rbCap) continue;
+              if (dest < 0 || after < destLoad) { dest = w2; destLoad = after; }
+            }
+            if (dest < 0) continue;
+            // Dependency/order invariant: any dependency that becomes
+            // same-worker must keep producer id < consumer id (the runtime
+            // runs each worker's MTasks in ascending id order). Ids are
+            // topo-monotone so this holds by construction; re-checked per
+            // moved task as a guard.
+            bool orderOk = true;
+            for (int p : mtasks[(size_t)t].predMTasks)
+              if (virt[(size_t)p] == dest && p >= t) { orderOk = false; break; }
+            if (orderOk)
+              for (int s : mtasks[(size_t)t].succMTasks)
+                if (virt[(size_t)s] == dest && s <= t) { orderOk = false; break; }
+            if (!orderOk) continue;
+            post[(size_t)target] -= c;
+            post[(size_t)dest] += c;
+            virt[(size_t)t] = dest;
+            moves.push_back({t, dest});
+          }
+        }
+        if ((double)post[(size_t)target] > rbHardCap) continue;  // target infeasible
+        long long maxLoad = 0;
+        for (int w = 0; w < threadCount; w++) maxLoad = std::max(maxLoad, post[(size_t)w]);
+        if (bestTarget < 0 || maxLoad < bestMax || (maxLoad == bestMax && target == preferWorker)) {
+          bestTarget = target; bestMax = maxLoad;
+          bestPost = post; bestMoves = moves;
+        }
+      }
+      if (bestTarget < 0) { rbSkippedBalance++; continue; }  // no target fits the cap
+      for (int m : members) outAssign[(size_t)m] = bestTarget;
+      for (const auto& mv : bestMoves) outAssign[(size_t)mv.first] = mv.second;
+      rbLoad = bestPost;
+      if (!bestMoves.empty()) rbCompensated++;
+      rbMovedOffloads += (int)bestMoves.size();
+      rbRelocated++;
+    }
+    long long rbMaxLoad = 0;
+    for (int w = 0; w < threadCount; w++) rbMaxLoad = std::max(rbMaxLoad, rbLoad[(size_t)w]);
+    fprintf(stderr, "[chain-rebalance] segments=%d relocated=%d compensated=%d skipped_balance=%d "
+                    "fanout_heads_kept=%d moved_offloads=%d max_worker_pct=%.2f\n",
+            rbSegments, rbRelocated, rbCompensated, rbSkippedBalance,
+            (int)rbFanoutHeads.size(), rbMovedOffloads,
+            rbMean > 0 ? (double)rbMaxLoad * 100.0 / rbMean : 0.0);
+    (void)rbSkipStale; (void)rbSkipNoSlot; (void)rbSkipNoProducer;
+    return;
+  }
   if (!chainpinOn) return;
   // ---- GSIM_MT_DENSE_SCHED_CHAINPIN post-pass ----
   // Rationale: a serial dependency chain loses no parallelism when pinned to
