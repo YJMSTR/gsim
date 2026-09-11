@@ -225,6 +225,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
          "GSIM_MT_DENSE_EDGE_TIMING requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!pscdBits || ownerReadyFlags,
          "GSIM_EMIT_PSCD_BITS requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
+  // ---- GSIM_MT_DENSE_TOKEN_LAYOUT_DUMP (default off, diagnostic only) ----
+  // Host-side generation-time dump of the FINAL owner-ready token layout
+  // (post lookahead replacement) as <name>_mt_dense_token_layout.json next
+  // to <name>_mt_dense_schedule.json, for the compact-token-slot probe.
+  // Never changes a byte of generated C++, set or unset.
+  const char* tokenLayoutDumpEnv = std::getenv("GSIM_MT_DENSE_TOKEN_LAYOUT_DUMP");
+  const bool tokenLayoutDump =
+      tokenLayoutDumpEnv != nullptr && tokenLayoutDumpEnv[0] != '\0' && tokenLayoutDumpEnv[0] != '0';
+  Assert(!tokenLayoutDump || ownerReadyFlags,
+         "GSIM_MT_DENSE_TOKEN_LAYOUT_DUMP requires GSIM_MT_DENSE_OWNER_READY_FLAGS=1");
   Assert(!pscdVerify || pscdBits,
          "GSIM_PSCD_VERIFY requires GSIM_EMIT_PSCD_BITS=1");
   Assert(!pushReady || ownerReadyFlags,
@@ -880,6 +890,74 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             ownerReadyLayout.physicalSlotCount,
             ownerReadyLayout.physicalSlotCount - ownerReadyLayout.tokenCount,
             ownerReadyLayout.pairBankCount, threadCount);
+  }
+  if (tokenLayoutDump) {
+    // Re-derive the pair-bank partition with the builder's exact rule (banks
+    // in ascending (producerOwner, consumerOwner) order, 64B-aligned begins,
+    // consecutive slots within a bank) and cross-check it against the
+    // layout's per-token physical slots before trusting it for the dump.
+    std::map<std::pair<int, int>, std::vector<int>> tokensByOwnerPair;
+    for (int t = 0; t < ownerReadyLayout.tokenCount; t ++) {
+      const MtDenseOwnerReadyTokenProvenance& prov =
+          ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)t];
+      tokensByOwnerPair[std::make_pair(prov.producerOwner, prov.consumerOwner)].push_back(t);
+    }
+    std::map<std::pair<int, int>, int> bankIdByPair, bankBeginByPair;
+    std::vector<int> expectedSlotByToken((size_t)ownerReadyLayout.tokenCount, -1);
+    int dumpNextSlot = 0, dumpBankId = 0;
+    for (const auto& bank : tokensByOwnerPair) {
+      const int begin = (dumpNextSlot + 63) & ~63;
+      bankIdByPair[bank.first] = dumpBankId ++;
+      bankBeginByPair[bank.first] = begin;
+      for (size_t i = 0; i < bank.second.size(); i ++)
+        expectedSlotByToken[(size_t)bank.second[i]] = begin + (int)i;
+      dumpNextSlot = ((begin + (int)bank.second.size()) + 63) & ~63;
+    }
+    Assert(dumpNextSlot == ownerReadyLayout.physicalSlotCount,
+           "token layout dump bank re-derivation mismatch: %d vs %d physical slots",
+           dumpNextSlot, ownerReadyLayout.physicalSlotCount);
+    std::string dumpPath = globalConfig.OutputDir + "/" + name + "_mt_dense_token_layout.json";
+    FILE* dump = std::fopen(dumpPath.c_str(), "w");
+    Assert(dump != nullptr, "failed to open token layout dump %s", dumpPath.c_str());
+    fprintf(dump, "{\"format\":\"gsim.dense-token-layout.v1\",\n");
+    fprintf(dump, " \"mtasks\":%d,\"threads\":%d,\"edges\":%d,\n",
+            nMTasks, threadCount, ownerReadyLayout.edgeCount);
+    fprintf(dump, " \"tokens\":%d,\"physical_slots\":%d,\"padding\":%d,\"pair_banks\":%d,\n",
+            ownerReadyLayout.tokenCount, ownerReadyLayout.physicalSlotCount,
+            ownerReadyLayout.physicalSlotCount - ownerReadyLayout.tokenCount,
+            ownerReadyLayout.pairBankCount);
+    fprintf(dump, " \"banks\":[\n");
+    for (auto it = tokensByOwnerPair.begin(); it != tokensByOwnerPair.end(); ++ it) {
+      if (it != tokensByOwnerPair.begin()) fprintf(dump, ",\n");
+      fprintf(dump,
+              "  {\"bank_id\":%d,\"producer_owner\":%d,\"consumer_owner\":%d,"
+              "\"begin_slot\":%d,\"slot_count\":%d}",
+              bankIdByPair[it->first], it->first.first, it->first.second,
+              bankBeginByPair[it->first], (int)it->second.size());
+    }
+    fprintf(dump, "\n ],\n \"tokens\":[\n");
+    for (int t = 0; t < ownerReadyLayout.tokenCount; t ++) {
+      const MtDenseOwnerReadyTokenProvenance& prov =
+          ownerReadyLayout.tokenProvenanceByLogicalToken[(size_t)t];
+      Assert(prov.readySlot == expectedSlotByToken[(size_t)t],
+             "token layout dump slot mismatch for logical token %d: %d vs bank-derived %d",
+             t, prov.readySlot, expectedSlotByToken[(size_t)t]);
+      const std::vector<int>& sources = ownerReadyLayout.sourceMTasksByLogicalToken[(size_t)t];
+      fprintf(dump,
+              "  {\"token\":%d,\"ready_slot\":%d,\"producer_mtask\":%d,\"producer_owner\":%d,"
+              "\"consumer_mtask\":%d,\"consumer_owner\":%d,\"source_mtasks\":[",
+              t, prov.readySlot, prov.producerMTask, prov.producerOwner,
+              prov.consumerMTask, prov.consumerOwner);
+      for (size_t si = 0; si < sources.size(); si ++) fprintf(dump, "%s%d", si ? "," : "", sources[si]);
+      fprintf(dump, "],\"bank_id\":%d}%s\n",
+              bankIdByPair[std::make_pair(prov.producerOwner, prov.consumerOwner)],
+              t + 1 < ownerReadyLayout.tokenCount ? "," : "");
+    }
+    fprintf(dump, " ]\n}\n");
+    fclose(dump);
+    fprintf(stderr, "[mt-dense-token-layout] wrote %d tokens (%d slots, %d banks) to %s\n",
+            ownerReadyLayout.tokenCount, ownerReadyLayout.physicalSlotCount,
+            ownerReadyLayout.pairBankCount, dumpPath.c_str());
   }
   if (denseLookahead) {
     fprintf(stderr,
