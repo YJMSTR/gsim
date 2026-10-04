@@ -360,6 +360,8 @@ worker 3: T6 -> T9
 | `mtDoneFlags` | worker 完成本周期后的 parity 标志 |
 | `mtGeneration` | 周期 generation；低位 parity 用于复用 token |
 | `mtThreads` | 后台 worker 线程对象；worker 0 使用调用线程 |
+| `mtLookaheadInfoW0...Wn` | `--mt-lookahead=N` 开启时每个表项的资格 kind 与同 worker 前驱区间（7.1 节） |
+| `mtLookaheadDoneW0...Wn` | `--mt-lookahead=N` 开启时每个表项的本周期执行 parity 标记 |
 
 `Task::waits/stores` 是生成器内部的规划数据，生成后被压缩成 `MtDispatch` 的四个区间字段；运行时不会为每个 task 动态分配 vector。
 
@@ -367,13 +369,13 @@ worker 3: T6 -> T9
 
 该算法优先缩短任务的预计开始时间，同时用关键路径处理平局，并通过跨 worker 惩罚倾向于把相关任务放在同一 worker。最终得到的 owner 和 worker chain 固定、可重复，运行时只解释静态 dispatch 表。
 
-同一 worker 必须严格按 chain 顺序执行，不能在队头等待时跳到后续任务。即使两个任务之间没有显式普通边，它们仍可能通过 external helper、memory side effect 或指令组织包含隐含顺序。
+同一 worker 默认严格按 chain 顺序执行，不能在队头等待时跳到后续任务。即使两个任务之间没有显式普通边，它们仍可能通过 external helper、memory side effect 或指令组织包含隐含顺序。
 
-本实现没有以下机制：
+本实现默认没有以下机制：
 
 - work stealing；
 - 运行时负载迁移；
-- worker 内候选扫描；
+- worker 内候选扫描（`--mt-lookahead=N` 提供有界版本，见 7.1 节）；
 - 动态活跃 task 队列；
 - 根据历史 profile 重新分配。
 
@@ -394,7 +396,10 @@ planner 为每个“producer owner -> consumer owner -> consumer task”组合�
 
 生成模型中，`mtWaitSlots` 和 `mtStoreSlots` 是扁平只读数组，`MtDispatch` 只保存区间，避免每周期构造容器。
 
+启用 `--mt-lookahead=N`（N ≥ 1）时 planner 不再做上述压缩：每个跨 worker 前驱都发布自己的槽位，consumer 等待全部前驱 token。压缩依赖“producer 严格顺序执行，最晚前驱完成蕴含更早前驱完成”；worker 内 lookahead 允许 publisher 越过同 worker 更早的前驱执行，该蕴含不再成立。
+
 ### 5.2 奇偶代际
+
 
 `mtGeneration` 每周期递增，token 只保存 `generation & 1`：
 
@@ -472,6 +477,30 @@ dense:
 
 `GSIM_MT_EXECUTOR` 不是 `dense`，或运行时线程数与生成时不同，模型会直接报错退出。单线程 active reference 必须由原 emitter 独立生成。
 
+### 7.1 有界 worker 内 lookahead（`--mt-lookahead=N`）
+
+生成期选项 `--mt-lookahead=N`（默认 0，即关闭）为 dense runtime 增加有界的 worker 内就绪扫描：当 chain 队头被跨 worker token 阻塞时，worker 最多向后扫描 N 个 dispatch 表项，执行其中可证明安全的就绪任务，缓解队头阻塞。选项在生成时固化；`--mt-lookahead=0`（含缺省）生成的代码与不传选项逐字节一致。
+
+一个表项可以提前执行，当且仅当生成期分析与运行时检查同时满足：
+
+1. 生成期资格（写入 `mtLookaheadInfoW*` 的 `kind`）：
+   - 该 MTask 全部成员为纯数据流节点（普通 wire/reg 计算、寄存器 `$NEXT` 写回、接口输入输出）；
+   - 不含 extmodule、异步 reset 触发、memory 端口（reader/writer/readwriter）、printf/assert 等 `NODE_SPECIAL`、`NODE_EXT*` 或 `NODE_REG_RESET` 成员——这些任务与其它任务之间存在依赖图未表达的隐含顺序，只按 chain 顺序执行；
+   - 异步 reset join（`mtJoinAsyncResetN W*`）是硬屏障：既不提前执行，也不允许后续表项越过它扫描（避免 post-trigger 任务看到部分复位的状态）。
+2. 运行时谓词（`mtRunWorker` 内非阻塞检查，不消费任何 wait/token）：
+   - 该表项的全部跨 worker wait token 已达到本周期 parity（提前执行发布自己的 store token，语义与按序执行相同）；
+   - 该表项在同一 worker 上的全部 MTask 前驱已在本周期执行（`mtLookaheadPreds` 给出前驱 dispatch 位置，`mtLookaheadDoneW*` 以 parity 标记完成，无需每周期清零）。同 worker 前驱没有 token，默认依赖 chain 顺序；这是 lookahead 必须显式跟踪它们的原因。
+
+队头表项只检查 wait token：其同 worker 前驱必然位于队头之前且已执行。扫描窗口内每轮要么执行至少一个任务，要么终止；被提前执行的任务在本周期内只执行一次（`done` 位去重）。扫描到屏障即停止，任何未被选中的表项仍按原顺序执行，因此关闭选项或无任务可提前时，执行顺序与默认 runtime 完全一致。
+
+与旧实验版 `GSIM_MT_DENSE_LOOKAHEAD` 的区别：旧版在队头等待时扫描后续任务并执行“看起来 ready”的任务，没有资格过滤，也没有同 worker 前驱跟踪，从而破坏了压缩 token 与隐含顺序（见 12.2 节）。本版本默认关闭，且只在上述不变量全部成立时重排。
+
+代价与验证要求：
+
+- token 数量增加：planner 在 lookahead 开启时不再压缩同 producer worker 的多个前驱（见 5.1 节），consumer 等待每个跨 worker 前驱各自的槽位；
+- 每周期增加 O(N) 的就绪扫描与每任务一次的 `done` 字节写入；
+- 任何使用该选项的模型仍必须通过单线程 active reference 的逐信号 difftest 与性能对比后才能合入。
+
 ## 8. Reset 与局部变量
 
 ### Reset
@@ -499,7 +528,7 @@ task 内局部中间量使用 `T value{};` 值初始化。部分 external/memory
 | `--mt-target-tasks=N` | `1600` | 期望 MTask 数，软限制 |
 | `--mt-partition-node-weight=N` | `0` | 划分成本中每个节点的固定权重 |
 | `--mt-schedule-global-weight=N` | `12` | worker 调度成本中每个跨 task 全局节点的权重 |
-| `GSIM_EMIT_RESET_CHUNK` | `4096` | reset 函数目标语句数；`0` 禁用 |
+| `--mt-lookahead=N` | `0` | 有界 worker 内 lookahead 窗口；`0` 为严格按序（见 7.1 节） |
 | `--supernode-max-size=N` | 项目默认值 | 上游图划分粒度，会影响 task 数和并行度 |
 | `--cpp-max-size-KB=N` | 项目默认值 | 生成 C++ 文件切分大小 |
 
@@ -515,7 +544,7 @@ task 内局部中间量使用 `T value{};` 值初始化。部分 external/memory
 `GSIM_MT_DENSE_EXECUTOR_CODEGEN`、`GSIM_MT_DENSE_LOOKAHEAD`、
 `GSIM_MT_DENSE_XTHREAD_DEPS_ONLY`、`GSIM_MT_DENSE_OWNER_READY_FLAGS`、
 `GSIM_MT_DENSE_UNPIN_SPECIAL`、`GSIM_MT_WORKER_POOL_FLAG_JOIN` 等开关不再读取。
-`GSIM_MT_DENSE_LOOKAHEAD` 是有意删除的：worker 内乱序与隐含顺序不兼容。
+`GSIM_MT_DENSE_LOOKAHEAD` 是有意删除的：worker 内乱序与隐含顺序不兼容。其受控替代是生成期选项 `--mt-lookahead=N`（见 7.1 节），它在默认关闭的前提下只重排满足资格与前驱不变量的任务。
 `--mt-target-tasks` 是当前 MTask 划分使用的目标任务数参数，默认值为 `1600`。
 
 ## 10. 构建与运行
@@ -646,7 +675,7 @@ Ready-to-run 测试同样应独立生成单线程 active reference 和多线程 
 早期 worker 在队头等待跨线程依赖时，会扫描后续 task 并提前执行“看起来 ready”的任务。XiangShan 在第一个周期出现 ROB 信号
 `_io_enq_canAccept_T_5` 差异。关闭 lookahead 后，单线程 active/MT 逐信号对比恢复一致。
 
-当前 runtime 始终严格顺序执行 worker chain。不要在没有补齐和证明全部隐含依赖前重新加入乱序。
+当前 runtime 默认严格顺序执行 worker chain。不要在没有补齐和证明全部隐含依赖前重新加入乱序；`--mt-lookahead=N`（7.1 节）是目前唯一的受控例外：默认关闭，只把纯数据流任务提前到被阻塞队头之前，且要求同 worker 前驱已完成、跨 worker 前驱逐一等待 token、异步 reset join 不可越过。开启该选项的模型上线前必须重跑逐信号 difftest。
 
 ### 12.3 未初始化 helper 参数
 

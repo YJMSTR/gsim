@@ -71,6 +71,7 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       enabled_(globalConfig.MtMode),
       workerCount_(positiveEnv("GSIM_THREADS", 1)),
       targetTasks_(globalConfig.MtTargetTasks),
+      lookahead_(globalConfig.MtLookahead),
       resetChunk_(resetChunkSize()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
@@ -88,6 +89,80 @@ void CppEmitterMt::prepare() {
   MtTaskLowerer::generateStmtTrees(graph_, static_cast<MtTaskPlan&>(*this));
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
+  if (lookahead_ > 0) buildLookaheadPlan();
+}
+
+// An MTask may run ahead of its blocked chain head only when it is pure
+// dataflow over model state: external module calls, memory port side effects,
+// printf/assert nodes, and async reset triggers all carry ordering that the
+// MTask dependency graph does not represent, so such tasks stay in order.
+bool CppEmitterMt::taskLookaheadEligible(const Task& task) const {
+  for (int cppId : task.cppIds) {
+    const SuperNode* super = byCppId_[static_cast<size_t>(cppId)];
+    if (super->superType == SUPER_EXTMOD || super->superType == SUPER_ASYNC_RESET) return false;
+    for (const Node* node : super->member) {
+      switch (node->type) {
+        case NODE_SPECIAL:
+        case NODE_MEMORY:
+        case NODE_READER:
+        case NODE_WRITER:
+        case NODE_READWRITER:
+        case NODE_EXT:
+        case NODE_EXT_IN:
+        case NODE_EXT_OUT:
+        case NODE_REG_RESET:
+          return false;
+        default:
+          break;
+      }
+    }
+  }
+  return true;
+}
+
+// Builds the per-worker lookahead side tables aligned with the emitted
+// dispatch arrays (async reset joins interleaved at their beforePosition).
+// Each eligible entry records the dispatch positions of its same-worker MTask
+// predecessors; cross-worker predecessors remain covered by the precise
+// per-predecessor wait tokens planned when lookahead is enabled.
+void CppEmitterMt::buildLookaheadPlan() {
+  lookaheadPlan_.assign(static_cast<size_t>(workerCount_), std::vector<LookaheadInfo>());
+  lookaheadPreds_.clear();
+  std::vector<uint32_t> positionByTask(tasks_.size(), 0);
+  for (int worker = 0; worker < workerCount_; ++worker) {
+    const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
+    const std::vector<ResetJoin>& joins = resetJoins_[static_cast<size_t>(worker)];
+    std::vector<LookaheadInfo>& plan = lookaheadPlan_[static_cast<size_t>(worker)];
+    plan.assign(chain.size() + joins.size(), LookaheadInfo());
+    size_t joinIndex = 0;
+    size_t dispatchPosition = 0;
+    for (size_t chainIndex = 0; chainIndex <= chain.size(); ++chainIndex) {
+      while (joinIndex < joins.size() && joins[joinIndex].beforePosition == chainIndex) {
+        // The rendezvous separates pre-trigger from post-trigger work; later
+        // entries must never overtake it.
+        plan[dispatchPosition].kind = kLookaheadBarrier;
+        ++joinIndex;
+        ++dispatchPosition;
+      }
+      if (chainIndex == chain.size()) break;
+      const int taskId = chain[chainIndex];
+      const Task& task = tasks_[static_cast<size_t>(taskId)];
+      positionByTask[static_cast<size_t>(taskId)] = static_cast<uint32_t>(dispatchPosition);
+      LookaheadInfo& info = plan[dispatchPosition];
+      info.kind = taskLookaheadEligible(task) ? kLookaheadEligible : kLookaheadStrict;
+      info.predBegin = static_cast<uint32_t>(lookaheadPreds_.size());
+      for (int predecessor : task.predecessors) {
+        if (tasks_[static_cast<size_t>(predecessor)].owner != worker) continue;
+        Assert(positionByTask[static_cast<size_t>(predecessor)] < dispatchPosition,
+               "lookahead predecessor of task %d is not ahead of it on worker %d", taskId, worker);
+        lookaheadPreds_.push_back(positionByTask[static_cast<size_t>(predecessor)]);
+      }
+      info.predEnd = static_cast<uint32_t>(lookaheadPreds_.size());
+      ++dispatchPosition;
+    }
+    Assert(joinIndex == joins.size(), "unplanned async reset joins for worker %d", worker);
+    Assert(dispatchPosition == plan.size(), "lookahead plan size mismatch for worker %d", worker);
+  }
 }
 
 bool CppEmitterMt::isTaskLocal(Node* node) const {
@@ -149,6 +224,22 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
     fprintf(header, "static const MtDispatch mtDispatchW%d[%zu];\n", worker,
             std::max<size_t>(1, workerTasks_[static_cast<size_t>(worker)].size() +
                                    resetJoins_[static_cast<size_t>(worker)].size()));
+  }
+  if (lookahead_ > 0) {
+    fprintf(header, "static constexpr uint8_t kMtLookaheadStrict = 0;\n");
+    fprintf(header, "static constexpr uint8_t kMtLookaheadEligible = 1;\n");
+    fprintf(header, "static constexpr uint8_t kMtLookaheadBarrier = 2;\n");
+    fprintf(header, "struct MtLookaheadInfo { uint8_t kind; uint32_t predBegin, predEnd; };\n");
+    fprintf(header, "static const uint32_t mtLookaheadPreds[%zu];\n",
+            std::max<size_t>(1, lookaheadPreds_.size()));
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      fprintf(header, "static const MtLookaheadInfo mtLookaheadInfoW%d[%zu];\n", worker,
+              std::max<size_t>(1, lookaheadPlan_[static_cast<size_t>(worker)].size()));
+    }
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      fprintf(header, "alignas(64) uint8_t mtLookaheadDoneW%d[%zu]{};\n", worker,
+              std::max<size_t>(1, lookaheadPlan_[static_cast<size_t>(worker)].size()));
+    }
   }
   fprintf(header, "void mtInit();\nvoid mtStart();\nvoid mtStopWorkers();\n");
   fprintf(header, "void mtWorkerLoop(int worker);\nvoid mtRunWorker(int worker, uint8_t parity);\n");
@@ -465,6 +556,27 @@ void CppEmitterMt::emitDefinitions() {
     emitText(0, true, text);
   }
 
+  if (lookahead_ > 0) {
+    emitArray("uint32_t", "mtLookaheadPreds", std::vector<int>(lookaheadPreds_.begin(),
+                                                               lookaheadPreds_.end()));
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      const std::vector<LookaheadInfo>& plan = lookaheadPlan_[static_cast<size_t>(worker)];
+      std::string text = "const " + className + "::MtLookaheadInfo " + className +
+                         "::mtLookaheadInfoW" + std::to_string(worker) + "[" +
+                         std::to_string(std::max<size_t>(1, plan.size())) + "] = {\n";
+      if (plan.empty()) {
+        text += "  {0, 0, 0}\n";
+      } else {
+        for (const LookaheadInfo& info : plan) {
+          text += "  {" + std::to_string(info.kind) + "," + std::to_string(info.predBegin) +
+                  "," + std::to_string(info.predEnd) + "},\n";
+        }
+      }
+      text += "};\n";
+      emitText(0, true, text);
+    }
+  }
+
   std::string runtime;
   runtime += "void " + className + "::mtInit() {\n";
   runtime += "  const char* executor = getenv(\"GSIM_MT_EXECUTOR\");\n";
@@ -535,6 +647,76 @@ void CppEmitterMt::emitDefinitions() {
       "  }\n"
       "}\n";
 
+  if (lookahead_ > 0) {
+    runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
+    runtime +=
+        "  const MtDispatch* entries = nullptr; const MtLookaheadInfo* lookahead = nullptr;\n"
+        "  uint8_t* done = nullptr; uint32_t count = 0;\n"
+        "  switch (worker) {\n";
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      runtime += "    case " + std::to_string(worker) + ": entries = mtDispatchW" +
+                 std::to_string(worker) + "; lookahead = mtLookaheadInfoW" + std::to_string(worker) +
+                 "; done = mtLookaheadDoneW" + std::to_string(worker) + "; count = " +
+                 std::to_string(workerTasks_[static_cast<size_t>(worker)].size() +
+                                resetJoins_[static_cast<size_t>(worker)].size()) +
+                 "; break;\n";
+    }
+    runtime += "    default: abort();\n  }\n";
+    // Readiness probes never consume a token: parity tokens are level
+    // signals for this cycle, so a failed check just leaves the entry for a
+    // later pass, in order or ahead of a blocked head.
+    runtime +=
+        "  auto waitsReady = [&](const MtDispatch& entry) {\n"
+        "    for (uint32_t i = entry.waitBegin; i < entry.waitEnd; ++i)\n"
+        "      if (mtReadyTokens[mtWaitSlots[i]].value.load(std::memory_order_acquire) != parity)\n"
+        "        return false;\n"
+        "    return true;\n"
+        "  };\n";
+    runtime +=
+        "  auto predsDone = [&](const MtLookaheadInfo& info) {\n"
+        "    for (uint32_t i = info.predBegin; i < info.predEnd; ++i)\n"
+        "      if (done[mtLookaheadPreds[i]] != parity) return false;\n"
+        "    return true;\n"
+        "  };\n";
+    runtime +=
+        "  auto runEntry = [&](uint32_t position) {\n"
+        "    const MtDispatch& entry = entries[position];\n"
+        "    (this->*entry.fn)();\n"
+        "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
+        "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
+        "    done[position] = parity;\n"
+        "  };\n";
+    runtime +=
+        "  uint32_t head = 0;\n"
+        "  for (;;) {\n"
+        "    while (head < count && done[head] == parity) ++head;\n"
+        "    if (head == count) break;\n"
+        // Same-worker predecessors of the head are all behind it and already
+        // executed; only cross-worker tokens can block the head.
+        "    if (waitsReady(entries[head])) {\n"
+        "      runEntry(head);\n"
+        "      ++head;\n"
+        "      continue;\n"
+        "    }\n";
+    runtime += "    const uint32_t limit = head + " + std::to_string(lookahead_) +
+               " <= count ? head + " + std::to_string(lookahead_) + " : count;\n";
+    runtime +=
+        "    bool advanced = true;\n"
+        "    while (advanced) {\n"
+        "      advanced = false;\n"
+        "      for (uint32_t position = head + 1; position < limit; ++position) {\n"
+        "        if (done[position] == parity) continue;\n"
+        "        if (lookahead[position].kind == kMtLookaheadBarrier) break;\n"
+        "        if (lookahead[position].kind != kMtLookaheadEligible) continue;\n"
+        "        if (!waitsReady(entries[position]) || !predsDone(lookahead[position])) continue;\n"
+        "        runEntry(position);\n"
+        "        advanced = true;\n"
+        "      }\n"
+        "    }\n"
+        "    __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "  }\n"
+        "}\n";
+  } else {
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
   runtime += "  const MtDispatch* entries = nullptr; uint32_t count = 0;\n  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {
@@ -560,6 +742,7 @@ void CppEmitterMt::emitDefinitions() {
       "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
       "  }\n"
       "}\n";
+  }
 
   runtime += "void " + className + "::stepMt() {\n";
   runtime += "  resetAllMt();\n";

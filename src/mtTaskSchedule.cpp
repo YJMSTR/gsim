@@ -431,6 +431,26 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
       }
     }
     for (const auto& entry : sourcesByOwner) {
+      // Compressing the group to its latest chain predecessor is only sound
+      // while producers run their chains strictly in order: the publisher
+      // finishing implies every earlier predecessor finished. Worker-local
+      // lookahead lets a publisher run ahead of an earlier same-chain
+      // predecessor, so with lookahead enabled every cross-worker
+      // predecessor publishes its own slot and the consumer waits them all.
+      const bool preciseTokens = globalConfig.MtLookahead > 0;
+      if (preciseTokens) {
+        for (int predecessor : entry.second) {
+          TokenGroup group;
+          group.producerOwner = entry.first;
+          group.consumerOwner = tasks.tasks_[consumer].owner;
+          group.consumer = consumer;
+          group.publisher = predecessor;
+          int groupId = static_cast<int>(groups.size());
+          groups.push_back(group);
+          groupsByOwnerPair[{group.producerOwner, group.consumerOwner}].push_back(groupId);
+        }
+        continue;
+      }
       int publisher = *std::max_element(entry.second.begin(), entry.second.end(), [&](int lhs, int rhs) {
         return workerPosition[static_cast<size_t>(lhs)] < workerPosition[static_cast<size_t>(rhs)];
       });

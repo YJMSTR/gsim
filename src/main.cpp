@@ -77,6 +77,7 @@ Config::Config() {
   MtTargetTasks = 1600;
   MtPartitionNodeWeight = 0;
   MtScheduleGlobalWeight = 12;
+  MtLookahead = 0;
 }
 Config globalConfig;
 
@@ -155,6 +156,8 @@ static void printUsage(const char* ProgName) {
             << "                                   Fixed per-node weight in MT partition cost (default: 0).\n"
             << "      --mt-schedule-global-weight=[num]\n"
             << "                                   Weight for cross-MTask nodes in worker cost (default: 12).\n"
+            << "      --mt-lookahead=[num]         Bounded worker-local lookahead window for the MT dense\n"
+            << "                                   executor (default: 0 = strict in-order chains).\n"
             ;
 }
 
@@ -188,6 +191,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_MT_TARGET_TASKS,
     OPT_MT_PARTITION_NODE_WEIGHT,
     OPT_MT_SCHEDULE_GLOBAL_WEIGHT,
+    OPT_MT_LOOKAHEAD,
   };
 
   const struct option Table[] = {
@@ -212,6 +216,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"mt-target-tasks", required_argument, nullptr, 0},
       {"mt-partition-node-weight", required_argument, nullptr, 0},
       {"mt-schedule-global-weight", required_argument, nullptr, 0},
+      {"mt-lookahead", required_argument, nullptr, 0},
       {nullptr, no_argument, nullptr, 0},
   };
 
@@ -310,6 +315,15 @@ static char* parseCommandLine(int argc, char** argv) {
                 }
                 case OPT_MT_PARTITION_NODE_WEIGHT: sscanf(optarg, "%d", &globalConfig.MtPartitionNodeWeight); break;
                 case OPT_MT_SCHEDULE_GLOBAL_WEIGHT: sscanf(optarg, "%d", &globalConfig.MtScheduleGlobalWeight); break;
+                case OPT_MT_LOOKAHEAD: {
+                  int lookahead = -1;
+                  if (sscanf(optarg, "%d", &lookahead) != 1 || lookahead < 0 || lookahead > 65535) {
+                    fprintf(stderr, "Error: --mt-lookahead expects a number in [0, 65535], got '%s'.\n", optarg);
+                    _exit(EXIT_FAILURE);
+                  }
+                  globalConfig.MtLookahead = lookahead;
+                  break;
+                }
                 default: printUsage(argv[0]); std::cout.flush(); fflush(nullptr); _exit(EXIT_SUCCESS);
               }
               break;
