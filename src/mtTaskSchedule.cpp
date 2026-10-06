@@ -213,9 +213,14 @@ size_t mtReduceCrossWorkerTokens(std::vector<MtTask>& tasks) {
       }
     }
   }
+  // With bounded lookahead a worker may execute a later chain entry before an
+  // earlier one, so the synthetic previous->next chain edges are no longer
+  // enforced ordering. Transitivity through them would be unsound (measured:
+  // combining chain-edge reduction with lookahead fails a design assertion).
+  // Restrict the reduction to cross-worker-edge transitivity only.
   int maxWorker = -1;
   for (const MtTask& task : tasks) maxWorker = std::max(maxWorker, task.owner);
-  if (maxWorker >= 0) {
+  if (maxWorker >= 0 && globalConfig.MtLookahead <= 0) {
     std::vector<int> previousOnWorker(static_cast<size_t>(maxWorker) + 1, -1);
     for (int taskId = 0; taskId < taskCount; ++taskId) {
       const int worker = tasks[static_cast<size_t>(taskId)].owner;
