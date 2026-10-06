@@ -8,6 +8,7 @@ struct Config {
   bool DumpAssignTree;
   bool DumpConstStatus;
   bool MtMode;
+  bool MtReduceTokens;
   std::string OutputDir;
   int SuperNodeMaxSize;
   uint32_t cppMaxSizeKB;

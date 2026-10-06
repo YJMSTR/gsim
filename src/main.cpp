@@ -65,6 +65,7 @@ Config::Config() {
   DumpAssignTree = false;
   DumpConstStatus = false;
   MtMode = false;
+  MtReduceTokens = false;
   OutputDir = ".";
   SuperNodeMaxSize = 35;
   cppMaxSizeKB = -1;
@@ -150,6 +151,8 @@ static void printUsage(const char* ProgName) {
             << "      --dump-const-status          Dump per-node constant-analysis status before removing constants.\n"
             << "      --mt-mode=off|on             Select the C++ emitter mode.\n"
             << "                                   off: single-thread active (default); on: multithread dense.\n"
+            << "      --mt-reduce-tokens=[0|1]      Drop cross-worker token waits that another enforced\n"
+            << "                                   producer path already covers (default: 0).\n"
             << "      --mt-target-tasks=[num]      Target number of MTasks used for MT partitioning (default: 1600).\n"
             << "      --mt-partition-node-weight=[num]\n"
             << "                                   Fixed per-node weight in MT partition cost (default: 0).\n"
@@ -185,6 +188,7 @@ static char* parseCommandLine(int argc, char** argv) {
     OPT_DUMP_ASSIGN_TREE,
     OPT_DUMP_CONST_STATUS,
     OPT_MT_MODE,
+    OPT_MT_REDUCE_TOKENS,
     OPT_MT_TARGET_TASKS,
     OPT_MT_PARTITION_NODE_WEIGHT,
     OPT_MT_SCHEDULE_GLOBAL_WEIGHT,
@@ -209,6 +213,7 @@ static char* parseCommandLine(int argc, char** argv) {
       {"dump-assign-tree", no_argument, nullptr, 0},
       {"dump-const-status", no_argument, nullptr, 0},
       {"mt-mode", required_argument, nullptr, 0},
+      {"mt-reduce-tokens", required_argument, nullptr, 0},
       {"mt-target-tasks", required_argument, nullptr, 0},
       {"mt-partition-node-weight", required_argument, nullptr, 0},
       {"mt-schedule-global-weight", required_argument, nullptr, 0},
@@ -295,6 +300,13 @@ static char* parseCommandLine(int argc, char** argv) {
                     _exit(EXIT_FAILURE);
                   }
                   globalConfig.MtMode = strcmp(optarg, "on") == 0;
+                  break;
+                case OPT_MT_REDUCE_TOKENS:
+                  if (strcmp(optarg, "0") != 0 && strcmp(optarg, "1") != 0) {
+                    fprintf(stderr, "Error: --mt-reduce-tokens expects 0 or 1, got '%s'.\n", optarg);
+                    _exit(EXIT_FAILURE);
+                  }
+                  globalConfig.MtReduceTokens = strcmp(optarg, "1") == 0;
                   break;
                 case OPT_MT_TARGET_TASKS: {
                   int targetTasks = 0;

@@ -188,6 +188,108 @@ int countResetChunks(const std::vector<Instruction>& body, int chunkSize) {
   return chunks;
 }
 
+// Transitive reduction of the cross-worker token DAG, ported from the dense
+// runtime emitter (mtReduceDenseRuntimeSuccsTransitive). A cross-worker edge
+// producer->consumer is redundant when the producer has another enforced
+// successor path to the same consumer: either another cross-worker consumer
+// whose own dependency cone already reaches this consumer, or the producer's
+// worker chain, where a chained task's token store happens after its own
+// waits fire. The successor-set test below keeps every path the original
+// graph enforced, so dropping the redundant wait cannot let a consumer run
+// ahead of any producer. Returns the number of cross-worker edges removed.
+size_t mtReduceCrossWorkerTokens(std::vector<MtTask>& tasks) {
+  const int taskCount = static_cast<int>(tasks.size());
+  if (taskCount <= 1) return 0;
+
+  // Effective successors: the original cross-worker edges plus the synthetic
+  // previous->next chain of each worker. A worker executes its chain strictly
+  // in program order, so chain edges are enforced without any token.
+  std::vector<std::vector<int>> effectiveSuccs(static_cast<size_t>(taskCount));
+  for (int from = 0; from < taskCount; ++from) {
+    const int owner = tasks[static_cast<size_t>(from)].owner;
+    for (int succ : tasks[static_cast<size_t>(from)].successors) {
+      if (tasks[static_cast<size_t>(succ)].owner != owner) {
+        effectiveSuccs[static_cast<size_t>(from)].push_back(succ);
+      }
+    }
+  }
+  int maxWorker = -1;
+  for (const MtTask& task : tasks) maxWorker = std::max(maxWorker, task.owner);
+  if (maxWorker >= 0) {
+    std::vector<int> previousOnWorker(static_cast<size_t>(maxWorker) + 1, -1);
+    for (int taskId = 0; taskId < taskCount; ++taskId) {
+      const int worker = tasks[static_cast<size_t>(taskId)].owner;
+      if (worker < 0 || worker > maxWorker) continue;
+      const int previous = previousOnWorker[static_cast<size_t>(worker)];
+      if (previous >= 0) effectiveSuccs[static_cast<size_t>(previous)].push_back(taskId);
+      previousOnWorker[static_cast<size_t>(worker)] = taskId;
+    }
+  }
+  for (std::vector<int>& succs : effectiveSuccs) {
+    std::sort(succs.begin(), succs.end());
+    succs.erase(std::unique(succs.begin(), succs.end()), succs.end());
+  }
+  // Task ids are a topological order; anything else means the schedule above
+  // changed shape, and then the reachability sweep below is not valid.
+  for (int from = 0; from < taskCount; ++from) {
+    for (int succ : effectiveSuccs[static_cast<size_t>(from)]) {
+      if (succ <= from || succ >= taskCount) return 0;
+    }
+  }
+
+  const size_t wordCount = (static_cast<size_t>(taskCount) + 63) / 64;
+  std::vector<std::vector<uint64_t>> reachable(static_cast<size_t>(taskCount),
+                                               std::vector<uint64_t>(wordCount, 0));
+  auto setReachable = [&](int from, int to) {
+    reachable[static_cast<size_t>(from)][static_cast<size_t>(to) >> 6] |=
+        (uint64_t{1} << (to & 63));
+  };
+  auto isReachable = [&](int from, int to) -> bool {
+    return (reachable[static_cast<size_t>(from)][static_cast<size_t>(to) >> 6] &
+            (uint64_t{1} << (to & 63))) != 0;
+  };
+  for (int from = taskCount - 1; from >= 0; --from) {
+    for (int succ : effectiveSuccs[static_cast<size_t>(from)]) {
+      setReachable(from, succ);
+      for (size_t word = 0; word < wordCount; ++word) {
+        reachable[static_cast<size_t>(from)][word] |=
+            reachable[static_cast<size_t>(succ)][word];
+      }
+    }
+  }
+
+  size_t removed = 0;
+  for (int from = 0; from < taskCount; ++from) {
+    const int owner = tasks[static_cast<size_t>(from)].owner;
+    std::vector<int> keptSuccessors;
+    keptSuccessors.reserve(tasks[static_cast<size_t>(from)].successors.size());
+    for (int succ : tasks[static_cast<size_t>(from)].successors) {
+      if (tasks[static_cast<size_t>(succ)].owner != owner) {
+        bool redundant = false;
+        for (int alt : effectiveSuccs[static_cast<size_t>(from)]) {
+          if (alt == succ) continue;
+          if (isReachable(alt, succ)) {
+            redundant = true;
+            break;
+          }
+        }
+        if (redundant) {
+          std::vector<int>& predecessors = tasks[static_cast<size_t>(succ)].predecessors;
+          const auto entry = std::find(predecessors.begin(), predecessors.end(), from);
+          Assert(entry != predecessors.end(),
+                 "cross-worker edge %d -> %d missing from the predecessor map", from, succ);
+          predecessors.erase(entry);
+          ++removed;
+          continue;
+        }
+      }
+      keptSuccessors.push_back(succ);
+    }
+    tasks[static_cast<size_t>(from)].successors.swap(keptSuccessors);
+  }
+  return removed;
+}
+
 
 }  // namespace
 
@@ -411,6 +513,21 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
       if (lhsTrigger != rhsTrigger) return lhsTrigger < rhsTrigger;
       return lhs.resetId < rhs.resetId;
     });
+  }
+
+  // Optional transitive reduction of the cross-worker predecessor edges,
+  // before they collapse into per-owner token groups below. With the flag off
+  // nothing here runs and the generated token layout is byte-identical.
+  if (globalConfig.MtReduceTokens) {
+    size_t tokenEdges = 0;
+    for (const MtTask& task : tasks.tasks_) {
+      for (int succ : task.successors) {
+        if (tasks.tasks_[static_cast<size_t>(succ)].owner != task.owner) ++tokenEdges;
+      }
+    }
+    const size_t dropped = mtReduceCrossWorkerTokens(tasks.tasks_);
+    fprintf(stderr, "[cppEmitter-mt] token-reduce: edges=%zu -> reduced=%zu dropped=%zu\n",
+            tokenEdges, tokenEdges - dropped, dropped);
   }
 
   struct TokenGroup {

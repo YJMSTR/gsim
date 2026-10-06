@@ -495,6 +495,7 @@ task 内局部中间量使用 `T value{};` 值初始化。部分 external/memory
 | 配置 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--mt-mode=on` | `off` | 启用 MT 代码生成 |
+| `--mt-reduce-tokens=1` | `0` | Transitive reduction of cross-worker token edges; default-off keeps generated output byte-identical |
 | `GSIM_THREADS` | `1` | 烘焙进生成模型的 worker 数 |
 | `--mt-target-tasks=N` | `1600` | 期望 MTask 数，软限制 |
 | `--mt-partition-node-weight=N` | `0` | 划分成本中每个节点的固定权重 |
@@ -517,6 +518,15 @@ task 内局部中间量使用 `T value{};` 值初始化。部分 external/memory
 `GSIM_MT_DENSE_UNPIN_SPECIAL`、`GSIM_MT_WORKER_POOL_FLAG_JOIN` 等开关不再读取。
 `GSIM_MT_DENSE_LOOKAHEAD` 是有意删除的：worker 内乱序与隐含顺序不兼容。
 `--mt-target-tasks` 是当前 MTask 划分使用的目标任务数参数，默认值为 `1600`。
+
+`--mt-reduce-tokens=1` applies a transitive reduction to the cross-worker
+predecessor edges before the per-owner token groups are formed: a consumer's
+wait on a producer group is dropped when another enforced path (a token the
+consumer already waits on, or the producer's own worker chain, where a
+chained task's token store happens after its own waits fire) already orders
+it after that producer. Enabled runs print one
+`[cppEmitter-mt] token-reduce: edges=E -> reduced=R dropped=D` line on stderr.
+The default (`0`) changes nothing, so generated output stays byte-identical.
 
 ## 10. 构建与运行
 
