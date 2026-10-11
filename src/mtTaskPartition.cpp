@@ -756,6 +756,16 @@ void MtTaskPartitioner::useDirectDependencies(graph& graph) {
     for (Node* node : super->member) {
       node->depPrev = node->prev;
       node->depNext = node->next;
+      // FIX (2026-10-12): the raw-dataflow reset discards the async-reset
+      // ordering edges installed by Node::updateDep() (reset condition and
+      // init value must be evaluated before the register update and before
+      // the register's consumers). Without them, a consumer or update can
+      // read the previous cycle's reset value on assert/release transition
+      // cycles, causing deterministic cycle-exact divergence (XiangShan
+      // coremark instrCnt@50K: 68768 vs reference 67944). Restore them.
+      if (node->type == NODE_REG_SRC && node->reset == ASYRESET) {
+        node->updateDep();
+      }
     }
   }
 }
