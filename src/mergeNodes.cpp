@@ -213,6 +213,22 @@ void graph::when2mux() {
 }
 
 void graph::mergeResetAll() {
+  // FIX (2026-10-12): the MT async-reset speculation (in-cycle evaluation
+  // without the reset mux + cycle-end check/apply/replay) is not
+  // cycle-exact: during reset-asserted cycles the replay leaves state that
+  // diverges from the netlist semantics deterministically (XiangShan coremark
+  // instrCnt@50K 68768 vs 67944 reference; first-bad commit cc6aa35).
+  // In a cycle-stepped evaluator, resets can only change between steps, so
+  // ASYRESET is exactly equivalent to UINTRESET there. Route MT async-reset
+  // registers through the synchronous-reset machinery and retire the
+  // speculation entirely. The serial emitter keeps true async semantics.
+  if (globalConfig.MtMode) {
+    for (Node* reg : regsrc) {
+      if (reg->status == VALID_NODE && reg->reset == ASYRESET) {
+        reg->reset = UINTRESET;
+      }
+    }
+  }
   std::map<Node*, std::pair<SuperNode*, SuperNode*>> resetSuper; // node as uint / async reset
   for (Node* reg : regsrc) {
     if (reg->reset != UINTRESET && reg->reset != ASYRESET) continue;
