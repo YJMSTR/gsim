@@ -27,18 +27,44 @@ static void mtDenseAddEdge(MtDenseSchedule& schedule,
   }
 }
 
-static void mtDenseAddSuperEdges(MtDenseSchedule& schedule,
-                                 std::vector<std::set<int>>& succSets,
-                                 std::vector<std::set<int>>& predSets,
-                                 std::set<std::tuple<int, int, std::string>>& edgeKinds,
-                                 int fromCppId, const std::set<SuperNode*>& supers,
-                                 const std::string& kind) {
-  for (SuperNode* super : supers) {
-    if (super && super->cppId >= 0) {
-      mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, fromCppId, super->cppId, kind);
+static bool mtDensePendingMemOrderEdge(const Node* from, const Node* to) {
+  if (from == nullptr || to == nullptr || from->type != NODE_READER ||
+      to->type != NODE_WRITER || from->parent == nullptr ||
+      from->parent != to->parent ||
+      from->memOrderNext.find(const_cast<Node*>(to)) == from->memOrderNext.end()) {
+    return false;
+  }
+  if (mtDensePendingMemPost()) {
+    return to->parent->extraInfo != "new" &&
+           mtDensePendingMemSingleWriter(to->parent, to);
+  }
+  return mtDensePendingMemWriterCandidate(to);
+}
+
+// A super-level pair may carry several node-level relations. Drop it only if
+// every relation in both next and depNext is an explicitly marked, staged
+// memory-order edge. This preserves signal, reset, and other dependency edges
+// even when they share the same supernode pair.
+static bool mtDenseSuperPairOnlyPendingMemOrder(const SuperNode* from,
+                                                const SuperNode* to) {
+  if (from == nullptr || to == nullptr) return false;
+  bool sawRelation = false;
+  for (Node* source : from->member) {
+    if (source == nullptr) continue;
+    for (Node* successor : source->next) {
+      if (successor == nullptr || successor->super != to) continue;
+      sawRelation = true;
+      if (!mtDensePendingMemOrderEdge(source, successor)) return false;
+    }
+    for (Node* successor : source->depNext) {
+      if (successor == nullptr || successor->super != to) continue;
+      sawRelation = true;
+      if (!mtDensePendingMemOrderEdge(source, successor)) return false;
     }
   }
+  return sawRelation;
 }
+
 
 // faithful Verilator V3OrderParallel edge contraction on the SCC DAG. The key detail that
 // makes contraction tractable (missed by budget-limited BFS that gave 3.2M false cycle
@@ -1165,14 +1191,48 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
   std::set<std::tuple<int, int, std::string>> edgeKinds;
 
   {
-  // Phase 1: Add dependency edges only.
   EmitPhaseTimer edgesTimer("Final.denseSched.edges");
+  // Phase 1: Add dependency edges only. A staged read-old memory is stable
+  // during the cycle, so its explicit reader->writer order edge is removable.
+  // The filter is provenance-based and conservative: both next and depNext
+  // must contain only marked memory-order pairs for a super pair to drop.
+  const bool pendingMem = (mtDensePendingMemEnabled() || mtDensePendingMemEdgeOnly()) &&
+                          !mtDensePendingMemPost();
+  size_t pendingMemOrderEdges = 0;
+  size_t pendingMemFilteredPairs = 0;
+  if (pendingMem) {
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      auto sourceIter = cppId2Super.find(cppId);
+      if (sourceIter == cppId2Super.end() || sourceIter->second == nullptr) continue;
+      for (Node* source : sourceIter->second->member) {
+        if (source == nullptr) continue;
+        for (Node* target : source->memOrderNext) {
+          if (mtDensePendingMemOrderEdge(source, target)) pendingMemOrderEdges ++;
+        }
+      }
+    }
+  }
   for (int cppId = 0; cppId < superId; cppId ++) {
     auto superIter = cppId2Super.find(cppId);
     if (superIter == cppId2Super.end() || !superIter->second) continue;
     SuperNode* super = superIter->second;
-    mtDenseAddSuperEdges(schedule, succSets, predSets, edgeKinds, cppId, super->next, "dependency");
-    mtDenseAddSuperEdges(schedule, succSets, predSets, edgeKinds, cppId, super->depNext, "dependency");
+    std::set<SuperNode*> dependencyTargets = super->next;
+    dependencyTargets.insert(super->depNext.begin(), super->depNext.end());
+    for (SuperNode* target : dependencyTargets) {
+      if (pendingMem && mtDenseSuperPairOnlyPendingMemOrder(super, target)) {
+        pendingMemFilteredPairs ++;
+        continue;
+      }
+      if (target == nullptr) continue;
+      if (super->next.find(target) != super->next.end())
+        mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, target->cppId, "dependency");
+      if (super->depNext.find(target) != super->depNext.end())
+        mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, target->cppId, "dependency");
+    }
+  }
+  if (pendingMem) {
+    fprintf(stderr, "[mt-dense] pending-mem marked-old-order-edges=%zu filtered-super-pairs=%zu\n",
+            pendingMemOrderEdges, pendingMemFilteredPairs);
   }
 
   // When GSIM_MT_DENSE_FORWARD_ACTIVATION_ONLY=1, compute a dependency-only
@@ -1632,6 +1692,87 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
       }
     } else {
       schedule.mtasks = mtBuildDenseMTasks(schedule, mtUseDenseSplitWorker0MTasks());
+    }
+    // Post-contraction memory-order edge removal (GSIM_MT_DENSE_PENDING_MEM_POST=1):
+    // the contraction above ran on the FULL champion edge set, so the MTask shape is
+    // byte-identical to the champion schedule. Only now do we drop MTask-level edges
+    // whose every underlying supernode relation is a provenance-marked reader->writer
+    // memory-order edge of a staged single-writer read-old memory, and stage exactly
+    // those writers. Pre-contraction removal was refuted (12488->18180 MTasks).
+    if (mtDensePendingMemPost()) {
+      const int nM = static_cast<int>(schedule.mtasks.size());
+      std::set<int> stagedWriterIds;
+      int droppedEdges = 0;
+      auto superOfScc = [&](int sccId) -> SuperNode* {
+        if (sccId < 0 || sccId >= static_cast<int>(schedule.sccs.size())) return nullptr;
+        const MtDenseScc& scc = schedule.sccs[(size_t)sccId];
+        if (scc.cppIds.empty()) return nullptr;
+        auto it = cppId2Super.find(scc.cppIds[0]);
+        return it == cppId2Super.end() ? nullptr : it->second;
+      };
+      // Pair purity at MTask level: every node-level relation from any member of
+      // `from` to any member of `to` must be a marked staged memory-order edge.
+      auto mtaskPairPure = [&](const MtDenseMTask& fm, const MtDenseMTask& tm) -> bool {
+        bool sawRelation = false;
+        for (int sccA : fm.sccIds) {
+          SuperNode* supA = superOfScc(sccA);
+          if (supA == nullptr) continue;
+          for (Node* src : supA->member) {
+            if (src == nullptr) continue;
+            for (Node* dst : src->next) {
+              if (dst == nullptr || dst->super == nullptr || dst->super->cppId < 0) continue;
+              bool inTo = false;
+              for (int sccB : tm.sccIds) {
+                SuperNode* supB = superOfScc(sccB);
+                if (supB == dst->super) { inTo = true; break; }
+              }
+              if (!inTo) continue;
+              sawRelation = true;
+              if (!mtDensePendingMemOrderEdge(src, dst)) return false;
+            }
+            for (Node* dst : src->depNext) {
+              if (dst == nullptr || dst->super == nullptr || dst->super->cppId < 0) continue;
+              bool inTo = false;
+              for (int sccB : tm.sccIds) {
+                SuperNode* supB = superOfScc(sccB);
+                if (supB == dst->super) { inTo = true; break; }
+              }
+              if (!inTo) continue;
+              sawRelation = true;
+              if (!mtDensePendingMemOrderEdge(src, dst)) return false;
+            }
+          }
+        }
+        return sawRelation;
+      };
+      for (int mi = 0; mi < nM; mi ++) {
+        MtDenseMTask& fm = schedule.mtasks[(size_t)mi];
+        std::vector<int> keptSuccs;
+        keptSuccs.reserve(fm.succMTasks.size());
+        for (int succ : fm.succMTasks) {
+          if (succ < 0 || succ >= nM || succ == mi) { if (succ >= 0) keptSuccs.push_back(succ); continue; }
+          const MtDenseMTask& tm = schedule.mtasks[(size_t)succ];
+          if (!mtaskPairPure(fm, tm)) { keptSuccs.push_back(succ); continue; }
+          droppedEdges ++;
+          // Stage every writer reached by the dropped relations.
+          for (int sccA : fm.sccIds) {
+            SuperNode* supA = superOfScc(sccA);
+            if (supA == nullptr) continue;
+            for (Node* src : supA->member) {
+              if (src == nullptr) continue;
+              for (Node* dst : src->next) {
+                if (dst != nullptr && mtDensePendingMemOrderEdge(src, dst)) stagedWriterIds.insert(dst->id);
+              }
+            }
+          }
+          auto& predList = schedule.mtasks[(size_t)succ].predMTasks;
+          predList.erase(std::remove(predList.begin(), predList.end(), mi), predList.end());
+        }
+        fm.succMTasks.swap(keptSuccs);
+      }
+      mtDensePendingMemSetStagedWriters(stagedWriterIds);
+      fprintf(stderr, "[mt-dense] pending-mem post-contraction dropped-mtask-edges=%d staged-writers=%zu\n",
+              droppedEdges, stagedWriterIds.size());
     }
     // Executes each worker's MTasks in schedule order (Verilator static per-worker chain). Only
     // reorders ids; keeps topo-monotonicity. Also sets the assignment from the scheduler.

@@ -14,6 +14,23 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   const char* threadsEnv = std::getenv("GSIM_THREADS");
   if (threadsEnv != nullptr && threadsEnv[0] != '\0') threadCount = std::atoi(threadsEnv);
   if (threadCount < 1) threadCount = 1;
+  std::vector<Node*> densePendingWriters;
+  if ((mtDensePendingMemEnabled() && !mtDensePendingMemEdgeOnly()) || mtDensePendingMemPost()) {
+    std::set<int> seenPendingWriterIds;
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter == cppId2Super.end() || superIter->second == nullptr) continue;
+      for (Node* member : superIter->second->member) {
+        const bool stage = mtDensePendingMemPost() ? mtDensePendingMemWriterStaged(member)
+                            : mtDensePendingMemWriterCandidate(member);
+        if (member == nullptr || !stage) continue;
+        if (seenPendingWriterIds.insert(member->id).second) densePendingWriters.push_back(member);
+      }
+    }
+    std::sort(densePendingWriters.begin(), densePendingWriters.end(),
+              [](const Node* lhs, const Node* rhs) { return lhs->id < rhs->id; });
+    fprintf(stderr, "[mt-dense] pending-mem eligible single writers=%zu\n", densePendingWriters.size());
+  }
   bool xthreadDepsOnly = mtUseDenseXThreadDepsOnly();
   bool transitiveReduceEdges = mtUseDenseTransitiveReduceEdges();
   bool staticEmptyElide = mtUseDenseStaticEmptyElide();
@@ -443,6 +460,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "#endif\n");
   }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
+  for (Node* writer : densePendingWriters) {
+    fprintf(header, "uint64_t %s = 0; uint64_t %s = 0; uint8_t %s = 0;\n",
+            mtDensePendingMemAddressName(writer).c_str(),
+            mtDensePendingMemDataName(writer).c_str(),
+            mtDensePendingMemValidName(writer).c_str());
+  }
+  if (!densePendingWriters.empty()) {
+    fprintf(header, "void commitDensePendingMem();\n");
+  }
   for (int i = 0; i < nMTasks; i++) fprintf(header, "void stepDenseMTask%d();\n", i);
   bool workerMajorText = mtUseDenseWorkerMajorText();
   std::vector<int> denseMTaskEmissionOrder;
@@ -519,6 +545,19 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
 
   auto emitFixedDenseThreadWorker = [&](const char* funcName) {
+    if (!densePendingWriters.empty()) {
+      emitFuncDecl(0, "void S%s::commitDensePendingMem() {\n", name.c_str());
+      for (Node* writer : densePendingWriters) {
+        Node* memory = writer->parent;
+        const std::string valid = mtDensePendingMemValidName(writer);
+        const std::string address = mtDensePendingMemAddressName(writer);
+        const std::string data = mtDensePendingMemDataName(writer);
+        emitBodyLock(1, "if (%s) { %s[%s] = (%s)%s; %s = 0; }\n",
+                     valid.c_str(), memory->name.c_str(), address.c_str(),
+                     widthUType(memory->width).c_str(), data.c_str(), valid.c_str());
+      }
+      emitBodyLock(0, "}\n");
+    }
     emitFuncDecl(0, "void S%s::%s(int threadId) {\n", name.c_str(), funcName);
     if (denseBreakdownWindowCodegen) {
       emitBodyLock(1, "const int mtDenseBreakdownWindowSlot = mtDenseBreakdownWindowCurrentSlot;\n");
@@ -989,6 +1028,7 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
 
   if (denseDuty) emitBodyLock(2, "std::chrono::steady_clock::time_point mtDutyJoinBegin; if (mtDutyEnabled) mtDutyJoinBegin = std::chrono::steady_clock::now();\n");
   emitBodyLock(2, "mtWorkerPoolWaitForDone(mtConfiguredWorkerCount - 1);\n");
+  if (!densePendingWriters.empty()) emitBodyLock(2, "commitDensePendingMem();\n");
   if (denseDuty) emitBodyLock(2, "if (mtDutyEnabled) mtDutyLanes[%d].joinNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - mtDutyJoinBegin).count();\n", threadCount);
   if (denseBreakdownWindowCodegen) {
     emitBodyLock(2, "if (unlikely(mtDenseBreakdownProfileInCycle && mtDenseBreakdownWindowCausalChainMode)) {\n");

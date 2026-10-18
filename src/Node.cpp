@@ -30,6 +30,7 @@ void Node::updateConnect() {
     for (Node* port : memory->member) {
       if (port->type == NODE_WRITER) {
         addNext(port);
+        memOrderNext.insert(port);
         port->addPrev(this);
       }
     }
@@ -38,6 +39,7 @@ void Node::updateConnect() {
     for (Node* port : memory->member) {
       if (port->type == NODE_READER) {
         addPrev(port);
+        memOrderNext.insert(port);
         port->addNext(this);
       }
     }

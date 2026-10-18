@@ -1329,14 +1329,21 @@ valInfo* ENode::instsReadMem(Node* node, std::string lvalue, bool isRoot) {
   valInfo* ret = computeInfo;
   Assert(node->type == NODE_READER || node->type == NODE_READWRITER, "invalid type %d", node->type);
   Node* memory = memoryNode;
-  ret->valStr = memory->name + "[" + ChildInfo(0, valStr) + "]";
+  const std::string address = ChildInfo(0, valStr);
+  std::string readExpr = memory->name + "[" + address + "]";
+  std::string indexStr;
   for (size_t i = 0; i < memory->dimension.size(); i ++) {
+    indexStr += "[i" + std::to_string(i) + "]";
     computeInfo->valStr += "[i" + std::to_string(i) + "]";
   }
+  readExpr += indexStr;
+
+  ret->valStr = readExpr;
 
   if (memory->width > width) {
     ret->valStr = format("(%s & %s)", ret->valStr.c_str(), bitMask(width).c_str());
   }
+
   ret->opNum = 0;
   return ret;
 }
@@ -1351,6 +1358,23 @@ valInfo* ENode::instsWriteMem(Node* node, std::string lvalue, bool isRoot) {
     Assert(lvalue.compare(0, node->name.length(), node->name) == 0, "writer lvalue %s does not start with %s", lvalue.c_str(), node->name.c_str());
     indexStr = lvalue.substr(node->name.length());
   }
+  const bool pending = mtDensePendingMemPost() ? mtDensePendingMemWriterStaged(node)
+                       : (!mtDensePendingMemEdgeOnly() &&
+                          mtDensePendingMemEnabled() &&
+                          mtDensePendingMemWriterCandidate(node));
+  const bool pendingStaged = pending && !isSubArray(lvalue, node);
+  if (pendingStaged) {
+    std::string value = ChildInfo(1, valStr);
+    if (memory->width < width) value += " & " + bitMask(memory->width);
+    ret->valStr = mtDensePendingMemAddressName(node) + " = (uint64_t)(" +
+                  ChildInfo(0, valStr) + ");\n";
+    ret->valStr += mtDensePendingMemDataName(node) + " = (uint64_t)(" + value + ");\n";
+    ret->valStr += mtDensePendingMemValidName(node) + " = 1;";
+    ret->opNum = -1;
+    ret->type = TYPE_STMT;
+    return ret;
+  }
+
   if (isSubArray(lvalue, node)) {
     std::string arraylvalue = format("%s[%s]%s", memory->name.c_str(), ChildInfo(0, valStr).c_str(), indexStr.c_str());
     ret->valStr = arrayCopy(arraylvalue, node, Child(1, computeInfo), countArrayIndex(arraylvalue) - 1);

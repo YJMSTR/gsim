@@ -4,6 +4,8 @@
 #include <sys/time.h>
 #include <string>
 
+class Node;
+
 enum class ShiftDir{
   Left,
   Right,
@@ -22,6 +24,20 @@ std::string format(const char *fmt, ...);
 std::string bitMask(int width);
 std::string shiftBits(unsigned int bits, ShiftDir dir);
 std::string shiftBits(std::string bits, ShiftDir dir);
+
+// Dense-only staged memory write helpers. The generator, schedule builder,
+// and dense executor must agree on the exact scalar-writer eligibility set.
+bool mtDensePendingMemEdgeOnly();
+bool mtDensePendingMemPost();
+bool mtDensePendingMemWriterStaged(const Node* port);
+void mtDensePendingMemSetStagedWriters(const std::set<int>& nodeIds);
+bool mtDensePendingMemEnabled();
+bool mtDensePendingMemEligible(const Node* port);
+bool mtDensePendingMemSingleWriter(const Node* memory, const Node* port);
+bool mtDensePendingMemWriterCandidate(const Node* port);
+std::string mtDensePendingMemAddressName(const Node* port);
+std::string mtDensePendingMemDataName(const Node* port);
+std::string mtDensePendingMemValidName(const Node* port);
 void print_stacktrace();
 
 static inline struct timeval getTime() {

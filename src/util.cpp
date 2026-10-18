@@ -7,9 +7,9 @@
 #include <map>
 #include <iostream>
 #include "common.h"
+#include "Node.h"
 #include <execinfo.h>
 #include "util.h"
-
 /* convert firrtl constant to C++ constant 
    In the new FIRRTL spec, there are 'int' and 'rint'.*/
 std::pair<int, std::string> firStrBase(std::string s) {
@@ -151,6 +151,107 @@ std::string shiftBits(std:: string bits, ShiftDir dir){
     return "";
   return (dir == ShiftDir::Left? " << " : " >> ") + bits;
 }
+
+bool mtDensePendingMemEnabled() {
+  const char* value = std::getenv("GSIM_MT_DENSE_PENDING_MEM");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+bool mtDensePendingMemEdgeOnly() {
+  const char* value = std::getenv("GSIM_MT_DENSE_PENDING_MEM_EDGE_ONLY");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+bool mtDensePendingMemPost() {
+  const char* value = std::getenv("GSIM_MT_DENSE_PENDING_MEM_POST");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static std::set<int> g_mtDensePendingStagedWriterIds;
+
+bool mtDensePendingMemWriterStaged(const Node* port) {
+  return port != nullptr &&
+         g_mtDensePendingStagedWriterIds.find(port->id) != g_mtDensePendingStagedWriterIds.end();
+}
+
+void mtDensePendingMemSetStagedWriters(const std::set<int>& nodeIds) {
+  g_mtDensePendingStagedWriterIds = nodeIds;
+}
+
+bool mtDensePendingMemEligible(const Node* port) {
+  if (port == nullptr || port->status != VALID_NODE || port->parent == nullptr) return false;
+  if (port->type != NODE_WRITER && port->type != NODE_READWRITER) return false;
+  const Node* memory = port->parent;
+  return memory->type == NODE_MEMORY && port->dimension.empty() &&
+         memory->dimension.empty() && port->width > 0 && port->width <= 64 &&
+         memory->width > 0 && memory->width <= 64;
+}
+
+bool mtDensePendingMemSingleWriter(const Node* memory, const Node* port) {
+  if (memory == nullptr || memory->type != NODE_MEMORY || port == nullptr ||
+      port->parent != memory || !mtDensePendingMemEligible(port)) return false;
+  const Node* onlyWriter = nullptr;
+  for (const Node* member : memory->member) {
+    if (member == nullptr || member->status != VALID_NODE) continue;
+    if (member->type != NODE_WRITER && member->type != NODE_READWRITER) continue;
+    if (!mtDensePendingMemEligible(member)) return false;
+    if (onlyWriter != nullptr) return false;
+    onlyWriter = member;
+  }
+  return onlyWriter == port;
+}
+static bool mtDensePendingMemMarkedEdge(const Node* from, const Node* to) {
+  return from != nullptr && to != nullptr && from->type == NODE_READER &&
+         to->type == NODE_WRITER && from->parent != nullptr &&
+         from->parent == to->parent &&
+         from->memOrderNext.find(const_cast<Node*>(to)) != from->memOrderNext.end() &&
+         to->parent->extraInfo != "new" &&
+         mtDensePendingMemSingleWriter(to->parent, to);
+}
+
+static bool mtDensePendingMemPairOnly(const SuperNode* from, const SuperNode* to) {
+  if (from == nullptr || to == nullptr) return false;
+  bool saw = false;
+  for (Node* source : from->member) {
+    if (source == nullptr) continue;
+    for (Node* successor : source->next) {
+      if (successor == nullptr || successor->super != to) continue;
+      saw = true;
+      if (!mtDensePendingMemMarkedEdge(source, successor)) return false;
+    }
+    for (Node* successor : source->depNext) {
+      if (successor == nullptr || successor->super != to) continue;
+      saw = true;
+      if (!mtDensePendingMemMarkedEdge(source, successor)) return false;
+    }
+  }
+  return saw;
+}
+
+bool mtDensePendingMemWriterCandidate(const Node* port) {
+  if (!mtDensePendingMemSingleWriter(port ? port->parent : nullptr, port) ||
+      port->parent->extraInfo == "new" || port->super == nullptr) return false;
+  for (Node* reader : port->parent->member) {
+    if (reader == nullptr || reader->type != NODE_READER || reader->super == nullptr ||
+        reader->super == port->super) continue;
+    if (reader->memOrderNext.find(const_cast<Node*>(port)) == reader->memOrderNext.end()) continue;
+    if (mtDensePendingMemPairOnly(reader->super, port->super)) return true;
+  }
+  return false;
+}
+
+
+std::string mtDensePendingMemAddressName(const Node* port) {
+  return "__gsim_dense_pm_" + std::to_string(port->id) + "_addr";
+}
+
+std::string mtDensePendingMemDataName(const Node* port) {
+  return "__gsim_dense_pm_" + std::to_string(port->id) + "_data";
+}
+
+std::string mtDensePendingMemValidName(const Node* port) {
+  return "__gsim_dense_pm_" + std::to_string(port->id) + "_valid";
+}
+
 
 void print_stacktrace() {
   int size = 16;

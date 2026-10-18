@@ -124,6 +124,10 @@ class Node {
   /* adjacent */
   std::set<Node*> next;
   std::set<Node*> prev;
+  // Exact provenance for READER<->WRITER memory-order edges added by
+  // updateConnect. Scheduler optimizations must not infer this from the
+  // supernode-level adjacency, which may also contain signal/reset edges.
+  std::set<Node*> memOrderNext;
   /* dependent but not adjacent
    * e.g. reg_src -> node1; node2->reg_dst; then:
    * node1 is depPrev of reg_dst, as activeFlags of node1 must first be cleared before reg_dst is activated
