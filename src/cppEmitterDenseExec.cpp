@@ -459,6 +459,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "MtDenseMTaskVertex mtDenseMTaskVertices[%d];\n", nMTasks);
     fprintf(header, "#endif\n");
   }
+  const bool denseStatePhase = mtDenseStatePhaseEnabled() && !mtDenseStatePhaseNoRedirect();
+  if (denseStatePhase) {
+    fprintf(header, "static constexpr bool kDenseStatePhaseEnabled = true;\n");
+    for (int t = 0; t < threadCount; t ++) {
+      fprintf(header, "void stepDenseStateW%d();\n", t);
+    }
+    fprintf(header, "alignas(64) std::atomic<uint8_t> mtDenseStateDone[%d] = {};\n", std::max(1, threadCount - 1));
+    fprintf(header, "alignas(64) std::atomic<uint8_t> mtDenseStateGo{0};\n");
+  }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
   for (Node* writer : densePendingWriters) {
     fprintf(header, "uint64_t %s = 0; uint64_t %s = 0; uint8_t %s = 0;\n",
@@ -509,6 +518,76 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
                           std::chrono::steady_clock::now() - densePrologueBegin).count();
     fprintf(stderr, "[emit-phase] Final.densePrologue.total = %ld ms\n", prologueMs);
   }
+  std::vector<std::vector<InstInfo>> denseStateCopySpans;
+  if (denseStatePhase) {
+    // Build the pure-copy node set BEFORE parallel body emission: genSuperEval
+    // workers consult it to skip the redirected spans. A span is redirected
+    // iff it is EXACTLY BEG + one STR assigning from $NEXT + END; groups that
+    // fuse the copy with other statements (mport reads under last-connect,
+    // multi-assign when branches) stay in the compute body.
+    mtDenseStateRegSrcByName.clear();
+    for (const Node* reg : regsrc) {
+      if (reg != nullptr) mtDenseStateRegSrcByName[reg->name] = const_cast<Node*>(reg);
+    }
+    mtDenseStateCopyNodes.clear();
+    for (SuperNode* super : sortedSuper) {
+      if (super == nullptr) continue;
+      Node* collecting = nullptr;
+      int frameDepth = 0;
+      for (const InstInfo& inst : super->insts) {
+        if (inst.infoType == SUPER_INFO_IF) frameDepth ++;
+        else if (inst.infoType == SUPER_INFO_DEDENT) frameDepth --;
+        if (collecting != nullptr) {
+          denseStateCopySpans.back().push_back(inst);
+          if (inst.infoType == SUPER_INFO_ASSIGN_END && inst.node == collecting) {
+            const auto& span = denseStateCopySpans.back();
+            // Group-redirect: every middle inst is a STR and every STR is an
+            // identity copy (lvalue == rvalue modulo $NEXT). IF frames inside
+            // the group mean a conditional copy -> must stay in the body.
+            bool pureCopy = span.size() >= 3;
+            for (size_t i = 1; pureCopy && i + 1 < span.size(); i ++) {
+              if (span[i].infoType != SUPER_INFO_STR ||
+                  !mtDenseStateCopyStatement(span[i].inst)) pureCopy = false;
+            }
+            if (pureCopy) {
+              mtDenseStateCopyNodes.insert(collecting);
+            } else {
+              denseStateCopySpans.pop_back();
+            }
+            collecting = nullptr;
+          }
+          continue;
+        }
+        if (inst.infoType == SUPER_INFO_ASSIGN_BEG && inst.node != nullptr &&
+            inst.node->type == NODE_REG_SRC && inst.node->status == VALID_NODE &&
+            !inst.node->assignTree.empty() && inst.node->reset != ASYRESET) {
+          collecting = inst.node;
+          denseStateCopySpans.push_back(std::vector<InstInfo>());
+          denseStateCopySpans.back().push_back(inst);
+          continue;
+        }
+        // Bare-STR redirect: array members and activation-less registers emit
+        // their copies WITHOUT assign-group markers. Take identity-copy STRs
+        // that sit at frame depth 0 (unconditional in the original body).
+        if (inst.infoType == SUPER_INFO_STR && frameDepth == 0 &&
+            mtDenseStateCopyStatement(inst.inst)) {
+          // Bare-copy redirect, node-verified: the lhs must resolve to a
+          // VALID non-async-reset REG_SRC. The resolved node joins
+          // mtDenseStateCopyNodes so genSuperEval's skip (same set, same
+          // name map) is in lockstep with the slice content by construction.
+          Node* regSrc = mtDenseStateRegSrcForStatement(inst.inst);
+          if (regSrc != nullptr && regSrc->type == NODE_REG_SRC &&
+              regSrc->status == VALID_NODE && regSrc->reset != ASYRESET) {
+            mtDenseStateCopyNodes.insert(regSrc);
+            denseStateCopySpans.push_back(std::vector<InstInfo>());
+            denseStateCopySpans.back().push_back(inst);
+          }
+        }
+      }
+    }
+    fprintf(stderr, "[mt-dense] state-phase pure-copy nodes=%zu spans=%zu\n",
+            mtDenseStateCopyNodes.size(), denseStateCopySpans.size());
+  }
   {
   EmitPhaseTimer denseBodyTimer("Final.denseMTaskBodies");
   // Each stepDenseMTaskN body is an independent emission unit (reads frozen
@@ -545,6 +624,36 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
 
   auto emitFixedDenseThreadWorker = [&](const char* funcName) {
+    if (denseStatePhase) {
+      const std::vector<std::vector<InstInfo>>& spans = denseStateCopySpans;
+      std::vector<uint64_t> sliceLoad((size_t)threadCount, 0);
+      std::vector<std::vector<const std::vector<InstInfo>*>> sliceSpans((size_t)threadCount);
+      std::vector<size_t> spanOrder(spans.size());
+      for (size_t i = 0; i < spans.size(); i ++) spanOrder[i] = i;
+      std::sort(spanOrder.begin(), spanOrder.end(), [&](size_t a, size_t b) { return spans[a].size() > spans[b].size(); });
+      for (size_t si : spanOrder) {
+        size_t lightest = 0;
+        for (int t = 1; t < threadCount; t ++) if (sliceLoad[(size_t)t] < sliceLoad[lightest]) lightest = (size_t)t;
+        sliceLoad[lightest] += spans[si].size();
+        sliceSpans[lightest].push_back(&spans[si]);
+      }
+      for (int t = 0; t < threadCount; t ++) {
+        emitFuncDecl(0, "void S%s::stepDenseStateW%d() {\n", name.c_str(), t);
+        int spanIndent = 1;
+        for (const std::vector<InstInfo>* span : sliceSpans[(size_t)t]) {
+          for (const InstInfo& inst : *span) {
+            spanIndent = translateInst(inst, spanIndent, "activeFlags[0]", "", false);
+          }
+        }
+        emitBodyLock(0, "}\n");
+      }
+      size_t totalInsts = 0;
+      for (const auto& s : spans) totalInsts += s.size();
+      fprintf(stderr, "[mt-dense] state-phase slices=%d spans=%zu insts=%zu loads(min=%llu max=%llu)\n",
+              threadCount, spans.size(), totalInsts,
+              (unsigned long long)*std::min_element(sliceLoad.begin(), sliceLoad.end()),
+              (unsigned long long)*std::max_element(sliceLoad.begin(), sliceLoad.end()));
+    }
     if (!densePendingWriters.empty()) {
       emitFuncDecl(0, "void S%s::commitDensePendingMem() {\n", name.c_str());
       for (Node* writer : densePendingWriters) {
@@ -559,6 +668,27 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(0, "}\n");
     }
     emitFuncDecl(0, "void S%s::%s(int threadId) {\n", name.c_str(), funcName);
+    if (denseStatePhase) {
+      emitBodyLock(1, "switch (threadId) {\n");
+      for (int t = 0; t < threadCount; t ++) {
+        emitBodyLock(2, "case %d: stepDenseStateW%d(); break;\n", t, t);
+      }
+      emitBodyLock(2, "default: abort();\n");
+      emitBodyLock(1, "}\n");
+      emitBodyLock(1, "{ const uint8_t mtDenseStateTarget = (cycles & 1) ? uint8_t{1} : uint8_t{0};\n");
+      emitBodyLock(2, "if (threadId == 0) {\n");
+      emitBodyLock(3, "for (int mtDenseStateW = 1; mtDenseStateW < mtConfiguredWorkerCount; mtDenseStateW ++) {\n");
+      emitBodyLock(4, "unsigned mtDenseStateCt = 0;\n");
+      emitBodyLock(4, "while (mtDenseStateDone[mtDenseStateW - 1].load(std::memory_order_acquire) != mtDenseStateTarget) { mtWorkerPoolPause(); if (++mtDenseStateCt > 256) { mtDenseStateCt = 0; std::this_thread::yield(); } }\n");
+      emitBodyLock(3, "}\n");
+      emitBodyLock(3, "mtDenseStateGo.store(mtDenseStateTarget, std::memory_order_release);\n");
+      emitBodyLock(2, "} else {\n");
+      emitBodyLock(3, "mtDenseStateDone[threadId - 1].store(mtDenseStateTarget, std::memory_order_release);\n");
+      emitBodyLock(3, "unsigned mtDenseStateCt = 0;\n");
+      emitBodyLock(3, "while (mtDenseStateGo.load(std::memory_order_acquire) != mtDenseStateTarget) { mtWorkerPoolPause(); if (++mtDenseStateCt > 256) { mtDenseStateCt = 0; std::this_thread::yield(); } }\n");
+      emitBodyLock(2, "}\n");
+      emitBodyLock(1, "}\n");
+    }
     if (denseBreakdownWindowCodegen) {
       emitBodyLock(1, "const int mtDenseBreakdownWindowSlot = mtDenseBreakdownWindowCurrentSlot;\n");
       emitBodyLock(1, "const bool mtDenseBreakdownWindow = mtDenseBreakdownWindowSlot >= 0;\n");

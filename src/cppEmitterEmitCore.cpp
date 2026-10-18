@@ -681,7 +681,26 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
         }
       }
     } else {
+      const bool statePhaseSkip = mtDenseStatePhaseEnabled() && !mtDenseStatePhaseNoRedirect() &&
+                                  mtActivationEventTraceSuppressed;
+      Node* skipUntilEnd = nullptr;
+      int frameDepth = 0;
       for (InstInfo inst : super->insts) {
+        if (inst.infoType == SUPER_INFO_IF) frameDepth ++;
+        else if (inst.infoType == SUPER_INFO_DEDENT) frameDepth --;
+        if (skipUntilEnd != nullptr) {
+          if (inst.infoType == SUPER_INFO_ASSIGN_END && inst.node == skipUntilEnd) skipUntilEnd = nullptr;
+          continue;
+        }
+        if (statePhaseSkip && inst.infoType == SUPER_INFO_ASSIGN_BEG && mtDenseStatePhaseCopyNode(inst.node)) {
+          skipUntilEnd = inst.node;
+          continue;
+        }
+        if (statePhaseSkip && inst.infoType == SUPER_INFO_STR && frameDepth == 0 &&
+            mtDenseStateCopyStatement(inst.inst) &&
+            mtDenseStatePhaseCopyNode(mtDenseStateRegSrcForStatement(inst.inst))) {
+          continue;
+        }
         indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);
       }
     }

@@ -26,6 +26,8 @@ static void mtDenseAddEdge(MtDenseSchedule& schedule,
     predSets[(size_t)toCppId].insert(fromCppId);
   }
 }
+// GSIM_MT_DENSE_STATE_PHASE classification lives in util.cpp
+// (mtDenseStatePhaseEnabled / mtDenseStatePhaseSuperExcluded).
 
 static bool mtDensePendingMemOrderEdge(const Node* from, const Node* to) {
   if (from == nullptr || to == nullptr || from->type != NODE_READER ||
@@ -544,16 +546,8 @@ static std::vector<MtDenseMTask> mtBuildDenseMTasksVerilatorContract(const MtDen
   if (vcPhaseTiming) vcAccMaterialize.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now() - vcMaterializeBegin).count();
   emitPhaseAccumReport(vcAccInit);
-  emitPhaseAccumReport(vcAccLoop);
-  emitPhaseAccumReport(vcAccRecompute);
-  emitPhaseAccumReport(vcAccPath);
-  emitPhaseAccumReport(vcAccBestTwo);
-  emitPhaseAccumReport(vcAccRebuildPQ);
-  emitPhaseAccumReport(vcAccMergeApply);
-  emitPhaseAccumReport(vcAccMaterialize);
   return mtasks;
 }
-
 std::vector<MtDenseMTask> mtBuildDenseMTasks(const MtDenseSchedule& schedule,
                                                     bool preserveWorkerZeroOnlyBoundary) {
   const int nSccs = static_cast<int>(schedule.sccs.size());
@@ -1189,7 +1183,24 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
   std::vector<std::set<int>> succSets((size_t)superId);
   std::vector<std::set<int>> predSets((size_t)superId);
   std::set<std::tuple<int, int, std::string>> edgeKinds;
-
+  const bool statePhase = mtDenseStatePhaseEnabled();
+  std::vector<char> stateExcluded((size_t)superId, 0);
+  if (statePhase) {
+    // v2: NO graph-level exclusion (v1 dropped conditional copies of excluded
+    // supers: not in any MTask body, rejected by the slice collector -> those
+    // registers never committed; sp2b/sp3 froze at instrCnt=1). The
+    // emission-redirect alone is correct-by-construction: anything not
+    // provably movable stays in its body.
+    size_t pureCount = 0;
+    for (int cppId = 0; cppId < superId; cppId ++) {
+      auto superIter = cppId2Super.find(cppId);
+      if (superIter != cppId2Super.end() && mtDenseStatePhaseSuperExcluded(superIter->second)) {
+        pureCount ++;
+      }
+    }
+    fprintf(stderr, "[mt-dense] state-phase pure-commit supers (reported, NOT excluded)=%zu of %d\n",
+            pureCount, superId);
+  }
   {
   EmitPhaseTimer edgesTimer("Final.denseSched.edges");
   // Phase 1: Add dependency edges only. A staged read-old memory is stable
@@ -1215,6 +1226,7 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
   for (int cppId = 0; cppId < superId; cppId ++) {
     auto superIter = cppId2Super.find(cppId);
     if (superIter == cppId2Super.end() || !superIter->second) continue;
+    if (statePhase && stateExcluded[(size_t)cppId]) continue;
     SuperNode* super = superIter->second;
     std::set<SuperNode*> dependencyTargets = super->next;
     dependencyTargets.insert(super->depNext.begin(), super->depNext.end());
@@ -1224,6 +1236,7 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
         continue;
       }
       if (target == nullptr) continue;
+      if (statePhase && stateExcluded[(size_t)target->cppId]) continue;
       if (super->next.find(target) != super->next.end())
         mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, target->cppId, "dependency");
       if (super->depNext.find(target) != super->depNext.end())
@@ -1264,19 +1277,20 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
     }
     Assert(rankCounter == (size_t)superId, "dependency graph has cycles; cannot compute topo rank for forward-activation filter");
   }
-
-  // Phase 2: Add activation edges (filtered by topo rank if enabled).
   for (int cppId = 0; cppId < superId; cppId ++) {
+    if (statePhase && stateExcluded[(size_t)cppId]) continue;
     auto superIter = cppId2Super.find(cppId);
     if (superIter == cppId2Super.end() || !superIter->second) continue;
     SuperNode* super = superIter->second;
     for (Node* member : super->member) {
       if (!member) continue;
       for (int toCppId : member->nextActiveId) {
+        if (statePhase && stateExcluded[(size_t)toCppId]) continue;
         if (forwardActivationOnly && (depTopoRank[(size_t)cppId] >= depTopoRank[(size_t)toCppId])) continue;
         mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, toCppId, "active");
       }
       for (int toCppId : member->nextNeedActivate) {
+        if (statePhase && stateExcluded[(size_t)toCppId]) continue;
         if (forwardActivationOnly && (depTopoRank[(size_t)cppId] >= depTopoRank[(size_t)toCppId])) continue;
         mtDenseAddEdge(schedule, succSets, predSets, edgeKinds, cppId, toCppId, "need_activate");
       }
@@ -1296,6 +1310,7 @@ MtDenseSchedule buildMtDenseSchedule(const std::map<int, MtTaskInfo>& tasks, boo
   std::vector<int> order;
   order.reserve((size_t)superId);
   for (int start = 0; start < superId; start ++) {
+    if (statePhase && stateExcluded[(size_t)start]) continue;
     if (visited[(size_t)start]) continue;
     std::vector<std::pair<int, size_t>> stack;
     stack.push_back({start, 0});

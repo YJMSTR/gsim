@@ -272,6 +272,7 @@ struct MtDenseSchedule {
   std::vector<MtDenseMTask> mtasks;
   std::vector<int> mtaskThreadAssign;
   std::vector<int> topoSccOrder;
+  std::vector<int> statePhaseCppIds;  // GSIM_MT_DENSE_STATE_PHASE: pure register-commit supers excluded from the DAG (copies run in cycle-start state slices)
   std::vector<int> worker0OnlyCppIds;
   std::vector<int> alwaysActiveCppIds;
 };
@@ -572,4 +573,14 @@ std::vector<std::string>& mtResetChunkDecls();
 void emitActiveBufferDef(FILE* header, int activeWords);
 void emitActivationDeltaDef(FILE* header, int activeWords);
 void emitActivationEventTraceDef(FILE* header);
+
+// GSIM_MT_DENSE_STATE_PHASE: nodes whose assign span is a PURE x = x$NEXT copy
+// (exactly BEG + one $NEXT STR + END). Built once on the main thread by
+// genDenseExecutor before parallel emission; read-only afterwards.
+extern std::set<const Node*> mtDenseStateCopyNodes;
+extern std::map<std::string, Node*> mtDenseStateRegSrcByName;
+Node* mtDenseStateRegSrcForStatement(const std::string& text);
+bool mtDenseStatePhaseCopyNode(const Node* node);
+bool mtDenseStateCopyStatement(const std::string& text);
+bool mtDenseStatePhaseNoRedirect();
 #endif  // CPPEMITTER_IMPL_H

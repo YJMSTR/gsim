@@ -197,6 +197,65 @@ bool mtUseDenseElideObservability() {
   return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+std::set<const Node*> mtDenseStateCopyNodes;
+
+bool mtDenseStatePhaseCopyNode(const Node* node) {
+  return node != nullptr && mtDenseStateCopyNodes.find(node) != mtDenseStateCopyNodes.end();
+}
+
+// True iff a STR statement is an unconditional register-commit copy:
+// scalar/array form `x[.member] = x$NEXT[.member];` where stripping "$NEXT"
+// from the rvalue yields EXACTLY the lvalue (identity predicate excludes
+// compute reads like y = x$NEXT), or whole-array form
+// `memcpy(x, x$NEXT, ...)`. Callers must additionally ensure the statement
+// sits at frame depth 0 (no enclosing when-guard) and the register is not
+// async-reset.
+
+bool mtDenseStatePhaseNoRedirect() {
+  const char* value = std::getenv("GSIM_MT_DENSE_STATE_PHASE_NOREDIR");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+std::map<std::string, Node*> mtDenseStateRegSrcByName;
+
+Node* mtDenseStateRegSrcForStatement(const std::string& text) {
+  size_t eq = text.find('=');
+  if (eq == std::string::npos) return nullptr;
+  size_t b = text.find_first_not_of(" \t");
+  if (b == std::string::npos) return nullptr;
+  std::string lhs = text.substr(b, eq - b);
+  auto it = mtDenseStateRegSrcByName.find(lhs);
+  return it == mtDenseStateRegSrcByName.end() ? nullptr : it->second;
+}
+bool mtDenseStateCopyStatement(const std::string& text) {
+  auto trim = [](const std::string& s) {
+    size_t b = s.find_first_not_of(" \t");
+    size_t e = s.find_last_not_of(" \t;");
+    return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
+  };
+  auto norm = [](const std::string& s) {
+    // collapse the sep-aggr '$' variance at the $NEXT junction: x vs x$
+    size_t e = s.find_last_not_of('$');
+    return e == std::string::npos ? std::string() : s.substr(0, e + 1);
+  };
+  size_t eq = text.find('=');
+  if (eq == std::string::npos || text.find("==") != std::string::npos) return false;
+  std::string lhs = trim(text.substr(0, eq));
+  std::string rhs = trim(text.substr(eq + 1));
+  if (lhs.empty() || rhs.size() < 5 || rhs.compare(rhs.size() - 5, 5, "$NEXT") != 0) return false;
+  std::string prefix = rhs.substr(0, rhs.size() - 5);
+  if (text.compare(0, 7, "memcpy(") == 0) {
+    size_t comma = text.find(',', 7);
+    size_t comma2 = text.find(',', comma + 1);
+    if (comma == std::string::npos || comma2 == std::string::npos) return false;
+    std::string dst = trim(text.substr(7, comma - 7));
+    std::string src = trim(text.substr(comma + 1, comma2 - comma - 1));
+    if (src.size() < 5 || src.compare(src.size() - 5, 5, "$NEXT") != 0) return false;
+    return norm(src.substr(0, src.size() - 5)) == norm(dst);
+  }
+  return norm(prefix) == norm(lhs);
+}
+
 static bool mtDenseObservabilityNameClassified(const std::string& name) {
   if (name.rfind("logEndpoint__DOT__", 0) == 0) return true;
   if (name.find("perfCtrl") != std::string::npos || name.find("perfEvents") != std::string::npos ||

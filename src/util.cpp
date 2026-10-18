@@ -161,6 +161,34 @@ bool mtDensePendingMemEdgeOnly() {
   const char* value = std::getenv("GSIM_MT_DENSE_PENDING_MEM_EDGE_ONLY");
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
+bool mtDenseStatePhaseEnabled() {
+  const char* value = std::getenv("GSIM_MT_DENSE_STATE_PHASE");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// A pure register-commit super: every valid member is a NON-async-reset
+// NODE_REG_SRC whose assignTree carries the x = x$NEXT update copy. With
+// GSIM_MT_DENSE_STATE_PHASE=1 such supers leave the compute DAG; the copies
+// run in parallel cycle-start state slices behind an all-worker barrier
+// (upstream dev-mt's state-task architecture ported onto the dense executor).
+// Async-reset registers keep the in-DAG commit: async supers still write x
+// mid-cycle, so a cycle-start copy could clobber them.
+static bool mtDensePureCommitSuper(const SuperNode* super) {
+  if (super == nullptr || super->superType != SUPER_VALID) return false;
+  bool any = false;
+  for (const Node* member : super->member) {
+    if (member == nullptr || member->status != VALID_NODE) continue;
+    if (member->type != NODE_REG_SRC) return false;
+    if (member->assignTree.empty()) return false;  // no update copy here
+    if (member->reset == ASYRESET) return false;   // async path writes x mid-cycle
+    any = true;
+  }
+  return any;
+}
+
+bool mtDenseStatePhaseSuperExcluded(const SuperNode* super) {
+  return mtDenseStatePhaseEnabled() && mtDensePureCommitSuper(super);
+}
 bool mtDensePendingMemPost() {
   const char* value = std::getenv("GSIM_MT_DENSE_PENDING_MEM_POST");
   return value != nullptr && value[0] != '\0' && value[0] != '0';

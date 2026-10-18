@@ -5,6 +5,7 @@
 #include <string>
 
 class Node;
+class SuperNode;
 
 enum class ShiftDir{
   Left,
@@ -27,6 +28,8 @@ std::string shiftBits(std::string bits, ShiftDir dir);
 
 // Dense-only staged memory write helpers. The generator, schedule builder,
 // and dense executor must agree on the exact scalar-writer eligibility set.
+bool mtDenseStatePhaseEnabled();
+bool mtDenseStatePhaseSuperExcluded(const SuperNode* super);
 bool mtDensePendingMemEdgeOnly();
 bool mtDensePendingMemPost();
 bool mtDensePendingMemWriterStaged(const Node* port);
