@@ -682,7 +682,7 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
       }
     } else {
       const bool statePhaseSkip = mtDenseStatePhaseEnabled() && !mtDenseStatePhaseNoRedirect() &&
-                                  mtActivationEventTraceSuppressed;
+                                  !mtDenseStatePhaseNoReskip() && mtActivationEventTraceSuppressed;
       Node* skipUntilEnd = nullptr;
       int frameDepth = 0;
       for (InstInfo inst : super->insts) {
@@ -692,7 +692,8 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
           if (inst.infoType == SUPER_INFO_ASSIGN_END && inst.node == skipUntilEnd) skipUntilEnd = nullptr;
           continue;
         }
-        if (statePhaseSkip && inst.infoType == SUPER_INFO_ASSIGN_BEG && mtDenseStatePhaseCopyNode(inst.node)) {
+        if (statePhaseSkip && inst.infoType == SUPER_INFO_ASSIGN_BEG &&
+            mtDenseStateGroupSkipNodes.count(inst.node) > 0) {
           skipUntilEnd = inst.node;
           continue;
         }

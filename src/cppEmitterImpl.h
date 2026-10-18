@@ -578,9 +578,12 @@ void emitActivationEventTraceDef(FILE* header);
 // (exactly BEG + one $NEXT STR + END). Built once on the main thread by
 // genDenseExecutor before parallel emission; read-only afterwards.
 extern std::set<const Node*> mtDenseStateCopyNodes;
+extern std::set<const Node*> mtDenseStateGroupSkipNodes;
 extern std::map<std::string, Node*> mtDenseStateRegSrcByName;
-Node* mtDenseStateRegSrcForStatement(const std::string& text);
 bool mtDenseStatePhaseCopyNode(const Node* node);
-bool mtDenseStateCopyStatement(const std::string& text);
+Node* mtDenseStateRegSrcForStatement(const std::string& text);
 bool mtDenseStatePhaseNoRedirect();
+long mtDenseStatePhaseSkipLimit();
+bool mtDenseStatePhaseNoReskip();
+bool mtDenseStateCopyStatement(const std::string& text);
 #endif  // CPPEMITTER_IMPL_H

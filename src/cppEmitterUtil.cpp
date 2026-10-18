@@ -217,16 +217,34 @@ bool mtDenseStatePhaseNoRedirect() {
 }
 
 std::map<std::string, Node*> mtDenseStateRegSrcByName;
-
 Node* mtDenseStateRegSrcForStatement(const std::string& text) {
   size_t eq = text.find('=');
   if (eq == std::string::npos) return nullptr;
   size_t b = text.find_first_not_of(" \t");
   if (b == std::string::npos) return nullptr;
-  std::string lhs = text.substr(b, eq - b);
+  size_t e = text.find_last_not_of(" \t", eq - 1);
+  if (e == std::string::npos || e < b) return nullptr;
+  std::string lhs = text.substr(b, e - b + 1);
   auto it = mtDenseStateRegSrcByName.find(lhs);
   return it == mtDenseStateRegSrcByName.end() ? nullptr : it->second;
 }
+
+bool mtDenseStatePhaseNoReskip() {
+  const char* value = std::getenv("GSIM_MT_DENSE_STATE_PHASE_NORESKIP");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+long mtDenseStatePhaseSkipLimit() {
+  const char* value = std::getenv("GSIM_MT_DENSE_STATE_PHASE_SKIP_LIMIT");
+  if (value == nullptr || value[0] == '\0') return -1;
+  return std::atol(value);
+}
+
+// Nodes whose BEG..END spans are PURE identity-copy spans (safe to skip
+// wholesale). Distinct from mtDenseStateCopyNodes: a node collected via the
+// bare path may ALSO have a BEG span elsewhere that mixes in compute - that
+// span must NOT be swallowed.
+std::set<const Node*> mtDenseStateGroupSkipNodes;
 bool mtDenseStateCopyStatement(const std::string& text) {
   auto trim = [](const std::string& s) {
     size_t b = s.find_first_not_of(" \t");
@@ -234,7 +252,6 @@ bool mtDenseStateCopyStatement(const std::string& text) {
     return b == std::string::npos ? std::string() : s.substr(b, e - b + 1);
   };
   auto norm = [](const std::string& s) {
-    // collapse the sep-aggr '$' variance at the $NEXT junction: x vs x$
     size_t e = s.find_last_not_of('$');
     return e == std::string::npos ? std::string() : s.substr(0, e + 1);
   };
@@ -242,18 +259,26 @@ bool mtDenseStateCopyStatement(const std::string& text) {
   if (eq == std::string::npos || text.find("==") != std::string::npos) return false;
   std::string lhs = trim(text.substr(0, eq));
   std::string rhs = trim(text.substr(eq + 1));
-  if (lhs.empty() || rhs.size() < 5 || rhs.compare(rhs.size() - 5, 5, "$NEXT") != 0) return false;
-  std::string prefix = rhs.substr(0, rhs.size() - 5);
+  if (lhs.empty() || rhs.empty()) return false;
+  size_t pos = rhs.find("$NEXT");
+  if (pos == std::string::npos || pos == 0) return false;
   if (text.compare(0, 7, "memcpy(") == 0) {
     size_t comma = text.find(',', 7);
     size_t comma2 = text.find(',', comma + 1);
     if (comma == std::string::npos || comma2 == std::string::npos) return false;
     std::string dst = trim(text.substr(7, comma - 7));
     std::string src = trim(text.substr(comma + 1, comma2 - comma - 1));
-    if (src.size() < 5 || src.compare(src.size() - 5, 5, "$NEXT") != 0) return false;
-    return norm(src.substr(0, src.size() - 5)) == norm(dst);
+    size_t spos = src.find("$NEXT");
+    if (spos == std::string::npos || spos == 0) return false;
+    return norm(src.substr(0, spos)) + src.substr(spos + 5) == dst;
   }
-  return norm(prefix) == norm(lhs);
+  // Identity copy, general member form: rhs == base + "$NEXT" + memberSuffix
+  // and lhs == base + memberSuffix (modulo the sep-aggr '$' collapse at the
+  // junction). Covers scalar (suffix empty) and array/split members
+  // (`x_8 = x$NEXT_8`).
+  std::string prefix = rhs.substr(0, pos);
+  std::string suffix = rhs.substr(pos + 5);
+  return norm(prefix) + suffix == lhs;
 }
 
 static bool mtDenseObservabilityNameClassified(const std::string& name) {
