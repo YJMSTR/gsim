@@ -460,13 +460,26 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(header, "#endif\n");
   }
   const bool denseStatePhase = mtDenseStatePhaseEnabled() && !mtDenseStatePhaseNoRedirect();
+  const bool denseStateTokenPhase = denseStatePhase && mtDenseStatePhaseTokenized();
+  if (denseStateTokenPhase) {
+    Assert(ownerReadyFlags && denseLookahead,
+           "GSIM_MT_DENSE_STATE_PHASE_TOKENIZED requires owner-ready lookahead");
+    Assert(!mtUseDenseElideObservability() && !mtDenseStatePhaseNoReskip(),
+           "GSIM_MT_DENSE_STATE_PHASE_TOKENIZED is incompatible with observability elide or NORESKIP");
+  }
   if (denseStatePhase) {
     fprintf(header, "static constexpr bool kDenseStatePhaseEnabled = true;\n");
     for (int t = 0; t < threadCount; t ++) {
       fprintf(header, "void stepDenseStateW%d();\n", t);
     }
-    fprintf(header, "alignas(64) std::atomic<uint8_t> mtDenseStateDone[%d] = {};\n", std::max(1, threadCount - 1));
-    fprintf(header, "alignas(64) std::atomic<uint8_t> mtDenseStateGo{0};\n");
+    if (denseStateTokenPhase) {
+      for (int t = 0; t < threadCount; t ++) {
+        fprintf(header, "void stepDenseStateTailW%d(uint8_t target);\n", t);
+      }
+    } else {
+      fprintf(header, "alignas(64) std::atomic<uint8_t> mtDenseStateDone[%d] = {};\n", std::max(1, threadCount - 1));
+      fprintf(header, "alignas(64) std::atomic<uint8_t> mtDenseStateGo{0};\n");
+    }
   }
   fprintf(header, "void stepDenseThreadWorker(int threadId);\n");
   for (Node* writer : densePendingWriters) {
@@ -519,6 +532,28 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     fprintf(stderr, "[emit-phase] Final.densePrologue.total = %ld ms\n", prologueMs);
   }
   std::vector<std::vector<InstInfo>> denseStateCopySpans;
+  std::vector<const SuperNode*> denseStateCopySpanSupers;
+  std::vector<const Node*> denseStateCopySpanNodes;
+  std::vector<char> denseStateCopySpanGroups;
+  std::vector<int> denseStateCopySpanOwners;
+  std::vector<int> denseCppIdToMTask((size_t)superId, -1);
+  for (int mtaskId = 0; mtaskId < nMTasks; mtaskId ++) {
+    const MtDenseMTask& mtask = denseSchedule.mtasks[(size_t)mtaskId];
+    for (int sccId : mtask.sccIds) {
+      if (sccId < 0 || sccId >= static_cast<int>(denseSchedule.sccs.size())) continue;
+      for (int cppId : denseSchedule.sccs[(size_t)sccId].cppIds) {
+        if (cppId >= 0 && cppId < superId) denseCppIdToMTask[(size_t)cppId] = mtaskId;
+      }
+    }
+  }
+
+  struct DenseStateTailBatch {
+    int owner = -1;
+    std::vector<int> waitSlots;
+    std::vector<size_t> spanIndices;
+  };
+  std::vector<DenseStateTailBatch> denseStateTailBatches;
+  std::vector<std::vector<int>> denseStateTailBatchesByWorker((size_t)threadCount);
   if (denseStatePhase) {
     // Build the pure-copy node set BEFORE parallel body emission: genSuperEval
     // workers consult it to skip the redirected spans. A span is redirected
@@ -540,6 +575,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       if (it->second == nullptr) it = mtDenseStateRegSrcByName.erase(it); else ++it;
     }
     mtDenseStateCopyNodes.clear();
+    mtDenseStateGroupSkipNodes.clear();
+    mtDenseStateTokenCopyPairs.clear();
+    mtDenseStateTokenGroupPairs.clear();
     unsigned long skipInserted = 0;
     size_t diagTextHits = 0, diagUnresolved = 0, diagNotRegSrc = 0, diagNotValid = 0, diagAsync = 0;
     for (SuperNode* super : sortedSuper) {
@@ -564,6 +602,10 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               mtDenseStateGroupSkipNodes.insert(collecting);
             } else {
               denseStateCopySpans.pop_back();
+              denseStateCopySpanSupers.pop_back();
+              denseStateCopySpanNodes.pop_back();
+              denseStateCopySpanGroups.pop_back();
+              denseStateCopySpanOwners.pop_back();
             }
             collecting = nullptr;
           }
@@ -579,6 +621,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             !inst.node->assignTree.empty() && inst.node->reset != ASYRESET) {
           collecting = inst.node;
           denseStateCopySpans.push_back(std::vector<InstInfo>());
+          denseStateCopySpanSupers.push_back(super);
+          denseStateCopySpanNodes.push_back(inst.node);
+          denseStateCopySpanGroups.push_back(1);
+          const int ownerMTask = super->cppId >= 0 && super->cppId < superId
+              ? denseCppIdToMTask[(size_t)super->cppId] : -1;
+          denseStateCopySpanOwners.push_back(ownerMTask >= 0 && ownerMTask < nMTasks
+              ? denseSchedule.mtaskThreadAssign[(size_t)ownerMTask] : -1);
           denseStateCopySpans.back().push_back(inst);
           continue;
         }
@@ -630,6 +679,13 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             if (!hasPostReader) {
               denseStateCopySpans.push_back(std::vector<InstInfo>());
               denseStateCopySpans.back().push_back(inst);
+              denseStateCopySpanSupers.push_back(super);
+              denseStateCopySpanNodes.push_back(regSrc);
+              denseStateCopySpanGroups.push_back(0);
+              const int ownerMTask = super->cppId >= 0 && super->cppId < superId
+                  ? denseCppIdToMTask[(size_t)super->cppId] : -1;
+              denseStateCopySpanOwners.push_back(ownerMTask >= 0 && ownerMTask < nMTasks
+                  ? denseSchedule.mtaskThreadAssign[(size_t)ownerMTask] : -1);
               const long skipLimit = mtDenseStatePhaseSkipLimit();
               if (skipLimit < 0 || skipInserted < (unsigned long)skipLimit) {
                 mtDenseStateCopyNodes.insert(regSrc);
@@ -671,6 +727,44 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
             diagTextHits, diagUnresolved, diagNotRegSrc, diagNotValid, diagAsync);
     fprintf(stderr, "[mt-dense] state-phase pure-copy nodes=%zu spans=%zu\n",
             mtDenseStateCopyNodes.size(), denseStateCopySpans.size());
+    if (denseStateTokenPhase) {
+      std::map<std::pair<int, std::vector<int>>, int> batchByKey;
+      for (size_t spanIndex = 0; spanIndex < denseStateCopySpans.size(); spanIndex ++) {
+        const Node* node = denseStateCopySpanNodes[spanIndex];
+        const SuperNode* super = denseStateCopySpanSupers[spanIndex];
+        if (node == nullptr || super == nullptr ||
+            mtDenseStateCopyNodes.find(node) == mtDenseStateCopyNodes.end()) continue;
+        const int cppId = super->cppId;
+        const int mtaskId = cppId >= 0 && cppId < superId ? denseCppIdToMTask[(size_t)cppId] : -1;
+        const int owner = mtaskId >= 0 && mtaskId < nMTasks
+            ? denseSchedule.mtaskThreadAssign[(size_t)mtaskId] : -1;
+        if (owner < 0 || owner >= threadCount || mtaskId < 0) continue;
+        if (!mtDenseStateTokenCopyPair(super, node) && !mtDenseStateTokenGroupPair(super, node)) {
+          if (denseStateCopySpanGroups[spanIndex]) mtDenseStateTokenGroupPairs.insert({super, node});
+          else mtDenseStateTokenCopyPairs.insert({super, node});
+        }
+        const std::vector<int>& waits = ownerReadyLayout.waitSlotsByMTask[(size_t)mtaskId];
+        const std::pair<int, std::vector<int>> key(owner, waits);
+        auto batchIt = batchByKey.find(key);
+        int batchId = -1;
+        if (batchIt == batchByKey.end()) {
+          batchId = static_cast<int>(denseStateTailBatches.size());
+          batchByKey.emplace(key, batchId);
+          DenseStateTailBatch batch;
+          batch.owner = owner;
+          batch.waitSlots = waits;
+          denseStateTailBatches.push_back(std::move(batch));
+          denseStateTailBatchesByWorker[(size_t)owner].push_back(batchId);
+        } else {
+          batchId = batchIt->second;
+        }
+        denseStateTailBatches[(size_t)batchId].spanIndices.push_back(spanIndex);
+      }
+      size_t tokenTailSpanCount = 0;
+      for (const DenseStateTailBatch& batch : denseStateTailBatches) tokenTailSpanCount += batch.spanIndices.size();
+      fprintf(stderr, "[mt-dense] tokenized state tail batches=%zu spans=%zu\n",
+              denseStateTailBatches.size(), tokenTailSpanCount);
+    }
   }
   {
   EmitPhaseTimer denseBodyTimer("Final.denseMTaskBodies");
@@ -710,10 +804,16 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   auto emitFixedDenseThreadWorker = [&](const char* funcName) {
     if (denseStatePhase) {
       const std::vector<std::vector<InstInfo>>& spans = denseStateCopySpans;
+      auto tokenSpan = [&](size_t index) {
+        if (!denseStateTokenPhase) return true;
+        const SuperNode* super = denseStateCopySpanSupers[index];
+        const Node* node = denseStateCopySpanNodes[index];
+        return mtDenseStateTokenCopyPair(super, node) || mtDenseStateTokenGroupPair(super, node);
+      };
       std::vector<uint64_t> sliceLoad((size_t)threadCount, 0);
       std::vector<std::vector<const std::vector<InstInfo>*>> sliceSpans((size_t)threadCount);
-      std::vector<size_t> spanOrder(spans.size());
-      for (size_t i = 0; i < spans.size(); i ++) spanOrder[i] = i;
+      std::vector<size_t> spanOrder;
+      for (size_t i = 0; i < spans.size(); i ++) if (tokenSpan(i)) spanOrder.push_back(i);
       std::sort(spanOrder.begin(), spanOrder.end(), [&](size_t a, size_t b) { return spans[a].size() > spans[b].size(); });
       for (size_t si : spanOrder) {
         size_t lightest = 0;
@@ -731,12 +831,31 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
         }
         emitBodyLock(0, "}\n");
       }
+      if (denseStateTokenPhase) {
+        for (int t = 0; t < threadCount; t ++) {
+          emitFuncDecl(0, "void S%s::stepDenseStateTailW%d(uint8_t target) {\n", name.c_str(), t);
+          for (int batchId : denseStateTailBatchesByWorker[(size_t)t]) {
+            const DenseStateTailBatch& batch = denseStateTailBatches[(size_t)batchId];
+            for (int slot : batch.waitSlots) {
+              emitBodyLock(1, "{ unsigned mtDenseStateCt = 0; while (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) != target) { mtWorkerPoolPause(); if (++mtDenseStateCt > 256) { mtDenseStateCt = 0; std::this_thread::yield(); } } }\n", slot);
+            }
+            for (size_t spanIndex : batch.spanIndices) {
+              int spanIndent = 1;
+              for (const InstInfo& inst : spans[spanIndex]) {
+                spanIndent = translateInst(inst, spanIndent, "activeFlags[0]", "", false);
+              }
+            }
+          }
+          emitBodyLock(0, "}\n");
+        }
+      }
       size_t totalInsts = 0;
-      for (const auto& s : spans) totalInsts += s.size();
-      fprintf(stderr, "[mt-dense] state-phase slices=%d spans=%zu insts=%zu loads(min=%llu max=%llu)\n",
-              threadCount, spans.size(), totalInsts,
+      for (size_t i : spanOrder) totalInsts += spans[i].size();
+      fprintf(stderr, "[mt-dense] state-phase slices=%d spans=%zu insts=%zu loads(min=%llu max=%llu) tokenized=%d tail-batches=%zu\n",
+              threadCount, spanOrder.size(), totalInsts,
               (unsigned long long)*std::min_element(sliceLoad.begin(), sliceLoad.end()),
-              (unsigned long long)*std::max_element(sliceLoad.begin(), sliceLoad.end()));
+              (unsigned long long)*std::max_element(sliceLoad.begin(), sliceLoad.end()),
+              denseStateTokenPhase ? 1 : 0, denseStateTailBatches.size());
     }
     if (!densePendingWriters.empty()) {
       emitFuncDecl(0, "void S%s::commitDensePendingMem() {\n", name.c_str());
@@ -752,12 +871,9 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(0, "}\n");
     }
     emitFuncDecl(0, "void S%s::%s(int threadId) {\n", name.c_str(), funcName);
-    if (denseStatePhase) {
-      // Cycle 0 skips the state phase entirely: the cycle-0 slice would read
-      // x$NEXT before ANY compute has run, committing construction-time values
-      // over init()/constructor state (observed: boot freeze at instrCnt=0).
-      // From cycle 1 on, the slice reads the previous cycle's finalized
-      // x$NEXT (join barrier separates the cycles).
+    if (denseStatePhase && !denseStateTokenPhase) {
+      // Legacy state-phase mode retains the correctness baseline barrier;
+      // tokenized hybrid copies run in the post-dispatch tail instead.
       emitBodyLock(1, "if (cycles != 0) {\n");
       emitBodyLock(2, "switch (threadId) {\n");
       for (int t = 0; t < threadCount; t ++) {
@@ -781,9 +897,6 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
       emitBodyLock(1, "}\n");
     }
     if (denseBreakdownWindowCodegen) {
-      emitBodyLock(1, "const int mtDenseBreakdownWindowSlot = mtDenseBreakdownWindowCurrentSlot;\n");
-      emitBodyLock(1, "const bool mtDenseBreakdownWindow = mtDenseBreakdownWindowSlot >= 0;\n");
-      emitBodyLock(1, "MtDenseBreakdownWindowWorker *mtDenseBreakdownWindowWorker = nullptr;\n");
       emitBodyLock(1, "int mtDenseBreakdownWindowWorker0MTaskNext = 0;\n");
       emitBodyLock(1, "if (unlikely(mtDenseBreakdownWindow)) {\n");
       emitBodyLock(2, "if (unlikely(mtDenseBreakdownWindowSlot >= kDenseBreakdownWindowMaxCycles || threadId < 0 || threadId >= kDenseBreakdownWindowThreadCount)) { mtDenseBreakdownWindowOverflow.store(true, std::memory_order_relaxed); fprintf(stderr, \"[mt-dense-breakdown] invalid window worker lane\\n\"); abort(); }\n");
@@ -823,11 +936,21 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
               emitBodyLock(5, "mtDenseInlineReady &= (mtDenseOwnerReadyTokens[%d].ready.load(std::memory_order_acquire) == target);\n", slot);
             }
             if (denseDuty) {
-              emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
-                           t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
+              if (denseStateTokenPhase) {
+                emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); goto mtDenseStateTail; }\n",
+                             t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
+              } else {
+                emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target, %du); return; }\n",
+                             t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition), t);
+              }
             } else {
-              emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); return; }\n",
-                           t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+              if (denseStateTokenPhase) {
+                emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); goto mtDenseStateTail; }\n",
+                             t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+              } else {
+                emitBodyLock(5, "if (!mtDenseInlineReady) { stepDenseLookaheadTail(kDenseDispatchTableW%d, kDenseDispatchTableW%d + %d, %uu, target); return; }\n",
+                             t, t, denseDispatchWorkerCounts[(size_t)t], static_cast<unsigned>(tablePosition));
+              }
             }
             emitBodyLock(5, "stepDenseMTask%d();\n", mtaskId);
             for (int slot : ownerReadyLayout.storeSlotsByMTask[(size_t)mtaskId]) {
@@ -1025,6 +1148,15 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     }
     emitBodyLock(2, "default: break;\n");
     emitBodyLock(1, "}\n");
+    if (denseStateTokenPhase) {
+      emitBodyLock(1, "mtDenseStateTail:\n");
+      emitBodyLock(1, "switch (threadId) {\n");
+      for (int t = 0; t < threadCount; t ++) {
+        emitBodyLock(2, "case %d: stepDenseStateTailW%d(evenCycle ? uint8_t{1} : uint8_t{0}); break;\n", t, t);
+      }
+      emitBodyLock(2, "default: abort();\n");
+      emitBodyLock(1, "}\n");
+    }
     if (denseBreakdownProfileCodegen) {
       emitBodyLock(1, "if (unlikely(mtDenseBreakdownProfile)) {\n");
       emitBodyLock(2, "MtDenseBreakdownWorker &mtDenseBreakdownWorker = mtDenseBreakdownWorkers[threadId];\n");
@@ -1394,9 +1526,8 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
     emitBodyLock(2, "mtDenseOwnerReadyTokensPrimed = false;\n");
     emitBodyLock(2, "#endif\n");
   }
-  if (denseStatePhase) {
-    // Serial fallback path must run the state phase too: the bodies no longer
-    // contain the identity copies (redirected to cycle start), so without
+  if (denseStatePhase && !denseStateTokenPhase) {
+    // Legacy serial fallback keeps cycle-0 semantics for the barrier mode.
     emitBodyLock(2, "if (cycles != 0) {");
     for (int t = 1; t < threadCount; t ++) {
       emitBodyLock(3, "stepDenseStateW%d();", t);
@@ -1405,6 +1536,12 @@ void graph::genDenseExecutor(const MtDenseSchedule& denseSchedule, FILE* header)
   }
   for (int mtaskId = 0; mtaskId < nMTasks; mtaskId++) {
     emitBodyLock(2, "stepDenseMTask%d();\n", mtaskId);
+  }
+  if (denseStateTokenPhase) {
+    for (int t = 1; t < threadCount; t ++) {
+      emitBodyLock(2, "stepDenseStateW%d();", t);
+    }
+    emitBodyLock(2, "stepDenseStateW0();\n");
   }
   emitBodyLock(1, "}\n");
   emitBodyLock(1, "if (mtProfileDynamicTraceFile != nullptr) dumpMtProfileDynamicTraceCycle();\n");
