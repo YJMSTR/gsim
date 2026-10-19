@@ -1,6 +1,13 @@
 """Verify state-task ownership, register timing, reset and pending commits.
 
 Run after `make build-gsim`: python3 test/test_mt_state_tasks.py
+
+GSIM_MT_DIRECT_DISPATCH=1 only changes lookahead-0 strict emission; it is
+covered by whole-model byte identity and a trace-only differential harness,
+never by emitted source-string assertions. The register/reset oracle below
+predates the intentional ASY->UINT late-reset change (0821ede) and fails on
+every variant including serial --mt-mode=off; it is retained unmodified and
+is not this feature's contract.
 """
 import csv
 import os
@@ -13,6 +20,40 @@ ROOT = Path(__file__).resolve().parents[1]
 GSIM = ROOT / 'build/gsim/gsim'
 
 
+# Trace-only differential harness: drives the generated mt-state-tasks model
+# with the same stimulus pattern as mt-state-tasks.cpp but carries no expected
+# values; every observable is printed each cycle so complete traces can be
+# compared across strict/direct/lookahead executions.
+TRACE_HARNESS = r'''
+#include "MtStateTasks.h"
+#include <cstdint>
+#include <cstdio>
+
+int main() {
+  SMtStateTasks dut;
+  for (unsigned cycle = 0; cycle < 256; ++cycle) {
+    bool reset = cycle < 3 || cycle % 79 == 0;
+    bool asyncReset = cycle < 2 || cycle % 47 == 0;
+    bool enable = cycle % 5 != 0;
+    bool request = cycle % 13 < 2;
+    uint8_t a = cycle * 17 + 3, b = cycle * 29 + 5;
+    dut.set_clock(cycle & 1);
+    dut.set_reset(reset);
+    dut.set_async_reset(asyncReset);
+    dut.set_reset_request(request);
+    dut.set_enable(enable);
+    dut.set_a(a);
+    dut.set_b(b);
+    dut.step();
+    std::printf("%u %u %u %u %u %u %u %u\n", cycle,
+                dut.get_value0(), dut.get_value1(), dut.get_value_async(),
+                dut.get_value_reg_reset(), dut.get_reset_value(),
+                dut.get_value_late_reset(), dut.get_mix());
+  }
+}
+'''
+
+
 def run(command, env):
     result = subprocess.run(list(map(str, command)), env=env, text=True,
                             capture_output=True, timeout=90)
@@ -22,8 +63,12 @@ def run(command, env):
 
 
 class StateTasksTest(unittest.TestCase):
-    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=()):
+    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=(),
+                 direct=None):
         env = dict(os.environ, GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
+        env.pop('GSIM_MT_DIRECT_DISPATCH', None)
+        if direct is not None:
+            env['GSIM_MT_DIRECT_DISPATCH'] = direct
         run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
              '--mt-scheduler=' + scheduler, f'--mt-lookahead-window={lookahead}',
              *extra, '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
@@ -69,6 +114,46 @@ class StateTasksTest(unittest.TestCase):
                                          {'q0', 'q1', 'qa', 'qb', 'qr', 'ql'})
                         signatures.append(self.simulate(out, 'mt-state-tasks', env))
         self.assertEqual(len(set(signatures)), 1, signatures)
+
+    def test_direct_dispatch_trace_equivalence(self):
+        traces = {}
+        for lookahead, direct in ((0, None), (0, '1'), (16, None), (16, '1')):
+            with self.subTest(lookahead=lookahead, direct=direct), \
+                    tempfile.TemporaryDirectory(
+                        prefix='mt-state-trace-') as directory:
+                out = Path(directory)
+                env, _ = self.generate(out, 'mt-state-tasks', 4,
+                                       lookahead=lookahead, direct=direct)
+                (out / 'trace-harness.cpp').write_text(TRACE_HARNESS)
+                exe = out / 'emu-trace'
+                run(['clang++', '-std=c++17', '-O1', '-Wno-parentheses-equality',
+                     '-I' + str(out), *sorted(out.glob('*.cpp')),
+                     '-pthread', '-o', exe], env)
+                traces[(lookahead, direct)] = run([exe], env).stdout
+        baseline = traces[(0, None)]
+        self.assertTrue(baseline)
+        self.assertEqual(traces[(0, '1')], baseline)
+        self.assertEqual(traces[(16, None)], baseline)
+        self.assertEqual(traces[(16, '1')], baseline)
+
+    def test_direct_dispatch_default_off_generation_identity(self):
+        with tempfile.TemporaryDirectory(prefix='mt-direct-identity-') as directory:
+            root = Path(directory)
+            trees = {}
+            for name, lookahead, direct in (('off-la0', 0, None),
+                                            ('explicit-off-la0', 0, '0'),
+                                            ('on-la0', 0, '1'),
+                                            ('off-la16', 16, None),
+                                            ('on-la16', 16, '1')):
+                out = root / name
+                out.mkdir()
+                self.generate(out, 'mt-state-tasks', 4, lookahead=lookahead,
+                              direct=direct)
+                trees[name] = {path.name: path.read_bytes()
+                               for path in sorted(out.iterdir())}
+            self.assertEqual(trees['off-la0'], trees['explicit-off-la0'])
+            self.assertNotEqual(trees['off-la0'], trees['on-la0'])
+            self.assertEqual(trees['off-la16'], trees['on-la16'])
 
     def test_memory_commits_against_reference(self):
         signatures = []
