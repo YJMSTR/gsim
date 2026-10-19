@@ -42,6 +42,21 @@ Compile the emitted C++ with `-pthread`, then run it with
 Multithreaded test sources are kept under `test/`; they are intentionally not exposed as dedicated
 Makefile targets. Per-signal comparison uses an independently generated single-thread active model.
 
+Recommended T32 configuration for large designs (validated on XiangShan
+kunminghu-v3): keep the packed-state architecture's coarse HEFT chains and
+enable a lookahead window so workers fill true-dependency stalls:
+
+```
+GSIM_THREADS=32 \
+  build/gsim/gsim --mt-mode=on --mt-target-tasks=2400 --mt-scheduler=heft \
+  --mt-lookahead-window=64 --supernode-max-size=30 --cpp-max-size-KB=8192 \
+  --sep-mod=__DOT__ --sep-aggr=__DOT__ --dir out/model SimTop.fir
+```
+
+Finer `--mt-target-tasks` or larger windows measured slower on this design
+(2,242-task chains with window 64 are the measured optimum); see
+docs/multithreaded-emitter.md before changing them.
+
 See [Multithreaded C++ Emitter Design and Usage](docs/multithreaded-emitter.md) for the scheduler,
 runtime synchronization protocol, XiangShan workflow, correctness tests, and tuning guidance.
 

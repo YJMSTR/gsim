@@ -35,12 +35,6 @@ int resetChunkSize() {
   return end != value && *end == '\0' && parsed >= 256 && parsed <= INT_MAX ? static_cast<int>(parsed) : 0;
 }
 
-// Generator-time flag: GSIM_MT_DIRECT_DISPATCH=1 emits the strict LA0 worker
-// loop as direct per-task dispatch instead of the MtDispatch table walk.
-bool directDispatchEnabled() {
-  const char* value = std::getenv("GSIM_MT_DIRECT_DISPATCH");
-  return value != nullptr && value[0] == '1' && value[1] == '\0';
-}
 void appendValues(std::string& text, const std::vector<int>& values) {
   if (values.empty()) {
     text += "0";
@@ -824,33 +818,7 @@ void CppEmitterMt::emitDefinitions() {
       "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
       "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
       "  }\n";
-  if (lookaheadWindow_ <= 0 && directDispatchEnabled()) {
-    // Direct strict fast path (GSIM_MT_DIRECT_DISPATCH=1): per-worker switch
-    // with literal acquire-spin waits for exactly task.waits, direct mtTaskN()
-    // calls and literal release stores for exactly task.stores, in the
-    // original workerTasks_ order. No dispatch-table indirection on the
-    // active path; identical ordered waits/body/stores to the indirect loop.
-    runtime += "  switch (worker) {\n";
-    for (int worker = 0; worker < workerCount_; ++worker) {
-      const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
-      runtime += "    case " + std::to_string(worker) + ": {\n";
-      for (const int taskId : chain) {
-        const Task& task = tasks_[static_cast<size_t>(taskId)];
-        for (const int slot : task.waits) {
-          runtime += "      while (mtReadyTokens[" + std::to_string(slot) +
-                     "].value.load(std::memory_order_acquire) != parity)\n"
-                     "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n";
-        }
-        runtime += "      mtTask" + std::to_string(taskId) + "();\n";
-        for (const int slot : task.stores) {
-          runtime += "      mtReadyTokens[" + std::to_string(slot) +
-                     "].value.store(parity, std::memory_order_release);\n";
-        }
-      }
-      runtime += "      return;\n    }\n";
-    }
-    runtime += "    default: abort();\n  }\n}\n";
-  } else if (lookaheadWindow_ <= 0) {
+  if (lookaheadWindow_ <= 0) {
     // Strict fixed-order fast path. This is the baseline protocol and avoids
     // all per-task ready scanning when lookahead is disabled.
     runtime += "  const MtDispatch* entries = nullptr; uint32_t count = 0;\n  switch (worker) {\n";
