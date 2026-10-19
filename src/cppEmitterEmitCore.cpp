@@ -692,14 +692,17 @@ void graph::genSuperEval(SuperNode* super, std::string flagName, std::string act
           if (inst.infoType == SUPER_INFO_ASSIGN_END && inst.node == skipUntilEnd) skipUntilEnd = nullptr;
           continue;
         }
+        const bool statePhaseTokenized = mtDenseStatePhaseTokenized();
         if (statePhaseSkip && inst.infoType == SUPER_INFO_ASSIGN_BEG &&
-            mtDenseStateGroupSkipNodes.count(inst.node) > 0) {
+            (statePhaseTokenized ? mtDenseStateTokenGroupPair(super, inst.node)
+                                 : mtDenseStateGroupSkipNodes.count(inst.node) > 0)) {
           skipUntilEnd = inst.node;
           continue;
         }
         if (statePhaseSkip && inst.infoType == SUPER_INFO_STR && frameDepth == 0 &&
             mtDenseStateCopyStatement(inst.inst) &&
-            mtDenseStatePhaseCopyNode(mtDenseStateRegSrcForStatement(inst.inst))) {
+            (statePhaseTokenized ? mtDenseStateTokenCopyPair(super, inst.node)
+                                 : mtDenseStatePhaseCopyNode(mtDenseStateRegSrcForStatement(inst.inst)))) {
           continue;
         }
         indent = translateInst(inst, indent, flagName, activeBufferName, emitActivation);

@@ -216,6 +216,28 @@ bool mtDenseStatePhaseNoRedirect() {
   return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+// Hybrid state-phase mode: keep the original owner-ready/lookahead pipeline,
+// but publish each worker's state slice as a normal readiness token instead of
+// imposing a global Done/Go barrier. Default-off; requires the owner-ready
+// compile path and lookahead dispatch.
+bool mtDenseStatePhaseTokenized() {
+  const char* value = std::getenv("GSIM_MT_DENSE_STATE_PHASE_TOKENIZED");
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+std::set<std::pair<const SuperNode*, const Node*>> mtDenseStateTokenCopyPairs;
+std::set<std::pair<const SuperNode*, const Node*>> mtDenseStateTokenGroupPairs;
+
+bool mtDenseStateTokenCopyPair(const SuperNode* super, const Node* node) {
+  return super != nullptr && node != nullptr &&
+         mtDenseStateTokenCopyPairs.find({super, node}) != mtDenseStateTokenCopyPairs.end();
+}
+
+bool mtDenseStateTokenGroupPair(const SuperNode* super, const Node* node) {
+  return super != nullptr && node != nullptr &&
+         mtDenseStateTokenGroupPairs.find({super, node}) != mtDenseStateTokenGroupPairs.end();
+}
+
 std::map<std::string, Node*> mtDenseStateRegSrcByName;
 Node* mtDenseStateRegSrcForStatement(const std::string& text) {
   size_t eq = text.find('=');
