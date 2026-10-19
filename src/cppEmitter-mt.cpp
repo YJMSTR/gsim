@@ -334,11 +334,20 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
       fprintf(header, "uint8_t %s{};\n", mtMemoryWriteValidName(writer).c_str());
     }
   }
+  // Pointer hash order changes class layout across identical generator runs.
+  std::vector<std::vector<Node*>> workerLocalNodes(static_cast<size_t>(workerCount_));
+  for (const auto& entry : workerLocalOwners_) {
+    workerLocalNodes[static_cast<size_t>(entry.second)].push_back(entry.first);
+  }
+  for (auto& nodes : workerLocalNodes) {
+    std::sort(nodes.begin(), nodes.end(), [](const Node* lhs, const Node* rhs) {
+      return lhs->id < rhs->id;
+    });
+  }
   for (int worker = 0; worker < workerCount_; ++worker) {
     fprintf(header, "struct MtWorkerStateW%d {\n", worker);
-    for (const auto& entry : workerLocalOwners_) {
-      if (entry.second != worker) continue;
-      fprintf(header, "  %s;\n", nodeDeclaration(entry.first).c_str());
+    for (Node* node : workerLocalNodes[static_cast<size_t>(worker)]) {
+      fprintf(header, "  %s;\n", nodeDeclaration(node).c_str());
     }
     fprintf(header, "};\n");
     fprintf(header, "alignas(64) MtWorkerStateW%d mtWorkerStateW%d{};\n", worker, worker);
@@ -512,7 +521,8 @@ void CppEmitterMt::emitTask(const Task& task, int indent) {
     }
   }
 
-  std::set<Node*> workerLocals;
+  auto byId = [](const Node* lhs, const Node* rhs) { return lhs->id < rhs->id; };
+  std::set<Node*, decltype(byId)> workerLocals(byId);
   for (Node* node : task.members) {
     if (isWorkerLocal(node) && workerLocalOwner(node) == task.owner) workerLocals.insert(node);
     for (ExpTree* tree : node->assignTree) {
