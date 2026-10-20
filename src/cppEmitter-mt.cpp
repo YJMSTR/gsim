@@ -27,6 +27,14 @@ int positiveEnv(const char* name, int fallback) {
              : fallback;
 }
 
+// Any non-empty value other than "0" enables the knob; unset stays off so
+// emission stays byte-identical by default.
+bool flagEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' &&
+         !(value[0] == '0' && value[1] == '\0');
+}
+
 int resetChunkSize() {
   const char* value = std::getenv("GSIM_EMIT_RESET_CHUNK");
   if (value == nullptr || value[0] == '\0') return 4096;
@@ -75,7 +83,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      dynamicQuery_(flagEnv("GSIM_MT_DYNAMIC_QUERY")) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -86,6 +95,7 @@ void CppEmitterMt::prepare() {
   MtTaskLowerer::generateStmtTrees(graph_, static_cast<MtTaskPlan&>(*this));
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
+  decideDynamicQuery();
   buildRegisterStorageNames();
   writeTaskPhaseReport();
 }
@@ -142,6 +152,114 @@ void CppEmitterMt::writeTaskPhaseReport() const {
   }
   Assert(std::fclose(phases) == 0, "cannot finish MTask phase report");
   Assert(std::fclose(members) == 0, "cannot finish state MTask member report");
+}
+
+// Generation-time query-vs-scan decision for the lookahead tail, following
+// the calibrated model in analysis/query-vs-scan-threshold.json:
+//
+//   enable ready-query for worker w iff
+//     tokens_cross(w) * avg_waiters * 40 < calls_est(w) * window
+//
+// 40 is the calibrated C_notify/C_scan floor: one cross-core notification
+// RMW costs at least 40x one L1/L2-resident acquire-load scan check (the
+// rejected per-store fetch_or design regressed la64 wall by 22.6% purely on
+// ~6331 cross-core notification writes per cycle against ~32 tail calls and
+// window 64 - 123x in favor of scan).
+//
+// Source data, straight from the final schedule:
+// - tokens_cross(w): consumer-side (inbound) token traffic - the remote
+//   tokens w's chain waits on each cycle, sum of task.waits.size() over w's
+//   tasks. Every ready token is cross-worker by construction (token groups
+//   are formed only for predecessors owned by another worker) and has
+//   exactly one publisher and one consumer, so the global totals of inbound
+//   waits and outbound stores coincide; per worker they differ, and inbound
+//   is the axis the query variant must be priced on: the notifications
+//   exist to serve w's tail queries about the tokens w consumes.
+// - avg_waiters: total wait instances / distinct waited tokens. The token
+//   scheme gives every token exactly one consumer task, so this is 1.0; it
+//   is still computed generally in case the schedule format grows fan-in.
+// - calls_est(w): exact upper bound from the emitted protocol, not a
+//   heuristic - each worker enters mtRunLookaheadTail at most once per cycle
+//   because the first failing inline ready check hands the whole chain
+//   remainder to the tail and returns. The la64 census measured 1.002 tail
+//   calls/worker/cycle, matching this bound. (A chain-length proxy would
+//   overestimate by up to the chain length: ~70x on la64.)
+// - window: lookaheadWindow_.
+void CppEmitterMt::decideDynamicQuery() {
+  queryWorkerMask_ = 0;
+  if (!dynamicQuery_) return;
+  if (lookaheadWindow_ <= 0) {
+    fprintf(stderr,
+            "[mt-dynquery] lookahead disabled (window=0): strict-order tail, "
+            "no scan to replace\n");
+    return;
+  }
+  constexpr uint64_t kNotifyCostFloor = 40;
+  std::set<int> waitedSlots;
+  uint64_t waitInstances = 0;
+  for (const Task& task : tasks_) {
+    waitInstances += task.waits.size();
+    waitedSlots.insert(task.waits.begin(), task.waits.end());
+  }
+  const uint64_t distinctTokens = waitedSlots.size();
+  std::vector<uint64_t> tokensCross(static_cast<size_t>(workerCount_), 0);
+  std::vector<int> waitPositions(static_cast<size_t>(workerCount_), 0);
+  uint64_t totalTokens = 0;
+  size_t longestChain = 1;
+  for (const std::vector<int>& chain : workerTasks_) {
+    longestChain = std::max(longestChain, chain.size());
+    for (int taskId : chain) {
+      const MtTask& task = tasks_[static_cast<size_t>(taskId)];
+      tokensCross[static_cast<size_t>(task.owner)] += task.waits.size();
+      waitPositions[static_cast<size_t>(task.owner)] += !task.waits.empty();
+    }
+  }
+  // Global published-token total (equals the inbound total above).
+  for (const Task& task : tasks_) totalTokens += task.stores.size();
+  if (workerCount_ > 64) {
+    fprintf(stderr,
+            "[mt-dynquery] workers=%d exceeds the 64-bit notify mask; forcing "
+            "scan for every worker\n",
+            workerCount_);
+    return;
+  }
+  uint64_t queryWorkers = 0;
+  for (int worker = 0; worker < workerCount_; ++worker) {
+    const size_t w = static_cast<size_t>(worker);
+    // lhs/rhs are the rule cross-multiplied by distinctTokens so
+    // avg_waiters stays exact integer arithmetic:
+    //   tokens * (waitInstances/distinctTokens) * 40 < calls * window.
+    const uint64_t callsEst = waitPositions[w] > 0 ? 1 : 0;
+    const uint64_t lhs = tokensCross[w] * waitInstances * kNotifyCostFloor;
+    const uint64_t rhs = callsEst * static_cast<uint64_t>(lookaheadWindow_) *
+                         distinctTokens;
+    const bool query = distinctTokens > 0 && lhs < rhs;
+    if (query) queryWorkers |= uint64_t{1} << worker;
+    fprintf(stderr,
+            "[mt-dynquery] worker=%d chain=%zu wait_positions=%d "
+            "tokens_cross=%llu avg_waiters=%.4f calls_est=%llu window=%d "
+            "lhs=%llu rhs=%llu decision=%s\n",
+            worker, workerTasks_[w].size(), waitPositions[w],
+            static_cast<unsigned long long>(tokensCross[w]),
+            distinctTokens == 0
+                ? 0.0
+                : static_cast<double>(waitInstances) /
+                      static_cast<double>(distinctTokens),
+            static_cast<unsigned long long>(callsEst), lookaheadWindow_,
+            static_cast<unsigned long long>(lhs),
+            static_cast<unsigned long long>(rhs), query ? "query" : "scan");
+  }
+  queryWorkerMask_ = queryWorkers;
+  fprintf(stderr,
+          "[mt-dynquery] summary workers=%d longest_chain=%zu tokens=%llu "
+          "wait_instances=%llu distinct_tokens=%llu query_workers=%d "
+          "mask=0x%llx\n",
+          workerCount_, longestChain,
+          static_cast<unsigned long long>(totalTokens),
+          static_cast<unsigned long long>(waitInstances),
+          static_cast<unsigned long long>(distinctTokens),
+          __builtin_popcountll(queryWorkers),
+          static_cast<unsigned long long>(queryWorkers));
 }
 
 bool CppEmitterMt::isTaskLocal(Node* node) const {
@@ -265,8 +383,14 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "static constexpr int kMtStateTaskCount = %zu;\n", stateTasks_.size());
   fprintf(header, "struct MtReadyToken { std::atomic<uint8_t> value{0}; };\n");
   fprintf(header, "struct alignas(64) MtDoneFlag { std::atomic<uint8_t> parity{0}; };\n");
-  fprintf(header, "struct MtDispatch { void (S%s::*fn)(); uint32_t waitBegin, waitEnd, storeBegin, storeEnd, localWaitBegin, localWaitEnd; };\n",
+  fprintf(header,
+          "struct MtDispatch { void (S%s::*fn)(); uint32_t waitBegin, waitEnd, "
+          "storeBegin, storeEnd, localWaitBegin, localWaitEnd;",
           graph_.name.c_str());
+  if (queryWorkerMask_ != 0) {
+    fprintf(header, " uint64_t notifyProducers, notifyConsumers;");
+  }
+  fprintf(header, " };\n");
   fprintf(header, "alignas(64) MtReadyToken mtReadyTokens[%d];\n", readySlotCount_);
   fprintf(header, "MtDoneFlag mtDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "std::vector<MtDeferredEvent> mtDeferredEventsByWorker[%d];\n",
@@ -281,6 +405,24 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     fprintf(header, "struct alignas(64) MtLookaheadStats { uint64_t calls{}, scanned{}, found{}, fullMiss{}; };\n");
     fprintf(header, "MtLookaheadStats mtLookaheadStats[%d];\n", workerCount_);
+  }
+  if (queryWorkerMask_ != 0) {
+    // Guarded ready-query hint layer, emitted only when the generation-time
+    // decision (decideDynamicQuery) selects query for at least one worker.
+    // mtNotifySeq[p][c] is a monotone epoch written only by producer p (one
+    // batched release fetch_add per flush of its locally aggregated consumer
+    // mask) and read only by consumer c as an advisory skip filter for the
+    // tail scan. Every task execution stays gated by the real token acquire
+    // loads and the head blocking spin still polls real tokens, so the hint
+    // can only skip scan work - it can never gate execution.
+    fprintf(header, "static constexpr uint64_t kMtQueryMask = 0x%llxull;\n",
+            static_cast<unsigned long long>(queryWorkerMask_));
+    fprintf(header,
+            "alignas(64) std::atomic<uint64_t> mtNotifySeq[%d][%d]{};\n",
+            workerCount_, workerCount_);
+    fprintf(header, "uint64_t mtNotifySeen[%d][%d];\n", workerCount_, workerCount_);
+    fprintf(header, "uint64_t mtPendingNotify[%d];\n", workerCount_);
+    fprintf(header, "void mtFlushNotify(int worker);\n");
   }
   for (const StateUpdate& update : stateTasks_) {
     fprintf(header, "struct MtRegisterBlockW%d {\n", update.owner);
@@ -627,7 +769,44 @@ void CppEmitterMt::emitDefinitions() {
   emitArray("uint32_t", "mtWaitSlots", waitSlots_);
   emitArray("uint32_t", "mtStoreSlots", storeSlots_);
   emitArray("uint32_t", "mtLocalWaitSlots", localWaitSlots_);
-
+  // Per-task notify masks for the guarded query tail: notifyProducers[t] =
+  // owners of the publisher tasks of t's remote wait tokens (the workers a
+  // scan of t can be skipped for when none of them advanced);
+  // notifyConsumers[t] = query-selected owners of tasks waiting on tokens t
+  // publishes, excluding t's own owner (it reads its own tokens directly).
+  // Producers aggregate and flush for these consumers regardless of the
+  // producer's own query selection: epochs serve consumers, so gating on the
+  // producer's bit would starve a selected consumer of an unselected
+  // producer's advances.
+  std::vector<uint64_t> notifyProducers(tasks_.size(), 0);
+  std::vector<uint64_t> notifyConsumers(tasks_.size(), 0);
+  const bool emitQuery = queryWorkerMask_ != 0;
+  if (emitQuery) {
+    std::map<int, int> publisherOwnerOfSlot;
+    std::map<int, int> consumerOwnerOfSlot;
+    for (const Task& task : tasks_) {
+      for (int slot : task.stores) publisherOwnerOfSlot[slot] = task.owner;
+      for (int slot : task.waits) consumerOwnerOfSlot[slot] = task.owner;
+    }
+    for (size_t id = 0; id < tasks_.size(); ++id) {
+      const Task& task = tasks_[id];
+      for (int slot : task.waits) {
+        auto publisher = publisherOwnerOfSlot.find(slot);
+        Assert(publisher != publisherOwnerOfSlot.end(),
+               "ready token %d has no publisher", slot);
+        notifyProducers[id] |= uint64_t{1} << publisher->second;
+      }
+      for (int slot : task.stores) {
+        auto consumer = consumerOwnerOfSlot.find(slot);
+        Assert(consumer != consumerOwnerOfSlot.end(),
+               "ready token %d has no consumer", slot);
+        if (consumer->second != task.owner &&
+            (queryWorkerMask_ >> consumer->second & 1) != 0) {
+          notifyConsumers[id] |= uint64_t{1} << consumer->second;
+        }
+      }
+    }
+  }
   for (int worker = 0; worker < workerCount_; ++worker) {
     const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
     const size_t dispatchCount = chain.size();
@@ -635,7 +814,8 @@ void CppEmitterMt::emitDefinitions() {
                        std::to_string(worker) + "[" +
                        std::to_string(std::max<size_t>(1, dispatchCount)) + "] = {\n";
     if (dispatchCount == 0) {
-      text += "  {nullptr, 0, 0, 0, 0, 0, 0}\n";
+      text += emitQuery ? "  {nullptr, 0, 0, 0, 0, 0, 0, 0, 0}\n"
+                        : "  {nullptr, 0, 0, 0, 0, 0, 0}\n";
     } else {
       for (int taskId : chain) {
         const Task& task = tasks_[static_cast<size_t>(taskId)];
@@ -643,7 +823,12 @@ void CppEmitterMt::emitDefinitions() {
                 std::to_string(task.waitBegin) + "," + std::to_string(task.waitEnd) + "," +
                 std::to_string(task.storeBegin) + "," + std::to_string(task.storeEnd) + "," +
                 std::to_string(task.localWaitBegin) + "," +
-                std::to_string(task.localWaitEnd) + "},\n";
+                std::to_string(task.localWaitEnd);
+        if (emitQuery) {
+          text += "," + format("0x%llx", static_cast<unsigned long long>(notifyProducers[static_cast<size_t>(taskId)])) +
+                  "," + format("0x%llx", static_cast<unsigned long long>(notifyConsumers[static_cast<size_t>(taskId)]));
+        }
+        text += "},\n";
       }
     }
     text += "};\n";
@@ -676,6 +861,26 @@ void CppEmitterMt::emitDefinitions() {
       "    fprintf(stderr, \"[gsim-mt] warning: failed to pin worker %d\\n\", worker);\n"
       "}\n";
 
+  if (emitQuery) {
+    // Producer-side batched publish: one release fetch_add per consumer that
+    // this worker's completed tasks have (locally) aggregated since the last
+    // flush, instead of the rejected design's per-token-store cross-core RMW.
+    // Called unconditionally (in query builds) before the tail's blocking
+    // spin and at chain end: aggregation is driven by query-selected
+    // consumers of the stored tokens, not by this producer's own selection,
+    // and a no-op flush costs one load of an all-zero word. Liveness only
+    // needs the pre-block site because consumers never wait on epochs.
+    runtime += "void " + className + "::mtFlushNotify(int worker) {\n";
+    runtime +=
+        "  uint64_t pending = mtPendingNotify[worker];\n"
+        "  while (pending != 0) {\n"
+        "    const int consumer = __builtin_ctzll(pending);\n"
+        "    pending &= pending - 1;\n"
+        "    mtNotifySeq[worker][consumer].fetch_add(1, std::memory_order_release);\n"
+        "  }\n"
+        "  mtPendingNotify[worker] = 0;\n"
+        "}\n";
+  }
   runtime += "void " + className + "::mtStart() {\n";
   runtime +=
       "  mtStop.store(false, std::memory_order_relaxed);\n"
@@ -755,12 +960,17 @@ void CppEmitterMt::emitDefinitions() {
         "      { const uint32_t predecessor = mtLocalWaitSlots[i];\n"
         "        if (predecessor >= currentHead && (doneBits[predecessor >> 6] & (uint64_t{1} << (predecessor & 63))) == 0) return false; }\n"
         "    return remoteReady(candidate);\n"
-        "  };\n"
+        "  };\n";
+    runtime +=
         "  auto runTask = [&](const MtDispatch& entry) {\n"
         "    (this->*entry.fn)();\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
-        "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
-        "  };\n"
+        "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n";
+    if (emitQuery)
+      runtime +=
+          "    mtPendingNotify[worker] |= entry.notifyConsumers;\n";
+    runtime += "  };\n";
+    runtime +=
         "  while (head < count) {\n"
         "    while (head < count && (doneBits[head >> 6] & (uint64_t{1} << (head & 63))) != 0) {\n"
         "      doneBits[head >> 6] &= ~(uint64_t{1} << (head & 63));\n"
@@ -775,12 +985,26 @@ void CppEmitterMt::emitDefinitions() {
         "    }\n"
         "    bool progressed = false;\n"
         "    uint32_t scanEnd = head + 1u + " + std::to_string(lookaheadWindow_) + ";\n"
-        "    if (scanEnd > count) scanEnd = count;\n"
+        "    if (scanEnd > count) scanEnd = count;\n";
+    if (emitQuery)
+      runtime +=
+          "    uint64_t advanced = ~uint64_t{0};\n"
+          "    if ((kMtQueryMask & (uint64_t{1} << worker)) != 0) {\n"
+          "      advanced = 0;\n"
+          "      for (int producer = 0; producer < kMtWorkerCount; ++producer)\n"
+          "        if (mtNotifySeq[producer][worker].load(std::memory_order_acquire) != mtNotifySeen[worker][producer])\n"
+          "          advanced |= uint64_t{1} << producer;\n"
+          "    }\n";
+    runtime +=
         "    for (uint32_t position = head + 1; position < scanEnd; ++position) {\n";
     if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].scanned;\n";
     runtime +=
         "      if ((doneBits[position >> 6] & (uint64_t{1} << (position & 63))) != 0) continue;\n"
-        "      const MtDispatch& candidate = entries[position];\n"
+        "      const MtDispatch& candidate = entries[position];\n";
+    if (emitQuery)
+      runtime +=
+          "      if (candidate.notifyProducers != 0 && (candidate.notifyProducers & advanced) == 0) continue;\n";
+    runtime +=
         "      if (!candidateReady(candidate, head)) continue;\n"
         "      runTask(candidate);\n"
         "      doneBits[position >> 6] |= uint64_t{1} << (position & 63);\n";
@@ -791,6 +1015,12 @@ void CppEmitterMt::emitDefinitions() {
         "    }\n"
         "    if (progressed) continue;\n";
     if (lookaheadStats_) runtime += "    ++mtLookaheadStats[worker].fullMiss;\n";
+    if (emitQuery)
+      runtime +=
+          "    if ((kMtQueryMask & (uint64_t{1} << worker)) != 0)\n"
+          "      for (int producer = 0; producer < kMtWorkerCount; ++producer)\n"
+          "        mtNotifySeen[worker][producer] = mtNotifySeq[producer][worker].load(std::memory_order_relaxed);\n"
+          "    mtFlushNotify(worker);\n";
     runtime +=
         "    for (uint32_t i = headEntry.waitBegin; i < headEntry.waitEnd; ++i)\n"
         "      while (mtReadyTokens[mtWaitSlots[i]].value.load(std::memory_order_acquire) != parity)\n"
@@ -800,6 +1030,11 @@ void CppEmitterMt::emitDefinitions() {
   }
 
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
+  if (emitQuery)
+    runtime +=
+        "  mtPendingNotify[worker] = 0;\n"
+        "  for (int producer = 0; producer < kMtWorkerCount; ++producer)\n"
+        "    mtNotifySeen[worker][producer] = mtNotifySeq[producer][worker].load(std::memory_order_relaxed);\n";
   runtime += "  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {
     runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +
@@ -857,15 +1092,22 @@ void CppEmitterMt::emitDefinitions() {
           }
           runtime += "        if (!ready) { mtRunLookaheadTail(mtDispatchW" +
                      std::to_string(worker) + ", " + std::to_string(chain.size()) +
-                     ", " + std::to_string(position) + ", parity, worker); return; }\n"
-                     "      }\n";
+                     ", " + std::to_string(position) + ", parity, worker);";
+          if (emitQuery) runtime += " mtFlushNotify(worker);";
+          runtime += " return; }\n      }\n";
         }
         runtime += "      mtTask" + std::to_string(taskId) + "();\n";
         for (int slot : task.stores) {
           runtime += "      mtReadyTokens[" + std::to_string(slot) +
                      "].value.store(parity, std::memory_order_release);\n";
         }
+        if (emitQuery && notifyConsumers[static_cast<size_t>(taskId)] != 0)
+          runtime += "      mtPendingNotify[worker] |= " +
+                     format("0x%llx", static_cast<unsigned long long>(
+                                          notifyConsumers[static_cast<size_t>(taskId)])) +
+                     "ull;\n";
       }
+      if (emitQuery) runtime += "      mtFlushNotify(worker);\n";
       runtime += "      return;\n    }\n";
     }
     runtime += "    default: abort();\n  }\n}\n";

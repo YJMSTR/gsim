@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "graph.h"
+#include "genCache.h"
 
 #include <sstream>
 #include <thread>
@@ -475,9 +476,21 @@ int main(int argc, char** argv) {
   char *strbuf;
   FUNC_TIMER(strbuf = readFile(InputFileName, size, mapSize));
 
+  /* Module-level generation cache (default off, GSIM_GEN_CACHE=<dir>). The
+     raw FIR bytes must be hashed before parseFIR(): the parser splits the
+     input buffer by writing NUL bytes at module boundaries. */
+  genCache::Cache* const cache = genCache::Cache::create();
+  if (cache) cache->hashFirInput(strbuf, size - 1);
+
   PNode* globalRoot;
   FUNC_TIMER(globalRoot= parseFIR(strbuf));
   munmap(strbuf, mapSize);
+
+  if (cache && cache->lookup(globalRoot->name)) {
+    fprintf(stderr, "[genCache] skipping generation for module %s\n", globalRoot->name.c_str());
+    TIMER_END(total);
+    return 0;
+  }
 
   FUNC_WRAPPER(g = AST2Graph(globalRoot), "Init");
 
@@ -513,6 +526,8 @@ int main(int argc, char** argv) {
 
   FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
 
+  if (cache) cache->beginEmission();
+
   if (globalConfig.MtMode) {
     FUNC_WRAPPER(g->cppEmitterMt(), "Final");
   } else {
@@ -525,6 +540,8 @@ int main(int argc, char** argv) {
     FUNC_TIMER(g->instsGenerator());
     FUNC_WRAPPER(g->cppEmitter(), "Final");
   }
+
+  if (cache) cache->finishEmission();
 
   TIMER_END(total);
 

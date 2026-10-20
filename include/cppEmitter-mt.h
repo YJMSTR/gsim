@@ -58,6 +58,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
   void emitTask(const Task& task, int indent);
   void buildRegisterStorageNames();
+  void decideDynamicQuery();
   void writeTaskPhaseReport() const;
   std::string mapRegisterNames(const std::string& text) const;
 
@@ -68,6 +69,12 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   int resetChunk_ = 4096;
   int lookaheadWindow_ = 128;
   bool lookaheadStats_ = false;
+  // GSIM_MT_DYNAMIC_QUERY=1: generation-time query-vs-scan decision per
+  // worker (analysis/query-vs-scan-threshold.json). Bit w of queryWorkerMask_
+  // selects the guarded ready-query hint layer for worker w's lookahead tail;
+  // with the knob unset (or scan selected everywhere) emission is unchanged.
+  bool dynamicQuery_ = false;
+  uint64_t queryWorkerMask_ = 0;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
 };
