@@ -91,13 +91,20 @@ bool CppEmitterMt::enabled() const { return enabled_; }
 
 void CppEmitterMt::prepare() {
   if (!enabled()) return;
+  // Stage-0 instrumentation: sub-stage timers mirroring main.cpp FUNC_TIMER
+  // style; feeds the pre-Final checkpoint economics (Stage-2 plan).
+  struct timeval t0 = getTime();
   MtTaskPartitioner::build(graph_, static_cast<MtTaskPlan&>(*this), targetTasks_);
+  struct timeval t1 = getTime(); { struct timeval a=t0,b=t1; showTime("Final.partition", a, b); }
   MtTaskLowerer::generateStmtTrees(graph_, static_cast<MtTaskPlan&>(*this));
+  struct timeval t2 = getTime(); { struct timeval a=t1,b=t2; showTime("Final.lowering", a, b); }
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
+  struct timeval t3 = getTime(); { struct timeval a=t2,b=t3; showTime("Final.schedule", a, b); }
   decideDynamicQuery();
   buildRegisterStorageNames();
   writeTaskPhaseReport();
+  struct timeval t4 = getTime(); { struct timeval a=t3,b=t4; showTime("Final.reports", a, b); }
 }
 
 void CppEmitterMt::writeTaskPhaseReport() const {
