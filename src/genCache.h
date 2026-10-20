@@ -14,6 +14,16 @@
                 | generation-relevant environment (GSIM_THREADS,
                   GSIM_EMIT_RESET_CHUNK, GSIM_MT_DYNAMIC_QUERY) )
 
+                The emitter-identity component (running-binary sha) is
+                selectable with GSIM_GEN_CACHE_KEY=srcset|binary (default
+                binary; srcset applies to --mt-mode=on runs only): srcset
+                swaps in a fingerprint of the generator's source closure
+                (mt-mode TU set + all headers + parser inputs +
+                compiler/allocator identity), so rebuilds that do not touch
+                emission-relevant sources stay cache hits. Serial runs and
+                every ambiguity fall back to the binary key; see
+                genCache.cpp.
+
   Fail-closed: any ambiguity (missing key component, unreadable/corrupt/
   partial/foreign cache entry) falls back to full regeneration. A stale hit
   is impossible by construction because every output-affecting input is in

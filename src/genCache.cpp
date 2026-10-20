@@ -12,12 +12,29 @@
                                 is deliberately NOT part of the key)
     2. complete FIR file text - the only semantic design input; hashed
                                 before parseFIR(), which splits the buffer
-    3. running gsim binary    - sha256(/proc/self/exe); covers GSIM_VERSION,
-                                build date, compiler, and every compile-time
-                                switch that shapes output (PERF,
-                                DIFFTEST_PER_SIG, GSIM_DIFF, VERILATOR_DIFF,
-                                ENABLE_ACTIVATOR, RW_COND_READ, ...) and any
-                                generator code change
+    3. emitter identity      - default: sha256(/proc/self/exe); covers
+                                GSIM_VERSION, build date, compiler, and
+                                every compile-time switch that shapes output
+                                (PERF, DIFFTEST_PER_SIG, GSIM_DIFF,
+                                VERILATOR_DIFF, ENABLE_ACTIVATOR,
+                                RW_COND_READ, ...) and any generator code
+                                change. GSIM_GEN_CACHE_KEY=srcset (opt-in,
+                                --mt-mode=on only) replaces this component
+                                with a source-closure fingerprint: the
+                                mt-mode src translation-unit set (see kMtClosureSrc), every include header,
+                                every parser/ input, the first line of
+                                `clang++ --version`, and the sha256 of the
+                                normalized `ldd /proc/self/exe` dependency
+                                list (allocator identity: the Makefile
+                                MALLOC probe links -ljemalloc /
+                                -lmimalloc / -ltcmalloc_minimal, which
+                                changes that dependency list). Serial mode
+                                always keeps the binary key (the serial
+                                emitter output depends on compile-time
+                                switches the closure cannot see). Any
+                                ambiguity - including any closure file newer
+                                than the running binary - falls back to the
+                                binary key; see computeSrcsetClosure().
     4. generation options     - every Config field that can reach emitted
                                 bytes (see buildKeyMaterial())
     5. generation env vars    - GSIM_THREADS, GSIM_EMIT_RESET_CHUNK and
@@ -61,6 +78,12 @@
     Staging impossible, OutputDir unlistable, or any OutputDir mutation
       fails -> cache goes miss-through (no restore, no store, no verify):
       full regeneration, output identical to a cache-less run.
+    GSIM_GEN_CACHE_KEY=srcset in serial mode (--mt-mode=off), or with a
+      closure that cannot be trusted (source tree not locatable, enumerated
+      file missing/unreadable, unknown src TU or include header entry,
+      clang++/ldd probe failure, closure file newer than the running
+      binary) -> falls back to the binary emitter key: correct but
+      conservative.
 */
 
 #include "genCache.h"
@@ -83,6 +106,7 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace genCache {
@@ -407,16 +431,447 @@ struct EntryArtifact {
 const char kEntryMagic[] = "GSIM_GEN_CACHE_ENTRY_V1";
 const char kKeyMagic[] = "GSIM_GEN_CACHE_KEY_V1";
 
+/* ------------------ srcset key mode (GSIM_GEN_CACHE_KEY=srcset) -------- */
+
+/* GSIM_GEN_CACHE_KEY=srcset (opt-in; default "binary"; --mt-mode=on runs
+   only) replaces the binary-sha key line with a fingerprint of the
+   generator's SOURCE closure, so a rebuild that did not touch
+   emission-relevant sources (a comment edit in a TU that is dead in
+   mt-mode, or the git-describe version churn baked into every TU) no
+   longer invalidates the cache. Serial runs always keep the binary key:
+   the serial emitter's output depends on compile-time switches (PERF,
+   MODE, ...) that a source-set key cannot observe. The closure must cover
+   every input that can change one emitted byte:
+
+     - the mt-mode set of src translation units (below; classification
+       verified against the link-time call graph: a TU is excluded only when
+       no symbol it defines is referenced from main()'s mt-mode path and its
+       static initializers touch no shared state),
+     - every include header (shared by every TU),
+     - every file under parser/ (flex/bison inputs plus the parser support
+       TUs; the parse runs even on a hit and pins the module name),
+     - compiler identity: first line of `clang++ --version` probed at
+       cache-create time (the baked GSIM_CXX_VERSION macro is unusable:
+       version macros churn on every rebuild),
+     - allocator identity: sha256 over the sorted, address-stripped `ldd
+       /proc/self/exe` dependency list. The Makefile allocator probe
+       (MALLOC=auto -> -ljemalloc / -lmimalloc / -ltcmalloc_minimal) is
+       visible there, and the allocator shapes pointer-order-sensitive
+       trajectories. (The binary key is equally blind to in-place library
+       upgrades: it hashes gsim itself, not its .so dependencies.)
+
+   Everything else in the key (module, FIR sha, flags, env) is unchanged;
+   only the emitter line differs. Fail-closed: a serial run, a missing or
+   unreadable enumerated file, a src/ or include/ entry that is neither
+   enumerated nor excluded (a NEW TU must not silently escape the closure),
+   an unlocatable source tree, a failed clang++/ldd probe, or any closure
+   file NEWER than the running binary (stale-binary window: the closure
+   would then describe sources the binary was not built from) falls back
+   to the binary key with a distinct log line. */
+
+struct SrcsetKey {
+  bool active = false;       // false: binary key (default and every fallback)
+  std::string closureSha;    // sha256 (hex) of the closure fingerprint blob
+  size_t files = 0;          // number of hashed source files
+  const char* modeTag = "";  // always "mt" (srcset is mt-mode only)
+};
+
+/* src translation units hashed in mt-mode (--mt-mode=on). Every TU reachable from
+   main()'s mt-mode pipeline (parse -> pre-Final passes -> cppEmitterMt) is
+   listed. mergeRegister.cpp is currently unreferenced but kept in the
+   closure conservatively. */
+const char* const kMtClosureSrc[] = {
+    "AST2Graph.cpp",               /* Init: FIR AST -> global graph */
+    "StmtTree.cpp",                /* StmtTree::addSeq/mergeExpTree used by MT lowering */
+    "aliasAnalysis.cpp",           /* pre-Final pass */
+    "clockOptimize.cpp",           /* called from AST2Graph in both modes */
+    "commonExpr.cpp",              /* pre-Final pass */
+    "constantNode.cpp",            /* pre-Final pass */
+    "cppEmitter-mt.cpp",           /* Final (mt emitter) */
+    "deadNodes.cpp",               /* pre-Final pass */
+    "ENode.cpp",                   /* expression-node support used everywhere */
+    "ExpTree.cpp",                 /* expression-tree support used everywhere */
+    "exprOpt.cpp",                 /* pre-Final pass */
+    "firParser.cpp",               /* parseFIR driver (runs even on a hit) */
+    "genCache.cpp",                /* this cache (key/capture semantics) */
+    "graph.cpp",                   /* graph container support */
+    "inferWidth.cpp",              /* pre-Final pass */
+    "instsGenerator.cpp",          /* StmtTree::compute/computeExtMod/legalCppCons/allOnes/maxConcatNum
+                                      used by MT lowering/schedule and constantNode */
+    "loopDetector.cpp",            /* pre-Final pass */
+    "main.cpp",                    /* pipeline driver: stage order fixes semantics */
+    "mergeNodes.cpp",              /* graph merging used by the MT partitioner */
+    "mergeRegister.cpp",           /* currently unreferenced; kept in conservatively */
+    "mtReplicationSchedule.cpp",   /* Final (mt) */
+    "mtTaskLowering.cpp",          /* Final (mt) */
+    "mtTaskPartition.cpp",         /* Final (mt) */
+    "mtTaskSchedule.cpp",          /* Final (mt) */
+    "Node.cpp",                    /* node support used everywhere */
+    "opFuncs.cpp",                 /* constant-folding ops used by passes */
+    "patternDetect.cpp",           /* pre-Final pass */
+    "resetAnalysis.cpp",           /* Node::addReset called from AST2Graph */
+    "splitArray.cpp",              /* pre-Final pass */
+    "splitNodes.cpp",              /* pre-Final pass */
+    "superNode.cpp",               /* SuperNode support used everywhere */
+    "topoSort.cpp",                /* pre-Final pass */
+    "traversal.cpp",               /* graph traversal support */
+    "usedBits.cpp",                /* pre-Final pass */
+    "util.cpp",                    /* shared helpers (format, str2op, ...) */
+};
+
+/* src translation units provably unreachable when MtMode is on, excluded from the
+   mt-mode closure (srcset is mt-only, so these are never hashed by a srcset
+   key):
+     cppEmitter.cpp / graphPartition.cpp / replication.cpp / MFFCPartition
+     are the --mt-mode=off emission path (main.cpp else-branch and its
+     callees only); GraphDumper.cpp runs only under dump flags, which
+     disable the cache outright in create(); perfAnalysis.cpp has no caller
+     anywhere in this tree. Any other src TU is UNKNOWN -> binary key. */
+const char* const kMtExcludedSrc[] = {
+    "GraphDumper.cpp",
+    "MFFCPartition.cpp",
+    "cppEmitter.cpp",
+    "graphPartition.cpp",
+    "perfAnalysis.cpp",
+    "replication.cpp",
+};
+
+/* src headers (included by their same-directory TUs via quoted
+   #include). Explicitly enumerated like the TU lists above: a new src header
+   is unknown -> binary key. Currently exactly one: genCache.h. */
+const char* const kClosureSrcH[] = {
+    "genCache.h",
+};
+
+bool nameInList(const char* const* list, size_t count, const std::string& name) {
+  for (size_t i = 0; i < count; i++) {
+    if (name == list[i]) return true;
+  }
+  return false;
+}
+
+bool endsWith(const std::string& s, const char* suffix) {
+  const size_t n = strlen(suffix);
+  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+/* Single-quotes s for safe interpolation into a popen(3) shell command. */
+std::string shellQuote(const std::string& s) {
+  std::string q = "'";
+  for (char c : s) {
+    if (c == '\'') q += "'\\''";
+    else q += c;
+  }
+  q += "'";
+  return q;
+}
+
+/* Runs cmd through /bin/sh and captures stdout. Returns false when the
+   command cannot be started or exits nonzero (or is killed by a signal). */
+bool captureCommandOutput(const std::string& cmd, std::string* out) {
+  FILE* p = popen(cmd.c_str(), "r");
+  if (p == nullptr) return false;
+  out->clear();
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof buf, p)) > 0) out->append(buf, n);
+  const int status = pclose(p);
+  return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* All non-hidden dirents of dir, sorted; directories carry a trailing '/',
+   anything that is neither a regular file nor a directory (after following
+   symlinks) a trailing '?' so the guards below reject it. A failed listing
+   is NOT an empty directory, so callers must treat false as fail-closed. */
+bool listDirEntries(const std::string& dir, std::vector<std::string>* out) {
+  DIR* d = opendir(dir.c_str());
+  if (d == nullptr) return false;
+  out->clear();
+  while (struct dirent* e = readdir(d)) {
+    const std::string name = e->d_name;
+    if (name == "." || name == "..") continue;
+    if (name[0] == '.') continue;  // hidden files are never compiled/included
+    struct stat sb;
+    if (fstatat(dirfd(d), name.c_str(), &sb, 0) != 0) {
+      closedir(d);
+      return false;
+    }
+    if (S_ISDIR(sb.st_mode)) out->push_back(name + "/");
+    else if (S_ISREG(sb.st_mode)) out->push_back(name);
+    else out->push_back(name + "?");
+  }
+  closedir(d);
+  std::sort(out->begin(), out->end());
+  return true;
+}
+
+bool isRegularFile(const std::string& path) {
+  struct stat sb;
+  return stat(path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
+}
+
+std::string parentDirOf(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) return std::string();
+  if (slash == 0) return "/";
+  return path.substr(0, slash);
+}
+
+/* The source tree root: must contain src/, include/ and parser/ plus the
+   src/genCache.cpp sentinel (build/gsim/src holds .o files, so the binary's
+   own directory must never pass for a root). */
+bool isSourceRoot(const std::string& dir) {
+  return isDirectory(dir + "/src") && isDirectory(dir + "/include") &&
+         isDirectory(dir + "/parser") && isRegularFile(dir + "/src/genCache.cpp");
+}
+
+/* Classifies src/ and include/ entries against the mt-mode closure and
+   appends "src/<f>" / "include/<f>" to files. Fails (with *reason set) on
+   anything not explicitly recognized: unknown src translation units,
+   unexpected file types, subdirectories, or missing enumerated files. */
+bool collectMtSrcIncludeFiles(const std::string& root, std::vector<std::string>* files,
+                              std::string* reason) {
+  std::vector<std::string> entries;
+  if (!listDirEntries(root + "/src", &entries)) {
+    *reason = "cannot list " + root + "/src";
+    return false;
+  }
+  std::vector<std::string> srcSeen;
+  for (const std::string& e : entries) {
+    if (e.back() == '/') {
+      *reason = "unexpected subdirectory in src/: " + e;
+      return false;
+    }
+    if (endsWith(e, ".cpp")) {
+      srcSeen.push_back(e);
+      if (nameInList(kMtExcludedSrc, sizeof kMtExcludedSrc / sizeof kMtExcludedSrc[0], e)) {
+        continue;
+      }
+      if (!nameInList(kMtClosureSrc, sizeof kMtClosureSrc / sizeof kMtClosureSrc[0], e)) {
+        *reason = "unknown src translation unit: src/" + e;
+        return false;
+      }
+      files->push_back("src/" + e);
+    } else if (endsWith(e, ".h")) {
+      if (!nameInList(kClosureSrcH, sizeof kClosureSrcH / sizeof kClosureSrcH[0], e)) {
+        *reason = "unknown src header: src/" + e;
+        return false;
+      }
+      files->push_back("src/" + e);
+    } else {
+      *reason = "unrecognized file in src/: " + e;
+      return false;
+    }
+  }
+  /* Every enumerated TU must be present and hashed; a missing one means the
+     list above is stale -> binary key. */
+  const size_t n = sizeof kMtClosureSrc / sizeof kMtClosureSrc[0];
+  for (size_t i = 0; i < n; i++) {
+    if (std::find(srcSeen.begin(), srcSeen.end(), std::string(kMtClosureSrc[i])) ==
+        srcSeen.end()) {
+      *reason = std::string("enumerated source missing: src/") + kMtClosureSrc[i];
+      return false;
+    }
+  }
+  entries.clear();
+  if (!listDirEntries(root + "/include", &entries)) {
+    *reason = "cannot list " + root + "/include";
+    return false;
+  }
+  for (const std::string& e : entries) {
+    if (e.back() == '/') {
+      *reason = "unexpected subdirectory in include/: " + e;
+      return false;
+    }
+    if (!endsWith(e, ".h")) {
+      *reason = "unrecognized file in include/: " + e;
+      return false;
+    }
+    files->push_back("include/" + e);
+  }
+  return true;
+}
+
+/* Every non-hidden file under parser/ recursively (flex/bison inputs, the
+   parser support TUs, and parser include headers). Nothing under parser/ is
+   ever excluded, so nothing can escape; depth-capped against cycles. */
+bool collectParserFiles(const std::string& root, const std::string& relDir, int depth,
+                        std::vector<std::string>* files, std::string* reason) {
+  if (depth > 8) {
+    *reason = "parser/ nesting too deep at " + relDir;
+    return false;
+  }
+  std::vector<std::string> entries;
+  if (!listDirEntries(root + "/" + relDir, &entries)) {
+    *reason = "cannot list " + relDir;
+    return false;
+  }
+  for (const std::string& e : entries) {
+    if (e.back() == '?') {
+      *reason = "unrecognized entry in parser/: " + e;
+      return false;
+    }
+    if (e.back() == '/') {
+      if (!collectParserFiles(root, relDir + "/" + e.substr(0, e.size() - 1), depth + 1,
+                              files, reason)) {
+        return false;
+      }
+    } else {
+      files->push_back(relDir + "/" + e);
+    }
+  }
+  return true;
+}
+
+/* Computes the srcset closure fingerprint for an mt-mode run (serial runs
+   are rejected by the caller and keep the binary key). On success
+   out->active is true. On failure returns false with *reason set (caller
+   falls back to the binary key). The snapshot is taken once at
+   cache-create time; later edits to the sources cannot change this run's
+   key (the binary key has the same snapshot property via the one-time
+   binary hash). */
+bool computeSrcsetClosure(SrcsetKey* out, std::string* reason) {
+  /* Compiler identity: first line of `clang++ --version`. */
+  std::string compilerOut;
+  if (!captureCommandOutput("clang++ --version 2>/dev/null", &compilerOut)) {
+    *reason = "compiler identity unavailable (clang++ --version failed)";
+    return false;
+  }
+  size_t lineEnd = compilerOut.find('\n');
+  const std::string compilerLine =
+      compilerOut.substr(0, lineEnd == std::string::npos ? compilerOut.size() : lineEnd);
+  if (compilerLine.empty()) {
+    *reason = "compiler identity unavailable (empty clang++ --version)";
+    return false;
+  }
+  /* Allocator identity: sha256 over the sorted, address-stripped ldd(1)
+     dependency list of the running binary (libjemalloc.so vs libc malloc
+     shows up here; the raw output cannot be hashed directly because ldd
+     prints ASLR-dependent addresses). */
+  char exeBuf[4096];
+  const ssize_t exeLen = readlink("/proc/self/exe", exeBuf, sizeof exeBuf - 1);
+  if (exeLen <= 0 || exeLen == (ssize_t)(sizeof exeBuf - 1)) {
+    *reason = "cannot resolve /proc/self/exe";
+    return false;
+  }
+  exeBuf[exeLen] = '\0';
+  /* Stale-binary window guard: a closure file newer than the running binary
+     means the binary was not built from the sources we are about to hash;
+     the closure would then claim inputs the running code does not
+     implement. Fail-closed to the binary key (which describes the code
+     that is actually running). */
+  struct stat exeSb;
+  if (stat(exeBuf, &exeSb) != 0) {
+    *reason = std::string("cannot stat ") + exeBuf;
+    return false;
+  }
+  std::string lddOut;
+  if (!captureCommandOutput(std::string("ldd ") + shellQuote(exeBuf) + " 2>/dev/null", &lddOut)) {
+    *reason = "allocator identity unavailable (ldd failed)";
+    return false;
+  }
+  std::vector<std::string> deps;
+  size_t pos = 0;
+  while (pos <= lddOut.size()) {
+    size_t nl = lddOut.find('\n', pos);
+    std::string line = lddOut.substr(pos, (nl == std::string::npos ? lddOut.size() : nl) - pos);
+    pos = (nl == std::string::npos) ? lddOut.size() + 1 : nl + 1;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const size_t paren = line.find(" (");
+    if (paren != std::string::npos) line = line.substr(0, paren);
+    size_t b = 0, e = line.size();
+    while (b < e && (line[b] == ' ' || line[b] == '\t')) b++;
+    while (e > b && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
+    if (e > b) deps.push_back(line.substr(b, e - b));
+  }
+  if (deps.empty()) {
+    *reason = "allocator identity unavailable (empty ldd output)";
+    return false;
+  }
+  std::sort(deps.begin(), deps.end());
+  std::string depsBlob;
+  for (const std::string& d : deps) {
+    depsBlob += d;
+    depsBlob += '\n';
+  }
+  const std::string depsSha = sha256Hex(depsBlob.data(), depsBlob.size());
+  /* Source tree root: the Makefile places the binary at <root>/build/gsim/
+     gsim, so the root is three dirname levels up; shallower placements and
+     running from the tree (or a subdirectory) are the fallbacks. */
+  const std::string exeDir = parentDirOf(exeBuf);
+  char cwdBuf[4096];
+  const char* cwd = getcwd(cwdBuf, sizeof cwdBuf);
+  const std::string cwdStr = cwd != nullptr ? std::string(cwd) : std::string();
+  const std::string candidates[5] = {parentDirOf(parentDirOf(exeDir)), parentDirOf(exeDir),
+                                     exeDir, cwdStr, parentDirOf(cwdStr)};
+  std::string root;
+  for (const std::string& cand : candidates) {
+    if (cand.empty()) continue;
+    if (isSourceRoot(cand)) {
+      root = cand;
+      break;
+    }
+  }
+  if (root.empty()) {
+    *reason = "source tree not found (no src/ include/ parser/ root near the binary or cwd)";
+    return false;
+  }
+  std::vector<std::string> files;
+  if (!collectMtSrcIncludeFiles(root, &files, reason)) return false;
+  if (!collectParserFiles(root, "parser", 0, &files, reason)) return false;
+  std::sort(files.begin(), files.end());
+  /* Fingerprint blob: format tag, mode, compiler, allocator deps, then one
+     "file <path> <sha256>" line per sorted closure member. */
+  std::string blob;
+  blob += "closure-format=1\n";
+  blob += "mode=mt\n";
+  blob += "compiler=" + escapeKeyToken(compilerLine) + "\n";
+  blob += "deps-sha256=" + depsSha + "\n";
+  for (const std::string& f : files) {
+    struct stat sb;
+    if (stat((root + "/" + f).c_str(), &sb) != 0) {
+      *reason = "cannot read " + f;
+      return false;
+    }
+    if (sb.st_mtim.tv_sec > exeSb.st_mtim.tv_sec ||
+        (sb.st_mtim.tv_sec == exeSb.st_mtim.tv_sec &&
+         sb.st_mtim.tv_nsec > exeSb.st_mtim.tv_nsec)) {
+      *reason = "source newer than binary: " + f;
+      return false;
+    }
+    std::string bytes;
+    if (!readFileBytes(root + "/" + f, &bytes)) {
+      *reason = "cannot read " + f;
+      return false;
+    }
+    blob += "file " + f + " " + sha256Hex(bytes.data(), bytes.size()) + "\n";
+  }
+  out->active = true;
+  out->closureSha = sha256Hex(blob.data(), blob.size());
+  out->files = files.size();
+  out->modeTag = "mt";
+  return true;
+}
+
 /* Every option below can change emitted bytes; see the header comment for
    why the omitted Config fields cannot. */
 std::string buildKeyMaterial(const std::string& module, const std::string& firSha,
-                             uint64_t firLen, const std::string& binSha, uint64_t binLen) {
+                             uint64_t firLen, const std::string& binSha, uint64_t binLen,
+                             const SrcsetKey& srcset) {
   std::string s;
   auto addLine = [&s](const std::string& line) { s += line; s += '\n'; };
   addLine(kKeyMagic);
   addLine("module=" + escapeKeyToken(module));
   addLine("fir-sha256=" + firSha + " fir-bytes=" + std::to_string(firLen));
-  addLine("emitter-sha256=" + binSha + " emitter-bytes=" + std::to_string(binLen));
+  /* Emitter identity: the running binary by default; under a resolved
+     GSIM_GEN_CACHE_KEY=srcset the source-closure fingerprint instead. This
+     is the ONLY line that differs between the two key modes. */
+  if (srcset.active) {
+    addLine("closure-sha256=" + srcset.closureSha + " files=" +
+            std::to_string(srcset.files) + " mode=" + srcset.modeTag);
+  } else {
+    addLine("emitter-sha256=" + binSha + " emitter-bytes=" + std::to_string(binLen));
+  }
   auto addFlag = [&](const char* k, const std::string& v) { addLine(std::string("opt:") + k + "=" + v); };
   auto addFlagInt = [&](const char* k, long long v) { addFlag(k, std::to_string(v)); };
   auto addFlagBool = [&](const char* k, bool v) { addFlagInt(k, v ? 1 : 0); };
@@ -444,7 +899,9 @@ std::string buildKeyMaterial(const std::string& module, const std::string& firSh
      GSIM_MT_EXECUTOR and GSIM_MT_CPU_AFFINITY appear only inside string
      literals baked into the emitted model (runtime knobs of the generated
      code) and so cannot change generated bytes; GSIM_GEN_CACHE /
-     GSIM_GEN_CACHE_VERIFY control this cache, not the emitter. */
+     GSIM_GEN_CACHE_VERIFY / GSIM_GEN_CACHE_KEY control this cache, not the
+     emitter. GSIM_GEN_CACHE_KEY in particular must stay OUT of the key:
+     an explicit "binary" must key identically to leaving it unset. */
   static const char* const kGenEnvVars[] = {
       "GSIM_THREADS",           /* MT worker count baked into the model */
       "GSIM_EMIT_RESET_CHUNK",  /* MT reset-emission chunking */
@@ -470,7 +927,8 @@ struct Cache::Impl {
   std::string module;
   std::string keyHex;
   std::string entryDir;
-  bool verifyPending = false;  // verified hit awaiting fresh emission to compare
+  SrcsetKey srcset;              // active only under a resolved GSIM_GEN_CACHE_KEY=srcset
+  bool verifyPending = false;   // verified hit awaiting fresh emission to compare
   bool cacheActive = true;     // false -> miss-through: no OutputDir mutation, no store
   bool staged = false;         // pre-existing namespace files moved away before our writes
   int lockFd = -1;             // exclusive OutputDir lock, held for the process lifetime
@@ -768,7 +1226,7 @@ struct Cache::Impl {
     keyFile += std::string(kEntryMagic) + "\n";
     keyFile += "key=" + keyHex + "\n";
     keyFile += "--key-material--\n";
-    keyFile += buildKeyMaterial(module, firSha, firLen, binSha, binLen);
+    keyFile += buildKeyMaterial(module, firSha, firLen, binSha, binLen, srcset);
     keyFile += "--artifacts--\n";
     for (const EntryArtifact& a : artifacts) {
       keyFile += a.sha256 + " " + std::to_string(a.size) + " " + a.name + "\n";
@@ -929,6 +1387,38 @@ Cache* Cache::create() {
     return nullptr;
   }
   pruneStaleScratchDirs(impl->cacheDir);
+  /* Key-mode selection: GSIM_GEN_CACHE_KEY=srcset|binary. Default (unset,
+     empty or "binary") and every unrecognized value use the binary key with
+     byte-identical key material and logs; "srcset" (mt-mode runs only)
+     swaps the emitter line for the source-closure fingerprint, falling
+     back to the binary key on any ambiguity (fail-closed, distinct log
+     lines below). */
+  const char* keyMode = std::getenv("GSIM_GEN_CACHE_KEY");
+  if (keyMode != nullptr && keyMode[0] != '\0' && strcmp(keyMode, "srcset") != 0 &&
+      strcmp(keyMode, "binary") != 0) {
+    fprintf(stderr, "[genCache] warning: GSIM_GEN_CACHE_KEY='%s' unrecognized "
+                    "(expected srcset or binary); using the binary key\n", keyMode);
+  }
+  if (keyMode != nullptr && strcmp(keyMode, "srcset") == 0) {
+    std::string reason;
+    bool ok = globalConfig.MtMode;
+    if (!ok) {
+      reason = "mt-mode only: the serial emitter's output depends on compile-time "
+               "switches (PERF, MODE, ...) that a source-set key cannot cover";
+    } else {
+      ok = computeSrcsetClosure(&impl->srcset, &reason);
+    }
+    if (ok) {
+      fprintf(stderr, "[genCache] key-mode=srcset closure-files=%zu closure-sha256=%s "
+                      "fallback=none\n",
+              impl->srcset.files, impl->srcset.closureSha.c_str());
+    } else {
+      fprintf(stderr, "[genCache] srcset key unavailable (%s); falling back to the binary key\n",
+              reason.c_str());
+      fprintf(stderr, "[genCache] key-mode=srcset closure-files=- closure-sha256=- "
+                      "fallback=%s\n", reason.c_str());
+    }
+  }
   Cache* cache = new Cache();
   cache->impl_ = impl;
   fprintf(stderr, "[genCache] enabled dir=%s verify=%d emitter-sha256=%s\n",
@@ -950,7 +1440,8 @@ bool Cache::lookup(const std::string& moduleName) {
   }
   impl.module = moduleName;
   const std::string material =
-      buildKeyMaterial(moduleName, impl.firSha, impl.firLen, impl.binSha, impl.binLen);
+      buildKeyMaterial(moduleName, impl.firSha, impl.firLen, impl.binSha, impl.binLen,
+                       impl.srcset);
   impl.keyHex = sha256Hex(material.data(), material.size());
   impl.entryDir =
       impl.cacheDir + "/" + sanitizePathComponent(moduleName) + "." + impl.keyHex.substr(0, 32);
