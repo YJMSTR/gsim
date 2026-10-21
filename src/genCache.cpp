@@ -87,6 +87,7 @@
 */
 
 #include "genCache.h"
+#include "genCacheInternal.h"
 
 #include "common.h"
 
@@ -109,9 +110,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace genCache {
-
-namespace {
+namespace genCacheUtil {
 
 /* ---------------------------------------------------------------- SHA-256 */
 class Sha256 {
@@ -195,14 +194,13 @@ class Sha256 {
     for (int i = 0; i < 64; i++) {
       const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
       const uint32_t ch = (e & f) ^ (~e & g);
-      const uint32_t t1 = h + S1 + ch + K[i] + w[i];
       const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
       const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
       const uint32_t t2 = S0 + maj;
+      const uint32_t t1 = K[i] + ch + S1;
       h = g;
       g = f;
       f = e;
-      e = d + t1;
       d = c;
       c = b;
       b = a;
@@ -305,8 +303,18 @@ bool writePrivateFile(const std::string& path, const std::string& data) {
   if (fd < 0) return false;
   size_t off = 0;
   while (off < data.size()) {
-    const ssize_t n = write(fd, data.data() + off, data.size() - off);
-    if (n <= 0) {
+    /* Cap each write well below the ~2GB kernel per-call limit and retry
+       on EINTR: multi-GB checkpoint bodies previously aborted the store
+       when a signal landed mid-write (n == -1 was treated as fatal). */
+    size_t chunk = data.size() - off;
+    if (chunk > (size_t)64 << 20) chunk = (size_t)64 << 20;
+    const ssize_t n = write(fd, data.data() + off, chunk);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      close(fd);
+      return false;
+    }
+    if (n == 0) {
       close(fd);
       return false;
     }
@@ -390,6 +398,182 @@ bool isHexString(const std::string& s, size_t len) {
   }
   return true;
 }
+
+bool nameInList(const char* const* list, size_t count, const std::string& name) {
+  for (size_t i = 0; i < count; i++) {
+    if (name == list[i]) return true;
+  }
+  return false;
+}
+
+bool endsWith(const std::string& s, const char* suffix) {
+  const size_t n = strlen(suffix);
+  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+/* Single-quotes s for safe interpolation into a popen(3) shell command. */
+std::string shellQuote(const std::string& s) {
+  std::string q = "'";
+  for (char c : s) {
+    if (c == '\'') q += "'\\''";
+    else q += c;
+  }
+  q += "'";
+  return q;
+}
+
+/* Runs cmd through /bin/sh and captures stdout. Returns false when the
+   command cannot be started or exits nonzero (or is killed by a signal). */
+bool captureCommandOutput(const std::string& cmd, std::string* out) {
+  FILE* p = popen(cmd.c_str(), "r");
+  if (p == nullptr) return false;
+  out->clear();
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof buf, p)) > 0) out->append(buf, n);
+  const int status = pclose(p);
+  return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/* All non-hidden dirents of dir, sorted; directories carry a trailing '/',
+   anything that is neither a regular file nor a directory (after following
+   symlinks) a trailing '?' so the guards below reject it. A failed listing
+   is NOT an empty directory, so callers must treat false as fail-closed. */
+bool listDirEntries(const std::string& dir, std::vector<std::string>* out) {
+  DIR* d = opendir(dir.c_str());
+  if (d == nullptr) return false;
+  out->clear();
+  while (struct dirent* e = readdir(d)) {
+    const std::string name = e->d_name;
+    if (name == "." || name == "..") continue;
+    if (name[0] == '.') continue;  // hidden files are never compiled/included
+    struct stat sb;
+    if (fstatat(dirfd(d), name.c_str(), &sb, 0) != 0) {
+      closedir(d);
+      return false;
+    }
+    if (S_ISDIR(sb.st_mode)) out->push_back(name + "/");
+    else if (S_ISREG(sb.st_mode)) out->push_back(name);
+    else out->push_back(name + "?");
+  }
+  closedir(d);
+  std::sort(out->begin(), out->end());
+  return true;
+}
+
+bool isRegularFile(const std::string& path) {
+  struct stat sb;
+  return stat(path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
+}
+
+std::string parentDirOf(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) return std::string();
+  if (slash == 0) return "/";
+  return path.substr(0, slash);
+}
+
+/* The source tree root: must contain src/, include/ and parser/ plus the
+   src/genCache.cpp sentinel (build/gsim/src holds .o files, so the binary's
+   own directory must never pass for a root). */
+bool isSourceRoot(const std::string& dir) {
+  return isDirectory(dir + "/src") && isDirectory(dir + "/include") &&
+         isDirectory(dir + "/parser") && isRegularFile(dir + "/src/genCache.cpp");
+}
+
+/* --------------------------------------------------- identity resolution */
+
+bool resolveSelfExe(std::string* exePath, std::string* reason) {
+  char exeBuf[4096];
+  const ssize_t exeLen = readlink("/proc/self/exe", exeBuf, sizeof exeBuf - 1);
+  if (exeLen <= 0 || exeLen == (ssize_t)(sizeof exeBuf - 1)) {
+    *reason = "cannot resolve /proc/self/exe";
+    return false;
+  }
+  exeBuf[exeLen] = '\0';
+  *exePath = exeBuf;
+  return true;
+}
+
+bool resolveCompilerIdentity(std::string* compilerLine, std::string* reason) {
+  std::string compilerOut;
+  if (!captureCommandOutput("clang++ --version 2>/dev/null", &compilerOut)) {
+    *reason = "compiler identity unavailable (clang++ --version failed)";
+    return false;
+  }
+  size_t lineEnd = compilerOut.find('\n');
+  *compilerLine =
+      compilerOut.substr(0, lineEnd == std::string::npos ? compilerOut.size() : lineEnd);
+  if (compilerLine->empty()) {
+    *reason = "compiler identity unavailable (empty clang++ --version)";
+    return false;
+  }
+  return true;
+}
+
+bool resolveAllocatorIdentity(const std::string& exePath, std::string* depsSha,
+                              std::string* reason) {
+  std::string lddOut;
+  if (!captureCommandOutput(std::string("ldd ") + shellQuote(exePath) + " 2>/dev/null", &lddOut)) {
+    *reason = "allocator identity unavailable (ldd failed)";
+    return false;
+  }
+  std::vector<std::string> deps;
+  size_t pos = 0;
+  while (pos <= lddOut.size()) {
+    size_t nl = lddOut.find('\n', pos);
+    std::string line = lddOut.substr(pos, (nl == std::string::npos ? lddOut.size() : nl) - pos);
+    pos = (nl == std::string::npos) ? lddOut.size() + 1 : nl + 1;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const size_t paren = line.find(" (");
+    if (paren != std::string::npos) line = line.substr(0, paren);
+    size_t b = 0, e = line.size();
+    while (b < e && (line[b] == ' ' || line[b] == '\t')) b++;
+    while (e > b && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
+    if (e > b) deps.push_back(line.substr(b, e - b));
+  }
+  if (deps.empty()) {
+    *reason = "allocator identity unavailable (empty ldd output)";
+    return false;
+  }
+  std::sort(deps.begin(), deps.end());
+  std::string depsBlob;
+  for (const std::string& d : deps) {
+    depsBlob += d;
+    depsBlob += '\n';
+  }
+  *depsSha = sha256Hex(depsBlob.data(), depsBlob.size());
+  return true;
+}
+
+bool findSourceRoot(const std::string& exePath, std::string* root, std::string* reason) {
+  /* The Makefile places the binary at <root>/build/gsim/gsim, so the root is
+     three dirname levels up; shallower placements and running from the tree
+     (or a subdirectory) are the fallbacks. */
+  const std::string exeDir = parentDirOf(exePath);
+  char cwdBuf[4096];
+  const char* cwd = getcwd(cwdBuf, sizeof cwdBuf);
+  const std::string cwdStr = cwd != nullptr ? std::string(cwd) : std::string();
+  const std::string candidates[5] = {parentDirOf(parentDirOf(exeDir)), parentDirOf(exeDir),
+                                     exeDir, cwdStr, parentDirOf(cwdStr)};
+  for (const std::string& cand : candidates) {
+    if (cand.empty()) continue;
+    if (isSourceRoot(cand)) {
+      *root = cand;
+      return true;
+    }
+  }
+  *reason = "source tree not found (no src/ include/ parser/ root near the binary or cwd)";
+  return false;
+}
+
+}  // namespace genCacheUtil
+
+namespace genCache {
+
+namespace {
+
+using namespace genCacheUtil;
 
 /* Files the two emitters can write into OutputDir for module `name`, plus
    the fixed-name MT schedule reports. Derived from every fopen/ofstream on
@@ -543,88 +727,6 @@ const char* const kClosureSrcH[] = {
     "genCache.h",
 };
 
-bool nameInList(const char* const* list, size_t count, const std::string& name) {
-  for (size_t i = 0; i < count; i++) {
-    if (name == list[i]) return true;
-  }
-  return false;
-}
-
-bool endsWith(const std::string& s, const char* suffix) {
-  const size_t n = strlen(suffix);
-  return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
-}
-
-/* Single-quotes s for safe interpolation into a popen(3) shell command. */
-std::string shellQuote(const std::string& s) {
-  std::string q = "'";
-  for (char c : s) {
-    if (c == '\'') q += "'\\''";
-    else q += c;
-  }
-  q += "'";
-  return q;
-}
-
-/* Runs cmd through /bin/sh and captures stdout. Returns false when the
-   command cannot be started or exits nonzero (or is killed by a signal). */
-bool captureCommandOutput(const std::string& cmd, std::string* out) {
-  FILE* p = popen(cmd.c_str(), "r");
-  if (p == nullptr) return false;
-  out->clear();
-  char buf[4096];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof buf, p)) > 0) out->append(buf, n);
-  const int status = pclose(p);
-  return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
-}
-
-/* All non-hidden dirents of dir, sorted; directories carry a trailing '/',
-   anything that is neither a regular file nor a directory (after following
-   symlinks) a trailing '?' so the guards below reject it. A failed listing
-   is NOT an empty directory, so callers must treat false as fail-closed. */
-bool listDirEntries(const std::string& dir, std::vector<std::string>* out) {
-  DIR* d = opendir(dir.c_str());
-  if (d == nullptr) return false;
-  out->clear();
-  while (struct dirent* e = readdir(d)) {
-    const std::string name = e->d_name;
-    if (name == "." || name == "..") continue;
-    if (name[0] == '.') continue;  // hidden files are never compiled/included
-    struct stat sb;
-    if (fstatat(dirfd(d), name.c_str(), &sb, 0) != 0) {
-      closedir(d);
-      return false;
-    }
-    if (S_ISDIR(sb.st_mode)) out->push_back(name + "/");
-    else if (S_ISREG(sb.st_mode)) out->push_back(name);
-    else out->push_back(name + "?");
-  }
-  closedir(d);
-  std::sort(out->begin(), out->end());
-  return true;
-}
-
-bool isRegularFile(const std::string& path) {
-  struct stat sb;
-  return stat(path.c_str(), &sb) == 0 && S_ISREG(sb.st_mode);
-}
-
-std::string parentDirOf(const std::string& path) {
-  const size_t slash = path.find_last_of('/');
-  if (slash == std::string::npos) return std::string();
-  if (slash == 0) return "/";
-  return path.substr(0, slash);
-}
-
-/* The source tree root: must contain src/, include/ and parser/ plus the
-   src/genCache.cpp sentinel (build/gsim/src holds .o files, so the binary's
-   own directory must never pass for a root). */
-bool isSourceRoot(const std::string& dir) {
-  return isDirectory(dir + "/src") && isDirectory(dir + "/include") &&
-         isDirectory(dir + "/parser") && isRegularFile(dir + "/src/genCache.cpp");
-}
-
 /* Classifies src/ and include/ entries against the mt-mode closure and
    appends "src/<f>" / "include/<f>" to files. Fails (with *reason set) on
    anything not explicitly recognized: unknown src translation units,
@@ -731,91 +833,24 @@ bool collectParserFiles(const std::string& root, const std::string& relDir, int 
    key (the binary key has the same snapshot property via the one-time
    binary hash). */
 bool computeSrcsetClosure(SrcsetKey* out, std::string* reason) {
-  /* Compiler identity: first line of `clang++ --version`. */
-  std::string compilerOut;
-  if (!captureCommandOutput("clang++ --version 2>/dev/null", &compilerOut)) {
-    *reason = "compiler identity unavailable (clang++ --version failed)";
-    return false;
-  }
-  size_t lineEnd = compilerOut.find('\n');
-  const std::string compilerLine =
-      compilerOut.substr(0, lineEnd == std::string::npos ? compilerOut.size() : lineEnd);
-  if (compilerLine.empty()) {
-    *reason = "compiler identity unavailable (empty clang++ --version)";
-    return false;
-  }
-  /* Allocator identity: sha256 over the sorted, address-stripped ldd(1)
-     dependency list of the running binary (libjemalloc.so vs libc malloc
-     shows up here; the raw output cannot be hashed directly because ldd
-     prints ASLR-dependent addresses). */
-  char exeBuf[4096];
-  const ssize_t exeLen = readlink("/proc/self/exe", exeBuf, sizeof exeBuf - 1);
-  if (exeLen <= 0 || exeLen == (ssize_t)(sizeof exeBuf - 1)) {
-    *reason = "cannot resolve /proc/self/exe";
-    return false;
-  }
-  exeBuf[exeLen] = '\0';
+  std::string compilerLine;
+  if (!resolveCompilerIdentity(&compilerLine, reason)) return false;
+  std::string exePath;
+  if (!resolveSelfExe(&exePath, reason)) return false;
   /* Stale-binary window guard: a closure file newer than the running binary
      means the binary was not built from the sources we are about to hash;
      the closure would then claim inputs the running code does not
      implement. Fail-closed to the binary key (which describes the code
      that is actually running). */
   struct stat exeSb;
-  if (stat(exeBuf, &exeSb) != 0) {
-    *reason = std::string("cannot stat ") + exeBuf;
+  if (stat(exePath.c_str(), &exeSb) != 0) {
+    *reason = std::string("cannot stat ") + exePath;
     return false;
   }
-  std::string lddOut;
-  if (!captureCommandOutput(std::string("ldd ") + shellQuote(exeBuf) + " 2>/dev/null", &lddOut)) {
-    *reason = "allocator identity unavailable (ldd failed)";
-    return false;
-  }
-  std::vector<std::string> deps;
-  size_t pos = 0;
-  while (pos <= lddOut.size()) {
-    size_t nl = lddOut.find('\n', pos);
-    std::string line = lddOut.substr(pos, (nl == std::string::npos ? lddOut.size() : nl) - pos);
-    pos = (nl == std::string::npos) ? lddOut.size() + 1 : nl + 1;
-    if (!line.empty() && line.back() == '\r') line.pop_back();
-    const size_t paren = line.find(" (");
-    if (paren != std::string::npos) line = line.substr(0, paren);
-    size_t b = 0, e = line.size();
-    while (b < e && (line[b] == ' ' || line[b] == '\t')) b++;
-    while (e > b && (line[e - 1] == ' ' || line[e - 1] == '\t')) e--;
-    if (e > b) deps.push_back(line.substr(b, e - b));
-  }
-  if (deps.empty()) {
-    *reason = "allocator identity unavailable (empty ldd output)";
-    return false;
-  }
-  std::sort(deps.begin(), deps.end());
-  std::string depsBlob;
-  for (const std::string& d : deps) {
-    depsBlob += d;
-    depsBlob += '\n';
-  }
-  const std::string depsSha = sha256Hex(depsBlob.data(), depsBlob.size());
-  /* Source tree root: the Makefile places the binary at <root>/build/gsim/
-     gsim, so the root is three dirname levels up; shallower placements and
-     running from the tree (or a subdirectory) are the fallbacks. */
-  const std::string exeDir = parentDirOf(exeBuf);
-  char cwdBuf[4096];
-  const char* cwd = getcwd(cwdBuf, sizeof cwdBuf);
-  const std::string cwdStr = cwd != nullptr ? std::string(cwd) : std::string();
-  const std::string candidates[5] = {parentDirOf(parentDirOf(exeDir)), parentDirOf(exeDir),
-                                     exeDir, cwdStr, parentDirOf(cwdStr)};
+  std::string depsSha;
+  if (!resolveAllocatorIdentity(exePath, &depsSha, reason)) return false;
   std::string root;
-  for (const std::string& cand : candidates) {
-    if (cand.empty()) continue;
-    if (isSourceRoot(cand)) {
-      root = cand;
-      break;
-    }
-  }
-  if (root.empty()) {
-    *reason = "source tree not found (no src/ include/ parser/ root near the binary or cwd)";
-    return false;
-  }
+  if (!findSourceRoot(exePath, &root, reason)) return false;
   std::vector<std::string> files;
   if (!collectMtSrcIncludeFiles(root, &files, reason)) return false;
   if (!collectParserFiles(root, "parser", 0, &files, reason)) return false;

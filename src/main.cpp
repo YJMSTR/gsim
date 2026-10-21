@@ -8,6 +8,7 @@
 #include "common.h"
 #include "graph.h"
 #include "genCache.h"
+#include "genCheckpoint.h"
 
 #include <sstream>
 #include <thread>
@@ -482,6 +483,13 @@ int main(int argc, char** argv) {
   genCache::Cache* const cache = genCache::Cache::create();
   if (cache) cache->hashFirInput(strbuf, size - 1);
 
+  /* Pre-Final graph checkpoint (default off, GSIM_GEN_CHECKPOINT=<dir>).
+     The FIR bytes are hashed here for the same reason as above. The
+     restore hook sits after the genCache lookup so the artifact cache
+     keeps its exact current behavior when both knobs are set. */
+  genCheckpoint::Checkpointer* const ckpt = genCheckpoint::Checkpointer::create();
+  if (ckpt) ckpt->hashFirInput(strbuf, size - 1);
+
   PNode* globalRoot;
   FUNC_TIMER(globalRoot= parseFIR(strbuf));
   munmap(strbuf, mapSize);
@@ -492,39 +500,52 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  FUNC_WRAPPER(g = AST2Graph(globalRoot), "Init");
+  /* A checkpoint hit replaces the pre-Final pipeline (AST2Graph ..
+     removeDeadNodes): the graph below is rebuilt from the entry and Final
+     runs on it directly. parseFIR has already run (3.6 s of the ~826 s
+     pre-Final time on kunminghu) because the genCache lookup above needs
+     the module name; keeping genCache's behavior identical was worth far
+     more than those seconds. */
+  bool graphRestored = ckpt ? ckpt->tryRestore(&g) : false;
+  if (!graphRestored) {
+    FUNC_WRAPPER(g = AST2Graph(globalRoot), "Init");
 
-  FUNC_TIMER(g->splitArray());
+    FUNC_TIMER(g->splitArray());
 
-  FUNC_TIMER(g->detectLoop());
+    FUNC_TIMER(g->detectLoop());
 
-  FUNC_WRAPPER(g->topoSort(), "TopoSort");
+    FUNC_WRAPPER(g->topoSort(), "TopoSort");
 
-  FUNC_TIMER(g->inferAllWidth());
+    FUNC_TIMER(g->inferAllWidth());
 
-  FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+    FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
 
-  FUNC_WRAPPER(g->exprOpt(), "ExprOpt");
+    FUNC_WRAPPER(g->exprOpt(), "ExprOpt");
 
-  FUNC_TIMER(g->usedBits());
+    FUNC_TIMER(g->usedBits());
 
-  FUNC_TIMER(g->splitNodes());
+    FUNC_TIMER(g->splitNodes());
 
-  if (globalConfig.EnableDumpGraph && shouldDumpStage("AfterSplitNodes")) g->dump(std::to_string(dumpIdx ++) + "AfterSplitNodes");
+    if (globalConfig.EnableDumpGraph && shouldDumpStage("AfterSplitNodes")) g->dump(std::to_string(dumpIdx ++) + "AfterSplitNodes");
 
-  FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes1");
+    FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes1");
 
-  FUNC_WRAPPER(g->constantAnalysis(), "ConstantAnalysis");
+    FUNC_WRAPPER(g->constantAnalysis(), "ConstantAnalysis");
 
-  FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+    FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
 
-  FUNC_WRAPPER(g->aliasAnalysis(), "AliasAnalysis");
+    FUNC_WRAPPER(g->aliasAnalysis(), "AliasAnalysis");
 
-  FUNC_WRAPPER(g->patternDetect(), "PatternDetect");
+    FUNC_WRAPPER(g->patternDetect(), "PatternDetect");
 
-  FUNC_WRAPPER(g->commonExpr(), "CommonExpr");
+    FUNC_WRAPPER(g->commonExpr(), "CommonExpr");
 
-  FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+    FUNC_WRAPPER(g->removeDeadNodes(), "RemoveDeadNodes");
+
+    /* Store the pre-Final graph at the removeDeadNodes -> beginEmission
+       boundary. */
+    if (ckpt) ckpt->store(g);
+  }
 
   if (cache) cache->beginEmission();
 

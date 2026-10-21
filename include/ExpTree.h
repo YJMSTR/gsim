@@ -208,6 +208,9 @@ public:
     nodePtr = _node;
     id = counter ++;
   }
+  /* Checkpoint (de)serialization needs the exact id-counter state; see Node. */
+  static int counterValue() { return counter; }
+  static void setCounterValue(int value) { counter = value; }
   void setNode(Node* node) { nodePtr = node; }
   // node can be empty (only for when)
   void addChild(ENode* node) { child.push_back(node); }

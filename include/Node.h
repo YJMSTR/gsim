@@ -97,6 +97,12 @@ class Node {
   static int counter;
  public:
 
+  /* Checkpoint (de)serialization needs the exact id-counter state so that
+     objects allocated after a restore keep receiving the ids a full run
+     would have assigned (ids reach emitted text via oldName()). */
+  static int counterValue() { return counter; }
+  static void setCounterValue(int value) { counter = value; }
+
   Node(NodeType _type = NODE_OTHERS) {
     type    = _type;
     id = counter ++;
@@ -381,6 +387,9 @@ public:
     member.push_back(_member);
     id = counter ++;
   }
+  /* Checkpoint (de)serialization needs the exact id-counter state; see Node. */
+  static int counterValue() { return counter; }
+  static void setCounterValue(int value) { counter = value; }
   void add_member(Node* _member) {
     Assert(std::find(member.begin(), member.end(), _member) == member.end(), "member %s is already in superNode %d", _member->name.c_str(), id);
     member.push_back(_member);
