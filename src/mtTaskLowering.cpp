@@ -10,6 +10,9 @@
 
 extern int maxConcatNum;
 std::string computeExtMod(Node* ext, std::vector<InstInfo>& instructions);
+// GSIM_MT_UNIFORM_FILL switch, shared with arrayCopy's uniform-fill loops
+// (defined in instsGenerator.cpp).
+bool uniformFillEnabled();
 
 namespace {
 
@@ -439,6 +442,119 @@ void predecessorPath(Node* node, const std::set<Node*>& scope,
   }
 }
 
+/* GSIM_MT_UNIFORM_FILL run merge (default off): a FIRRTL source that
+   connects array elements one statement at a time (ToAXI4.scala's
+   sourceStall) lowers to tens of thousands of consecutive
+   "base[i] = rhs;" SUPER_INFO_STR entries, one per element. When a maximal
+   run of consecutive entries shares one base, one rhs and steps the index
+   by exactly one, a single loop entry performs the same stores in the same
+   order, mirroring arrayCopy's uniform-fill loop form. Every entry that is
+   not exactly that single-line element-assignment shape (when-block
+   markers, multi-line arrayCopy text, other statements) breaks the run, so
+   a merge never crosses a statement boundary. */
+constexpr size_t kUniformFillMinRun = 8;
+constexpr long long kUniformFillMaxIndex = 0x7fffffff;
+
+bool uniformFillRunIdentChar(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Parses text of the exact single-line shape "<ident>[<decimal>] = <rhs>;".
+   Rejects every other shape: newline anywhere, embedded ';', multi-index
+   or member-access lvalues, empty rhs, out-of-range index. */
+bool parseUniformFillElement(const std::string& text, std::string& base,
+                             long long& index, std::string& rhs) {
+  size_t pos = 0;
+  while (pos < text.size() && uniformFillRunIdentChar(text[pos])) pos++;
+  if (pos == 0 || pos >= text.size() || text[pos] != '[') return false;
+  base = text.substr(0, pos);
+  pos++;
+  long long value = 0;
+  const size_t digitsBegin = pos;
+  while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
+    value = value * 10 + (text[pos] - '0');
+    if (value > kUniformFillMaxIndex) return false;
+    pos++;
+  }
+  if (pos == digitsBegin) return false;
+  if (pos >= text.size() || text[pos] != ']') return false;
+  pos++;
+  /* " = " plus at least one rhs character plus the closing ';' must fit. */
+  if (pos + 5 > text.size() || text[pos] != ' ' || text[pos + 1] != '=' ||
+      text[pos + 2] != ' ' || text.back() != ';') {
+    return false;
+  }
+  rhs = text.substr(pos + 3, text.size() - pos - 4);
+  if (rhs.find(';') != std::string::npos ||
+      rhs.find('\n') != std::string::npos) {
+    return false;
+  }
+  index = value;
+  return true;
+}
+
+/* Rewrites insts in place, replacing each qualifying run with one loop
+   entry. A no-op (not even a reorder) when the knob is off. */
+void mergeUniformFillRuns(std::vector<InstInfo>& insts) {
+  if (!uniformFillEnabled()) return;
+  size_t write = 0;
+  size_t runBegin = 0;
+  bool runOpen = false;
+  std::string runBase, runRhs;
+  long long runFirst = 0, runLast = 0;
+  auto flushRun = [&](size_t runEnd) {
+    runOpen = false;
+    const size_t length = runEnd - runBegin;
+    /* Same conservative self-reference bail as arrayCopy's uniform fill:
+       when the rhs could read any element of the destination, keep the
+       unrolled form. */
+    if (length >= kUniformFillMinRun &&
+        runRhs.find(runBase) == std::string::npos) {
+      /* Same loop form arrayCopy's uniform-fill branch emits, generalized
+         to a first index that need not be zero. */
+      insts[write] = InstInfo(
+          SUPER_INFO_STR, nullptr,
+          "for(int __gsim_uf_i0 = " + std::to_string(runFirst) +
+              "; __gsim_uf_i0 < " + std::to_string(runLast + 1) +
+              "; __gsim_uf_i0 ++) { " + runBase + "[__gsim_uf_i0] = " +
+              runRhs + "; }");
+      write++;
+      return;
+    }
+    for (size_t i = runBegin; i < runEnd; i++) {
+      if (write != i) insts[write] = std::move(insts[i]);
+      write++;
+    }
+  };
+  for (size_t read = 0; read < insts.size(); read++) {
+    std::string base, rhs;
+    long long index = 0;
+    const bool candidate =
+        insts[read].infoType == SUPER_INFO_STR &&
+        parseUniformFillElement(insts[read].inst, base, index, rhs);
+    if (runOpen && candidate && base == runBase && rhs == runRhs &&
+        index == runLast + 1) {
+      runLast = index;
+      continue;
+    }
+    if (runOpen) flushRun(read);
+    if (candidate) {
+      runOpen = true;
+      runBegin = read;
+      runBase = base;
+      runRhs = rhs;
+      runFirst = index;
+      runLast = index;
+    } else {
+      if (write != read) insts[write] = std::move(insts[read]);
+      write++;
+    }
+  }
+  if (runOpen) flushRun(insts.size());
+  insts.erase(insts.begin() + static_cast<std::ptrdiff_t>(write), insts.end());
+}
+
 void buildTaskTree(MtTask& task, const MtTaskPlan& plan) {
   task.stmtTree = new StmtTree();
   task.stmtTree->root = new StmtNode(OP_STMT_SEQ);
@@ -453,6 +569,7 @@ void buildTaskTree(MtTask& task, const MtTaskPlan& plan) {
   }
   task.insts = new std::vector<InstInfo>();
   task.stmtTree->compute(*task.insts);
+  mergeUniformFillRuns(*task.insts);
 }
 
 void buildResetTree(SuperNode* super) {

@@ -141,7 +141,10 @@ static bool parseUniformFillEnv() {
          !(value[0] == '0' && value[1] == '\0');
 }
 
-static bool uniformFillEnabled() {
+/* Not file-local: mtTaskLowering.cpp's post-compute run merge follows the
+   same GSIM_MT_UNIFORM_FILL switch so both uniform-fill emitters toggle
+   together. */
+bool uniformFillEnabled() {
   static const bool enabled = parseUniformFillEnv();
   return enabled;
 }
