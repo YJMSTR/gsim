@@ -66,6 +66,55 @@ void collectReferencedNodes(ENode* root, std::set<Node*>& nodes) {
   }
 }
 
+// Node types whose storage is owned by a cycle-start state task. References
+// to any of these in a compute expression create a producer edge from the
+// owning mtUpdateStateW<w> to the referencing task.
+bool mtIsStatefulReference(const Node* node) {
+  switch (node->type) {
+    case NODE_REG_SRC:
+    case NODE_REG_DST:
+    case NODE_REG_RESET:
+    case NODE_READER:
+    case NODE_WRITER:
+    case NODE_READWRITER:
+    case NODE_MEMORY:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Collects every node referenced by a lowered expression tree for the
+// GSIM_MT_STATE_READY ownership analysis. Both ENode::nodePtr and
+// ENode::memoryNode must be visited: memory accesses carry the memory array
+// in memoryNode (instsReadMem/instsWriteMem emit memory->name[...] from it)
+// while the port and register leaves appear as nodePtr.
+struct MtStateRefCollector {
+  std::set<Node*> nodes;
+  bool extFunc = false;
+
+  void walk(ENode* root) {
+    if (root == nullptr) return;
+    std::vector<ENode*> pending{root};
+    while (!pending.empty()) {
+      ENode* current = pending.back();
+      pending.pop_back();
+      if (current->opType == OP_EXT_FUNC) extFunc = true;
+      if (current->nodePtr != nullptr) nodes.insert(current->nodePtr);
+      if (current->memoryNode != nullptr) nodes.insert(current->memoryNode);
+      for (ENode* child : current->child) {
+        if (child != nullptr) pending.push_back(child);
+      }
+    }
+  }
+
+  void walkTree(const ExpTree* tree) {
+    if (tree == nullptr) return;
+    walk(tree->getRoot());
+    walk(tree->getlval());
+  }
+};
+
 std::string nodeDeclaration(Node* node) {
   std::string declaration = widthUType(node->width) + " " + node->name;
   for (int dimension : node->dimension) {
@@ -84,7 +133,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
       lookaheadStats_(globalConfig.MtLookaheadStats),
-      dynamicQuery_(flagEnv("GSIM_MT_DYNAMIC_QUERY")) {}
+      dynamicQuery_(flagEnv("GSIM_MT_DYNAMIC_QUERY")),
+      stateReady_(flagEnv("GSIM_MT_STATE_READY")) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -103,6 +153,7 @@ void CppEmitterMt::prepare() {
   struct timeval t3 = getTime(); { struct timeval a=t2,b=t3; showTime("Final.schedule", a, b); }
   decideDynamicQuery();
   buildRegisterStorageNames();
+  buildStateReadyMasks();
   writeTaskPhaseReport();
   struct timeval t4 = getTime(); { struct timeval a=t3,b=t4; showTime("Final.reports", a, b); }
 }
@@ -325,6 +376,161 @@ void CppEmitterMt::buildRegisterStorageNames() {
   }
 }
 
+// GSIM_MT_STATE_READY ownership derivation. Builds, per compute task, the set
+// of state owners whose cycle-start mtUpdateStateW<w> must have completed
+// before the task may run, replacing the all-worker state barrier:
+//   (a) every state-task member (register sources, memory arrays, sync reset
+//       destinations, sparse register sources) maps to its owning worker;
+//   (b) each state register's destination storage (memcpy WAR plus reset
+//       writes) maps to the same worker, including sparse sources;
+//   (c) memory writer ports map to the owner that consumes and clears their
+//       pending address/data/valid slots;
+//   (d) sparse register writers map likewise;
+//   (e) memory ports referenced by compute resolve through node->parent to
+//       the memory array's owner.
+// Anything the map cannot decide fails closed to the all-owners mask:
+// ExtModule tasks (their body comes from computeExtMod, not member trees),
+// rheft replica tasks ($MT_REP$ members mirror lowered text; the tree/text
+// correspondence is not a contract), tasks with instructions but no walkable
+// members, OP_EXT_FUNC expressions, and any unmapped stateful reference.
+// A task's own owner bit is dropped: mtRunWorker always executes
+// mtUpdateStateW<self> before its compute chain, so program order covers it.
+void CppEmitterMt::buildStateReadyMasks() {
+  stateReadyMasks_.assign(tasks_.size(), 0);
+  if (!stateReadyActive()) return;
+  Assert(workerCount_ > 0 && workerCount_ <= 32,
+         "GSIM_MT_STATE_READY supports 1..32 generated workers, got %d",
+         workerCount_);
+  const uint32_t allOwners = workerCount_ == 32
+                                 ? 0xffffffffu
+                                 : (uint32_t{1} << workerCount_) - 1;
+
+  std::unordered_map<Node*, int> ownerByNode;
+  auto addOwner = [&](Node* node, int owner) {
+    auto entry = ownerByNode.emplace(node, owner);
+    Assert(entry.second || entry.first->second == owner,
+           "conflicting state owners for %s", node->name.c_str());
+  };
+  for (const auto& member : stateTaskByNode_) addOwner(member.first, member.second);
+  for (const StateUpdate& update : stateTasks_) {
+    for (Node* reg : update.registers) addOwner(reg->getDst(), update.owner);
+    for (Node* writer : update.memoryWriters) addOwner(writer, update.owner);
+    for (Node* writer : update.sparseRegisterWriters) addOwner(writer, update.owner);
+  }
+  for (const MtSparseRegister& sparse : sparseRegisters_) {
+    auto owner = ownerByNode.find(sparse.source);
+    Assert(owner != ownerByNode.end(), "sparse register %s has no state owner",
+           sparse.source->name.c_str());
+    addOwner(sparse.source->getDst(), owner->second);
+  }
+  auto resolveOwner = [&](Node* node) {
+    auto owner = ownerByNode.find(node);
+    if (owner != ownerByNode.end()) return owner->second;
+    if (node->type == NODE_READER || node->type == NODE_WRITER ||
+        node->type == NODE_READWRITER) {
+      owner = ownerByNode.find(node->parent);
+      if (owner != ownerByNode.end()) return owner->second;
+    }
+    return -1;
+  };
+
+  // (f) Reverse edges. State-task bodies evaluate live reset conditions
+  // (buildStateUpdates emits `if (unlikely(<condition>))` into every state
+  // task owning destinations of the group). The compute task producing such
+  // a condition must not overwrite it before each reading state task has
+  // finished and published, or the state task would observe this cycle's
+  // value instead of the previous one's. REG_SRC conditions read their
+  // $RESET copies captured before the generation bump; conditions without a
+  // producing compute task (inputs, constants) are stable during the cycle.
+  // Same-worker edges are covered by the own-bit omission below (a worker's
+  // state task always precedes its compute chain in program order).
+  std::vector<uint32_t> reverseEdges(tasks_.size(), 0);
+  for (SuperNode* super : graph_.allReset) {
+    if (super->superType != SUPER_UINT_RESET ||
+        super->resetNode->status == CONSTANT_NODE) {
+      continue;
+    }
+    Node* resetNode = super->resetNode;
+    if (resetNode->type == NODE_REG_SRC) continue;
+    auto producer = taskByNode_.find(resetNode);
+    if (producer == taskByNode_.end()) continue;
+    for (Node* member : super->member) {
+      if (member->type != NODE_REG_RESET) continue;
+      Node* reg = member->getResetSrc();
+      if (reg == nullptr || member->name != reg->getDst()->name) continue;
+      auto owner = ownerByNode.find(reg);
+      if (owner == ownerByNode.end()) continue;
+      reverseEdges[static_cast<size_t>(producer->second)] |=
+          uint32_t{1} << owner->second;
+    }
+  }
+
+  static constexpr char kReplicaMarker[] = "$MT_REP$";
+  size_t fallbackTasks = 0;
+  size_t waitedTasks = 0;
+  size_t maskBits = 0;
+  for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) {
+    const Task& task = tasks_[taskId];
+    uint32_t mask = 0;
+    bool failClosed = task.kind == MtTaskKind::ExtModule;
+    if (!failClosed && task.members.empty() && task.insts != nullptr) failClosed = true;
+    if (!failClosed) {
+      MtStateRefCollector collector;
+      for (Node* member : task.members) {
+        if (member->name.find(kReplicaMarker) != std::string::npos) {
+          failClosed = true;
+          break;
+        }
+        // Mirror mergeNodeAssignments so the walk sees exactly the trees the
+        // lowered instructions were generated from.
+        auto sparse = sparseRegisterByDestination_.find(member);
+        if (sparse != sparseRegisterByDestination_.end()) {
+          for (const ExpTree* write : sparseRegisters_[sparse->second].writeTrees) {
+            collector.walkTree(write);
+          }
+          continue;
+        }
+        for (const ExpTree* assignment : member->assignTree) {
+          collector.walkTree(assignment);
+          // mergeNodeAssignments also lowers an async-regSplit duplicate
+          // assignment whose lvalue is the destination storage.
+          if (member->type == NODE_REG_SRC && member->reset == ASYRESET &&
+              member->regSplit && member->getDst()->status == VALID_NODE) {
+            collector.nodes.insert(member->getDst());
+          }
+        }
+      }
+      if (!failClosed && collector.extFunc) failClosed = true;
+      if (!failClosed) {
+        for (Node* reference : collector.nodes) {
+          if (!mtIsStatefulReference(reference)) continue;
+          const int owner = resolveOwner(reference);
+          if (owner < 0) {
+            failClosed = true;
+            break;
+          }
+          mask |= uint32_t{1} << owner;
+        }
+      }
+    }
+    if (failClosed) {
+      mask = allOwners;
+      ++fallbackTasks;
+    } else {
+      mask |= reverseEdges[taskId];
+    }
+    mask &= ~(uint32_t{1} << task.owner);
+    if (mask != 0) ++waitedTasks;
+    maskBits += __builtin_popcount(mask);
+    stateReadyMasks_[taskId] = mask;
+  }
+  fprintf(stderr,
+          "[cppEmitter-mt] state-ready owners=%d tasks=%zu fallback-all=%zu "
+          "waited-tasks=%zu mask-bits=%zu avg-bits=%.2f\n",
+          workerCount_, tasks_.size(), fallbackTasks, waitedTasks, maskBits,
+          tasks_.empty() ? 0.0 : static_cast<double>(maskBits) / tasks_.size());
+}
+
 std::string CppEmitterMt::mapRegisterNames(const std::string& input) const {
   if (packedRegisterNamesByText_.empty()) return input;
   auto nameCharacter = [](unsigned char value) {
@@ -394,6 +600,11 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           "struct MtDispatch { void (S%s::*fn)(); uint32_t waitBegin, waitEnd, "
           "storeBegin, storeEnd, localWaitBegin, localWaitEnd;",
           graph_.name.c_str());
+  if (stateReadyActive()) {
+    // Per-consumer state-owner mask; field and dispatch initializers exist
+    // only in this mode so default-off class layout stays byte-identical.
+    fprintf(header, " uint32_t stateMask;");
+  }
   if (queryWorkerMask_ != 0) {
     fprintf(header, " uint64_t notifyProducers, notifyConsumers;");
   }
@@ -404,6 +615,12 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           workerCount_);
   fprintf(header, "MtDoneFlag mtStateDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "MtDoneFlag mtStateReady;\n");
+  if (stateReadyActive()) {
+    // One publisher flag per worker, worker0 included: every worker releases
+    // its own state completion right after mtUpdateStateW<self> and compute
+    // tasks wait only on the owner flags their stateMask references.
+    fprintf(header, "MtDoneFlag mtStateReadyFlags[%d];\n", workerCount_);
+  }
   fprintf(header, "std::vector<std::thread> mtThreads;\n");
   fprintf(header, "alignas(64) std::atomic<uint64_t> mtGeneration{0};\n");
   fprintf(header, "alignas(64) std::atomic<int> mtReadyWorkers{0};\n");
@@ -508,7 +725,11 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   if (lookaheadWindow_ > 0) {
     fprintf(header,
             "void mtRunLookaheadTail(const MtDispatch* entries, uint32_t count, "
-            "uint32_t head, uint8_t parity, int worker);\n");
+            "uint32_t head, uint8_t parity, int worker");
+    // The tail carries the caller's observed-ready state-owner mask by value:
+    // the inline path never resumes after handing the chain remainder over.
+    if (stateReadyActive()) fprintf(header, ", uint32_t stateSeen");
+    fprintf(header, ");\n");
   }
   fprintf(header, "void mtPinWorker(int worker);\nvoid stepMt();\n");
   for (const StateUpdate& update : stateTasks_) {
@@ -821,8 +1042,10 @@ void CppEmitterMt::emitDefinitions() {
                        std::to_string(worker) + "[" +
                        std::to_string(std::max<size_t>(1, dispatchCount)) + "] = {\n";
     if (dispatchCount == 0) {
-      text += emitQuery ? "  {nullptr, 0, 0, 0, 0, 0, 0, 0, 0}\n"
-                        : "  {nullptr, 0, 0, 0, 0, 0, 0}\n";
+      text += "  {nullptr, 0, 0, 0, 0, 0, 0";
+      if (stateReadyActive()) text += ", 0x0u";
+      if (emitQuery) text += ", 0, 0";
+      text += "}\n";
     } else {
       for (int taskId : chain) {
         const Task& task = tasks_[static_cast<size_t>(taskId)];
@@ -831,6 +1054,9 @@ void CppEmitterMt::emitDefinitions() {
                 std::to_string(task.storeBegin) + "," + std::to_string(task.storeEnd) + "," +
                 std::to_string(task.localWaitBegin) + "," +
                 std::to_string(task.localWaitEnd);
+        if (stateReadyActive()) {
+          text += "," + format("0x%xu", stateReadyMasks_[static_cast<size_t>(taskId)]);
+        }
         if (emitQuery) {
           text += "," + format("0x%llx", static_cast<unsigned long long>(notifyProducers[static_cast<size_t>(taskId)])) +
                   "," + format("0x%llx", static_cast<unsigned long long>(notifyConsumers[static_cast<size_t>(taskId)]));
@@ -953,7 +1179,9 @@ void CppEmitterMt::emitDefinitions() {
     const size_t doneWordCount = (maxWorkerTasks + 63) / 64;
     runtime += "void " + className +
                "::mtRunLookaheadTail(const MtDispatch* entries, uint32_t count, "
-               "uint32_t head, uint8_t parity, int worker) {\n";
+               "uint32_t head, uint8_t parity, int worker";
+    if (stateReadyActive()) runtime += ", uint32_t stateSeen";
+    runtime += ") {\n";
     if (lookaheadStats_) runtime += "  ++mtLookaheadStats[worker].calls;\n";
     runtime +=
         "  uint64_t doneBits[" + std::to_string(doneWordCount) + "]{};\n"
@@ -969,7 +1197,17 @@ void CppEmitterMt::emitDefinitions() {
         "    return remoteReady(candidate);\n"
         "  };\n";
     runtime +=
-        "  auto runTask = [&](const MtDispatch& entry) {\n"
+        "  auto runTask = [&](const MtDispatch& entry) {\n";
+    if (stateReadyActive()) {
+      runtime +=
+          "    for (uint32_t bits = entry.stateMask & ~stateSeen; bits != 0; bits &= bits - 1) {\n"
+          "      const int owner = __builtin_ctz(bits);\n"
+          "      while (mtStateReadyFlags[owner].parity.load(std::memory_order_acquire) != parity)\n"
+          "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+          "      stateSeen |= uint32_t{1} << owner;\n"
+          "    }\n";
+    }
+    runtime +=
         "    (this->*entry.fn)();\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n";
@@ -1048,18 +1286,30 @@ void CppEmitterMt::emitDefinitions() {
                std::to_string(worker) + "(); break;\n";
   }
   runtime += "    default: abort();\n  }\n";
-  runtime +=
-      "  if (worker == 0) {\n"
-      "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
-      "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
-      "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    }\n"
-      "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
-      "  } else {\n"
-      "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
-      "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
-      "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "  }\n";
+  if (stateReadyActive()) {
+    // Per-worker publication replaces the all-worker Done/Go barrier: every
+    // worker (worker0 included) releases its own state completion right
+    // after mtUpdateStateW<self>; consumers acquire exactly the owner flags
+    // their dispatch entries reference. stateSeen caches owners already
+    // observed this cycle so each task spins only on the missing bits.
+    runtime +=
+        "  mtStateReadyFlags[worker].parity.store(parity, std::memory_order_release);\n"
+        "  uint32_t stateSeen = 0;\n"
+        "  (void)stateSeen;\n";
+  } else {
+    runtime +=
+        "  if (worker == 0) {\n"
+        "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
+        "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
+        "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    }\n"
+        "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
+        "  } else {\n"
+        "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
+        "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
+        "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "  }\n";
+  }
   if (lookaheadWindow_ <= 0) {
     // Strict fixed-order fast path. This is the baseline protocol and avoids
     // all per-task ready scanning when lookahead is disabled.
@@ -1077,7 +1327,17 @@ void CppEmitterMt::emitDefinitions() {
         "    for (uint32_t i = entry.waitBegin; i < entry.waitEnd; ++i) {\n"
         "      while (mtReadyTokens[mtWaitSlots[i]].value.load(std::memory_order_acquire) != parity)\n"
         "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-        "    }\n"
+        "    }\n";
+    if (stateReadyActive()) {
+      runtime +=
+          "    for (uint32_t bits = entry.stateMask & ~stateSeen; bits != 0; bits &= bits - 1) {\n"
+          "      const int owner = __builtin_ctz(bits);\n"
+          "      while (mtStateReadyFlags[owner].parity.load(std::memory_order_acquire) != parity)\n"
+          "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+          "      stateSeen |= uint32_t{1} << owner;\n"
+          "    }\n";
+    }
+    runtime +=
         "    (this->*entry.fn)();\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
@@ -1091,15 +1351,34 @@ void CppEmitterMt::emitDefinitions() {
       for (size_t position = 0; position < chain.size(); ++position) {
         const int taskId = chain[position];
         const Task& task = tasks_[static_cast<size_t>(taskId)];
-        if (!task.waits.empty()) {
+        // In state-ready mode a task with no token waits may still wait on
+        // state owners; the precheck block is emitted for either kind and,
+        // before handing the remainder to the tail, observes (nonblocking)
+        // whatever owner flags are already published so the tail receives a
+        // current seen-mask by value.
+        const uint32_t stateMask =
+            stateReadyActive() ? stateReadyMasks_[static_cast<size_t>(taskId)] : 0;
+        if (!task.waits.empty() || stateMask != 0) {
           runtime += "      { bool ready = true;\n";
           for (int slot : task.waits) {
             runtime += "        ready &= mtReadyTokens[" + std::to_string(slot) +
                        "].value.load(std::memory_order_acquire) == parity;\n";
           }
+          if (stateMask != 0) {
+            const std::string maskLiteral = format("0x%xu", stateMask);
+            runtime +=
+                "        for (uint32_t bits = " + maskLiteral + " & ~stateSeen; bits != 0; bits &= bits - 1) {\n"
+                "          const int owner = __builtin_ctz(bits);\n"
+                "          if (mtStateReadyFlags[owner].parity.load(std::memory_order_acquire) == parity)\n"
+                "            stateSeen |= uint32_t{1} << owner;\n"
+                "        }\n"
+                "        ready &= (" + maskLiteral + " & ~stateSeen) == 0;\n";
+          }
           runtime += "        if (!ready) { mtRunLookaheadTail(mtDispatchW" +
                      std::to_string(worker) + ", " + std::to_string(chain.size()) +
-                     ", " + std::to_string(position) + ", parity, worker);";
+                     ", " + std::to_string(position) + ", parity, worker";
+          if (stateReadyActive()) runtime += ", stateSeen";
+          runtime += ");";
           if (emitQuery) runtime += " mtFlushNotify(worker);";
           runtime += " return; }\n      }\n";
         }

@@ -58,6 +58,8 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
   void emitTask(const Task& task, int indent);
   void buildRegisterStorageNames();
+  void buildStateReadyMasks();
+  bool stateReadyActive() const { return stateReady_; }
   void decideDynamicQuery();
   void writeTaskPhaseReport() const;
   std::string mapRegisterNames(const std::string& text) const;
@@ -75,6 +77,16 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   // with the knob unset (or scan selected everywhere) emission is unchanged.
   bool dynamicQuery_ = false;
   uint64_t queryWorkerMask_ = 0;
+  // GSIM_MT_STATE_READY=1: replace the all-worker cycle-start state barrier
+  // with per-worker publication plus per-consumer state-owner masks. Bit w of
+  // stateReadyMasks_[t] marks the state owner whose mtUpdateStateW<w> must
+  // complete before compute task t runs; task t's own owner bit is omitted
+  // (program order inside mtRunWorker). Unmapped stateful references,
+  // ExtModule tasks, rheft replica tasks and OP_EXT_FUNC expressions fail
+  // closed to the all-owners mask. With the knob unset every dependent
+  // emission site is skipped and generation output is byte-identical.
+  bool stateReady_ = false;
+  std::vector<uint32_t> stateReadyMasks_;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
 };

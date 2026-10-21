@@ -8,6 +8,17 @@ assertions on the emitted trace — never by emitted source-string comparison.
 The old hand-written register/reset oracle predates the intentional
 ASY->UINT change (0821ede) and failed on every variant including serial
 --mt-mode=off; it was removed rather than carried red.
+
+GSIM_MT_STATE_READY (per-consumer state-owner masks replacing the all-worker
+state barrier) is covered by three tests: default-off literal identity
+(knob unset must equal knob=0 and emit none of the mode-only members), on/off
+differential traces over the same design/window/worker matrix, and a census
+smoke test on the generator's stderr diagnostics. Full default-off identity
+against the pre-change generator is proven with Main's literal-extract
+harness: generate the same design twice (pristine fbf8dc4 binary vs patched,
+knob unset, identical flags) and diff the emitted trees byte-for-byte —
+every new emission site in this change is `stateReadyActive()`-gated, so the
+off-mode sequence is unchanged by construction and the harness verifies it.
 """
 import csv
 import os
@@ -66,13 +77,17 @@ def run(command, env):
 
 
 class StateTasksTest(unittest.TestCase):
-    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=()):
+    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=(),
+                 state_ready_env=None):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
-        run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
-             '--mt-scheduler=' + scheduler, f'--mt-lookahead-window={lookahead}',
-             *extra, '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
+        if state_ready_env is not None:
+            env['GSIM_MT_STATE_READY'] = state_ready_env
+        result = run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
+                      '--mt-scheduler=' + scheduler,
+                      f'--mt-lookahead-window={lookahead}',
+                      *extra, '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
         with (out / 'mt-task-phases.csv').open() as stream:
             phases = list(csv.DictReader(stream))
         with (out / 'mt-state-task-members.csv').open() as stream:
@@ -90,7 +105,7 @@ class StateTasksTest(unittest.TestCase):
         self.assertEqual(sum(int(r['members']) for r in states), len(owned))
         self.assertEqual(sum(int(r['reg_src_members']) for r in states),
                          sum(r['node_type'] == 'reg_src' for r in owned))
-        return env, members
+        return env, members, result.stderr
 
     def trace(self, out, design, env):
         (out / 'trace-harness.cpp').write_text(TRACE_HARNESS)
@@ -120,8 +135,8 @@ class StateTasksTest(unittest.TestCase):
                         tempfile.TemporaryDirectory(
                             prefix='mt-state-trace-') as directory:
                     out = Path(directory)
-                    env, members = self.generate(out, 'mt-state-tasks', workers,
-                                                 lookahead=lookahead)
+                    env, members, _ = self.generate(out, 'mt-state-tasks', workers,
+                                                    lookahead=lookahead)
                     registers = {r['node'] for r in members
                                  if r['node_type'] == 'reg_src'}
                     self.assertEqual(registers,
@@ -159,8 +174,8 @@ class StateTasksTest(unittest.TestCase):
             with self.subTest(lookahead=lookahead), tempfile.TemporaryDirectory(
                     prefix='mt-state-memory-') as directory:
                 out = Path(directory)
-                env, members = self.generate(out, 'mt-memory-commit', 4,
-                                             lookahead=lookahead)
+                env, members, _ = self.generate(out, 'mt-memory-commit', 4,
+                                                lookahead=lookahead)
                 self.assertTrue(any(r['node_type'] == 'memory' and r['role'] == 'member'
                                     for r in members))
                 self.assertTrue(any(r['node_type'] == 'memory_writer' and
@@ -175,7 +190,7 @@ class StateTasksTest(unittest.TestCase):
                 with self.subTest(design=design, max_writes=max_writes), tempfile.TemporaryDirectory(
                         prefix='mt-state-sparse-') as directory:
                     out = Path(directory)
-                    env, members = self.generate(out, design, 2, extra=(
+                    env, members, _ = self.generate(out, design, 2, extra=(
                         '--mt-sparse-register-min-bytes=1',
                         f'--mt-sparse-register-max-writes={max_writes}'))
                     self.assertEqual(sum(r['node_type'] == 'reg_src' and
@@ -184,6 +199,108 @@ class StateTasksTest(unittest.TestCase):
                                      0 if max_writes == 0 else 2)
                     signatures.append(self.simulate(out, design, env))
             self.assertEqual(len(set(signatures)), 1, (design, signatures))
+
+    def test_state_ready_default_off_literal_identity(self):
+        # With the knob unset and with an explicit "0", generation must emit
+        # byte-identical trees and none of the state-ready mode members: the
+        # knob is inert by default so champion builds keep the barrier
+        # protocol's exact layout. (Identity against the pre-change generator
+        # is Main's literal-extract harness; see the module docstring.)
+        with tempfile.TemporaryDirectory(prefix='mt-state-ready-off-') as directory:
+            root = Path(directory)
+            trees = []
+            for subdir, knob in (('unset', None), ('zero', '0')):
+                out = root / subdir
+                out.mkdir()
+                self.generate(out, 'mt-state-tasks', 4, lookahead=64,
+                              state_ready_env=knob)
+                trees.append({path.name: path.read_bytes()
+                              for path in sorted(out.iterdir())})
+                header = (out / 'MtStateTasks.h').read_text()
+                self.assertNotIn('mtStateReadyFlags', header)
+                self.assertNotIn('stateMask', header)
+                cpp = '\n'.join(path.read_text()
+                                for path in sorted(out.glob('*.cpp')))
+                self.assertNotIn('stateSeen', cpp)
+                self.assertIn('mtStateReady.parity.store', cpp)
+            self.assertEqual(trees[0], trees[1])
+
+    def test_state_ready_differential_traces(self):
+        # Replacing the all-worker state barrier with per-consumer masks must
+        # not change any observable output: for every design, lookahead mode
+        # (strict la0 included) and worker count, the state-ready model's
+        # complete trace must equal the barrier model's byte-for-byte.
+        sparse_extra = ('--mt-sparse-register-min-bytes=1',
+                        '--mt-sparse-register-max-writes=8')
+        for design in ('mt-state-tasks', 'mt-memory-commit',
+                       'mt-sparse-register-reset'):
+            extra = sparse_extra if design.startswith('mt-sparse') else ()
+            for workers in (1, 2, 4):
+                for lookahead in (0, 16, 64):
+                    with self.subTest(design=design, workers=workers,
+                                      lookahead=lookahead), \
+                            tempfile.TemporaryDirectory(
+                                prefix='mt-state-ready-diff-') as directory:
+                        root = Path(directory)
+                        signatures = {}
+                        for label, knob in (('off', None), ('on', '1')):
+                            out = root / label
+                            out.mkdir()
+                            env, _, _ = self.generate(out, design, workers,
+                                                      lookahead=lookahead,
+                                                      extra=extra,
+                                                      state_ready_env=knob)
+                            if design == 'mt-state-tasks':
+                                signatures[label] = self.trace(out, design, env)
+                            else:
+                                signatures[label] = self.simulate(out, design, env)
+                        self.assertTrue(signatures['off'])
+                        self.assertEqual(signatures['on'], signatures['off'],
+                                         (design, workers, lookahead))
+
+    def test_state_ready_census_smoke(self):
+        # The generator must report the derived masks once per run, only in
+        # this mode, and the mode must actually engage in the emitted code.
+        # Ground truth for mt-state-tasks @ 4 workers (13 compute tasks, six
+        # registers spread over 4 owners, plus one reverse reset-condition
+        # edge from the late_reset producer to ql's state owner): every task
+        # maps precisely, 11 mask bits total, no fail-closed fallback.
+        with tempfile.TemporaryDirectory(prefix='mt-state-ready-census-') as directory:
+            out = Path(directory)
+            _, _, stderr = self.generate(out, 'mt-state-tasks', 4, lookahead=64,
+                                         state_ready_env='1')
+            lines = [line for line in stderr.splitlines()
+                     if line.startswith('[cppEmitter-mt] state-ready ')]
+            self.assertEqual(len(lines), 1, stderr)
+            fields = dict(field.split('=', 1)
+                          for field in lines[0].split()[2:])
+            self.assertEqual(int(fields['owners']), 4)
+            self.assertEqual(int(fields['tasks']), 13)
+            self.assertEqual(int(fields['fallback-all']), 0)
+            self.assertEqual(int(fields['waited-tasks']), 10)
+            self.assertEqual(int(fields['mask-bits']), 11)
+            header = (out / 'MtStateTasks.h').read_text()
+            cpp = '\n'.join(path.read_text()
+                            for path in sorted(out.glob('*.cpp')))
+            self.assertIn('mtStateReadyFlags[worker].parity.store', cpp)
+            self.assertIn('entry.stateMask & ~stateSeen', cpp)
+            self.assertNotIn('mtStateDoneFlags[worker - 1].parity.store', cpp)
+            # Strict path (la0) carries the per-entry wait as well.
+            strict = Path(directory) / 'strict'
+            strict.mkdir()
+            _, _, stderr = self.generate(strict, 'mt-state-tasks', 2, lookahead=0,
+                                         state_ready_env='1')
+            self.assertTrue(any(line.startswith('[cppEmitter-mt] state-ready ')
+                                for line in stderr.splitlines()))
+            strict_cpp = '\n'.join(path.read_text()
+                                   for path in sorted(strict.glob('*.cpp')))
+            self.assertIn('entry.stateMask & ~stateSeen', strict_cpp)
+            # Knob off: no census line at all.
+            plain = Path(directory) / 'plain'
+            plain.mkdir()
+            _, _, stderr = self.generate(plain, 'mt-state-tasks', 4, lookahead=64)
+            self.assertFalse(any('state-ready' in line
+                                 for line in stderr.splitlines()))
 
 
 if __name__ == '__main__':

@@ -941,6 +941,7 @@ std::string buildKeyMaterial(const std::string& module, const std::string& firSh
       "GSIM_THREADS",           /* MT worker count baked into the model */
       "GSIM_EMIT_RESET_CHUNK",  /* MT reset-emission chunking */
       "GSIM_MT_DYNAMIC_QUERY",  /* MT ready-query codegen knob */
+      "GSIM_MT_STATE_READY",    /* MT per-consumer state-ready codegen knob */
   };
   for (const char* name : kGenEnvVars) {
     const char* value = std::getenv(name);
