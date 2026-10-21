@@ -4,7 +4,10 @@
 #include "mtCostModel.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <queue>
 #include <set>
@@ -78,6 +81,25 @@ int mtStructuralNodeCost(const Node* node) {
 
 namespace {
 
+// Same semantics as the Final-stage knobs in cppEmitter-mt.cpp: unset keeps
+// the default so knob-off generation stays byte-identical.
+int positiveEnv(const char* name, int fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') return fallback;
+  char* end = nullptr;
+  errno = 0;
+  long parsed = std::strtol(value, &end, 10);
+  return errno == 0 && end != value && *end == '\0' && parsed > 0 && parsed <= INT_MAX
+             ? static_cast<int>(parsed)
+             : fallback;
+}
+
+bool flagEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' &&
+         !(value[0] == '0' && value[1] == '\0');
+}
+
 int groupCost(const std::vector<Node*>& members) {
   double work = 0;
   for (const Node* node : members) work += mtStructuralNodeCost(node);
@@ -114,7 +136,16 @@ class DirectMTaskCoarsener {
     mergeIn1Groups();
     mergeSiblingGroups();
     topologicalOrder();
-    formFinalTasks(plan, targetTasks);
+    // GSIM_MT_GROUP_SPLIT=<member-threshold>: after contraction, split every
+    // giant Normal group at the structural-cost midpoint. Unset/0 keeps this
+    // pass entirely absent, so knob-off generation is byte-identical.
+    const int splitThreshold = positiveEnv("GSIM_MT_GROUP_SPLIT", 0);
+    std::vector<int> splitTaskOrder;
+    const size_t splits = splitThreshold > 0
+        ? splitGiantGroups(static_cast<size_t>(splitThreshold), splitTaskOrder)
+        : 0;
+    formFinalTasks(plan, targetTasks, splits > 0 ? &splitTaskOrder : nullptr,
+                   flagEnv("GSIM_MT_EXTMOD_BATCH"));
   }
 
  private:
@@ -649,7 +680,90 @@ class DirectMTaskCoarsener {
     }
   }
 
-  void formFinalTasks(MtTaskPlan& plan, int targetTasks) {
+  // GSIM_MT_GROUP_SPLIT pass: one split per over-threshold Normal group, at
+  // the member prefix whose accumulated mtStructuralNodeCost first reaches
+  // half of the group total (fallback: everything but the last member, when a
+  // single tail member alone exceeds half). Group members are in topological
+  // order (every merge pass concatenates predecessor-run then successor-run),
+  // so the prefix/suffix cut is dependency closed: any node edge between the
+  // halves points forward, prefix -> suffix. The suffix becomes a new group
+  // spliced directly after its head, and *splitOrder returns the pre-split
+  // dependencyOrder with each giant replaced by [head, tail]. formFinalTasks
+  // therefore packs every unsplit group at exactly its original position and
+  // only the giants' tasks change.
+  size_t splitGiantGroups(size_t threshold, std::vector<int>& splitOrder) {
+    const std::vector<int> baseOrder = dependencyOrder();
+    std::vector<int> derived;
+    derived.reserve(baseOrder.size());
+    size_t splitCount = 0;
+    for (int groupId : baseOrder) {
+      derived.push_back(groupId);
+      std::vector<Node*>& members = groups_[static_cast<size_t>(groupId)].members;
+      if (groups_[static_cast<size_t>(groupId)].kind != MtTaskKind::Normal ||
+          members.size() <= threshold) {
+        continue;
+      }
+
+      long long total = 0;
+      for (const Node* node : members) total += mtStructuralNodeCost(node);
+      size_t splitAt = members.size() - 1;
+      long long accumulated = 0;
+      for (size_t index = 0; index + 1 < members.size(); ++index) {
+        accumulated += mtStructuralNodeCost(members[index]);
+        if (accumulated * 2 >= total) {
+          splitAt = index + 1;
+          break;
+        }
+      }
+
+      Group tail;
+      tail.kind = MtTaskKind::Normal;
+      // No pass after the split re-sorts groups (orderKey/topologyKey only
+      // drive the merge passes); the tail just has to track its head.
+      tail.orderKey = groups_[static_cast<size_t>(groupId)].orderKey;
+      tail.topologyKey = groups_[static_cast<size_t>(groupId)].topologyKey;
+      tail.members.assign(members.begin() + static_cast<std::ptrdiff_t>(splitAt),
+                          members.end());
+      members.resize(splitAt);
+      const int tailId = static_cast<int>(groups_.size());
+      groups_.push_back(std::move(tail));
+      for (Node* node : groups_[static_cast<size_t>(tailId)].members) {
+        groupByNode_[node] = tailId;
+      }
+
+      const size_t headPosition =
+          static_cast<size_t>(groups_[static_cast<size_t>(groupId)].order);
+      order_.insert(order_.begin() + static_cast<std::ptrdiff_t>(headPosition) + 1,
+                    tailId);
+      for (size_t position = headPosition + 1; position < order_.size(); ++position) {
+        groups_[static_cast<size_t>(order_[position])].order = static_cast<int>(position);
+      }
+      derived.push_back(tailId);
+      ++splitCount;
+    }
+    if (splitCount == 0) return 0;
+
+    // Node-level dependencies decide every group edge: prefix -> suffix member
+    // edges become the head -> tail group edge, external edges are recomputed.
+    rebuildEdges();
+    // Same renumbering as topologicalOrder(). Tail members keep the positions
+    // they held inside the giant, so every node keeps its pre-split order.
+    int nodeOrder = 1;
+    for (int id : order_) {
+      const std::vector<Node*>& ordered = groups_[static_cast<size_t>(id)].members;
+      for (size_t member = 0; member < ordered.size(); ++member) {
+        ordered[member]->order = nodeOrder++;
+        ordered[member]->orderInSuper = static_cast<int>(member);
+      }
+    }
+    splitOrder = std::move(derived);
+    fprintf(stderr, "[MtTaskPartitioner] group split threshold=%zu split %zu giant groups\n",
+            threshold, splitCount);
+    return splitCount;
+  }
+
+  void formFinalTasks(MtTaskPlan& plan, int targetTasks,
+                      const std::vector<int>* splitTaskOrder, bool extmodBatch) {
     plan.partitionGroupCount_ = static_cast<int>(order_.size());
     plan.partitionGroupByNode_.clear();
     // Storage / initialization / reset snapshots still need these nodes even
@@ -667,7 +781,12 @@ class DirectMTaskCoarsener {
       groupSuccessors[static_cast<size_t>(groupId)] =
           groups_[static_cast<size_t>(groupId)].depNext;
     }
-    const std::vector<int> taskOrder = dependencyOrder();
+    // After a split, the derived order (pre-split dependencyOrder with each
+    // giant replaced by [head, tail]) is a valid topological order: pre-split
+    // group pairs keep their relative positions, head precedes tail, and both
+    // halves' external dependencies/successors surrounded the giant already.
+    const std::vector<int> taskOrder =
+        splitTaskOrder != nullptr ? *splitTaskOrder : dependencyOrder();
     addActivationEdges(taskOrder, groupSuccessors);
 
     long long totalCost = 0;
@@ -692,13 +811,32 @@ class DirectMTaskCoarsener {
       const Group& group = groups_[static_cast<size_t>(groupId)];
       const int cost = groupCost(group.members);
       if (group.kind != MtTaskKind::Normal) {
+        if (!extmodBatch) {
+          flush();
+          current.members = group.members;
+          current.kind = group.kind;
+          current.cost = cost;
+          flush();
+          continue;
+        }
+        // GSIM_MT_EXTMOD_BATCH: accumulate consecutive ExtModule groups into
+        // one task while the combined cost stays within targetCost. Empty
+        // extmod groups contribute nothing (flush() drops empty tasks anyway).
+        if (group.members.empty()) continue;
+        if (current.kind == group.kind && !current.members.empty() &&
+            static_cast<long long>(current.cost) + cost <= targetCost) {
+          current.members.insert(current.members.end(),
+                                 group.members.begin(), group.members.end());
+          current.cost += cost;
+          continue;
+        }
         flush();
         current.members = group.members;
         current.kind = group.kind;
         current.cost = cost;
-        flush();
         continue;
       }
+      if (extmodBatch && current.kind != MtTaskKind::Normal) flush();
       if (!current.members.empty() && static_cast<long long>(current.cost) + cost > targetCost) flush();
       current.members.insert(current.members.end(), group.members.begin(), group.members.end());
       current.cost += cost;

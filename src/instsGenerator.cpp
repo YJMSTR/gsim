@@ -132,6 +132,50 @@ static std::string constantAssign(std::string lvalue, int dimIdx, Node* node, va
   return ret;
 }
 
+/* GSIM_MT_UNIFORM_FILL (default off), flagEnv-style parse: any non-empty
+   value other than "0" enables. Cached because arrayCopy runs per array
+   assignment and must not pay a getenv per call. */
+static bool parseUniformFillEnv() {
+  const char* value = std::getenv("GSIM_MT_UNIFORM_FILL");
+  return value != nullptr && value[0] != '\0' &&
+         !(value[0] == '0' && value[1] == '\0');
+}
+
+static bool uniformFillEnabled() {
+  static const bool enabled = parseUniformFillEnv();
+  return enabled;
+}
+
+static bool uniformFillIdentChar(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+/* Uniform-fill candidate for arrayCopy's per-member path: true when every
+   member carries the identical runtime value expression and that expression
+   cannot mention the destination. Callers guarantee memberValid (all
+   memberInfo entries non-null) and consType 0/1 (memberInfo non-empty). The
+   loop form then writes lv[e] = value for e = 0..num-1 in the unrolled
+   order; since value reads no element of lv, every read still precedes its
+   write exactly as in the unrolled sequence. */
+static bool uniformFillCandidate(valInfo* rinfo, const std::string& lvalue) {
+  const std::string& value = rinfo->memberInfo[0]->valStr;
+  if (value.empty()) return false;
+  /* Destination base name: leading identifier of the lvalue; the first
+     '[', '.' or '-' onward is indexing or member access. */
+  size_t baseLen = 0;
+  while (baseLen < lvalue.size() && uniformFillIdentChar(lvalue[baseLen])) baseLen++;
+  if (baseLen == 0) return false;
+  /* Bail when the value could read any element of the destination: a plain
+     substring test over the base name catches every reference path and only
+     ever over-bails, falling back to the unrolled form. */
+  if (value.find(lvalue.substr(0, baseLen)) != std::string::npos) return false;
+  for (valInfo* member : rinfo->memberInfo) {
+    if (member->valStr != value) return false;
+  }
+  return true;
+}
+
 static std::string arrayCopy(std::string lvalue, Node* node, valInfo* rinfo, int dimIdx = -1) {
   std::string ret;
   int num = 1;
@@ -142,9 +186,27 @@ static std::string arrayCopy(std::string lvalue, Node* node, valInfo* rinfo, int
   } else if (memberValid(rinfo, num)) {
     int consType = memberConstant(rinfo);
     if (consType == 0 || consType == 1) {
-      for (int i = 0; i < num; i ++) {
-        valInfo* assignInfo = rinfo->getMemberInfo(i);
-        ret += format("%s%s = %s;\n", lvalue.c_str(), idx2Str(node, i, dimIdx).c_str(), assignInfo->valStr.c_str());
+      /* GSIM_MT_UNIFORM_FILL (default off): every member carries the same
+         runtime value and that value cannot name the destination, so one
+         loop nest replaces num unrolled statements. Same statement shape,
+         loop-variable naming style and element order (last dimension
+         fastest, matching idx2Str's flat order) as the bare-array fallback
+         below; the value expression is re-read before each write, exactly
+         as the unrolled sequence did. */
+      if (uniformFillEnabled() && uniformFillCandidate(rinfo, lvalue)) {
+        std::string idxStr, bracket;
+        for (size_t i = 0; i < node->dimension.size() - dimIdx; i ++) {
+          ret += format("for(int __gsim_uf_i%ld = 0; __gsim_uf_i%ld < %d; __gsim_uf_i%ld ++) { ", i, i, node->dimension[i + dimIdx], i);
+          idxStr += "[__gsim_uf_i" + std::to_string(i) + "]";
+          bracket += "}";
+        }
+        ret += format("%s%s = %s; ", lvalue.c_str(), idxStr.c_str(), rinfo->memberInfo[0]->valStr.c_str());
+        ret += bracket;
+      } else {
+        for (int i = 0; i < num; i ++) {
+          valInfo* assignInfo = rinfo->getMemberInfo(i);
+          ret += format("%s%s = %s;\n", lvalue.c_str(), idx2Str(node, i, dimIdx).c_str(), assignInfo->valStr.c_str());
+        }
       }
     } else if (consType == 2) {
       ret = constantAssign(lvalue, dimIdx, node, rinfo->memberInfo[0]);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 
@@ -11,6 +12,15 @@ extern int maxConcatNum;
 std::string computeExtMod(Node* ext, std::vector<InstInfo>& instructions);
 
 namespace {
+
+// Any non-empty value other than "0" enables the knob; unset stays off so
+// emission stays byte-identical by default (same semantics as
+// cppEmitter-mt.cpp).
+bool flagEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' &&
+         !(value[0] == '0' && value[1] == '\0');
+}
 
 int taskForNode(const Node* node, const MtTaskPlan& plan) {
   if (node == nullptr) return -1;
@@ -480,6 +490,7 @@ void updateTaskRoots(const MtTaskPlan& plan) {
 }  // namespace
 
 void MtTaskLowerer::generateStmtTrees(graph& graph, MtTaskPlan& plan) {
+  const bool extmodBatch = flagEnv("GSIM_MT_EXTMOD_BATCH");
   maxConcatNum = 0;
   selectSparseRegisters(graph, plan);
   completeTaskLocalDependencies(graph, plan);
@@ -492,12 +503,24 @@ void MtTaskLowerer::generateStmtTrees(graph& graph, MtTaskPlan& plan) {
   for (MtTask& task : plan.tasks_) {
     Assert(!task.members.empty(), "cannot lower an empty MTask");
     if (task.kind == MtTaskKind::ExtModule) {
-      Node* ext = task.members.front();
-      Assert(ext->type == NODE_EXT, "extmodule MTask must start with NODE_EXT");
       task.stmtTree = new StmtTree();
       task.stmtTree->root = new StmtNode(OP_STMT_SEQ);
       std::vector<InstInfo> instructions;
-      graph.extDecl.push_back(computeExtMod(ext, instructions));
+      if (extmodBatch) {
+        // GSIM_MT_EXTMOD_BATCH tasks carry several ExtModule groups. Members
+        // are the NODE_EXT instances plus their NODE_EXT_OUT port nodes (the
+        // SuperNode ctor seeds the instance, constructSuperNode appends the
+        // ports); ports are covered by their instance's computeExtMod.
+        for (Node* ext : task.members) {
+          if (ext->type != NODE_EXT) continue;
+          graph.extDecl.push_back(computeExtMod(ext, instructions));
+        }
+        Assert(!instructions.empty(), "extmodule MTask has no NODE_EXT member");
+      } else {
+        Node* ext = task.members.front();
+        Assert(ext->type == NODE_EXT, "extmodule MTask must start with NODE_EXT");
+        graph.extDecl.push_back(computeExtMod(ext, instructions));
+      }
       task.insts = new std::vector<InstInfo>(std::move(instructions));
       continue;
     }

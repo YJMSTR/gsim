@@ -1074,7 +1074,12 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   }
   const size_t actualCrossWorkerNodes =
       actualCrossWorkerCommunicationNodes(tasks, communicationNodes);
-  if (replicationAware && !globalConfig.OutputDir.empty()) {
+  // Report-only final joint schedule dump. Historically rheft-only; plain
+  // heft emits the same per-worker chain view (the list scheduler keeps its
+  // none). No runtime effect: mt-replication-final.csv is one of the fixed
+  // report artifact names (genCache isNamespaceFile), never model code.
+  if ((replicationAware || globalConfig.MtScheduler == "heft") &&
+      !globalConfig.OutputDir.empty()) {
     FILE* report = std::fopen((globalConfig.OutputDir + "/mt-replication-final.csv").c_str(), "w");
     Assert(report != nullptr, "cannot write final joint schedule report");
     fprintf(report, "task,worker,position,start,finish,cost\n");
@@ -1087,6 +1092,8 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
       }
     }
     Assert(std::fclose(report) == 0, "cannot finish final joint schedule report");
+  }
+  if (replicationAware) {
     fprintf(stderr, "[cppEmitter-mt] replication-aware-heft cost=lowered "
                     "placement=joint-eft chains=heft-insertion\n");
   }

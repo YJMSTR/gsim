@@ -942,6 +942,9 @@ std::string buildKeyMaterial(const std::string& module, const std::string& firSh
       "GSIM_EMIT_RESET_CHUNK",  /* MT reset-emission chunking */
       "GSIM_MT_DYNAMIC_QUERY",  /* MT ready-query codegen knob */
       "GSIM_MT_STATE_READY",    /* MT per-consumer state-ready codegen knob */
+      "GSIM_MT_GROUP_SPLIT",    /* MT post-contraction giant-group split knob */
+      "GSIM_MT_EXTMOD_BATCH",   /* MT ExtModule task-batching knob */
+      "GSIM_MT_UNIFORM_FILL",   /* MT uniform array-fill loop emission knob */
   };
   for (const char* name : kGenEnvVars) {
     const char* value = std::getenv(name);
