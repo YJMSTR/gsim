@@ -110,7 +110,7 @@ class RepcutTopTest(unittest.TestCase):
         replicated_somewhere = False
         for workers, lookahead, depth in ((2, 0, None), (4, 0, None),
                                           (4, 64, None), (4, 64, 1),
-                                          (4, 16, 1)):
+                                          (4, 16, 1), (8, 64, None)):
             with self.subTest(workers=workers, lookahead=lookahead,
                               depth=depth), tempfile.TemporaryDirectory(
                     prefix='mt-repcut-on-') as directory:
