@@ -492,12 +492,20 @@ void MtTaskLowerer::generateStmtTrees(graph& graph, MtTaskPlan& plan) {
   for (MtTask& task : plan.tasks_) {
     Assert(!task.members.empty(), "cannot lower an empty MTask");
     if (task.kind == MtTaskKind::ExtModule) {
-      Node* ext = task.members.front();
-      Assert(ext->type == NODE_EXT, "extmodule MTask must start with NODE_EXT");
+      // Members are NODE_EXT instances plus their port nodes (the SuperNode
+      // ctor seeds the instance, constructSuperNode appends the ports); port
+      // nodes are covered by their instance's computeExtMod. Lower every
+      // NODE_EXT member so multi-instance ExtModule tasks stay correct.
+      // Current shapes carry exactly one instance per task, so this is
+      // byte-identical to the previous front()-only emission.
+      std::vector<InstInfo> instructions;
+      for (Node* ext : task.members) {
+        if (ext->type != NODE_EXT) continue;
+        graph.extDecl.push_back(computeExtMod(ext, instructions));
+      }
+      Assert(!instructions.empty(), "extmodule MTask has no NODE_EXT member");
       task.stmtTree = new StmtTree();
       task.stmtTree->root = new StmtNode(OP_STMT_SEQ);
-      std::vector<InstInfo> instructions;
-      graph.extDecl.push_back(computeExtMod(ext, instructions));
       task.insts = new std::vector<InstInfo>(std::move(instructions));
       continue;
     }
