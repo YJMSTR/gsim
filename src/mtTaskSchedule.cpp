@@ -5,6 +5,7 @@
 #include "mtReplicationSchedule.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -14,6 +15,23 @@
 #include <set>
 #include <unordered_map>
 #include <utility>
+
+namespace {
+// GSIM_MT_STORE_DISCOUNT=<divisor> softens the static price of long
+// same-value global store groups so HEFT stops reserving worker time for
+// stores the dense runtime performs nearly for free. Unset, unparsable or
+// non-positive values keep the calibrated /16 tail, leaving generation
+// byte-identical to the knob-off build.
+int storeDiscountTailDivisor() {
+  static const int divisor = [] {
+    const char* raw = std::getenv("GSIM_MT_STORE_DISCOUNT");
+    if (raw == nullptr) return 16;
+    const int value = std::atoi(raw);
+    return value > 0 ? value : 16;
+  }();
+  return divisor;
+}
+}
 
 int mtLoweredTaskCost(const MtTask& task) {
   mtcost::Accumulator features;
@@ -30,7 +48,8 @@ int mtLoweredTaskCost(const MtTask& task) {
   }
   return mtcost::bounded(mtcost::taskOverhead + mtcost::loweredScore(features.all) +
       mtcost::globalStorageCost(task.globalNodeCount,
-                               globalConfig.MtScheduleGlobalWeight));
+                               globalConfig.MtScheduleGlobalWeight,
+                               static_cast<double>(storeDiscountTailDivisor())));
 }
 
 namespace {

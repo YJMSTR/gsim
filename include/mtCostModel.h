@@ -108,12 +108,15 @@ inline double loweredScore(const Features& f) {
       (defaultWeights[Branch] - loweredBranchWeight) * f[Branch];
 }
 // Large groups of global result stores have a lower marginal cost than the
-// original per-node linear charge in the measured dense simulator.
-inline double globalStorageCost(int count, int weight) {
+// original per-node linear charge in the measured dense simulator. The tail
+// divisor defaults to the calibrated 16; GSIM_MT_STORE_DISCOUNT (read once by
+// the scheduler) raises it to discount duplicate same-value stores that the
+// dense runtime executes at near-zero marginal cost.
+inline double globalStorageCost(int count, int weight, double tailDivisor = 16.0) {
   const double nodes = std::max(0, count);
   const double head = std::min(nodes, static_cast<double>(globalWriteFastCount));
   return std::max(0, weight) *
-      (2.0 * head + (nodes - head) / 16.0);
+      (2.0 * head + (nodes - head) / tailDivisor);
 }
 // Relative units fixed from the XiangShan trace/perf calibration. They are
 // static inputs to all later designs; generated simulators read no profile.
