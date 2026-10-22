@@ -1194,6 +1194,10 @@ void CppEmitterMt::emitDefinitions() {
   }
   fprintf(out, "  ],\n");
   fprintf(out, "  \"top_wait_slots\": [\n");
+  int liveSlots = 0;
+  for (int k = 0; k < topK; ++k)
+    if (topSlot[k] >= 0 && topSpin[k] > 0) ++liveSlots;
+  int printedSlots = 0;
   for (int k = 0; k < topK; ++k) {
     if (topSlot[k] < 0 || topSpin[k] == 0) continue;
     const int s = topSlot[k];
@@ -1210,7 +1214,8 @@ void CppEmitterMt::emitDefinitions() {
         fprintf(out, "%s%d", spinnerCount ? "," : "", w);
         ++spinnerCount;
       }
-    fprintf(out, "]}\n");
+    fprintf(out, printedSlots + 1 < liveSlots ? "]},\n" : "]}\n");
+    ++printedSlots;
   }
   fprintf(out, "  ],\n");
   fprintf(out, "  \"cycle_duration_histogram_log2_tsc\": {");
