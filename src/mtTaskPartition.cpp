@@ -2,9 +2,11 @@
 
 #include "common.h"
 #include "mtCostModel.h"
+#include "mtRepcutForm.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <queue>
 #include <set>
@@ -649,6 +651,241 @@ class DirectMTaskCoarsener {
     }
   }
 
+  // GSIM_MT_REPCUT_FORM knob for the sink-IoU task forming pass. Absent,
+  // empty, 0 or non-numeric values keep the baseline packing (and the
+  // knob-off path byte-identical). "1" enables it with the default union
+  // threshold (one task's share of the structural cost); larger values
+  // override the threshold in raw structural cost units (p2sim's union-size
+  // threshold analog).
+  struct RepcutKnob {
+    bool present = false;
+    bool enabled = false;
+    long long threshold = 0;
+  };
+
+  static RepcutKnob repcutKnob(long long targetCost) {
+    RepcutKnob knob;
+    const char* value = std::getenv("GSIM_MT_REPCUT_FORM");
+    if (value == nullptr) return knob;
+    knob.present = true;
+    char* end = nullptr;
+    const long long parsed = std::strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0) {
+      fprintf(stderr, "[MtTaskPartitioner] repcut-form ignored GSIM_MT_REPCUT_FORM=%s\n",
+              value);
+      return knob;
+    }
+    if (parsed == 0) return knob;
+    knob.enabled = true;
+    knob.threshold = parsed == 1 ? targetCost : parsed;
+    return knob;
+  }
+
+  static bool groupFeedsState(const Group& group) {
+    for (Node* node : group.members) {
+      if (node->type == NODE_WRITER || node->type == NODE_READWRITER) return true;
+      for (Node* target : node->depNext) {
+        if (mtIsCycleStartRegisterUpdate(target)) return true;
+      }
+    }
+    return false;
+  }
+
+  // Sink-IoU forming (repcut port). Seeds fine buckets with the baseline
+  // accumulate/flush mechanics, merges them by reachable-sink-set IoU
+  // (mtrepcut::Former), then materializes one task per surviving cluster in
+  // cluster-topological order. Returns false without touching the plan when
+  // the former rejects its input, so the caller can fall back to the
+  // baseline packing.
+  bool repcutFormTasks(MtTaskPlan& plan, std::vector<int>& taskByGroup,
+                       const std::vector<int>& taskOrder, long long totalCost,
+                       int targetTasks, long long threshold,
+                       std::vector<std::set<int>>& groupSuccessors) {
+    // Stage 1: seed buckets at ~4x the target task count (capped) so the
+    // IoU phase has freedom to pick partners instead of pairing whole tasks.
+    const long long seedBuckets = std::min<long long>(4LL * targetTasks, 16384);
+    const long long bucketBudget =
+        std::max<long long>(1, (totalCost + seedBuckets - 1) / seedBuckets);
+    std::vector<std::vector<int>> bucketGroups;
+    std::vector<int> bucketOfGroup(groups_.size(), -1);
+    std::vector<long long> bucketCost;
+    std::vector<char> bucketPinned;
+    std::vector<int> current;
+    long long currentCost = 0;
+    auto flushBucket = [&]() {
+      if (current.empty()) return;
+      const int id = static_cast<int>(bucketGroups.size());
+      for (int groupId : current) bucketOfGroup[static_cast<size_t>(groupId)] = id;
+      bucketGroups.push_back(std::move(current));
+      bucketCost.push_back(currentCost);
+      bucketPinned.push_back(0);
+      current.clear();
+      currentCost = 0;
+    };
+    for (int groupId : taskOrder) {
+      const Group& group = groups_[static_cast<size_t>(groupId)];
+      if (group.members.empty()) continue;  // like baseline flush: never tasked
+      const int cost = groupCost(group.members);
+      if (group.kind != MtTaskKind::Normal) {
+        flushBucket();
+        bucketOfGroup[static_cast<size_t>(groupId)] = static_cast<int>(bucketGroups.size());
+        bucketGroups.push_back(std::vector<int>{groupId});
+        bucketCost.push_back(cost);
+        bucketPinned.push_back(1);
+        continue;
+      }
+      if (!current.empty() && currentCost + cost > bucketBudget) flushBucket();
+      current.push_back(groupId);
+      currentCost += cost;
+    }
+    flushBucket();
+
+    // Stage 2: bucket DAG (contracted group depNext) and sink flags.
+    const int bucketCount = static_cast<int>(bucketGroups.size());
+    std::vector<std::vector<int>> bucketSucc(static_cast<size_t>(bucketCount));
+    {
+      std::vector<std::set<int>> successorSets(static_cast<size_t>(bucketCount));
+      for (int bucketId = 0; bucketId < bucketCount; ++bucketId) {
+        for (int groupId : bucketGroups[static_cast<size_t>(bucketId)]) {
+          for (int succGroup : groups_[static_cast<size_t>(groupId)].depNext) {
+            const int target = bucketOfGroup[static_cast<size_t>(succGroup)];
+            if (target >= 0 && target != bucketId) {
+              successorSets[static_cast<size_t>(bucketId)].insert(target);
+            }
+          }
+        }
+      }
+      for (int bucketId = 0; bucketId < bucketCount; ++bucketId) {
+        bucketSucc[static_cast<size_t>(bucketId)].assign(
+            successorSets[static_cast<size_t>(bucketId)].begin(),
+            successorSets[static_cast<size_t>(bucketId)].end());
+      }
+    }
+    std::vector<char> bucketSink(static_cast<size_t>(bucketCount), 0);
+    for (int bucketId = 0; bucketId < bucketCount; ++bucketId) {
+      bool sink = bucketSucc[static_cast<size_t>(bucketId)].empty();
+      const std::vector<int>& groups = bucketGroups[static_cast<size_t>(bucketId)];
+      for (size_t member = 0; !sink && member < groups.size(); ++member) {
+        sink = groupFeedsState(groups_[static_cast<size_t>(groups[member])]);
+      }
+      bucketSink[static_cast<size_t>(bucketId)] = sink ? 1 : 0;
+    }
+
+    // Stage 3: run the former and materialize one task per cluster. Bucket
+    // ids follow the topological taskOrder, so ascending bucket lists keep
+    // members in topological order within every task.
+    mtrepcut::Options options;
+    options.threshold = std::max<long long>(1, threshold);
+    options.stopCount = targetTasks;
+    mtrepcut::Former former(bucketCount, bucketSucc, bucketCost, bucketPinned,
+                            bucketSink, options);
+    if (!former.valid()) return false;
+    former.run();
+    if (!former.valid()) return false;
+    const std::vector<std::vector<int>>& clusters = former.orderedClusters();
+
+    plan.tasks_.clear();
+    std::vector<int> groupOrder;
+    groupOrder.reserve(order_.size());
+    for (const std::vector<int>& cluster : clusters) {
+      const int taskId = static_cast<int>(plan.tasks_.size());
+      MtTask task;
+      for (int bucketId : cluster) {
+        for (int groupId : bucketGroups[static_cast<size_t>(bucketId)]) {
+          taskByGroup[static_cast<size_t>(groupId)] = taskId;
+          const Group& group = groups_[static_cast<size_t>(groupId)];
+          if (task.members.empty()) task.kind = group.kind;
+          task.members.insert(task.members.end(), group.members.begin(),
+                              group.members.end());
+          task.cost += groupCost(group.members);
+          groupOrder.push_back(groupId);
+        }
+      }
+      plan.tasks_.push_back(std::move(task));
+    }
+    size_t expectedGroups = 0;
+    for (int groupId : order_) {
+      if (groups_[static_cast<size_t>(groupId)].members.empty()) continue;
+      ++expectedGroups;
+      Assert(taskByGroup[static_cast<size_t>(groupId)] >= 0,
+             "repcut forming lost group %d", groupId);
+    }
+    Assert(groupOrder.size() == expectedGroups,
+           "repcut forming changed the group set (%zu/%zu)", groupOrder.size(),
+           expectedGroups);
+
+    // Activation ranks must agree with the final task order; groupOrder is
+    // topological because the cluster order is topological over contracted
+    // depNext edges and buckets keep their taskOrder sequence.
+    addActivationEdges(groupOrder, groupSuccessors);
+
+    const mtrepcut::Stats& stats = former.stats();
+    fprintf(stderr,
+            "[MtTaskPartitioner] repcut-form buckets=%d sinks=%d clusters=%d merges=%d "
+            "rounds=%d threshold=%lld stop=%d stalled=%d pass-ms=%lld "
+            "cross-bucket-edges=%lld cross-cluster-edges=%lld sink-overlap-sum=%lld "
+            "sink-overlap-edges=%lld\n",
+            stats.buckets, stats.sinks, stats.clusters, stats.merges, stats.rounds,
+            options.threshold, targetTasks, stats.stoppedEarly, stats.passMs,
+            stats.crossEdgesBefore, stats.crossEdgesAfter, stats.sinkOverlapSum,
+            stats.sinkOverlapEdges);
+    if (static_cast<int>(plan.tasks_.size()) > targetTasks) {
+      fprintf(stderr,
+              "[cppEmitter-mt] target MTask count=%d produced %zu repcut-formed tasks\n",
+              targetTasks, plan.tasks_.size());
+    }
+    return true;
+  }
+
+  // ksim queue-cost observation: how many (producer writes state -> consumer
+  // reads) pairs land inside one task versus crossing tasks. Registers pair
+  // the register-update owner with each reader task; memories pair every
+  // write-port task with every read-port task of the same memory. Pure
+  // observation over the finished plan; never influences forming.
+  void reportStateChainPairs(const MtTaskPlan& plan) const {
+    long long regPairs = 0, regSame = 0, memPairs = 0, memSame = 0;
+    for (Node* reg : plan.stateRegisters_) {
+      int producer = -1;
+      Node* destination = reg->getDst();
+      if (destination != nullptr) {
+        auto owner = plan.taskByNode_.find(destination);
+        if (owner != plan.taskByNode_.end()) producer = owner->second;
+      }
+      for (Node* reader : reg->next) {
+        auto owner = plan.taskByNode_.find(reader);
+        if (owner == plan.taskByNode_.end()) continue;
+        ++regPairs;
+        if (producer >= 0 && owner->second == producer) ++regSame;
+      }
+    }
+    std::map<Node*, std::vector<int>> writersByMemory, readersByMemory;
+    for (size_t taskId = 0; taskId < plan.tasks_.size(); ++taskId) {
+      for (Node* node : plan.tasks_[taskId].members) {
+        if (node->parent == nullptr) continue;
+        if (node->type == NODE_WRITER || node->type == NODE_READWRITER) {
+          writersByMemory[node->parent].push_back(static_cast<int>(taskId));
+        } else if (node->type == NODE_READER) {
+          readersByMemory[node->parent].push_back(static_cast<int>(taskId));
+        }
+      }
+    }
+    for (const auto& entry : writersByMemory) {
+      auto readers = readersByMemory.find(entry.first);
+      if (readers == readersByMemory.end()) continue;
+      for (int writerTask : entry.second) {
+        for (int readerTask : readers->second) {
+          ++memPairs;
+          if (writerTask == readerTask) ++memSame;
+        }
+      }
+    }
+    fprintf(stderr,
+            "[MtTaskPartitioner] state-chain write-read reg-pairs=%lld reg-same=%lld "
+            "reg-cross=%lld mem-pairs=%lld mem-same=%lld mem-cross=%lld\n",
+            regPairs, regSame, regPairs - regSame, memPairs, memSame,
+            memPairs - memSame);
+  }
+
   void formFinalTasks(MtTaskPlan& plan, int targetTasks) {
     plan.partitionGroupCount_ = static_cast<int>(order_.size());
     plan.partitionGroupByNode_.clear();
@@ -668,7 +905,6 @@ class DirectMTaskCoarsener {
           groups_[static_cast<size_t>(groupId)].depNext;
     }
     const std::vector<int> taskOrder = dependencyOrder();
-    addActivationEdges(taskOrder, groupSuccessors);
 
     long long totalCost = 0;
     for (int groupId : taskOrder) {
@@ -679,36 +915,49 @@ class DirectMTaskCoarsener {
 
     plan.tasks_.clear();
     std::vector<int> taskByGroup(groups_.size(), -1);
-    MtTask current;
-    auto flush = [&]() {
-      if (current.members.empty()) return;
-      const int taskId = static_cast<int>(plan.tasks_.size());
-      for (Node* node : current.members) taskByGroup[static_cast<size_t>(groupFor(node))] = taskId;
-      plan.tasks_.push_back(std::move(current));
-      current = MtTask();
-    };
-
-    for (int groupId : taskOrder) {
-      const Group& group = groups_[static_cast<size_t>(groupId)];
-      const int cost = groupCost(group.members);
-      if (group.kind != MtTaskKind::Normal) {
-        flush();
-        current.members = group.members;
-        current.kind = group.kind;
-        current.cost = cost;
-        flush();
-        continue;
+    const RepcutKnob knob = repcutKnob(targetCost);
+    if (knob.enabled &&
+        repcutFormTasks(plan, taskByGroup, taskOrder, totalCost, targetTasks,
+                        knob.threshold, groupSuccessors)) {
+      // Sink-IoU path: plan.tasks_ and taskByGroup are built and activation
+      // edges were added with cluster-consistent ranks inside.
+    } else {
+      if (knob.enabled) {
+        fprintf(stderr,
+                "[MtTaskPartitioner] repcut-form fell back to baseline packing\n");
       }
-      if (!current.members.empty() && static_cast<long long>(current.cost) + cost > targetCost) flush();
-      current.members.insert(current.members.end(), group.members.begin(), group.members.end());
-      current.cost += cost;
-    }
-    flush();
+      addActivationEdges(taskOrder, groupSuccessors);
+      MtTask current;
+      auto flush = [&]() {
+        if (current.members.empty()) return;
+        const int taskId = static_cast<int>(plan.tasks_.size());
+        for (Node* node : current.members) taskByGroup[static_cast<size_t>(groupFor(node))] = taskId;
+        plan.tasks_.push_back(std::move(current));
+        current = MtTask();
+      };
 
-    if (static_cast<int>(plan.tasks_.size()) > targetTasks) {
-      fprintf(stderr,
-              "[cppEmitter-mt] target MTask count=%d produced %zu dependency-safe tasks\n",
-              targetTasks, plan.tasks_.size());
+      for (int groupId : taskOrder) {
+        const Group& group = groups_[static_cast<size_t>(groupId)];
+        const int cost = groupCost(group.members);
+        if (group.kind != MtTaskKind::Normal) {
+          flush();
+          current.members = group.members;
+          current.kind = group.kind;
+          current.cost = cost;
+          flush();
+          continue;
+        }
+        if (!current.members.empty() && static_cast<long long>(current.cost) + cost > targetCost) flush();
+        current.members.insert(current.members.end(), group.members.begin(), group.members.end());
+        current.cost += cost;
+      }
+      flush();
+
+      if (static_cast<int>(plan.tasks_.size()) > targetTasks) {
+        fprintf(stderr,
+                "[cppEmitter-mt] target MTask count=%d produced %zu dependency-safe tasks\n",
+                targetTasks, plan.tasks_.size());
+      }
     }
 
     std::vector<std::set<int>> taskSuccessors(plan.tasks_.size());
@@ -737,6 +986,7 @@ class DirectMTaskCoarsener {
       }
     }
 
+    reportStateChainPairs(plan);
     fprintf(stderr, "[MtTaskPartitioner] coarsen MTask candidates %zu -> %zu\n",
             groups_.size(), order_.size());
   }
