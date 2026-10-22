@@ -741,33 +741,45 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       insertBefore = std::min(insertBefore, workerPos[static_cast<size_t>(consumer)]);
     }
 
-    // Safe-insertion rule (exact). A replica must run after every task that
-    // is ordered before it through ANY dependency path: a transitive
-    // predecessor sitting later in the consumer worker's own chain is a
-    // structural deadlock (the worker stalls at the replica waiting for a
-    // path that only completes after the replica). Waiting for the whole
-    // transitive predecessor closure of the replica's inherited dependency
-    // set is exactly the set of tasks whose chain positions constrain the
-    // insertion point.
-    std::vector<char> predecessorScratch;
+    // Safe-insertion rule (composed closure, exact for the runtime
+    // dependency graph). The runtime orders a task after (a) every earlier
+    // position in its own worker's chain and (b) the whole chain prefix of
+    // every token publisher it waits on — including tasks it has no DAG edge
+    // to. A replica therefore deadlocks iff its runtime-causal closure
+    // contains a consumer-worker task positioned after the insertion point.
+    // The closure composes DAG predecessors with chain prefixes to a fixed
+    // point; neither relation alone is sufficient.
+    std::vector<char> closureScratch;
     auto closureSafeAfter = [&](const std::vector<int>& predecessors,
                                 int consumerWorker, int after) {
-      predecessorScratch.assign(tasks.size(), 0);
+      closureScratch.assign(tasks.size(), 0);
       std::vector<int> pending(predecessors);
       for (int start : predecessors) {
-        predecessorScratch[static_cast<size_t>(start)] = 1;
+        if (!closureScratch[static_cast<size_t>(start)]) {
+          closureScratch[static_cast<size_t>(start)] = 1;
+        }
       }
       while (!pending.empty()) {
         const int current = pending.back();
         pending.pop_back();
         for (int input : tasks[static_cast<size_t>(current)].predecessors) {
-          if (predecessorScratch[static_cast<size_t>(input)]) continue;
-          predecessorScratch[static_cast<size_t>(input)] = 1;
+          if (closureScratch[static_cast<size_t>(input)]) continue;
+          closureScratch[static_cast<size_t>(input)] = 1;
           pending.push_back(input);
+        }
+        const int owner = owners[static_cast<size_t>(current)];
+        const int position = workerPos[static_cast<size_t>(current)];
+        if (owner < 0 || position < 0) continue;
+        const std::vector<int>& chain = chains[static_cast<size_t>(owner)];
+        for (int earlier = 0; earlier < position; ++earlier) {
+          const int prefixTask = chain[static_cast<size_t>(earlier)];
+          if (closureScratch[static_cast<size_t>(prefixTask)]) continue;
+          closureScratch[static_cast<size_t>(prefixTask)] = 1;
+          pending.push_back(prefixTask);
         }
       }
       for (size_t taskId = 0; taskId < tasks.size(); ++taskId) {
-        if (!predecessorScratch[taskId]) continue;
+        if (!closureScratch[taskId]) continue;
         if (owners[taskId] != consumerWorker) continue;
         const int position = workerPos[taskId];
         if (position > after) after = position;
@@ -956,6 +968,60 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
   // eligibility cap above is the conservative guard this architecture
   // needs; the wolvrix cross-partition-value whitelist has no equivalent
   // violation surface here.
+
+  // Liveness gate (gold standard): event-driven progress simulation of the
+  // transformed schedule. Every worker advances its chain cursor; a task at
+  // the cursor may run when all its token publishers (last-position source
+  // per producer worker) have already run. If no cursor can advance while
+  // tasks remain, the schedule deadlocks at cycle 0 — abort with the
+  // offending worker/position instead of shipping a hanging model.
+  if (report.replicas > 0) {
+    std::vector<int> chainCursor(static_cast<size_t>(workerCount), 0);
+    std::vector<char> hasRun(tasks.size(), 0);
+    size_t completed = 0;
+    bool progressed = true;
+    while (completed < tasks.size() && progressed) {
+      progressed = false;
+      for (int worker = 0; worker < workerCount; ++worker) {
+        std::vector<int>& chain = chains[static_cast<size_t>(worker)];
+        int& cursor = chainCursor[static_cast<size_t>(worker)];
+        while (cursor < static_cast<int>(chain.size())) {
+          const int taskId = chain[static_cast<size_t>(cursor)];
+          bool ready = true;
+          for (int predecessor : tasks[static_cast<size_t>(taskId)].predecessors) {
+            if (!hasRun[static_cast<size_t>(predecessor)]) {
+              ready = false;
+              break;
+            }
+          }
+          if (!ready) break;
+          hasRun[static_cast<size_t>(taskId)] = 1;
+          ++completed;
+          ++cursor;
+          progressed = true;
+        }
+      }
+    }
+    if (completed < tasks.size()) {
+      for (int worker = 0; worker < workerCount; ++worker) {
+        const std::vector<int>& chain = chains[static_cast<size_t>(worker)];
+        const int cursor = chainCursor[static_cast<size_t>(worker)];
+        if (cursor >= static_cast<int>(chain.size())) continue;
+        const int stuck = chain[static_cast<size_t>(cursor)];
+        fprintf(stderr, "[cppEmitter-mt] repcut-top FATAL: worker %d stuck at "
+                        "position %d task %d waiting [",
+                worker, cursor, stuck);
+        for (int predecessor : tasks[static_cast<size_t>(stuck)].predecessors) {
+          if (!hasRun[static_cast<size_t>(predecessor)]) {
+            fprintf(stderr, "%d(w%d) ", predecessor,
+                    owners[static_cast<size_t>(predecessor)]);
+          }
+        }
+        fprintf(stderr, "]\n");
+      }
+      Assert(false, "repcut-top produced a deadlocking schedule");
+    }
+  }
 
   report.replicatedProducers = static_cast<int>(replicatedProducers.size());
   report.costPct = report.totalCost > 0
