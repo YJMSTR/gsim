@@ -265,7 +265,7 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "static constexpr int kMtStateTaskCount = %zu;\n", stateTasks_.size());
   fprintf(header, "struct MtReadyToken { std::atomic<uint8_t> value{0}; };\n");
   fprintf(header, "struct alignas(64) MtDoneFlag { std::atomic<uint8_t> parity{0}; };\n");
-  fprintf(header, "struct MtDispatch { void (S%s::*fn)(); uint32_t waitBegin, waitEnd, storeBegin, storeEnd, localWaitBegin, localWaitEnd; };\n",
+  fprintf(header, "struct MtDispatch { void (S%s::*fn)(); uint32_t taskId, waitBegin, waitEnd, storeBegin, storeEnd, localWaitBegin, localWaitEnd; };\n",
           graph_.name.c_str());
   fprintf(header, "alignas(64) MtReadyToken mtReadyTokens[%d];\n", readySlotCount_);
   fprintf(header, "MtDoneFlag mtDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
@@ -305,6 +305,14 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "static const int mtBubbleSlotTask[%d];\n", readySlotCount_);
   fprintf(header, "static const uint8_t mtBubbleTaskWorker[%zu];\n",
           std::max<size_t>(1, tasks_.size()));
+  fprintf(header, "static constexpr int kMtBubbleTaskCount = %zu;\n",
+          std::max<size_t>(1, tasks_.size()));
+  fprintf(header, "bool mtBubbleTaskTimes = false;\n");
+  fprintf(header, "const char* mtBubbleTaskTimesPath = nullptr;\n");
+  fprintf(header, "unsigned long long mtBubbleTaskTsc[%d][kMtBubbleTaskCount] = {};\n",
+          workerCount_);
+  fprintf(header, "unsigned long long mtBubbleTaskCalls[%d][kMtBubbleTaskCount] = {};\n",
+          workerCount_);
   fprintf(header,
           "unsigned long long mtBubbleFirstTsc = 0, mtBubbleLastTsc = 0;\n"
           "unsigned long long mtBubbleFirstNs = 0, mtBubbleLastNs = 0;\n"
@@ -667,11 +675,12 @@ void CppEmitterMt::emitDefinitions() {
                        std::to_string(worker) + "[" +
                        std::to_string(std::max<size_t>(1, dispatchCount)) + "] = {\n";
     if (dispatchCount == 0) {
-      text += "  {nullptr, 0, 0, 0, 0, 0, 0}\n";
+      text += "  {nullptr, 0, 0, 0, 0, 0, 0, 0}\n";
     } else {
       for (int taskId : chain) {
         const Task& task = tasks_[static_cast<size_t>(taskId)];
         text += "  {&" + className + "::mtTask" + std::to_string(taskId) + "," +
+                std::to_string(taskId) + "," +
                 std::to_string(task.waitBegin) + "," + std::to_string(task.waitEnd) + "," +
                 std::to_string(task.storeBegin) + "," + std::to_string(task.storeEnd) + "," +
                 std::to_string(task.localWaitBegin) + "," +
@@ -725,6 +734,12 @@ void CppEmitterMt::emitDefinitions() {
       "#define MTBP_TICK(w, b) do { if (mtBubbleProfile) mtBpTick(w, b); } while (0)\n"
       "#define MTBP_TASK(w) \\\n"
       "  do { if (mtBubbleProfile) { mtBubble[w].taskCalls++; mtBpTick(w, mtBpTaskCompute); } } while (0)\n"
+      "#define MTBP_TASK_ID(w, t) \\\n"
+      "  do { if (mtBubbleProfile) { mtBubble[w].taskCalls++; \\\n"
+      "       const unsigned long long mtBpTaskT0 = mtBubble[w].lastTsc; \\\n"
+      "       mtBpTick(w, mtBpTaskCompute); \\\n"
+      "       if (mtBubbleTaskTimes) { ++mtBubbleTaskCalls[w][t]; \\\n"
+      "         mtBubbleTaskTsc[w][t] += mtBubble[w].lastTsc - mtBpTaskT0; } } } while (0)\n"
       "inline void " + className + "::mtBpTick(int worker, int bucket) {\n"
       "  MtBubbleCounters* mtBpBp = &mtBubble[worker];\n"
       "  const unsigned long long mtBpNow = mtBpRdtsc();\n"
@@ -747,6 +762,12 @@ void CppEmitterMt::emitDefinitions() {
       "    for (auto& spin : mtBubbleSpinBySlot) spin.store(0, std::memory_order_relaxed);\n"
       "    for (auto& mask : mtBubbleSpinWorkerMask) mask.store(0, std::memory_order_relaxed);\n"
       "    fprintf(stderr, \"[mt-bubble] bubble profiling enabled via GSIM_MT_BUBBLE_PROFILE=1\\n\");\n"
+      "    const char* taskTimes = getenv(\"GSIM_MT_BUBBLE_TASKTIMES\");\n"
+      "    mtBubbleTaskTimes = taskTimes != nullptr && *taskTimes != 0;\n"
+      "    if (mtBubbleTaskTimes) {\n"
+      "      mtBubbleTaskTimesPath = taskTimes;\n"
+      "      fprintf(stderr, \"[mt-bubble] per-task timing enabled, CSV -> %s\\n\", taskTimes);\n"
+      "    }\n"
       "  }\n"
       "  mtEnabled = true;\n}\n";
 
@@ -859,7 +880,7 @@ void CppEmitterMt::emitDefinitions() {
         "  auto runTask = [&](const MtDispatch& entry) {\n"
         "    MTBP_TICK(worker, mtBpLookahead);\n"
         "    (this->*entry.fn)();\n"
-        "    MTBP_TASK(worker);\n"
+        "    MTBP_TASK_ID(worker, entry.taskId);\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
         "  };\n"
@@ -958,7 +979,7 @@ void CppEmitterMt::emitDefinitions() {
         "    }\n"
         "    MTBP_TICK(worker, mtBpSpinReady);\n"
         "    (this->*entry.fn)();\n"
-        "    MTBP_TASK(worker);\n"
+        "    MTBP_TASK_ID(worker, entry.taskId);\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
         "  }\n"
@@ -983,7 +1004,7 @@ void CppEmitterMt::emitDefinitions() {
                      "      }\n";
         }
         runtime += "      mtTask" + std::to_string(taskId) + "();\n";
-        runtime += "      MTBP_TASK(worker);\n";
+        runtime += "      MTBP_TASK_ID(worker, " + std::to_string(taskId) + ");\n";
         for (int slot : task.stores) {
           runtime += "      mtReadyTokens[" + std::to_string(slot) +
                      "].value.store(parity, std::memory_order_release);\n";
@@ -1253,6 +1274,25 @@ void CppEmitterMt::emitDefinitions() {
             (double)topSpin[k] * secPerTsc);
   }
   fprintf(stderr, "\n[mt-bubble] report written to %s\n", outPath);
+  if (mtBubbleTaskTimes) {
+    FILE* csv = fopen(mtBubbleTaskTimesPath, "w");
+    if (csv == nullptr) {
+      fprintf(stderr, "[mt-bubble] cannot open task-times CSV %s\n", mtBubbleTaskTimesPath);
+    } else {
+      for (int t = 0; t < kMtBubbleTaskCount; ++t) {
+        unsigned long long calls = 0, tsc = 0;
+        for (int w = 0; w < kMtWorkerCount; ++w) {
+          calls += mtBubbleTaskCalls[w][t];
+          tsc += mtBubbleTaskTsc[w][t];
+        }
+        fprintf(csv, "%d,%llu,%llu\n", t, calls,
+                (unsigned long long)((double)tsc / hz * 1.0e9));
+      }
+      fclose(csv);
+      fprintf(stderr, "[mt-bubble] per-task CSV written to %s (%d tasks)\n",
+              mtBubbleTaskTimesPath, kMtBubbleTaskCount);
+    }
+  }
 }
 )mtbp").substr(1);
   emitText(0, true, runtime);
