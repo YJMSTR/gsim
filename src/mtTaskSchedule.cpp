@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "mtCostModel.h"
+#include "mtRepcutTop.h"
 #include "mtReplicationSchedule.h"
 
 #include <algorithm>
@@ -1100,6 +1101,13 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
 
   const size_t transitiveEdgesRemoved = transitivelyReduceTaskEdges(tasks);
 
+  // Attribution-driven replication (GSIM_MT_REPCUT_TOP, default off). The
+  // transform runs after transitive reduction so replica predecessors match
+  // the token DAG exactly, and before worker-local classification so that
+  // values read by both a producer and its replica stay globally visible.
+  const mtrepcut::Report repcutReport = mtrepcut::applyRepcutTop(
+      graph, tasks, schedule.owner, schedule.chains, workerCount);
+
   collectWorkerLocalNodes(tasks, graph);
 
   workers.workerTasks_ = std::move(schedule.chains);
@@ -1179,6 +1187,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     int consumer = -1;
     int publisher = -1;
     int slot = -1;
+    std::vector<int> sources;  // set only while repcut-top slot sharing is on
   };
   std::vector<TokenGroup> groups;
   for (size_t consumer = 0; consumer < tasks.tasks_.size(); ++consumer) {
@@ -1207,6 +1216,16 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
           tasks.tasks_[static_cast<size_t>(publisher)].localWaits.push_back(
               workerPosition[static_cast<size_t>(source)]);
         }
+      }
+      if (repcutReport.replicas > 0) {
+        group.sources = entry.second;
+        std::sort(group.sources.begin(), group.sources.end());
+      }
+      if (std::getenv("GSIM_MT_REPCUT_DEBUG") != nullptr) {
+        fprintf(stderr, "[repcut-dbg] group consumer=%d(w%d) producerOwner=w%d sources=[",
+                static_cast<int>(consumer), tasks.tasks_[consumer].owner, entry.first);
+        for (int source : entry.second) fprintf(stderr, "%d ", source);
+        fprintf(stderr, "] publisher=%d\n", publisher);
       }
       groups.push_back(group);
     }
@@ -1248,10 +1267,45 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
         static_cast<int>(groupId));
   }
 
+  // Slot assignment. While repcut-top is active, groups with an identical
+  // (producer owner, source set) share one ready-token slot: a replica task
+  // inherits its producer's predecessors, so its token groups have exactly
+  // the producer's sources and reuse the token the protocol already
+  // publishes — targeted replication then never adds ready-token slots.
   int nextSlot = 0;
+  int repcutSharedSlots = 0;
+  int repcutReplicaNewSlots = 0;
+  std::map<std::pair<int, std::vector<int>>, int> slotBySources;
   for (const auto& bank : groupsByOwnerPair) {
     nextSlot = (nextSlot + 63) & ~63;
-    for (int groupId : bank.second) groups[static_cast<size_t>(groupId)].slot = nextSlot++;
+    for (int groupId : bank.second) {
+      TokenGroup& group = groups[static_cast<size_t>(groupId)];
+      if (!group.sources.empty() || repcutReport.replicas > 0) {
+        if (group.sources.empty()) {
+          for (int predecessor : tasks.tasks_[static_cast<size_t>(group.consumer)].predecessors) {
+            if (tasks.tasks_[static_cast<size_t>(predecessor)].owner == group.producerOwner) {
+              group.sources.push_back(predecessor);
+            }
+          }
+          std::sort(group.sources.begin(), group.sources.end());
+        }
+        const auto key = std::make_pair(group.producerOwner, group.sources);
+        auto existing = slotBySources.find(key);
+        if (existing != slotBySources.end()) {
+          group.slot = existing->second;
+          ++repcutSharedSlots;
+          continue;
+        }
+        group.slot = nextSlot++;
+        slotBySources.emplace(key, group.slot);
+        if (repcutReport.firstReplicaId >= 0 &&
+            group.consumer >= repcutReport.firstReplicaId) {
+          ++repcutReplicaNewSlots;
+        }
+        continue;
+      }
+      group.slot = nextSlot++;
+    }
     nextSlot = (nextSlot + 63) & ~63;
   }
   workers.readySlotCount_ = std::max(1, nextSlot);
@@ -1280,10 +1334,21 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   for (const MtTask& task : tasks.tasks_) edgeCount += task.successors.size();
   size_t localEdgeCount = 0;
   for (const MtTask& task : tasks.tasks_) localEdgeCount += task.localWaits.size();
+  std::string repcutTokens;
+  if (repcutReport.replicas > 0) {
+    // Honest token delta of the transform: groups whose last producer-worker
+    // source was replicated away disappear; replica groups reuse existing
+    // slots unless their source set is new (depth tier rewrites them).
+    repcutTokens = " repcut-tokens-deduped=" + std::to_string(repcutSharedSlots) +
+                   " repcut-tokens-new=" + std::to_string(repcutReplicaNewSlots) +
+                   " repcut-tokens-net=" +
+                   std::to_string(repcutReport.killedGroups - repcutReplicaNewSlots);
+  }
   fprintf(stderr,
           "[cppEmitter-mt] workers=%d groups=%d mtasks=%zu edges=%zu tokens=%zu "
           "token-groups-before-chain-compression=%zu local-edges=%zu "
-          "transitive-edges-removed=%zu\n",
+          "transitive-edges-removed=%zu%s\n",
           workerCount, groupCount, tasks.tasks_.size(), edgeCount, groups.size(),
-          uncompressedTokenGroups, localEdgeCount, transitiveEdgesRemoved);
+          uncompressedTokenGroups, localEdgeCount, transitiveEdgesRemoved,
+          repcutTokens.c_str());
 }
