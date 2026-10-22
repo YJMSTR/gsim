@@ -49,10 +49,16 @@ enable a lookahead window so workers fill true-dependency stalls:
 ```
 GSIM_THREADS=32 \
   build/gsim/gsim --mt-mode=on --mt-target-tasks=2400 --mt-scheduler=heft \
-  --mt-lookahead-window=64 --supernode-max-size=30 --cpp-max-size-KB=8192 \
+  --mt-lookahead-window=64 \
   --sep-mod=__DOT__ --sep-aggr=__DOT__ --dir out/model SimTop.fir
 ```
 
+Generation thread count changes the partition result (worker-chain shaping),
+so always generate with the same `GSIM_THREADS` as the runtime (32 here).
+The emitted files are split at 4096 KB by default (`--cpp-max-size-KB`); a
+six-way split scan on kunminghu (2048/4096/8192/16384/32768 KB vs single
+file) measured 4096 KB fastest on all three gates (coremark 8.55 vs 8.86 s,
+linux 5.27 vs 5.43 s, fulltrap ~54.2 vs ~55.7 s against the no-split build).
 Finer `--mt-target-tasks` or larger windows measured slower on this design
 (2,242-task chains with window 64 are the measured optimum); see
 docs/multithreaded-emitter.md before changing them.

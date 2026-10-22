@@ -67,7 +67,7 @@ Config::Config() {
   MtMode = false;
   OutputDir = ".";
   SuperNodeMaxSize = 35;
-  cppMaxSizeKB = -1;
+  cppMaxSizeKB = 4096;
   sep_module = "$";
   sep_aggr = "$$";
   MergeWhenSize = 5;
