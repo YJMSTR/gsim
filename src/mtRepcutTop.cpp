@@ -741,37 +741,36 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       insertBefore = std::min(insertBefore, workerPos[static_cast<size_t>(consumer)]);
     }
 
-    // Safe-insertion rule. A replica waits, through its inherited token
-    // groups, for its producers' chain prefixes to complete. If any task in
-    // such a prefix itself waits on a consumer-worker task, that task must
-    // run before the replica or the two chains can deadlock: the worker
-    // stalls at the replica waiting the prefix while the prefix stalls
-    // waiting a later task on this worker. The replica is therefore inserted
-    // after the last consumer-worker dependency of every producer chain
-    // prefix it effectively waits on.
-    auto prefixSafeAfter = [&](const std::vector<int>& predecessors,
-                               int consumerWorker, int after) {
-      std::vector<int> publisherPos(static_cast<size_t>(workerCount), -1);
-      for (int predecessor : predecessors) {
-        const int owner = owners[static_cast<size_t>(predecessor)];
-        if (owner == consumerWorker) continue;
-        publisherPos[static_cast<size_t>(owner)] =
-            std::max(publisherPos[static_cast<size_t>(owner)],
-                     workerPos[static_cast<size_t>(predecessor)]);
+    // Safe-insertion rule (exact). A replica must run after every task that
+    // is ordered before it through ANY dependency path: a transitive
+    // predecessor sitting later in the consumer worker's own chain is a
+    // structural deadlock (the worker stalls at the replica waiting for a
+    // path that only completes after the replica). Waiting for the whole
+    // transitive predecessor closure of the replica's inherited dependency
+    // set is exactly the set of tasks whose chain positions constrain the
+    // insertion point.
+    std::vector<char> predecessorScratch;
+    auto closureSafeAfter = [&](const std::vector<int>& predecessors,
+                                int consumerWorker, int after) {
+      predecessorScratch.assign(tasks.size(), 0);
+      std::vector<int> pending(predecessors);
+      for (int start : predecessors) {
+        predecessorScratch[static_cast<size_t>(start)] = 1;
       }
-      for (int worker = 0; worker < workerCount; ++worker) {
-        const int limit = publisherPos[static_cast<size_t>(worker)];
-        if (limit < 0) continue;
-        const std::vector<int>& chain = chains[static_cast<size_t>(worker)];
-        for (int position = 0;
-             position <= limit && position < static_cast<int>(chain.size()); ++position) {
-          for (int input :
-               tasks[static_cast<size_t>(chain[static_cast<size_t>(position)])].predecessors) {
-            if (owners[static_cast<size_t>(input)] == consumerWorker) {
-              after = std::max(after, workerPos[static_cast<size_t>(input)]);
-            }
-          }
+      while (!pending.empty()) {
+        const int current = pending.back();
+        pending.pop_back();
+        for (int input : tasks[static_cast<size_t>(current)].predecessors) {
+          if (predecessorScratch[static_cast<size_t>(input)]) continue;
+          predecessorScratch[static_cast<size_t>(input)] = 1;
+          pending.push_back(input);
         }
+      }
+      for (size_t taskId = 0; taskId < tasks.size(); ++taskId) {
+        if (!predecessorScratch[taskId]) continue;
+        if (owners[taskId] != consumerWorker) continue;
+        const int position = workerPos[taskId];
+        if (position > after) after = position;
       }
       return after;
     };
@@ -817,7 +816,7 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
           if (owners[static_cast<size_t>(input)] != consumerWorker) continue;
           after = std::max(after, workerPos[static_cast<size_t>(input)]);
         }
-        after = prefixSafeAfter(candidateSources, consumerWorker, after);
+        after = closureSafeAfter(candidateSources, consumerWorker, after);
         candidates.emplace_back(predecessor, after + 1);
       }
       std::sort(candidates.begin(), candidates.end(),
@@ -835,7 +834,7 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       }
     }
     plannedInsertAfter =
-        prefixSafeAfter(producerSources, consumerWorker, plannedInsertAfter);
+        closureSafeAfter(producerSources, consumerWorker, plannedInsertAfter);
     if (plannedInsertAfter + 1 > insertBefore) {
       reject(row, "ordering-conflict");
       continue;
@@ -915,7 +914,7 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       finalInsertAfter =
           std::max(finalInsertAfter, workerPos[static_cast<size_t>(replacement.second)]);
     }
-    finalInsertAfter = prefixSafeAfter(producerSources, consumerWorker, finalInsertAfter);
+    finalInsertAfter = closureSafeAfter(producerSources, consumerWorker, finalInsertAfter);
     consumers = consumersOn(producerId);
     int finalInsertBefore = std::numeric_limits<int>::max();
     for (int consumer : consumers) {
