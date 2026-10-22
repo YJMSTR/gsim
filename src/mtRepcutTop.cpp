@@ -345,6 +345,25 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
   std::set<int> replicatedProducers;
   int sequence = 0;
 
+  // True when the task owns a writer port of a memory that has more than
+  // one writer/readwriter port across different tasks.
+  auto producerWritesSharedMemory = [&](const MtTask& producer) {
+    for (Node* member : producer.members) {
+      if (member->type != NODE_WRITER && member->type != NODE_READWRITER) continue;
+      Node* memory = member->parent;
+      if (memory == nullptr || memory->type != NODE_MEMORY) continue;
+      std::set<int> writerTasks;
+      for (Node* port : memory->member) {
+        if (port->status != VALID_NODE) continue;
+        if (port->type != NODE_WRITER && port->type != NODE_READWRITER) continue;
+        auto owner = plan.taskByNode_.find(port);
+        if (owner != plan.taskByNode_.end()) writerTasks.insert(owner->second);
+      }
+      if (writerTasks.size() > 1) return true;
+    }
+    return false;
+  };
+
   // Node-level data sources of a producer: every cross-task value its
   // members read. Transitive reduction may drop task edges that node reads
   // still imply (their ordering survives only through same-worker chain
@@ -400,6 +419,16 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     }
     if (copyable.empty()) {
       *reason = "no-copyable-members";
+      return -1;
+    }
+    // D3 hard constraint (multi-write-port memory): a memory whose write
+    // ports span several tasks commits per-port pending slots; replicating
+    // one writer re-executes its slots with identical values, but the
+    // ordering web around a shared symbol is exactly where a silent
+    // schedule bug costs a whole NEMU run, so such producers stay
+    // unreplicated in the first shot.
+    if (producerWritesSharedMemory(producer)) {
+      *reason = "multi-writer-memory";
       return -1;
     }
     bool hasValueStatement = false;
@@ -920,6 +949,14 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
         std::to_string(consumerWorker) + ",cost" +
         std::to_string(tasks[static_cast<size_t>(replicaId)].cost));
   }
+
+  // D6 note: gsim's dense memory model is read-old with per-port pending
+  // slots committed by the state phase, so plain readers never require
+  // writer ordering and write-forwarding ("new" memories) reads only a
+  // port's own pending slots inside its own task. The multi-writer-memory
+  // eligibility cap above is the conservative guard this architecture
+  // needs; the wolvrix cross-partition-value whitelist has no equivalent
+  // violation surface here.
 
   report.replicatedProducers = static_cast<int>(replicatedProducers.size());
   report.costPct = report.totalCost > 0
