@@ -40,6 +40,120 @@ bool taskEmitsCode(const MtTask& task) {
   return task.kind == MtTaskKind::ExtModule;
 }
 
+struct CostOverrideRow {
+  int taskId = -1;
+  unsigned long long calls = 0;
+  unsigned long long totalNs = 0;
+};
+
+// Parses unsigned decimal fields; returns false on empty or overflowed text.
+bool parseUnsignedField(const char*& text, unsigned long long& value) {
+  if (*text < '0' || *text > '9') return false;
+  unsigned long long parsed = 0;
+  while (*text >= '0' && *text <= '9') {
+    if (parsed > (0xFFFFFFFFFFFFFFFFull - (unsigned long long)(*text - '0')) / 10ull)
+      return false;
+    parsed = parsed * 10ull + (unsigned long long)(*text++ - '0');
+  }
+  value = parsed;
+  return true;
+}
+
+// Reads task_id,calls,total_ns rows (the GSIM_MT_BUBBLE_TASKTIMES format: no
+// header, one row per task, ascending id). Malformed lines are counted and
+// skipped so a truncated dump degrades instead of aborting a long campaign.
+bool loadCostOverrideRows(const std::string& path, std::vector<CostOverrideRow>* rows,
+                          size_t* malformed) {
+  FILE* file = std::fopen(path.c_str(), "r");
+  if (file == nullptr) return false;
+  char buffer[512];
+  while (std::fgets(buffer, sizeof(buffer), file) != nullptr) {
+    const char* cursor = buffer;
+    CostOverrideRow row;
+    unsigned long long taskId = 0;
+    if (parseUnsignedField(cursor, taskId) && taskId <= 0x7FFFFFFFull &&
+        *cursor == ',' && ++cursor &&
+        parseUnsignedField(cursor, row.calls) &&
+        *cursor == ',' && ++cursor &&
+        parseUnsignedField(cursor, row.totalNs)) {
+      while (*cursor == ' ' || *cursor == '\t') ++cursor;
+      if (*cursor == '\0' || *cursor == '\n' || *cursor == '\r') {
+        row.taskId = static_cast<int>(taskId);
+        rows->push_back(row);
+        continue;
+      }
+    }
+    ++*malformed;
+  }
+  std::fclose(file);
+  return true;
+}
+
+// Optional companion written by rheft runs (mt-emitted-task-ids.csv) mapping
+// the emitted task id (the one profiling CSVs use) back to the pre-schedule
+// index used here. Without it heft/list ids are already identical.
+void loadEmittedIdMap(const std::string& csvPath, std::unordered_map<int, int>* emittedToPre) {
+  const size_t slash = csvPath.find_last_of('/');
+  const std::string mapPath = (slash == std::string::npos ? std::string()
+                                                          : csvPath.substr(0, slash + 1)) +
+                              "mt-emitted-task-ids.csv";
+  FILE* file = std::fopen(mapPath.c_str(), "r");
+  if (file == nullptr) return;
+  char buffer[256];
+  while (std::fgets(buffer, sizeof(buffer), file) != nullptr) {
+    const char* cursor = buffer;
+    unsigned long long emitted = 0;
+    unsigned long long pre = 0;
+    if (parseUnsignedField(cursor, emitted) && *cursor == ',' && ++cursor &&
+        parseUnsignedField(cursor, pre)) {
+      (*emittedToPre)[static_cast<int>(emitted)] = static_cast<int>(pre);
+    }
+  }
+  std::fclose(file);
+}
+
+// Replaces analytic task costs with measured means (total_ns/calls) before
+// any scheduling decision reads them. Only task.cost changes; forming, id
+// order, and emission stay untouched. Rows without a matching pre-schedule
+// task (replicas appended during scheduling) and tasks without a row are
+// counted on stderr so misaligned dumps are visible, never silent.
+void applyCostOverride(MtTaskPlan& tasks) {
+  std::vector<CostOverrideRow> rows;
+  size_t malformed = 0;
+  if (!loadCostOverrideRows(globalConfig.MtCostOverrideCsv, &rows, &malformed)) {
+    fprintf(stderr, "[cppEmitter-mt] cost-override: cannot open %s; keeping analytic costs\n",
+            globalConfig.MtCostOverrideCsv.c_str());
+    return;
+  }
+  std::unordered_map<int, int> emittedToPre;
+  loadEmittedIdMap(globalConfig.MtCostOverrideCsv, &emittedToPre);
+  size_t applied = 0;
+  size_t unmappedRows = 0;
+  for (const CostOverrideRow& row : rows) {
+    if (row.calls == 0) {
+      ++unmappedRows;
+      continue;
+    }
+    int taskId = row.taskId;
+    auto remapped = emittedToPre.find(taskId);
+    if (remapped != emittedToPre.end()) taskId = remapped->second;
+    if (taskId < 0 || taskId >= static_cast<int>(tasks.tasks_.size())) {
+      ++unmappedRows;
+      continue;
+    }
+    MtTask& task = tasks.tasks_[static_cast<size_t>(taskId)];
+    const unsigned long long mean = (row.totalNs + row.calls / 2) / row.calls;
+    task.cost = static_cast<int>(mean > 0 ? mean : 1);
+    ++applied;
+  }
+  const size_t keptOriginal = tasks.tasks_.size() - std::min(applied, tasks.tasks_.size());
+  fprintf(stderr,
+          "[cppEmitter-mt] cost-override: csv=%s rows=%zu applied=%zu "
+          "kept-analytic=%zu unmapped-or-replica-rows=%zu malformed=%zu id-map=%s\n",
+          globalConfig.MtCostOverrideCsv.c_str(), rows.size(), applied, keptOriginal,
+          unmappedRows, malformed, emittedToPre.empty() ? "none" : "loaded");
+}
+
 void compactEmptyTasks(MtTaskPlan& plan) {
   const std::vector<MtTask> original = plan.tasks_;
   std::vector<int> oldToNew(original.size(), -1);
@@ -1041,6 +1155,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   const int groupCount = tasks.partitionGroupCount_;
   compactEmptyTasks(tasks);
   for (MtTask& task : tasks.tasks_) task.cost = mtLoweredTaskCost(task);
+  if (!globalConfig.MtCostOverrideCsv.empty()) applyCostOverride(tasks);
   EdgeCommunicationNodes communicationNodes = buildEdgeCommunicationNodes(tasks);
   size_t communicationEdges = 0;
   long long communicationUnits = 0;
@@ -1061,6 +1176,23 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     // transitive reduction, including the selected worker order.
     const auto remapping = reorderHeftTasks(tasks, schedule);
     replication->report(remapping, schedule.makespan);
+    if (!globalConfig.OutputDir.empty()) {
+      // Profiling CSVs (GSIM_MT_BUBBLE_TASKTIMES) name tasks by the emitted
+      // id, which is this post-reorder index. Persist the permutation so
+      // GSIM_MT_COST_OVERRIDE can map measured rows back onto the
+      // pre-schedule indices used above, where heft/list ids already match.
+      FILE* idMap = std::fopen((globalConfig.OutputDir + "/mt-emitted-task-ids.csv").c_str(), "w");
+      Assert(idMap != nullptr, "cannot write emitted task id map");
+      fprintf(idMap, "emitted_id,pre_schedule_id\n");
+      std::vector<int> preByEmitted(remapping.size(), -1);
+      for (size_t pre = 0; pre < remapping.size(); ++pre) {
+        preByEmitted[static_cast<size_t>(remapping[pre])] = static_cast<int>(pre);
+      }
+      for (size_t emitted = 0; emitted < preByEmitted.size(); ++emitted) {
+        fprintf(idMap, "%zu,%d\n", emitted, preByEmitted[emitted]);
+      }
+      Assert(std::fclose(idMap) == 0, "cannot finish emitted task id map");
+    }
     communicationNodes = buildEdgeCommunicationNodes(tasks);
     communicationEdges = 0;
     communicationUnits = 0;

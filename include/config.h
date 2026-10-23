@@ -1,6 +1,9 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <set>
+#include <string>
+
 struct Config {
   bool EnableDumpGraph;
   bool DumpGraphDot;
@@ -25,6 +28,7 @@ struct Config {
   int MtReplicationMaxOps;
   int MtReplicationMinFanout;
   int MtLookaheadWindow;
+  std::string MtCostOverrideCsv;
   bool MtLookaheadStats;
   int MtSparseRegisterMinBytes;
   int MtSparseRegisterMaxWrites;
