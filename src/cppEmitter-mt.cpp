@@ -570,8 +570,10 @@ void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
     emitText(indent, false, "if (mtValueTraceOn) { uint64_t mtVtH = mtTraceHash[" +
                std::to_string(taskId) + "];\n");
     for (Node* node : task.members) {
+      // Worker-local members are aliased into the task body, so folding by
+      // the bare name stays valid; the fold set must be identical across
+      // knob-on/off variants (locality itself shifts under replication).
       if (node->type != NODE_OTHERS || task.localNodes.count(node) != 0) continue;
-      if (isWorkerLocal(node)) continue;
       std::string ref = node->name;
       if (!node->dimension.empty()) {
         std::string loops, close, index;
