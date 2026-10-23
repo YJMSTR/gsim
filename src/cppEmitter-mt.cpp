@@ -284,16 +284,30 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   }
   // Bubble profiling: default off, enabled at runtime with GSIM_MT_BUBBLE_PROFILE=1.
   // The knob only gates rdtsc accounting; control flow and output are unchanged.
+  // Buckets are the coarse legacy lens; phases are the p2sim-style per-cycle
+  // decomposition (state_update/join_arrive/join_wait/generation_wait/
+  // dispatch_scan/task_eval/token_publish/other) used by the A6 T32 audit:
+  // every tick credits the same rdtsc delta to one bucket and one phase, so
+  // per worker sum(phases) == sum(buckets) exactly.
   fprintf(header, "bool mtBubbleProfile = false;\n");
   fprintf(header,
           "enum MtBpBucket { mtBpTaskCompute = 0, mtBpSpinReady, mtBpSpinStateBarrier, "
           "mtBpSpinGenIdle, mtBpLookahead, mtBpProtocolOther, mtBpSpinJoin, mtBpStateUpdate, "
-          "mtBpBucketCount };\n");
+          "mtBpTokenPublish, mtBpBucketCount };\n");
+  fprintf(header,
+          "enum MtBpPhase { mtBpPhStateUpdate = 0, mtBpPhJoinArrive, mtBpPhJoinWait, "
+          "mtBpPhGenWait, mtBpPhDispatchScan, mtBpPhTaskEval, mtBpPhTokenPublish, "
+          "mtBpPhOther, mtBpPhaseCount };\n");
+  fprintf(header,
+          "enum MtBpPauseClass { mtBpPauseGenWait = 0, mtBpPauseStateBarrier, "
+          "mtBpPauseJoin, mtBpPauseReadyWait, mtBpPauseCount };\n");
   fprintf(header,
           "struct alignas(64) MtBubbleCounters {\n"
-          "  unsigned long long bucket[mtBpBucketCount];\n"
-          "  unsigned long long lastTsc;\n"
-          "  unsigned long long taskCalls;\n"
+          "  unsigned long long bucket[mtBpBucketCount]{};\n"
+          "  unsigned long long phase[mtBpPhaseCount]{};\n"
+          "  unsigned long long pause[mtBpPauseCount]{};\n"
+          "  unsigned long long lastTsc{};\n"
+          "  unsigned long long taskCalls{};\n"
           "};\n");
   fprintf(header, "MtBubbleCounters mtBubble[kMtWorkerCount];\n");
   fprintf(header,
@@ -320,7 +334,7 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           "unsigned long long mtBubbleStartTsc[kMtWorkerCount] = {};\n"
           "unsigned long long mtBubbleEndTsc[kMtWorkerCount] = {};\n"
           "unsigned long long mtBubbleCycleHist[64] = {};\n");
-  fprintf(header, "void mtBpTick(int worker, int bucket);\n");
+  fprintf(header, "void mtBpTick(int worker, int bucket, int phase);\n");
   fprintf(header, "void mtBpReport();\n");
   for (const StateUpdate& update : stateTasks_) {
     fprintf(header, "struct MtRegisterBlockW%d {\n", update.owner);
@@ -715,10 +729,13 @@ void CppEmitterMt::emitDefinitions() {
   }
 
   std::string runtime;
-  // Bubble-profiling helpers. mtBpTick is a plain per-worker accumulator: each
-  // bucket receives the tsc interval elapsed since the previous tick, so the
-  // buckets of one worker partition its wall time between the first and last
-  // tick. All call sites are guarded by the runtime knob.
+  // Bubble-profiling helpers. mtBpTick is a plain per-worker accumulator: the
+  // interval elapsed since the previous tick is credited to one legacy bucket
+  // and one A6 phase, so both lens partition a worker's wall time between its
+  // first and last tick (sum(phases) == sum(buckets) exactly). MTBP_PAUSE
+  // counts spin-loop pause iterations per wait class (this executor spins on
+  // bare pause; it makes no yield syscalls). All call sites are guarded by the
+  // runtime knob.
   runtime +=
       "static inline unsigned long long mtBpRdtsc() {\n"
       "  unsigned int lo, hi;\n"
@@ -731,19 +748,20 @@ void CppEmitterMt::emitDefinitions() {
       "  return static_cast<unsigned long long>(mtBpTs.tv_sec) * 1000000000ull +\n"
       "         static_cast<unsigned long long>(mtBpTs.tv_nsec);\n"
       "}\n"
-      "#define MTBP_TICK(w, b) do { if (mtBubbleProfile) mtBpTick(w, b); } while (0)\n"
-      "#define MTBP_TASK(w) \\\n"
-      "  do { if (mtBubbleProfile) { mtBubble[w].taskCalls++; mtBpTick(w, mtBpTaskCompute); } } while (0)\n"
+      "#define MTBP_TICK(w, b, p) do { if (mtBubbleProfile) mtBpTick(w, b, p); } while (0)\n"
+      "#define MTBP_PAUSE(w, c) do { if (mtBubbleProfile) ++mtBubble[w].pause[c]; } while (0)\n"
       "#define MTBP_TASK_ID(w, t) \\\n"
       "  do { if (mtBubbleProfile) { mtBubble[w].taskCalls++; \\\n"
       "       const unsigned long long mtBpTaskT0 = mtBubble[w].lastTsc; \\\n"
-      "       mtBpTick(w, mtBpTaskCompute); \\\n"
+      "       mtBpTick(w, mtBpTaskCompute, mtBpPhTaskEval); \\\n"
       "       if (mtBubbleTaskTimes) { ++mtBubbleTaskCalls[w][t]; \\\n"
       "         mtBubbleTaskTsc[w][t] += mtBubble[w].lastTsc - mtBpTaskT0; } } } while (0)\n"
-      "inline void " + className + "::mtBpTick(int worker, int bucket) {\n"
+      "inline void " + className + "::mtBpTick(int worker, int bucket, int phase) {\n"
       "  MtBubbleCounters* mtBpBp = &mtBubble[worker];\n"
       "  const unsigned long long mtBpNow = mtBpRdtsc();\n"
-      "  mtBpBp->bucket[bucket] += mtBpNow - mtBpBp->lastTsc;\n"
+      "  const unsigned long long mtBpDelta = mtBpNow - mtBpBp->lastTsc;\n"
+      "  mtBpBp->bucket[bucket] += mtBpDelta;\n"
+      "  mtBpBp->phase[phase] += mtBpDelta;\n"
       "  mtBpBp->lastTsc = mtBpNow;\n"
       "}\n";
   runtime += "void " + className + "::mtInit() {\n";
@@ -828,21 +846,22 @@ void CppEmitterMt::emitDefinitions() {
       "  if (mtBubbleProfile) mtBubble[worker].lastTsc = mtBubbleStartTsc[worker] = mtBpRdtsc();\n"
       "  uint64_t seen = mtGeneration.load(std::memory_order_acquire);\n"
       "  mtReadyWorkers.fetch_add(1, std::memory_order_release);\n"
+      "  MTBP_TICK(worker, mtBpProtocolOther, mtBpPhJoinArrive);\n"
       "  for (;;) {\n"
-      "    MTBP_TICK(worker, mtBpProtocolOther);\n"
       "    uint64_t generation;\n"
       "    do {\n"
       "      generation = mtGeneration.load(std::memory_order_acquire);\n"
       "      if (mtStop.load(std::memory_order_acquire)) {\n"
-      "        MTBP_TICK(worker, mtBpSpinGenIdle);\n"
+      "        MTBP_TICK(worker, mtBpSpinGenIdle, mtBpPhGenWait);\n"
       "        if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
       "        return;\n"
       "      }\n"
       "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+      "      MTBP_PAUSE(worker, mtBpPauseGenWait);\n"
       "    } while (generation == seen);\n"
-      "    MTBP_TICK(worker, mtBpSpinGenIdle);\n"
+      "    MTBP_TICK(worker, mtBpSpinGenIdle, mtBpPhGenWait);\n"
       "    if (mtStop.load(std::memory_order_acquire)) {\n"
-      "      MTBP_TICK(worker, mtBpProtocolOther);\n"
+      "      MTBP_TICK(worker, mtBpProtocolOther, mtBpPhOther);\n"
       "      if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
       "      return;\n"
       "    }\n"
@@ -850,6 +869,7 @@ void CppEmitterMt::emitDefinitions() {
       "    mtDeferredEventsByWorker[worker] = mtTakeDeferredEvents();\n"
       "    mtDoneFlags[worker - 1].parity.store(static_cast<uint8_t>(generation & 1),\n"
       "                                         std::memory_order_release);\n"
+      "    MTBP_TICK(worker, mtBpProtocolOther, mtBpPhJoinArrive);\n"
       "    seen = generation;\n"
       "  }\n"
       "}\n";
@@ -878,11 +898,12 @@ void CppEmitterMt::emitDefinitions() {
         "    return remoteReady(candidate);\n"
         "  };\n"
         "  auto runTask = [&](const MtDispatch& entry) {\n"
-        "    MTBP_TICK(worker, mtBpLookahead);\n"
+        "    MTBP_TICK(worker, mtBpLookahead, mtBpPhDispatchScan);\n"
         "    (this->*entry.fn)();\n"
         "    MTBP_TASK_ID(worker, entry.taskId);\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
+        "    MTBP_TICK(worker, mtBpTokenPublish, mtBpPhTokenPublish);\n"
         "  };\n"
         "  while (head < count) {\n"
         "    while (head < count && (doneBits[head >> 6] & (uint64_t{1} << (head & 63))) != 0) {\n"
@@ -918,40 +939,48 @@ void CppEmitterMt::emitDefinitions() {
         "    for (uint32_t i = headEntry.waitBegin; i < headEntry.waitEnd; ++i) {\n"
         "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
         "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
-        "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity)\n"
+        "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity) {\n"
         "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "        MTBP_PAUSE(worker, mtBpPauseReadyWait);\n"
+        "      }\n"
         "      if (mtBubbleProfile) {\n"
         "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
         "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
         "      }\n"
         "    }\n"
-        "    MTBP_TICK(worker, mtBpSpinReady);\n"
+        "    MTBP_TICK(worker, mtBpSpinReady, mtBpPhDispatchScan);\n"
         "  }\n"
-        "  MTBP_TICK(worker, mtBpLookahead);\n"
+        "  MTBP_TICK(worker, mtBpLookahead, mtBpPhDispatchScan);\n"
         "}\n";
   }
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
-  runtime += "  MTBP_TICK(worker, mtBpProtocolOther);\n";
+  runtime += "  MTBP_TICK(worker, mtBpProtocolOther, mtBpPhJoinArrive);\n";
   runtime += "  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {
     runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +
                std::to_string(worker) + "(); break;\n";
   }
   runtime += "    default: abort();\n  }\n";
-  runtime += "  MTBP_TICK(worker, mtBpStateUpdate);\n";
+  runtime += "  MTBP_TICK(worker, mtBpStateUpdate, mtBpPhStateUpdate);\n";
   runtime +=
       "  if (worker == 0) {\n"
       "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
-      "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
+      "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity) {\n"
       "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+      "        MTBP_PAUSE(worker, mtBpPauseStateBarrier);\n"
+      "      }\n"
       "    }\n"
-      "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
+      "    MTBP_TICK(worker, mtBpSpinStateBarrier, mtBpPhJoinWait);\n"
       "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
+      "    MTBP_TICK(worker, mtBpSpinStateBarrier, mtBpPhJoinArrive);\n"
       "  } else {\n"
       "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
-      "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
+      "    MTBP_TICK(worker, mtBpSpinStateBarrier, mtBpPhJoinArrive);\n"
+      "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity) {\n"
       "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
+      "      MTBP_PAUSE(worker, mtBpPauseStateBarrier);\n"
+      "    }\n"
+      "    MTBP_TICK(worker, mtBpSpinStateBarrier, mtBpPhJoinWait);\n"
       "  }\n";
   if (lookaheadWindow_ <= 0) {
     // Strict fixed-order fast path. This is the baseline protocol and avoids
@@ -970,18 +999,21 @@ void CppEmitterMt::emitDefinitions() {
         "    for (uint32_t i = entry.waitBegin; i < entry.waitEnd; ++i) {\n"
         "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
         "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
-        "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity)\n"
+        "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity) {\n"
         "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "        MTBP_PAUSE(worker, mtBpPauseReadyWait);\n"
+        "      }\n"
         "      if (mtBubbleProfile) {\n"
         "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
         "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
         "      }\n"
         "    }\n"
-        "    MTBP_TICK(worker, mtBpSpinReady);\n"
+        "    MTBP_TICK(worker, mtBpSpinReady, mtBpPhDispatchScan);\n"
         "    (this->*entry.fn)();\n"
         "    MTBP_TASK_ID(worker, entry.taskId);\n"
         "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
+        "    MTBP_TICK(worker, mtBpTokenPublish, mtBpPhTokenPublish);\n"
         "  }\n"
         "}\n";
   } else {
@@ -1009,6 +1041,7 @@ void CppEmitterMt::emitDefinitions() {
           runtime += "      mtReadyTokens[" + std::to_string(slot) +
                      "].value.store(parity, std::memory_order_release);\n";
         }
+        runtime += "      MTBP_TICK(worker, mtBpTokenPublish, mtBpPhTokenPublish);\n";
       }
       runtime += "      return;\n    }\n";
     }
@@ -1036,17 +1069,21 @@ void CppEmitterMt::emitDefinitions() {
     }
   }
   runtime +=
+      "  MTBP_TICK(0, mtBpProtocolOther, mtBpPhOther);\n"
       "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
       "  uint8_t parity = static_cast<uint8_t>(generation & 1);\n";
   runtime += "  mtRunWorker(0, parity);\n";
   runtime +=
-      "  mtDeferredEventsByWorker[0] = mtTakeDeferredEvents();\n";
+      "  mtDeferredEventsByWorker[0] = mtTakeDeferredEvents();\n"
+      "  MTBP_TICK(0, mtBpSpinJoin, mtBpPhJoinArrive);\n";
   runtime +=
       "  for (int worker = 1; worker < kMtWorkerCount; ++worker) {\n"
-      "    while (mtDoneFlags[worker - 1].parity.load(std::memory_order_acquire) != parity)\n"
+      "    while (mtDoneFlags[worker - 1].parity.load(std::memory_order_acquire) != parity) {\n"
       "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+      "      MTBP_PAUSE(0, mtBpPauseJoin);\n"
+      "    }\n"
       "  }\n"
-      "  MTBP_TICK(0, mtBpSpinJoin);\n";
+      "  MTBP_TICK(0, mtBpSpinJoin, mtBpPhJoinWait);\n";
   runtime +=
       "  if (mtAnyAsyncResetAsserted()) {\n"
       "    for (int worker = 0; worker < kMtWorkerCount; ++worker)\n"
@@ -1065,7 +1102,7 @@ void CppEmitterMt::emitDefinitions() {
   runtime +=
       "  ++cycles;\n"
       "  if (mtBubbleProfile) {\n"
-      "    MTBP_TICK(0, mtBpProtocolOther);\n"
+      "    MTBP_TICK(0, mtBpProtocolOther, mtBpPhOther);\n"
       "    mtBubbleLastTsc = mtBubble[0].lastTsc;\n"
       "    mtBubbleLastNs = mtBpMonoNs();\n"
       "    const unsigned long long mtBpDur = mtBubbleLastTsc - mtBpStepStart;\n"
@@ -1097,18 +1134,30 @@ void CppEmitterMt::emitDefinitions() {
   (void)calSink;
   const double tickOverhead = (double)(calT1 - calT0) / 1024.0;
   unsigned long long raw[mtBpBucketCount] = {};
+  unsigned long long phaseRaw[mtBpPhaseCount] = {};
+  unsigned long long pauseRaw[mtBpPauseCount] = {};
   unsigned long long workerTotal[kMtWorkerCount] = {};
   unsigned long long workerCompute[kMtWorkerCount] = {};
+  unsigned long long workerPhaseSum[kMtWorkerCount] = {};
   for (int w = 0; w < kMtWorkerCount; ++w) {
     unsigned long long total = 0;
     for (int b = 0; b < mtBpBucketCount; ++b) {
       raw[b] += mtBubble[w].bucket[b];
       total += mtBubble[w].bucket[b];
     }
+    unsigned long long phaseSum = 0;
+    for (int p = 0; p < mtBpPhaseCount; ++p) {
+      phaseRaw[p] += mtBubble[w].phase[p];
+      phaseSum += mtBubble[w].phase[p];
+    }
+    for (int c = 0; c < mtBpPauseCount; ++c) pauseRaw[c] += mtBubble[w].pause[c];
     workerTotal[w] = total;
+    workerPhaseSum[w] = phaseSum;
     workerCompute[w] = mtBubble[w].bucket[mtBpTaskCompute] +
                        mtBubble[w].bucket[mtBpStateUpdate];
   }
+  unsigned long long phaseSumAll = 0;
+  for (int p = 0; p < mtBpPhaseCount; ++p) phaseSumAll += phaseRaw[p];
   unsigned long long totalWorkerTsc = 0;
   for (int w = 0; w < kMtWorkerCount; ++w) totalWorkerTsc += workerTotal[w];
   const unsigned long long taskComputeAll = raw[mtBpTaskCompute] + raw[mtBpStateUpdate];
@@ -1175,18 +1224,19 @@ void CppEmitterMt::emitDefinitions() {
   fprintf(out, "    \"four_bucket_tsc\": {\"task_compute\": %llu, \"spin_wait\": %llu, \"lookahead\": %llu, \"cycle_boundary_other\": %llu},\n",
           taskComputeAll, raw[mtBpSpinReady], raw[mtBpLookahead],
           raw[mtBpSpinStateBarrier] + raw[mtBpSpinGenIdle] + raw[mtBpProtocolOther] + raw[mtBpSpinJoin]);
-  fprintf(out, "    \"raw_bucket_tsc\": {\"task_bodies\": %llu, \"state_update\": %llu, \"spin_ready\": %llu, \"spin_state_barrier\": %llu, \"spin_gen_idle\": %llu, \"lookahead_scan\": %llu, \"protocol_other\": %llu, \"spin_join\": %llu},\n",
+  fprintf(out, "    \"raw_bucket_tsc\": {\"task_bodies\": %llu, \"state_update\": %llu, \"spin_ready\": %llu, \"spin_state_barrier\": %llu, \"spin_gen_idle\": %llu, \"lookahead_scan\": %llu, \"protocol_other\": %llu, \"spin_join\": %llu, \"token_publish\": %llu},\n",
           raw[mtBpTaskCompute], raw[mtBpStateUpdate], raw[mtBpSpinReady],
           raw[mtBpSpinStateBarrier], raw[mtBpSpinGenIdle], raw[mtBpLookahead],
-          raw[mtBpProtocolOther], raw[mtBpSpinJoin]);
+          raw[mtBpProtocolOther], raw[mtBpSpinJoin], raw[mtBpTokenPublish]);
   fprintf(out, "    \"total_worker_tsc\": %llu, \"utilization\": %.4f, \"avg_parallelism\": %.3f, \"busy_wait_pct\": %.2f, \"all_spin_pct\": %.2f,\n",
           totalWorkerTsc, utilization, avgParallelism,
           (double)raw[mtBpSpinReady] * pctScale, (double)spinBusyAll * pctScale);
-  fprintf(out, "    \"pct_of_worker_total\": {\"task_compute\": %.2f, \"state_update\": %.2f, \"spin_ready\": %.2f, \"spin_state_barrier\": %.2f, \"spin_gen_idle\": %.2f, \"lookahead\": %.2f, \"protocol_other\": %.2f, \"spin_join\": %.2f},\n",
+  fprintf(out, "    \"pct_of_worker_total\": {\"task_compute\": %.2f, \"state_update\": %.2f, \"spin_ready\": %.2f, \"spin_state_barrier\": %.2f, \"spin_gen_idle\": %.2f, \"lookahead\": %.2f, \"protocol_other\": %.2f, \"spin_join\": %.2f, \"token_publish\": %.2f},\n",
           (double)taskComputeAll * pctScale, (double)raw[mtBpStateUpdate] * pctScale,
           (double)raw[mtBpSpinReady] * pctScale, (double)raw[mtBpSpinStateBarrier] * pctScale,
           (double)raw[mtBpSpinGenIdle] * pctScale, (double)raw[mtBpLookahead] * pctScale,
-          (double)raw[mtBpProtocolOther] * pctScale, (double)raw[mtBpSpinJoin] * pctScale);
+          (double)raw[mtBpProtocolOther] * pctScale, (double)raw[mtBpSpinJoin] * pctScale,
+          (double)raw[mtBpTokenPublish] * pctScale);
   fprintf(out, "    \"worker_compute_stats_tsc\": {\"min\": %llu, \"median\": %llu, \"max\": %llu, \"mean\": %.1f, \"imbalance_max_over_median\": %.3f}\n",
           computeMin, computeMedian, computeMax, computeMean,
           computeMedian > 0 ? (double)computeMax / (double)computeMedian : 0.0);
@@ -1199,17 +1249,56 @@ void CppEmitterMt::emitDefinitions() {
           (double)spanTsc * secPerTsc,
           zeroWaitPure > 0 ? (double)spanTsc / (double)zeroWaitPure : 0.0);
   fprintf(out, "  },\n");
+  fprintf(out, "  \"phases\": {\n");
+  fprintf(out, "    \"note\": \"p2sim-style per-cycle rdtsc decomposition for the T32 audit; each tick credits one bucket and one phase with the same delta, so per worker sum(phases) == sum(buckets) exactly; worker 0 is the driving emulator thread (no generation_wait; its between-cycle gap is emu_serial_gap_tsc)\",\n");
+  fprintf(out, "    \"totals_tsc\": {\"state_update\": %llu, \"join_arrive\": %llu, \"join_wait\": %llu, \"generation_wait\": %llu, \"dispatch_scan\": %llu, \"task_eval\": %llu, \"token_publish\": %llu, \"other\": %llu},\n",
+          phaseRaw[mtBpPhStateUpdate], phaseRaw[mtBpPhJoinArrive], phaseRaw[mtBpPhJoinWait],
+          phaseRaw[mtBpPhGenWait], phaseRaw[mtBpPhDispatchScan], phaseRaw[mtBpPhTaskEval],
+          phaseRaw[mtBpPhTokenPublish], phaseRaw[mtBpPhOther]);
+  fprintf(out, "    \"pct_of_worker_total\": {\"state_update\": %.2f, \"join_arrive\": %.2f, \"join_wait\": %.2f, \"generation_wait\": %.2f, \"dispatch_scan\": %.2f, \"task_eval\": %.2f, \"token_publish\": %.2f, \"other\": %.2f},\n",
+          (double)phaseRaw[mtBpPhStateUpdate] * pctScale, (double)phaseRaw[mtBpPhJoinArrive] * pctScale,
+          (double)phaseRaw[mtBpPhJoinWait] * pctScale, (double)phaseRaw[mtBpPhGenWait] * pctScale,
+          (double)phaseRaw[mtBpPhDispatchScan] * pctScale, (double)phaseRaw[mtBpPhTaskEval] * pctScale,
+          (double)phaseRaw[mtBpPhTokenPublish] * pctScale, (double)phaseRaw[mtBpPhOther] * pctScale);
+  fprintf(out, "    \"conservation\": {\"phases_sum_tsc\": %llu, \"buckets_sum_tsc\": %llu, \"phases_over_buckets_pct\": %.4f, \"core_six_plus_publish_tsc\": %llu, \"core_six_plus_publish_pct\": %.2f},\n",
+          phaseSumAll, totalWorkerTsc,
+          totalWorkerTsc > 0 ? 100.0 * (double)phaseSumAll / (double)totalWorkerTsc : 0.0,
+          phaseSumAll - phaseRaw[mtBpPhOther],
+          totalWorkerTsc > 0 ? 100.0 * (double)(phaseSumAll - phaseRaw[mtBpPhOther]) / (double)totalWorkerTsc : 0.0);
+  fprintf(out, "    \"pause_iters\": {\"gen_wait\": %llu, \"state_barrier\": %llu, \"join\": %llu, \"ready_wait\": %llu, \"note\": \"this executor spins on bare pause and makes no yield syscalls\"},\n",
+          pauseRaw[mtBpPauseGenWait], pauseRaw[mtBpPauseStateBarrier],
+          pauseRaw[mtBpPauseJoin], pauseRaw[mtBpPauseReadyWait]);
+  fprintf(out, "    \"workers\": [\n");
+  for (int w = 0; w < kMtWorkerCount; ++w) {
+    const unsigned long long spanW = mtBubbleEndTsc[w] > mtBubbleStartTsc[w] ?
+        mtBubbleEndTsc[w] - mtBubbleStartTsc[w] : 0;
+    const unsigned long long coverW = w == 0 && spanW > mtBubbleEmuGapTsc ?
+        spanW - mtBubbleEmuGapTsc : spanW;
+    fprintf(out, "      {\"worker\": %d, \"state_update\": %llu, \"join_arrive\": %llu, \"join_wait\": %llu, \"generation_wait\": %llu, \"dispatch_scan\": %llu, \"task_eval\": %llu, \"token_publish\": %llu, \"other\": %llu, \"phases_sum\": %llu, \"span_tsc\": %llu, \"coverage_pct\": %.2f, \"pause_iters\": {\"gen_wait\": %llu, \"state_barrier\": %llu, \"join\": %llu, \"ready_wait\": %llu}}%s\n",
+            w, mtBubble[w].phase[mtBpPhStateUpdate], mtBubble[w].phase[mtBpPhJoinArrive],
+            mtBubble[w].phase[mtBpPhJoinWait], mtBubble[w].phase[mtBpPhGenWait],
+            mtBubble[w].phase[mtBpPhDispatchScan], mtBubble[w].phase[mtBpPhTaskEval],
+            mtBubble[w].phase[mtBpPhTokenPublish], mtBubble[w].phase[mtBpPhOther],
+            workerPhaseSum[w], spanW,
+            coverW > 0 ? 100.0 * (double)workerPhaseSum[w] / (double)coverW : 0.0,
+            mtBubble[w].pause[mtBpPauseGenWait], mtBubble[w].pause[mtBpPauseStateBarrier],
+            mtBubble[w].pause[mtBpPauseJoin], mtBubble[w].pause[mtBpPauseReadyWait],
+            w + 1 < kMtWorkerCount ? "," : "");
+  }
+  fprintf(out, "    ]\n");
+  fprintf(out, "  },\n");
   fprintf(out, "  \"workers\": [\n");
   for (int w = 0; w < kMtWorkerCount; ++w) {
     const unsigned long long preIdle = mtBubbleFirstTsc > mtBubbleStartTsc[w] ?
         mtBubbleFirstTsc - mtBubbleStartTsc[w] : 0;
     const unsigned long long postIdle = mtBubbleEndTsc[w] > mtBubbleLastTsc ?
         mtBubbleEndTsc[w] - mtBubbleLastTsc : 0;
-    fprintf(out, "    {\"worker\": %d, \"task_bodies\": %llu, \"state_update\": %llu, \"spin_ready\": %llu, \"spin_state_barrier\": %llu, \"spin_gen_idle\": %llu, \"lookahead\": %llu, \"protocol_other\": %llu, \"spin_join\": %llu, \"task_calls\": %llu, \"total\": %llu, \"pre_run_idle_tsc\": %llu, \"post_run_idle_tsc\": %llu}%s\n",
+    fprintf(out, "    {\"worker\": %d, \"task_bodies\": %llu, \"state_update\": %llu, \"spin_ready\": %llu, \"spin_state_barrier\": %llu, \"spin_gen_idle\": %llu, \"lookahead\": %llu, \"protocol_other\": %llu, \"spin_join\": %llu, \"token_publish\": %llu, \"task_calls\": %llu, \"total\": %llu, \"pre_run_idle_tsc\": %llu, \"post_run_idle_tsc\": %llu}%s\n",
             w, mtBubble[w].bucket[mtBpTaskCompute], mtBubble[w].bucket[mtBpStateUpdate],
             mtBubble[w].bucket[mtBpSpinReady], mtBubble[w].bucket[mtBpSpinStateBarrier],
             mtBubble[w].bucket[mtBpSpinGenIdle], mtBubble[w].bucket[mtBpLookahead],
             mtBubble[w].bucket[mtBpProtocolOther], mtBubble[w].bucket[mtBpSpinJoin],
+            mtBubble[w].bucket[mtBpTokenPublish],
             mtBubble[w].taskCalls, workerTotal[w], preIdle, postIdle,
             w + 1 < kMtWorkerCount ? "," : "");
   }
@@ -1257,6 +1346,15 @@ void CppEmitterMt::emitDefinitions() {
           (double)raw[mtBpSpinStateBarrier] * pctScale, (double)raw[mtBpSpinGenIdle] * pctScale,
           (double)raw[mtBpSpinJoin] * pctScale, (double)raw[mtBpLookahead] * pctScale,
           (double)raw[mtBpProtocolOther] * pctScale);
+  fprintf(stderr, "[mt-bubble] phases pct: state_update=%.2f%% join_arrive=%.2f%% join_wait=%.2f%% generation_wait=%.2f%% dispatch_scan=%.2f%% task_eval=%.2f%% token_publish=%.2f%% other=%.2f%% (phases/buckets=%.2f%%)\n",
+          (double)phaseRaw[mtBpPhStateUpdate] * pctScale, (double)phaseRaw[mtBpPhJoinArrive] * pctScale,
+          (double)phaseRaw[mtBpPhJoinWait] * pctScale, (double)phaseRaw[mtBpPhGenWait] * pctScale,
+          (double)phaseRaw[mtBpPhDispatchScan] * pctScale, (double)phaseRaw[mtBpPhTaskEval] * pctScale,
+          (double)phaseRaw[mtBpPhTokenPublish] * pctScale, (double)phaseRaw[mtBpPhOther] * pctScale,
+          totalWorkerTsc > 0 ? 100.0 * (double)phaseSumAll / (double)totalWorkerTsc : 0.0);
+  fprintf(stderr, "[mt-bubble] pause iters: gen_wait=%llu state_barrier=%llu join=%llu ready_wait=%llu (bare-pause spins, no yields)\n",
+          pauseRaw[mtBpPauseGenWait], pauseRaw[mtBpPauseStateBarrier],
+          pauseRaw[mtBpPauseJoin], pauseRaw[mtBpPauseReadyWait]);
   fprintf(stderr, "[mt-bubble] avg_parallelism=%.2f/%d utilization=%.1f%% busy_wait=%.2f%%\n",
           avgParallelism, kMtWorkerCount, utilization * 100.0,
           (double)raw[mtBpSpinReady] * pctScale);
