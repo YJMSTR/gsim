@@ -46,10 +46,22 @@ struct MtStateTask : MtTask {
 
 struct MtWorkerPlan {
   int readySlotCount_ = 1;
+  // GSIM_MT_READY_WORDS=1 packs 64 ready slots per uint64_t word. Slot runs
+  // within a bank are reordered so each publish task owns whole words only;
+  // publishing becomes one release store per word and waiting becomes one
+  // acquire load plus a precomputed mask-parity compare per word.
+  bool readyWords_ = false;
+  int readyWordCount_ = 1;
   std::vector<std::vector<int>> workerTasks_;
   std::vector<int> waitSlots_;
   std::vector<int> storeSlots_;
   std::vector<int> localWaitSlots_;
+  // Word-mode replacements for waitSlots_/storeSlots_. waitWords_[i] pairs
+  // with waitMasks_[i]; task waitBegin/waitEnd and storeBegin/storeEnd index
+  // these tables instead of the per-slot tables.
+  std::vector<int> waitWords_;
+  std::vector<uint64_t> waitMasks_;
+  std::vector<int> storeWords_;
   // stateTasks_[w] -> all-worker state barrier -> workerTasks_[w].
   // State and compute task IDs have separate namespaces; no state task is
   // included in the token DAG, lookahead, or asynchronous-reset replay.

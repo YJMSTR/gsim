@@ -561,12 +561,14 @@ makespan = max(finish(T,w))
 | 生成结构 | 作用 |
 | --- | --- |
 | `kMtWorkerCount` | 生成时固定的 worker 数；dense 运行时必须匹配 |
-| `MtDispatch` | 一个 worker chain 中的静态任务描述，包括函数指针和 wait/store 区间 |
 | `mtDispatchW0...Wn` | 每个 worker 的固定 MTask 顺序 |
 | `mtTaskN()` | 一个或多个超节点拼接后的计算函数 |
-| `MtReadyToken` | 跨 worker 依赖的奇偶 token，内部是 atomic byte |
+| `MtReadyToken` | 跨 worker 依赖的奇偶 token，内部是 atomic byte（默认） |
+| `MtReadyWord` | `GSIM_MT_READY_WORDS=1` 时的按字 token，内部是 atomic `uint64_t`，64 槽一位 |
 | `mtWaitSlots` | 所有 task 的等待 token 槽位扁平数组 |
 | `mtStoreSlots` | 所有 task 的发布 token 槽位扁平数组 |
+| `mtWaitWords`/`mtWaitMasks` | 字模式的等待 `(word, mask)` 表，替代 `mtWaitSlots` |
+| `mtStoreWords` | 字模式的发布字表，替代 `mtStoreSlots` |
 | `mtRegisterSrcW0...Wn` / `mtRegisterDstW0...Wn` | 每个 worker 连续排布的寄存器当前状态和下一状态块 |
 | `__gsim_mt_mem_write_*` | memory 写端口的 pending address/data/valid 缓冲 |
 | `mtUpdateStateW0...Wn` | 提交寄存器块和上一周期 memory pending writes 的状态更新函数 |
@@ -647,6 +649,30 @@ cycle k:
 7. dense runtime 的 worker 数必须等于生成宽度。
 
 破坏第 2 或第 5 条会重现早期 XiangShan 乱序问题；破坏第 3、4 或第 6 条会形成数据竞争、旧值读取或死锁。
+
+### 5.4 按字掩码 token（GSIM_MT_READY_WORDS）
+
+设置生成期环境变量 `GSIM_MT_READY_WORDS=1`（默认关闭）后，token 存储从
+每槽一个 atomic byte 改为每 64 槽一个 atomic `uint64_t` 字，每个槽占一位：
+
+- bank 内的 token group 按 publisher 在 producer chain 上的位置排序，每个
+  publisher 的槽段从 64 槽字边界开始连续分配。因此任一 publisher 的槽段
+  不跨字，且任一字至多被一个发布任务写；
+- 发布侧对每个独占字做一次无分支 release store：`mtReadyWords[w] =
+  0 - parity`（parity 为 1 时写入全 1，为 0 时写入全 0），一次原子写发布
+  该字内全部 token；
+- 等待侧为每个任务预计算 `(word, mask)` 表（`mtWaitWords`/`mtWaitMasks`），
+  检查为 `(load(word) & mask) == (0 - parity) & mask`，一次 acquire load
+  覆盖最多 64 个 token；
+- lookahead 候选扫描改为 ctz 跳转：从 `doneBits` 反转字直接定位下一个
+  未完成候选，跳过已执行位置。
+
+该模式只改变 token 的表示与槽位编号，不改变依赖结构：同一 publisher 的
+发布仍发生在任务函数返回后，等待条件仍等价于"组内最晚前驱已完成"。
+生成器在 worker chain 规划完成后运行链序活性模拟（每个 worker 一个游标，
+任务在其全部 DAG 前驱完成后才可运行；见 wt-repcut7 bd16a33 的 plan-B 门），
+模拟无法推进即 fatal 并报告卡住 worker 的位置与未完成前驱。关闭该开关时
+生成的模型与不包含本功能的版本逐字节相同。
 
 ## 6. 固定线程池
 
