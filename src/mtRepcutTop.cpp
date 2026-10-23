@@ -4,6 +4,7 @@
 #include "mtCostModel.h"
 #include "mtTaskPartition.h"
 #include "mtTaskSchedule.h"
+#include "mtReplicationSchedule.h"
 #include "Node.h"
 
 #include <algorithm>
@@ -29,6 +30,8 @@ struct RepcutConfig {
   int topN = 0;
   int depth = 0;
   int maxCostPctMilli = 3810;  // 3.81% RepCut prior, in thousandths
+  int coneMode = 0;            // 1 = sub-task pure-cone granularity
+  int maxOps = 0;              // per-cone pure-op budget (0 = unlimited)
   std::string csvPath;
 };
 
@@ -65,6 +68,8 @@ RepcutConfig parseConfig() {
   config.topN = envInt("GSIM_MT_REPCUT_TOP", 0);
   config.depth = envInt("GSIM_MT_REPCUT_DEPTH", 0);
   config.maxCostPctMilli = envPercent("GSIM_MT_REPCUT_MAX_COST_PCT", 3810);
+  config.coneMode = envInt("GSIM_MT_REPCUT_MODE", 0);
+  config.maxOps = envInt("GSIM_MT_REPCUT_MAX_OPS", 0);
   const char* path = std::getenv("GSIM_MT_REPCUT_CSV");
   config.csvPath = path != nullptr && path[0] != '\0'
                        ? std::string(path)
@@ -578,6 +583,168 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     return replicaId;
   };
 
+  // Sub-task granularity: replicate only the PURE combinational share of
+  // the producer that the consumer worker actually reads. Roots are the
+  // producer's plain value members with readers on the consumer worker;
+  // the cone walk stops at state inputs and at values already produced on
+  // the consumer worker (chain-ordered locals) or elsewhere (token
+  // boundaries). Register sinks and memory writes are structurally outside
+  // the cone — the sink task keeps them.
+  auto replicateCone = [&](int producerId, int consumerWorker, int insertPosition,
+                           std::string* reason) -> int {
+    const MtTask& producer = tasks[static_cast<size_t>(producerId)];
+    if (producer.insts == nullptr || producer.insts->empty()) {
+      *reason = "empty-body";
+      return -1;
+    }
+    if (redirectedTasks.count(producerId) != 0) {
+      *reason = "reads-replica-copies";
+      return -1;
+    }
+    std::vector<Node*> roots;
+    for (Node* member : producer.members) {
+      if (member->type != NODE_OTHERS) continue;
+      if (producer.localNodes.count(member) != 0) continue;
+      for (Node* reader : member->next) {
+        auto owner = plan.taskByNode_.find(reader);
+        if (owner != plan.taskByNode_.end() &&
+            owners[static_cast<size_t>(owner->second)] == consumerWorker) {
+          roots.push_back(member);
+          break;
+        }
+      }
+    }
+    if (roots.empty()) {
+      *reason = "no-pure-share-read";
+      return -1;
+    }
+    std::sort(roots.begin(), roots.end(), [](Node* a, Node* b) { return a->id < b->id; });
+
+    const int replicaId = static_cast<int>(tasks.size());
+    auto available = [&](Node* node) {
+      auto found = plan.taskByNode_.find(node);
+      if (found == plan.taskByNode_.end()) return false;
+      return owners[static_cast<size_t>(found->second)] == consumerWorker;
+    };
+    MtReplicationCone cone = mtBuildAvailableCone(roots, config.maxOps, available);
+    if (!cone.valid() || cone.nodes.empty()) {
+      *reason = cone.valid() ? "empty-cone" : cone.rejection.c_str();
+      return -1;
+    }
+    // Every cone node must belong to the producer (pure share of P); nodes
+    // from other tasks are boundaries and never copied.
+    for (Node* node : cone.nodes) {
+      auto found = plan.taskByNode_.find(node);
+      if (found == plan.taskByNode_.end() || found->second != producerId) {
+        *reason = "cone-crossed-producer";
+        return -1;
+      }
+    }
+
+    MtTask replica;
+    replica.kind = MtTaskKind::Normal;
+    replica.owner = consumerWorker;
+    auto* super = new SuperNode();
+    g.sortedSuper.push_back(super);
+    const int group = plan.partitionGroupCount_++;
+    std::unordered_map<Node*, Node*> replacements;
+    std::unordered_map<Node*, Node*> boundaryCopies;
+    std::vector<Node*> ordered(cone.nodes.rbegin(), cone.nodes.rend());  // deps-first
+    for (Node* member : ordered) {
+      Node* copy = member->dup(member->type,
+                               member->name + "$MT_RC$" + std::to_string(sequence++));
+      copy->nodeIsRoot = true;
+      replacements[member] = copy;
+      replica.members.push_back(copy);
+      super->add_member(copy);
+      g.allNodes.push_back(copy);
+      plan.emissionNodes_.push_back(copy);
+      plan.taskByNode_[copy] = replicaId;
+      plan.partitionGroupByNode_[copy] = group;
+    }
+    for (Node* member : ordered) {
+      Node* copy = replacements[member];
+      for (ExpTree* assignment : member->assignTree) {
+        ExpTree* duplicate = assignment->dup();
+        replaceTreeReferences(duplicate, replacements);
+        copy->assignTree.push_back(duplicate);
+      }
+      for (Node* input : member->prev) {
+        if (replacements.count(input) != 0) continue;
+        if (producer.localNodes.count(input) != 0) continue;
+        if (plan.taskByNode_.count(input) == 0) continue;
+        input->next.insert(copy);
+        copy->prev.insert(input);
+      }
+    }
+    // Instruction stream: each cone node's assignment, deps-first, with
+    // member references redirected to the copies (printf/assert dropped as
+    // in the task-body path).
+    std::unordered_map<std::string, std::string> names;
+    for (const auto& entry : replacements) {
+      names.emplace(entry.first->name, entry.second->name);
+    }
+    auto* instructions = new std::vector<InstInfo>();
+    for (Node* member : ordered) {
+      StmtTree tree;
+      tree.root = new StmtNode(OP_STMT_SEQ);
+      for (ExpTree* assignment : member->assignTree) {
+        std::vector<int> emptyPath;
+        tree.mergeExpTree(assignment, emptyPath, emptyPath, member);
+      }
+      std::vector<InstInfo> nodeInsts;
+      tree.compute(nodeInsts);
+      for (const InstInfo& instruction : nodeInsts) {
+        if (instruction.infoType == SUPER_INFO_STR &&
+            isObservationStatement(instruction.inst)) {
+          continue;
+        }
+        instructions->emplace_back(instruction.infoType, instruction.node,
+                                   redirectText(instruction.inst, names));
+      }
+    }
+    if (instructions->empty()) {
+      *reason = "observation-only-cone";
+      delete instructions;
+      return -1;
+    }
+    replica.insts = instructions;
+    // Boundary inputs define the replica's predecessors: every boundary
+    // node's owning task (deduplicated, sorted).
+    std::set<int> sources;
+    for (Node* boundary : cone.boundaryInputs) {
+      if (producer.localNodes.count(boundary) != 0) continue;
+      auto found = plan.taskByNode_.find(boundary);
+      if (found == plan.taskByNode_.end()) continue;
+      if (found->second == producerId) continue;
+      sources.insert(found->second);
+    }
+    for (Node* member : ordered) {
+      for (Node* input : member->prev) {
+        if (replacements.count(input) != 0) continue;
+        if (producer.localNodes.count(input) != 0) continue;
+        auto found = plan.taskByNode_.find(input);
+        if (found == plan.taskByNode_.end() || found->second == producerId) continue;
+        sources.insert(found->second);
+      }
+    }
+    replica.predecessors.assign(sources.begin(), sources.end());
+    int globalCount = 0;
+    for (Node* copy : replica.members) { (void)copy; ++globalCount; }
+    replica.globalNodeCount = globalCount;
+    replica.cost = mtLoweredTaskCost(replica);
+    for (int predecessor : replica.predecessors) {
+      tasks[static_cast<size_t>(predecessor)].successors.push_back(replicaId);
+    }
+    tasks.push_back(std::move(replica));
+    owners.push_back(consumerWorker);
+    workerPos.push_back(-1);
+    std::vector<int>& chain = chains[static_cast<size_t>(consumerWorker)];
+    chain.insert(chain.begin() + insertPosition, replicaId);
+    rebuildPositions();
+    return replicaId;
+  };
+
   // Points every consumer of `producerId` on `consumerWorker` at the local
   // replica: the ready-token edge P->C becomes an in-chain rep->C edge and
   // the consumer's lowered text reads the replica's copies. Returns the
@@ -951,6 +1118,59 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       // consumer). The depth replicas are independently valid, so keep them
       // and drop only the main target.
       reject(row, "ordering-conflict-after-depth");
+      continue;
+    }
+    if (config.coneMode >= 1) {
+      std::string coneReason;
+      const int coneReplica =
+          replicateCone(producerId, consumerWorker, finalInsertAfter + 1, &coneReason);
+      if (coneReplica < 0) {
+        reject(row, coneReason.c_str());
+        continue;
+      }
+      MtTask& coneRep = tasks[static_cast<size_t>(coneReplica)];
+      std::unordered_map<std::string, std::string> coneNames;
+      for (Node* member : tasks[static_cast<size_t>(producerId)].members) {
+        if (member->type != NODE_OTHERS) continue;
+        for (Node* copy : coneRep.members) {
+          if (copy->name.compare(0, member->name.size() + 8,
+                                 member->name + "$MT_RC$") == 0) {
+            coneNames.emplace(member->name, copy->name);
+            break;
+          }
+        }
+      }
+      for (int consumer : consumers) {
+        MtTask& consumerTask = tasks[static_cast<size_t>(consumer)];
+        if (std::find(consumerTask.predecessors.begin(), consumerTask.predecessors.end(),
+                      coneReplica) == consumerTask.predecessors.end()) {
+          consumerTask.predecessors.push_back(coneReplica);
+        }
+        std::sort(consumerTask.predecessors.begin(), consumerTask.predecessors.end());
+        consumerTask.predecessors.erase(
+            std::unique(consumerTask.predecessors.begin(), consumerTask.predecessors.end()),
+            consumerTask.predecessors.end());
+        if (std::find(coneRep.successors.begin(), coneRep.successors.end(), consumer) ==
+            coneRep.successors.end()) {
+          coneRep.successors.push_back(consumer);
+        }
+        for (InstInfo& instruction : *consumerTask.insts) {
+          instruction.inst = redirectText(instruction.inst, coneNames);
+        }
+        redirectedTasks.insert(consumer);
+        ++report.rewiredConsumers;
+        ++report.residualGroups;
+      }
+      targets.insert({producerId, consumerWorker});
+      replicatedProducers.insert(producerId);
+      ++report.replicas;
+      report.replicaCost += coneRep.cost;
+      report.expectedSavingNs += std::max(0LL, row.totalNs);
+      ++report.replicatedRows;
+      report.decisions.push_back(
+          std::to_string(row.rank) + "," + std::to_string(row.slotId) + "," +
+          std::to_string(producerId) + ",cone-ok," + std::to_string(coneReplica) +
+          ",cost" + std::to_string(coneRep.cost));
       continue;
     }
     std::string reason;
