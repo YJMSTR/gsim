@@ -39,6 +39,14 @@ bool coneActivityEnabled() {
   const char* value = std::getenv("GSIM_MT_CONE_ACTIVITY");
   return value != nullptr && *value != '\0';
 }
+
+std::string coneHex(uint64_t value) {
+  char buffer[24];
+  std::snprintf(buffer, sizeof(buffer), "%llx",
+                static_cast<unsigned long long>(value));
+  return buffer;
+}
+
 // Object-layout facts for the emitted widthUType declarations. The per-member
 // offsets computed here are verified by static_asserts in the generated
 // header, so any divergence from the compiler's layout fails the build.
