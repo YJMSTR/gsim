@@ -45,6 +45,10 @@ struct MtTask {
   uint32_t storeEnd = 0;
   uint32_t localWaitBegin = 0;
   uint32_t localWaitEnd = 0;
+  // GSIM_MT_STATE_TOKENS only: state owners whose per-owner commit token this
+  // task waits (committed-state readers, dst/pending writers, reset-condition
+  // producers). Sorted unique, own owner excluded; empty when disabled.
+  std::vector<int> stateOwners;
 };
 
 // A large register array whose next-state updates are represented as ordered

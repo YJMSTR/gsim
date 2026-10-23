@@ -40,6 +40,30 @@ HEFT/list 的插入调度，也不进入普通 worker dispatch 表、token 压�
 `reg_dst` 生产者的 owner 分配状态工作。寄存器的提交 owner 与其消费者
 所在 worker 可以不同；state barrier 保证消费者读取的是已提交的当前值。
 
+## 拍内去屏障：GSIM_MT_STATE_TOKENS（默认关，L0）
+
+生成期旋钮 `GSIM_MT_STATE_TOKENS=1` 把上面的全 worker state barrier 细化为
+per-owner state token；关态（默认）产物与旧协议逐字节相同。
+
+- 派生层（`buildStateUpdates`）为每个计算任务求“所读 owner 集”：已提交
+  存储读者（reg_src / memory / 同步 reset 成员的 prev 引用）、dst/pending
+  写者（reg_dst 所属任务、memory/sparse writer 端口所属任务），以及反向
+  reset 条件边——同步 reset 条件为计算节点时，条件生产者必须排在该 owner
+  提交之后，否则提交会读到本周期的值。ExtModule 与含 OP_EXT_FUNC 的任务
+  保守回退为等待全部 owner；任务自身 owner 位恒省略（程序序已覆盖）。
+- token 层为每个 (owner, 消费 worker) 对分配一个槽（沿用 owner-pair 的
+  64 对齐 bank）；消费者任务把槽加入 `waits`，owner 的 `mtUpdateStateW`
+  执行后直接发布自己的槽。commit 本身不等待任何任务：它消费的 dst/pending
+  都是上一周期产物，周期末 join 已保证完成——若让 commit 等待生产者反而
+  构成生产者⇄token 的双链死锁（活性门可当场复现）。
+- 发射层删去 `mtStateDoneFlags`/`mtStateReady` 全屏障；lookahead 的
+  remoteReady 判据零改动即可感知 state token 槽。
+- 发射前运行 R7 式活性模拟门（链前缀 ∘ DAG 前驱 ∘ commit 因果闭包的
+  cycle-0 事件驱动推进）：任一 worker 链无法推进即 FATAL 中止生成并打印
+  worker/position/task 诊断。
+- `mt-task-phases.csv` 的 barrier 列在开态写 `state_token_publish` /
+  `state_token_acquire`，关态保持 `state_publish` / `state_acquire`。
+
 ## 哪些操作进入状态任务
 
 状态任务保留现有执行顺序和代码生成路径：

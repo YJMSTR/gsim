@@ -42,6 +42,14 @@ struct MtStateTask : MtTask {
   std::vector<Node*> memoryWriters;
   std::vector<Node*> sparseRegisterWriters;
   std::vector<MtReset::Instruction> body;
+  // GSIM_MT_STATE_TOKENS only: compute tasks whose dst/pending writes or
+  // reset-condition stores this commit consumes or must be ordered against
+  // (WAR). They wait this owner's state-token slot; the commit itself waits
+  // nothing — prior-cycle producers are join-covered.
+  std::vector<int> stateProducers;
+  // Ready-token slots published by this owner's commit (one per consumer
+  // worker pair); empty when state tokens are disabled.
+  std::vector<int> stateTokenSlots;
 };
 
 struct MtWorkerPlan {
@@ -56,6 +64,11 @@ struct MtWorkerPlan {
   std::vector<MtStateTask> stateTasks_;
   std::unordered_map<Node*, int> stateTaskByNode_;
   std::vector<MtReset> resets_;
+  // GSIM_MT_STATE_TOKENS: replace the all-worker state barrier with
+  // per-owner state tokens (generation-time knob, default off).
+  bool stateTokens_ = false;
+  int stateTokenGroups_ = 0;
+  size_t stateTokenFailClosed_ = 0;
 };
 
 class MtWorkerBuilder {

@@ -325,7 +325,26 @@ int countResetChunks(const std::vector<Instruction>& body, int chunkSize) {
   return chunks;
 }
 
-void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
+// True when a lowered expression tree contains an external-function call.
+// The state-token ownership analysis is graph-based; ext functions may touch
+// state invisible to node edges, so callers fail closed instead.
+bool mtTreeTouchesExtFunc(const ExpTree* tree) {
+  if (tree == nullptr) return false;
+  std::vector<const ENode*> pending;
+  if (tree->getRoot() != nullptr) pending.push_back(tree->getRoot());
+  if (tree->getlval() != nullptr) pending.push_back(tree->getlval());
+  while (!pending.empty()) {
+    const ENode* current = pending.back();
+    pending.pop_back();
+    if (current->opType == OP_EXT_FUNC) return true;
+    for (const ENode* child : current->child) {
+      if (child != nullptr) pending.push_back(child);
+    }
+  }
+  return false;
+}
+
+void buildStateUpdates(graph& graph, MtTaskPlan& tasks,
                        MtWorkerPlan& workers, int workerCount, int chunkSize) {
   workers.stateTasks_.assign(static_cast<size_t>(workerCount), MtStateTask());
   workers.stateTaskByNode_.clear();
@@ -582,6 +601,148 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
     }
   }
 
+  if (workers.stateTokens_) {
+    // L0 intra-cycle barrier removal (GSIM_MT_STATE_TOKENS): derive, per
+    // compute task, the set of state owners whose cycle-start commit must
+    // have published before the task may run, and per owner the producers
+    // that must be ordered after its commit. Hazard classes:
+    //   (a) committed-storage reads: members' prev referencing a state-task
+    //       member (reg sources incl. sparse, memory arrays, sync-reset
+    //       destinations) — RAW against the commit's memcpy/scatter;
+    //   (b) dst/pending writes: tasks owning a state register's destination
+    //       node, a memory writer port, or a sparse writer port — WAR against
+    //       the same;
+    //   (c) memory port members (reader/writer/readwriter) resolve through
+    //       node->parent to the memory owner — readers read the committed
+    //       array, writers stage pending slots;
+    //   (d) reverse reset-condition edges: sync-reset groups whose condition
+    //       is a computed node are read live by every owner holding a
+    //       destination, so the condition producer must run after those
+    //       commits. REG_SRC conditions read their $RESET copies captured
+    //       before the generation bump; inputs and constants are stable.
+    // ExtModule tasks and OP_EXT_FUNC expressions fail closed to all owners.
+    // A task's own owner is excluded: mtRunWorker runs mtUpdateStateW<self>
+    // before its compute chain in program order. The commit itself waits
+    // nothing — every value it consumes was produced in the prior cycle and
+    // is join-covered.
+    std::unordered_map<Node*, int> ownerByStateNode;
+    for (const MtStateTask& update : workers.stateTasks_) {
+      for (Node* member : update.members) {
+        ownerByStateNode.emplace(member, update.owner);
+      }
+      for (Node* writer : update.memoryWriters) {
+        ownerByStateNode.emplace(writer, update.owner);
+      }
+      for (Node* writer : update.sparseRegisterWriters) {
+        ownerByStateNode.emplace(writer, update.owner);
+      }
+      for (Node* member : update.members) {
+        if (member->type != NODE_REG_SRC) continue;
+        Node* destination = member->getDst();
+        if (destination->status == VALID_NODE) {
+          ownerByStateNode.emplace(destination, update.owner);
+        }
+      }
+    }
+    auto ownerOf = [&](Node* node) {
+      auto found = ownerByStateNode.find(node);
+      if (found != ownerByStateNode.end()) return found->second;
+      if (node->type == NODE_READER || node->type == NODE_WRITER ||
+          node->type == NODE_READWRITER) {
+        found = ownerByStateNode.find(node->parent);
+        if (found != ownerByStateNode.end()) return found->second;
+      }
+      return -1;
+    };
+
+    size_t failClosed = 0;
+    size_t waitedTasks = 0;
+    size_t ownerBits = 0;
+    std::vector<std::set<int>> producersByOwner(static_cast<size_t>(workerCount));
+    for (size_t taskId = 0; taskId < tasks.tasks_.size(); ++taskId) {
+      MtTask& task = tasks.tasks_[taskId];
+      std::set<int> owners;
+      bool fail = task.kind == MtTaskKind::ExtModule || task.members.empty();
+      if (!fail) {
+        for (Node* member : task.members) {
+          const int memberOwner = ownerOf(member);
+          if (memberOwner >= 0) owners.insert(memberOwner);
+          for (Node* predecessor : member->prev) {
+            const int predecessorOwner = ownerOf(predecessor);
+            if (predecessorOwner >= 0) owners.insert(predecessorOwner);
+          }
+          // Mirror mergeNodeAssignments: sparse destinations lower their
+          // write trees instead of assignTree.
+          auto sparse = tasks.sparseRegisterByDestination_.find(member);
+          if (sparse != tasks.sparseRegisterByDestination_.end()) {
+            for (const ExpTree* write :
+                 tasks.sparseRegisters_[sparse->second].writeTrees) {
+              if (mtTreeTouchesExtFunc(write)) fail = true;
+            }
+            continue;
+          }
+          for (const ExpTree* assignment : member->assignTree) {
+            if (mtTreeTouchesExtFunc(assignment)) fail = true;
+          }
+        }
+      }
+      if (fail) {
+        owners.clear();
+        for (int owner = 0; owner < workerCount; ++owner) owners.insert(owner);
+        ++failClosed;
+      }
+      owners.erase(task.owner);
+      if (!owners.empty()) {
+        ++waitedTasks;
+        ownerBits += owners.size();
+      }
+      task.stateOwners.assign(owners.begin(), owners.end());
+      for (int owner : owners) {
+        producersByOwner[static_cast<size_t>(owner)].insert(static_cast<int>(taskId));
+      }
+    }
+
+    // Reverse reset-condition edges (class d above).
+    for (const SyncResetGroup& group : syncGroups) {
+      Node* resetNode = group.super->resetNode;
+      if (resetNode->status == CONSTANT_NODE) continue;
+      if (resetNode->type == NODE_REG_SRC) continue;
+      auto producer = tasks.taskByNode_.find(resetNode);
+      if (producer == tasks.taskByNode_.end()) continue;
+      const int producerTask = producer->second;
+      for (int worker = 0; worker < workerCount; ++worker) {
+        if (group.resetDestinationsByWorker[static_cast<size_t>(worker)].empty()) {
+          continue;
+        }
+        MtStateTask& update = workers.stateTasks_[static_cast<size_t>(worker)];
+        if (update.owner == tasks.tasks_[static_cast<size_t>(producerTask)].owner) {
+          continue;
+        }
+        MtTask& producerRef = tasks.tasks_[static_cast<size_t>(producerTask)];
+        if (std::find(producerRef.stateOwners.begin(), producerRef.stateOwners.end(),
+                      update.owner) == producerRef.stateOwners.end()) {
+          producerRef.stateOwners.push_back(update.owner);
+          std::sort(producerRef.stateOwners.begin(), producerRef.stateOwners.end());
+        }
+        producersByOwner[static_cast<size_t>(update.owner)].insert(producerTask);
+      }
+    }
+    for (int worker = 0; worker < workerCount; ++worker) {
+      MtStateTask& update = workers.stateTasks_[static_cast<size_t>(worker)];
+      update.stateProducers.assign(producersByOwner[static_cast<size_t>(worker)].begin(),
+                                   producersByOwner[static_cast<size_t>(worker)].end());
+    }
+    workers.stateTokenFailClosed_ = failClosed;
+    fprintf(stderr,
+            "[cppEmitter-mt] state-token-derivation tasks=%zu waited=%zu "
+            "fail-closed=%zu avg-owners=%.2f\n",
+            tasks.tasks_.size(), waitedTasks, failClosed,
+            tasks.tasks_.empty()
+                ? 0.0
+                : static_cast<double>(ownerBits) /
+                      static_cast<double>(tasks.tasks_.size()));
+  }
+
   for (int worker = 0; worker < workerCount; ++worker) {
     MtStateTask& update = workers.stateTasks_[static_cast<size_t>(worker)];
     if (!update.registers.empty()) {
@@ -610,8 +771,9 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
            "register %s must belong to exactly one state MTask", reg->name.c_str());
   }
   fprintf(stderr, "[cppEmitter-mt] state-mtasks=%zu state-members=%zu registers=%zu "
-                  "compute-state-registers=0 barrier=all-workers\n",
-          workers.stateTasks_.size(), workers.stateTaskByNode_.size(), registers.size());
+                  "compute-state-registers=0 barrier=%s\n",
+          workers.stateTasks_.size(), workers.stateTaskByNode_.size(), registers.size(),
+          workers.stateTokens_ ? "state-tokens" : "all-workers");
 
   const auto registerLimits =
       std::minmax_element(copiedRegisterLoad.begin(), copiedRegisterLoad.end());
@@ -1038,6 +1200,8 @@ std::vector<int> reorderHeftTasks(MtTaskPlan& tasks, WorkerSchedule& schedule) {
 
 void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& workers,
                             int workerCount, int resetChunk) {
+  const char* stateTokens = std::getenv("GSIM_MT_STATE_TOKENS");
+  workers.stateTokens_ = stateTokens != nullptr && std::strcmp(stateTokens, "1") == 0;
   const int groupCount = tasks.partitionGroupCount_;
   compactEmptyTasks(tasks);
   for (MtTask& task : tasks.tasks_) task.cost = mtLoweredTaskCost(task);
@@ -1241,6 +1405,26 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     groups.swap(compressed);
   }
 
+  // L0 state tokens (GSIM_MT_STATE_TOKENS): one slot per (state owner,
+  // consumer worker) pair, published by the owner's mtUpdateStateW commit.
+  // The pseudo-groups ride the same owner-pair 64-aligned slot banks as
+  // regular tokens (consumer<0 marks them; they have no compute publisher).
+  if (workers.stateTokens_) {
+    std::set<std::pair<int, int>> statePairs;
+    for (const MtTask& task : tasks.tasks_) {
+      for (int owner : task.stateOwners) {
+        statePairs.insert({owner, task.owner});
+      }
+    }
+    for (const auto& pair : statePairs) {
+      TokenGroup group;
+      group.producerOwner = pair.first;
+      group.consumerOwner = pair.second;
+      groups.push_back(group);
+      ++workers.stateTokenGroups_;
+    }
+  }
+
   std::map<std::pair<int, int>, std::vector<int>> groupsByOwnerPair;
   for (size_t groupId = 0; groupId < groups.size(); ++groupId) {
     const TokenGroup& group = groups[groupId];
@@ -1256,8 +1440,95 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   }
   workers.readySlotCount_ = std::max(1, nextSlot);
   for (const TokenGroup& group : groups) {
+    if (group.consumer < 0) {
+      // State-token pseudo-group: the owner's commit stores the slot; every
+      // task on the consumer worker that derived this owner waits it.
+      workers.stateTasks_[static_cast<size_t>(group.producerOwner)]
+          .stateTokenSlots.push_back(group.slot);
+      for (MtTask& task : tasks.tasks_) {
+        if (task.owner != group.consumerOwner) continue;
+        if (std::binary_search(task.stateOwners.begin(), task.stateOwners.end(),
+                               group.producerOwner)) {
+          task.waits.push_back(group.slot);
+        }
+      }
+      continue;
+    }
     tasks.tasks_[static_cast<size_t>(group.consumer)].waits.push_back(group.slot);
     tasks.tasks_[static_cast<size_t>(group.publisher)].stores.push_back(group.slot);
+  }
+
+  if (workers.stateTokens_) {
+    // Liveness gate (R7 replay of the runtime causal graph: a task runs after
+    // its own chain prefix, the chain prefixes of every token publisher it
+    // waits on, and the state commits it waits on; commits sit at the chain
+    // head and wait nothing). Event-driven progress simulation at cycle 0:
+    // if no cursor can advance while tasks remain, the schedule deadlocks —
+    // abort instead of shipping a hanging model.
+    std::vector<std::vector<int>> waitPublishers(tasks.tasks_.size());
+    for (const TokenGroup& group : groups) {
+      if (group.consumer < 0) continue;
+      waitPublishers[static_cast<size_t>(group.consumer)].push_back(group.publisher);
+    }
+    std::vector<char> commitRun(static_cast<size_t>(workerCount), 0);
+    std::vector<char> hasRun(tasks.tasks_.size(), 0);
+    std::vector<int> cursor(static_cast<size_t>(workerCount), 0);
+    size_t completed = 0;
+    bool progressed = true;
+    auto taskReady = [&](size_t taskId) {
+      const MtTask& task = tasks.tasks_[taskId];
+      for (int owner : task.stateOwners) {
+        if (!commitRun[static_cast<size_t>(owner)]) return false;
+      }
+      for (int publisher : waitPublishers[taskId]) {
+        if (!hasRun[static_cast<size_t>(publisher)]) return false;
+      }
+      return true;
+    };
+    while (completed < tasks.tasks_.size() && progressed) {
+      progressed = false;
+      for (int worker = 0; worker < workerCount; ++worker) {
+        // The commit is pinned before the chain head; it has no waits.
+        if (!commitRun[static_cast<size_t>(worker)]) {
+          commitRun[static_cast<size_t>(worker)] = 1;
+          progressed = true;
+        }
+        std::vector<int>& chain = workers.workerTasks_[static_cast<size_t>(worker)];
+        int& position = cursor[static_cast<size_t>(worker)];
+        while (position < static_cast<int>(chain.size())) {
+          const size_t taskId = static_cast<size_t>(chain[static_cast<size_t>(position)]);
+          if (!taskReady(taskId)) break;
+          hasRun[taskId] = 1;
+          ++completed;
+          ++position;
+          progressed = true;
+        }
+      }
+    }
+    if (completed < tasks.tasks_.size()) {
+      for (int worker = 0; worker < workerCount; ++worker) {
+        std::vector<int>& chain = workers.workerTasks_[static_cast<size_t>(worker)];
+        const int position = cursor[static_cast<size_t>(worker)];
+        if (position >= static_cast<int>(chain.size())) continue;
+        const int stuck = chain[static_cast<size_t>(position)];
+        fprintf(stderr, "[cppEmitter-mt] state-tokens FATAL: worker %d stuck at "
+                        "position %d task %d waiting [",
+                worker, position, stuck);
+        for (int owner : tasks.tasks_[static_cast<size_t>(stuck)].stateOwners) {
+          if (!commitRun[static_cast<size_t>(owner)]) {
+            fprintf(stderr, "commit(w%d) ", owner);
+          }
+        }
+        for (int publisher : waitPublishers[static_cast<size_t>(stuck)]) {
+          if (!hasRun[static_cast<size_t>(publisher)]) {
+            fprintf(stderr, "%d(w%d) ", publisher,
+                    tasks.tasks_[static_cast<size_t>(publisher)].owner);
+          }
+        }
+        fprintf(stderr, "]\n");
+      }
+      Assert(false, "state-token schedule deadlocks at cycle 0");
+    }
   }
 
   for (MtTask& task : tasks.tasks_) {
@@ -1283,7 +1554,19 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   fprintf(stderr,
           "[cppEmitter-mt] workers=%d groups=%d mtasks=%zu edges=%zu tokens=%zu "
           "token-groups-before-chain-compression=%zu local-edges=%zu "
-          "transitive-edges-removed=%zu\n",
+          "transitive-edges-removed=%zu%s\n",
           workerCount, groupCount, tasks.tasks_.size(), edgeCount, groups.size(),
-          uncompressedTokenGroups, localEdgeCount, transitiveEdgesRemoved);
+          uncompressedTokenGroups, localEdgeCount, transitiveEdgesRemoved,
+          workers.stateTokens_
+              ? (" state-token-groups=" + std::to_string(workers.stateTokenGroups_) +
+                 " state-token-slots=" +
+                 std::to_string([&] {
+                   size_t slots = 0;
+                   for (const MtStateTask& update : workers.stateTasks_) {
+                     slots += update.stateTokenSlots.size();
+                   }
+                   return slots;
+                 }()))
+                    .c_str()
+              : "");
 }

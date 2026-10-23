@@ -60,6 +60,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void buildRegisterStorageNames();
   void writeTaskPhaseReport() const;
   std::string mapRegisterNames(const std::string& text) const;
+  bool stateTokensActive() const;
 
   graph& graph_;
   bool enabled_ = false;

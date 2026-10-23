@@ -90,6 +90,8 @@ void CppEmitterMt::prepare() {
   writeTaskPhaseReport();
 }
 
+bool CppEmitterMt::stateTokensActive() const { return stateTokens_; }
+
 void CppEmitterMt::writeTaskPhaseReport() const {
   const std::string phasesPath = globalConfig.OutputDir + "/mt-task-phases.csv";
   const std::string membersPath = globalConfig.OutputDir + "/mt-state-task-members.csv";
@@ -124,21 +126,23 @@ void CppEmitterMt::writeTaskPhaseReport() const {
     };
     for (Node* writer : task.memoryWriters) writeProducer(writer, "memory_writer");
     for (Node* writer : task.sparseRegisterWriters) writeProducer(writer, "sparse_writer");
-    fprintf(phases, "state,%d,%d,mtUpdateStateW%d,%zu,%zu,%zu,%d,%zu,%zu,%zu,state_publish\n",
+    fprintf(phases, "state,%d,%d,mtUpdateStateW%d,%zu,%zu,%zu,%d,%zu,%zu,%zu,%s\n",
             task.owner, task.owner, task.owner, task.members.size(), registers,
             task.insts->size(), task.cost, task.registerStorageBytes,
-            task.memoryWriteBytes, task.sparseRegisterWriteBytes);
+            task.memoryWriteBytes, task.sparseRegisterWriteBytes,
+            stateTokensActive() ? "state_token_publish" : "state_publish");
   }
   for (size_t id = 0; id < tasks_.size(); ++id) {
     const Task& task = tasks_[id];
     size_t registers = 0;
     for (Node* node : task.members) {
       registers += node->type == NODE_REG_SRC;
-      Assert(!mtIsCycleStartRegisterUpdate(node) && stateTaskByNode_.count(node) == 0,
-             "node %s belongs to both state and compute phases", node->name.c_str());
-    }
-    fprintf(phases, "compute,%zu,%d,mtTask%zu,%zu,%zu,%zu,%d,0,0,0,state_acquire\n",
-            id, task.owner, id, task.members.size(), registers, task.insts->size(), task.cost);
+    Assert(!mtIsCycleStartRegisterUpdate(node) && stateTaskByNode_.count(node) == 0,
+           "node %s belongs to both state and compute phases", node->name.c_str());
+  }
+  fprintf(phases, "compute,%zu,%d,mtTask%zu,%zu,%zu,%zu,%d,0,0,0,%s\n",
+          id, task.owner, id, task.members.size(), registers, task.insts->size(), task.cost,
+          stateTokensActive() ? "state_token_acquire" : "state_acquire");
   }
   Assert(std::fclose(phases) == 0, "cannot finish MTask phase report");
   Assert(std::fclose(members) == 0, "cannot finish state MTask member report");
@@ -273,6 +277,19 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           workerCount_);
   fprintf(header, "MtDoneFlag mtStateDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "MtDoneFlag mtStateReady;\n");
+  if (stateTokensActive()) {
+    // L0 state tokens: slots published by each owner's commit, indexed by
+    // [begin[w], begin[w+1]). Exists only in this mode so the default-off
+    // class layout stays byte-identical.
+    size_t stateStoreSlots = 0;
+    for (const StateUpdate& update : stateTasks_) {
+      stateStoreSlots += update.stateTokenSlots.size();
+    }
+    fprintf(header, "static const uint32_t mtStateTokenStoreSlots[%zu];\n",
+            std::max<size_t>(1, stateStoreSlots));
+    fprintf(header, "static const uint32_t mtStateTokenStoreBegin[%d];\n",
+            workerCount_ + 1);
+  }
   fprintf(header, "std::vector<std::thread> mtThreads;\n");
   fprintf(header, "alignas(64) std::atomic<uint64_t> mtGeneration{0};\n");
   fprintf(header, "alignas(64) std::atomic<int> mtReadyWorkers{0};\n");
@@ -667,6 +684,16 @@ void CppEmitterMt::emitDefinitions() {
   emitArray("uint32_t", "mtWaitSlots", waitSlots_);
   emitArray("uint32_t", "mtStoreSlots", storeSlots_);
   emitArray("uint32_t", "mtLocalWaitSlots", localWaitSlots_);
+  if (stateTokensActive()) {
+    std::vector<int> stateStoreSlots;
+    std::vector<int> stateStoreBegin{0};
+    for (const StateUpdate& update : stateTasks_) {
+      for (int slot : update.stateTokenSlots) stateStoreSlots.push_back(slot);
+      stateStoreBegin.push_back(static_cast<int>(stateStoreSlots.size()));
+    }
+    emitArray("uint32_t", "mtStateTokenStoreSlots", stateStoreSlots);
+    emitArray("uint32_t", "mtStateTokenStoreBegin", stateStoreBegin);
+  }
 
   for (int worker = 0; worker < workerCount_; ++worker) {
     const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
@@ -939,20 +966,32 @@ void CppEmitterMt::emitDefinitions() {
   }
   runtime += "    default: abort();\n  }\n";
   runtime += "  MTBP_TICK(worker, mtBpStateUpdate);\n";
-  runtime +=
-      "  if (worker == 0) {\n"
-      "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
-      "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
-      "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    }\n"
-      "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
-      "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
-      "  } else {\n"
-      "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
-      "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
-      "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
-      "  }\n";
+  if (stateTokensActive()) {
+    // L0 state tokens: the owner's commit publishes its slots right here;
+    // consumers wait them through the regular wait lists (lookahead
+    // remoteReady sees them with zero changes). No all-worker barrier.
+    runtime +=
+        "  for (uint32_t i = mtStateTokenStoreBegin[worker]; "
+        "i < mtStateTokenStoreBegin[worker + 1]; ++i)\n"
+        "    mtReadyTokens[mtStateTokenStoreSlots[i]].value.store(parity, "
+        "std::memory_order_release);\n";
+    runtime += "  MTBP_TICK(worker, mtBpProtocolOther);\n";
+  } else {
+    runtime +=
+        "  if (worker == 0) {\n"
+        "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
+        "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
+        "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    }\n"
+        "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
+        "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
+        "  } else {\n"
+        "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
+        "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
+        "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
+        "  }\n";
+  }
   if (lookaheadWindow_ <= 0) {
     // Strict fixed-order fast path. This is the baseline protocol and avoids
     // all per-task ready scanning when lookahead is disabled.
