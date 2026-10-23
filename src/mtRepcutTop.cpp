@@ -1172,6 +1172,32 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       }
       for (int consumer : consumers) {
         MtTask& consumerTask = tasks[static_cast<size_t>(consumer)];
+        // Full-coverage consumers stop waiting for the producer entirely:
+        // every P-member they read is cone-copied. Partial consumers keep
+        // the token for the uncovered (sink) share.
+        bool fullCoverage = true;
+        for (Node* wanted : consumerTask.members) {
+          for (Node* input : wanted->prev) {
+            if (plan.taskByNode_.count(input) == 0) continue;
+            if (plan.taskByNode_[input] != producerId) continue;
+            if (coneNames.count(input->name) == 0) {
+              fullCoverage = false;
+              break;
+            }
+          }
+          if (!fullCoverage) break;
+        }
+        if (fullCoverage) {
+          auto& preds = consumerTask.predecessors;
+          preds.erase(std::remove(preds.begin(), preds.end(), producerId), preds.end());
+          auto& producerSuccessors = tasks[static_cast<size_t>(producerId)].successors;
+          producerSuccessors.erase(std::remove(producerSuccessors.begin(),
+                                               producerSuccessors.end(), consumer),
+                                   producerSuccessors.end());
+          ++report.killedGroups;
+        } else {
+          ++report.residualGroups;
+        }
         if (std::find(consumerTask.predecessors.begin(), consumerTask.predecessors.end(),
                       coneReplica) == consumerTask.predecessors.end()) {
           consumerTask.predecessors.push_back(coneReplica);
@@ -1189,7 +1215,6 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
         }
         redirectedTasks.insert(consumer);
         ++report.rewiredConsumers;
-        ++report.residualGroups;
       }
       targets.insert({producerId, consumerWorker});
       replicatedProducers.insert(producerId);
