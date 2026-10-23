@@ -302,14 +302,17 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
                       std::vector<std::vector<int>>& chains, int workerCount) {
   Report report;
   const RepcutConfig config = parseConfig();
-  if (config.topN <= 0 || workerCount <= 1) return report;
+  if ((config.topN <= 0 && config.splitPublish <= 0) || workerCount <= 1) return report;
   report.active = true;
   report.csvPath = config.csvPath;
   report.topN = config.topN;
   std::vector<SlotRow> rows;
   if (!loadSlotRows(config.csvPath, &rows) || rows.empty()) {
     report.rejected[rows.empty() ? "csv-empty" : "csv-unreadable"] = 1;
-    return report;
+    // Split-publication accounting needs no attribution rows; only the
+    // replication row loop does.
+    if (config.splitPublish <= 0) return report;
+    rows.clear();
   }
   report.csvRows = static_cast<int>(rows.size());
   for (size_t index = 0; index < rows.size(); ++index) {
@@ -333,6 +336,45 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     }
   };
   rebuildPositions();
+
+  // Split publication (V6): the paper-metrics pass counts pure-only
+  // consumers — the audience an early token would address. The emission
+  // variant (mid-body publish) is V6b.
+  if (config.splitPublish > 0) {
+    for (int producerId = 0; producerId < static_cast<int>(tasks.size()); ++producerId) {
+      const MtTask& producer = tasks[static_cast<size_t>(producerId)];
+      if (producer.kind != MtTaskKind::Normal) continue;
+      const int producerWorker = owners[static_cast<size_t>(producerId)];
+      std::set<Node*> pureMembers;
+      for (Node* member : producer.members) {
+        if (member->type == NODE_OTHERS && producer.localNodes.count(member) == 0) {
+          pureMembers.insert(member);
+        }
+      }
+      if (pureMembers.empty()) continue;
+      for (int consumer : producer.successors) {
+        if (owners[static_cast<size_t>(consumer)] == producerWorker) continue;
+        bool pureOnly = true;
+        bool anyRead = false;
+        for (Node* member : tasks[static_cast<size_t>(consumer)].members) {
+          for (Node* input : member->prev) {
+            if (plan.taskByNode_.count(input) == 0) continue;
+            if (plan.taskByNode_[input] != producerId) continue;
+            anyRead = true;
+            if (pureMembers.count(input) == 0) {
+              pureOnly = false;
+              break;
+            }
+          }
+          if (!pureOnly) break;
+        }
+        if (pureOnly && anyRead) ++report.splitPureConsumers;
+      }
+    }
+    fprintf(stderr, "[cppEmitter-mt] repcut-split pure-only-consumers=%d\n",
+            report.splitPureConsumers);
+  }
+
   if (std::getenv("GSIM_MT_REPCUT_DEBUG") != nullptr) {
     for (size_t taskId = 0; taskId < tasks.size(); ++taskId) {
       fprintf(stderr, "[repcut-dbg] entry task %zu(w%d) preds=[", taskId,
@@ -899,44 +941,6 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     }
     return consumers.size();
   };
-
-  // Split publication (V6): the paper-metrics pass counts pure-only
-  // consumers — the audience an early token would address. The emission
-  // variant (mid-body publish) is V6b.
-  if (config.splitPublish > 0) {
-    for (int producerId = 0; producerId < static_cast<int>(tasks.size()); ++producerId) {
-      const MtTask& producer = tasks[static_cast<size_t>(producerId)];
-      if (producer.kind != MtTaskKind::Normal) continue;
-      const int producerWorker = owners[static_cast<size_t>(producerId)];
-      std::set<Node*> pureMembers;
-      for (Node* member : producer.members) {
-        if (member->type == NODE_OTHERS && producer.localNodes.count(member) == 0) {
-          pureMembers.insert(member);
-        }
-      }
-      if (pureMembers.empty()) continue;
-      for (int consumer : producer.successors) {
-        if (owners[static_cast<size_t>(consumer)] == producerWorker) continue;
-        bool pureOnly = true;
-        bool anyRead = false;
-        for (Node* member : tasks[static_cast<size_t>(consumer)].members) {
-          for (Node* input : member->prev) {
-            if (plan.taskByNode_.count(input) == 0) continue;
-            if (plan.taskByNode_[input] != producerId) continue;
-            anyRead = true;
-            if (pureMembers.count(input) == 0) {
-              pureOnly = false;
-              break;
-            }
-          }
-          if (!pureOnly) break;
-        }
-        if (pureOnly && anyRead) ++report.splitPureConsumers;
-      }
-    }
-    fprintf(stderr, "[cppEmitter-mt] repcut-split pure-only-consumers=%d\n",
-            report.splitPureConsumers);
-  }
 
   const int limit = std::min<int>(config.topN, static_cast<int>(rows.size()));
   for (int index = 0; index < limit; ++index) {

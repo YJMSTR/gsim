@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -56,6 +57,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitAsyncResetFunction(const Reset& reset);
   void emitStateUpdateFunction(const StateUpdate& update);
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
+  void emitInstruction(const InstInfo& inst, int indent);
   void emitTask(const Task& task, size_t taskId, int indent);
   void buildRegisterStorageNames();
   void writeTaskPhaseReport() const;
@@ -64,6 +66,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   graph& graph_;
   bool enabled_ = false;
   bool valueTrace_ = false;
+  std::set<int> timingHot_;  // V6 census hot producers (empty = off)
   int workerCount_ = 1;
   int targetTasks_ = 2400;
   int resetChunk_ = 4096;

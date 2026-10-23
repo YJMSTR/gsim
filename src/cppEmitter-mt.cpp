@@ -76,12 +76,38 @@ bool valueTraceEmissionEnabled() {
   const char* value = std::getenv("GSIM_MT_VALUE_TRACE");
   return value != nullptr && value[0] == '1';
 }
+// V6 S2/S3 census: hot producers from the attribution CSV.
+std::set<int> repcutTimingHotSet() {
+  std::set<int> hot;
+  const char* path = std::getenv("GSIM_MT_REPCUT_TIMING_CSV");
+  if (path == nullptr || path[0] == '\0') return hot;
+  FILE* file = std::fopen(path, "r");
+  if (file == nullptr) return hot;
+  char buffer[4096];
+  bool header = true;
+  int rank = 0;
+  while (std::fgets(buffer, sizeof(buffer), file) != nullptr) {
+    if (header) { header = false; continue; }
+    if (++rank > 16) break;
+    char* end = nullptr;
+    long task = std::strtol(buffer, &end, 10);  // first field varies; find producer_task col
+    // producer_task is the 3rd column: rank,slot,producer_task,...
+    int col = 0; const char* cursor = buffer;
+    while (col < 2 && cursor != nullptr) { cursor = std::strchr(cursor, ','); if (cursor) ++cursor; ++col; }
+    if (cursor == nullptr) continue;
+    task = std::strtol(cursor, &end, 10);
+    if (end != cursor && task >= 0) hot.insert(static_cast<int>(task));
+  }
+  std::fclose(file);
+  return hot;
+}
 }  // namespace
 
 CppEmitterMt::CppEmitterMt(graph& graph)
     : graph_(graph),
       enabled_(globalConfig.MtMode),
       valueTrace_(valueTraceEmissionEnabled()),
+      timingHot_(repcutTimingHotSet()),
       workerCount_(positiveEnv("GSIM_THREADS", 1)),
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
@@ -388,6 +414,20 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "bool mtAnyAsyncResetAsserted();\n");
   fprintf(header, "void mtApplyAsyncResets();\n");
   fprintf(header, "void mtReplayAfterAsyncReset();\n");
+  if (!timingHot_.empty()) {
+    fprintf(header,
+            "static inline unsigned long long mtTmRdtsc() { unsigned int lo, hi;\n"
+            "  __asm__ __volatile__(\"rdtsc\" : \"=a\"(lo), \"=d\"(hi));\n"
+            "  return ((unsigned long long)hi << 32) | lo; }\n");
+    fprintf(header, "bool mtTimingOn = false;\n");
+    fprintf(header, "alignas(64) unsigned long long mtTimingPrefixEnd[%d];\n",
+            workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtTimingTaskEnd[%d];\n",
+            workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtTimingWait[%d];\n", workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtTimingSaved[%d];\n", workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtTimingSamples[%d];\n", workerCount_);
+  }
   if (valueTrace_) {
     fprintf(header, "bool mtValueTraceOn = false;\n");
     fprintf(header, "uint64_t mtTraceHash[%zu] = {};\n", tasks_.size());
@@ -503,6 +543,17 @@ void CppEmitterMt::emitStateUpdateFunction(const StateUpdate& update) {
                         update.body, update.chunkCount);
 }
 
+void CppEmitterMt::emitInstruction(const InstInfo& inst, int indent) {
+  switch (inst.infoType) {
+    case SUPER_INFO_IF: emitText(indent, false, mapRegisterNames(inst.inst) + "\n"); break;
+    case SUPER_INFO_ELSE: emitText(indent - 1, false, mapRegisterNames(inst.inst) + "\n"); break;
+    case SUPER_INFO_DEDENT: emitText(indent, false, mapRegisterNames(inst.inst) + "\n"); break;
+    case SUPER_INFO_STR: emitText(indent, false, mapRegisterNames(inst.inst) + "\n"); break;
+    case SUPER_INFO_ASSIGN_BEG:
+    case SUPER_INFO_ASSIGN_END: break;
+  }
+}
+
 void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, int indent) {
   const int initialIndent = indent;
   for (const InstInfo& inst : instructions) {
@@ -560,7 +611,99 @@ void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
     }
   }
 
-  emitInstructions(*task.insts, indent);
+  const bool timingHotProducer =
+      !timingHot_.empty() && timingHot_.count(static_cast<int>(taskId)) != 0;
+  int timingHotPred = -1;
+  bool timingPureOnly = false;
+  if (!timingHot_.empty() && !timingHotProducer) {
+    for (int predecessor : task.predecessors) {
+      if (timingHot_.count(predecessor) == 0) continue;
+      if (tasks_[static_cast<size_t>(predecessor)].owner == task.owner) continue;
+      if (timingHotPred < 0 || predecessor < timingHotPred) timingHotPred = predecessor;
+    }
+    if (timingHotPred >= 0) {
+      // precise check: every input owned by timingHotPred is pure
+      timingPureOnly = true;
+      for (Node* member : task.members) {
+        for (Node* input : member->prev) {
+          auto found = taskByNode_.find(input);
+          if (found == taskByNode_.end() || found->second != timingHotPred) continue;
+          if (input->type != NODE_OTHERS ||
+              tasks_[static_cast<size_t>(timingHotPred)].localNodes.count(input) != 0) {
+            timingPureOnly = false;
+          }
+        }
+        if (!timingPureOnly) break;
+      }
+    }
+  }
+  if (timingHotProducer) {
+    // Split-body emission with a prefix stamp after the last pure-member
+    // assignment: hypothetical early-token publish point.
+    // Locate the last instruction assigning a pure member by text match:
+    // InstInfo::node is not reliably initialized across constructors, so it
+    // must never be dereferenced here.
+    int lastPure = -1;
+    std::vector<std::string> pureNames;
+    for (Node* member : task.members) {
+      if (member->type == NODE_OTHERS && task.localNodes.count(member) == 0) {
+        pureNames.push_back(member->name);
+      }
+    }
+    for (size_t i = 0; i < task.insts->size(); ++i) {
+      const std::string& text = (*task.insts)[i].inst;
+      const size_t begin = text.find_first_not_of(" \t");
+      if (begin == std::string::npos) continue;
+      for (const std::string& name : pureNames) {
+        if (text.compare(begin, name.size(), name) != 0) continue;
+        const char next = begin + name.size() < text.size()
+                              ? text[begin + name.size()]
+                              : '\0';
+        if (next == ' ' || next == '[' || next == '=') {
+          lastPure = static_cast<int>(i);
+          break;
+        }
+      }
+    }
+    const int worker = task.owner;
+    emitText(indent, false, "if (mtTimingOn) {\n");
+    for (size_t i = 0; i < task.insts->size(); ++i) {
+      if (static_cast<int>(i) == lastPure + 1) {
+        emitText(indent, false,
+                 "  mtTimingPrefixEnd[" + std::to_string(worker) + "] = mtTmRdtsc();\n");
+      }
+      emitInstruction((*task.insts)[i], indent);
+    }
+    if (lastPure < 0) {
+      emitText(indent, false,
+               "  mtTimingPrefixEnd[" + std::to_string(worker) + "] = mtTmRdtsc();\n");
+    }
+    emitText(indent, false,
+             "  mtTimingTaskEnd[" + std::to_string(worker) + "] = mtTmRdtsc(); }\n");
+  } else if (timingHotPred >= 0) {
+    const int hotOwner = tasks_[static_cast<size_t>(timingHotPred)].owner;
+    const std::string pureFlag = timingPureOnly ? "1" : "0";
+    emitText(indent, false,
+             "if (mtTimingOn && mtTimingTaskEnd[" + std::to_string(hotOwner) +
+                 "] != 0) { unsigned long long mtTmT = mtTmRdtsc();\n");
+    emitText(indent, false,
+             "  unsigned long long mtTmEnd = mtTimingTaskEnd[" + std::to_string(hotOwner) +
+                 "]; unsigned long long mtTmPre = mtTimingPrefixEnd[" +
+                 std::to_string(hotOwner) + "];\n");
+    emitText(indent, false,
+             "  if (mtTmT > mtTmEnd) { mtTimingWait[" + std::to_string(task.owner) +
+                 "] += mtTmT - mtTmEnd;\n");
+    emitText(indent, false,
+             "    if (" + pureFlag + " && mtTmT > mtTmPre) { unsigned long long s = mtTmT - mtTmPre;\n");
+    emitText(indent, false,
+             "      if (s > mtTmT - mtTmEnd) s = mtTmT - mtTmEnd; mtTimingSaved[" +
+                 std::to_string(task.owner) + "] += s; }\n");
+    emitText(indent, false,
+             "    ++mtTimingSamples[" + std::to_string(task.owner) + "]; } }\n");
+    emitInstructions(*task.insts, indent);
+  } else {
+    emitInstructions(*task.insts, indent);
+  }
 
   if (valueTrace_) {
     // Value fingerprint: fold every plain-storage member the task wrote.
@@ -710,6 +853,11 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "  if (!threads || end == threads || *end != '\\0' || count != kMtWorkerCount) {\n";
   runtime += "    fprintf(stderr, \"[gsim-mt] runtime GSIM_THREADS must equal generated width %d\\n\", kMtWorkerCount); abort();\n";
   runtime += "  }\n  mtEnabled = true;\n";
+  if (!timingHot_.empty()) {
+    runtime +=
+        "  const char* mtTm = getenv(\"GSIM_MT_REPCUT_TIMING\");\n"
+        "  mtTimingOn = mtTm != nullptr && mtTm[0] == '1';\n";
+  }
   if (valueTrace_) {
     runtime +=
         "  const char* mtVt = getenv(\"GSIM_MT_VALUE_TRACE\");\n"
@@ -760,6 +908,20 @@ void CppEmitterMt::emitDefinitions() {
       "  mtThreads.clear();\n"
       "}\n";
   runtime += className + "::~" + className + "() {\n  mtStopWorkers();\n";
+  if (!timingHot_.empty()) {
+    runtime +=
+        "  if (mtTimingOn) {\n"
+        "    unsigned long long wait = 0, saved = 0, samples = 0;\n"
+        "    for (int w = 0; w < kMtWorkerCount; ++w) {\n"
+        "      wait += mtTimingWait[w]; saved += mtTimingSaved[w];\n"
+        "      samples += mtTimingSamples[w];\n"
+        "    }\n"
+        "    fprintf(stderr, \"[repcut-timing] samples=%llu wait-tsc=%llu saved-tsc=%llu saved-pct=%.2f\\n\",\n"
+        "            (unsigned long long)samples, (unsigned long long)wait,\n"
+        "            (unsigned long long)saved,\n"
+        "            wait ? 100.0 * (double)saved / (double)wait : 0.0);\n"
+        "  }\n";
+  }
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     runtime +=
         "  for (int worker = 0; worker < kMtWorkerCount; ++worker) {\n"
