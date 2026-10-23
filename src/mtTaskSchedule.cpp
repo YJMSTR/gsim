@@ -39,21 +39,15 @@ bool coneActivityEnabled() {
   const char* value = std::getenv("GSIM_MT_CONE_ACTIVITY");
   return value != nullptr && *value != '\0';
 }
-
-std::string coneHex(uint64_t value) {
-  char buffer[32];
-  std::snprintf(buffer, sizeof(buffer), "%llx",
-                static_cast<unsigned long long>(value));
-  return buffer;
-}
-
 // Object-layout facts for the emitted widthUType declarations. The per-member
 // offsets computed here are verified by static_asserts in the generated
 // header, so any divergence from the compiler's layout fails the build.
+// Empirically (clang/x86-64): scalar types cap at align 8, and _BitInt(N)
+// for N > 64 also aligns 8 despite sizes up to 256B.
 size_t coneTypeAlignBytes(int width) {
   size_t align = 1;
   const size_t bytes = static_cast<size_t>(widthBits(width)) / 8;
-  while (align < bytes && align < 16) align <<= 1;
+  while (align < bytes && align < 8) align <<= 1;
   return align;
 }
 
