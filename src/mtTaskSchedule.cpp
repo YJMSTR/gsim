@@ -620,6 +620,9 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
       region.regBlockBytes = (offset + maxAlign - 1) & ~(maxAlign - 1);
       region.regChunkCount =
           static_cast<uint32_t>((region.regBlockBytes + 63) / 64);
+      const uint32_t regionBits = region.regChunkCount +
+          static_cast<uint32_t>(update.memoryWriters.size()) +
+          static_cast<uint32_t>(update.sparseRegisterWriters.size());
       region.bitBegin = wordCursor * 64;
       region.bitCount = regionBits;
       region.wordBegin = wordCursor;
