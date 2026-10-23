@@ -591,6 +591,11 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
         static_cast<uint32_t>(((nextBit + 63) / 64 + 7) & ~static_cast<uint32_t>(7));
     uint32_t wordCursor = cone.inputRegionWords;
     cone.regions.assign(workers.stateTasks_.size(), MtConePlan::WorkerRegion());
+    std::set<uint32_t> assignedBits;
+    auto assignBit = [&](uint32_t bit) {
+      Assert(assignedBits.insert(bit).second, "cone bit %u assigned twice", bit);
+    };
+    for (uint32_t bit : cone.inputBits) assignBit(bit);
     for (size_t worker = 0; worker < workers.stateTasks_.size(); ++worker) {
       MtStateTask& update = workers.stateTasks_[worker];
       MtConePlan::WorkerRegion& region = cone.regions[worker];
@@ -610,7 +615,10 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
       const uint32_t regionBits = region.regChunkCount +
           static_cast<uint32_t>(update.memoryWriters.size()) +
           static_cast<uint32_t>(update.sparseRegisterWriters.size());
-      region.bitBegin = nextBit;
+      // Regions are word-aligned in BOTH spaces: bit b always lives in dirty
+      // word b >> 6, each dirty word has exactly one owning producer thread,
+      // and the per-region clear loop covers precisely [wordBegin, wordEnd).
+      region.bitBegin = wordCursor * 64;
       region.bitCount = regionBits;
       region.wordBegin = wordCursor;
       region.wordEnd = wordCursor +
@@ -622,21 +630,23 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
             static_cast<uint32_t>((layout.offset + layout.bytes + 63) / 64);
         Assert(cone.regChunkBits.emplace(layout.node, std::make_pair(first, last - first)).second,
                "duplicate cone chunk range for register %s", layout.node->name.c_str());
+        for (uint32_t bit = first; bit < last; ++bit) assignBit(bit);
       }
+      nextBit = region.bitBegin + region.regChunkCount;
       for (Node* writer : update.memoryWriters) {
         Assert(cone.bitByWriter.emplace(writer, nextBit).second,
                "duplicate cone bit for memory writer %s", writer->name.c_str());
-        ++nextBit;
+        assignBit(nextBit++);
       }
       for (Node* writer : update.sparseRegisterWriters) {
         Assert(cone.bitByWriter.emplace(writer, nextBit).second,
                "duplicate cone bit for sparse writer %s", writer->name.c_str());
-        ++nextBit;
+        assignBit(nextBit++);
       }
-      nextBit = region.bitBegin + regionBits;
+      Assert(nextBit == region.bitBegin + regionBits, "region bit packing mismatch");
       wordCursor = region.wordEnd;
     }
-    cone.bitCount = nextBit;
+    cone.bitCount = wordCursor * 64;
     cone.dirtyWords = wordCursor;
   }
 
