@@ -266,6 +266,23 @@ void CppEmitterMt::emitHeaderPreamble(FILE* header) const {
   fprintf(header,
           "#include <atomic>\n#include <cstdio>\n#include <thread>\n#include <sched.h>\n"
           "#include <string>\n#include <utility>\n\n");
+  if (valueHistogram_) {
+    // Fold helper lives in the header so every split model file sees it.
+    fprintf(header,
+            "static inline uint64_t mtVhFoldBytes(const void* mtVhData, size_t mtVhBytes) {\n"
+            "  const unsigned char* mtVhP = (const unsigned char*)mtVhData;\n"
+            "  uint64_t mtVhAcc = 0x9E3779B97F4A7C15ull;\n"
+            "  size_t mtVhI = 0;\n"
+            "  for (; mtVhI + 8 <= mtVhBytes; mtVhI += 8) {\n"
+            "    uint64_t mtVhW = 0;\n"
+            "    __builtin_memcpy(&mtVhW, mtVhP + mtVhI, 8);\n"
+            "    mtVhAcc = (mtVhAcc ^ mtVhW) * 0xFF51AFD7ED558CCDull;\n"
+            "  }\n"
+            "  uint64_t mtVhTail = 0;\n"
+            "  if (mtVhI < mtVhBytes) __builtin_memcpy(&mtVhTail, mtVhP + mtVhI, mtVhBytes - mtVhI);\n"
+            "  return (mtVhAcc ^ mtVhTail) * 0xC4CEB9FE1A85EC53ull;\n"
+            "}\n");
+  }
 }
 
 void CppEmitterMt::emitClassMembers(FILE* header) const {
@@ -761,24 +778,7 @@ void CppEmitterMt::emitDefinitions() {
   if (!enabled()) return;
   const std::string className = "S" + graph_.name;
 
-  if (valueHistogram_) {
-    // File-scope fold helper; must precede the first mtTask definition below.
-    emitText(0, true,
-             "static inline uint64_t mtVhFoldBytes(const void* mtVhData, size_t mtVhBytes) {\n"
-             "  const unsigned char* mtVhP = (const unsigned char*)mtVhData;\n"
-             "  uint64_t mtVhAcc = 0x9E3779B97F4A7C15ull;\n"
-             "  size_t mtVhI = 0;\n"
-             "  for (; mtVhI + 8 <= mtVhBytes; mtVhI += 8) {\n"
-             "    uint64_t mtVhW = 0;\n"
-             "    __builtin_memcpy(&mtVhW, mtVhP + mtVhI, 8);\n"
-             "    mtVhAcc = (mtVhAcc ^ mtVhW) * 0xFF51AFD7ED558CCDull;\n"
-             "  }\n"
-             "  uint64_t mtVhTail = 0;\n"
-             "  if (mtVhI < mtVhBytes) __builtin_memcpy(&mtVhTail, mtVhP + mtVhI, mtVhBytes - mtVhI);\n"
-             "  return (mtVhAcc ^ mtVhTail) * 0xC4CEB9FE1A85EC53ull;\n"
-             "}\n");
-    valueProbes_.assign(tasks_.size(), ValueProbePlan());
-  }
+  if (valueHistogram_) valueProbes_.assign(tasks_.size(), ValueProbePlan());
 
   for (const StateUpdate& update : stateTasks_) {
     emitStateUpdateFunction(update);
