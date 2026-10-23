@@ -621,25 +621,53 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     std::sort(roots.begin(), roots.end(), [](Node* a, Node* b) { return a->id < b->id; });
 
     const int replicaId = static_cast<int>(tasks.size());
-    auto available = [&](Node* node) {
-      auto found = plan.taskByNode_.find(node);
-      if (found == plan.taskByNode_.end()) return false;
-      return owners[static_cast<size_t>(found->second)] == consumerWorker;
-    };
-    MtReplicationCone cone = mtBuildAvailableCone(roots, config.maxOps, available);
-    if (!cone.valid() || cone.nodes.empty()) {
-      *reason = cone.valid() ? "empty-cone" : cone.rejection.c_str();
-      return -1;
-    }
-    // Every cone node must belong to the producer (pure share of P); nodes
-    // from other tasks are boundaries and never copied.
-    for (Node* node : cone.nodes) {
-      auto found = plan.taskByNode_.find(node);
-      if (found == plan.taskByNode_.end() || found->second != producerId) {
-        *reason = "cone-crossed-producer";
-        return -1;
+    // Structural cone walk over the producer's own pure members: any input
+    // that is another pure member of the same producer is absorbed; every
+    // other input (state, interface, other tasks' values, this producer's
+    // local temporaries) is a boundary. Copies lower through the same
+    // per-node machinery as the original, so no operator whitelist applies.
+    const int nodeBudget = config.maxOps > 0 ? config.maxOps : 1000000000;
+    std::vector<Node*> coneNodes;      // dependency-first (post-order)
+    std::set<Node*> coneSet(roots.begin(), roots.end());
+    std::vector<Node*> stack(roots.begin(), roots.end());
+    std::set<Node*> visited;
+    while (!stack.empty()) {
+      Node* node = stack.back();
+      stack.pop_back();
+      if (!visited.insert(node).second) continue;
+      bool pureProducerMember = node->type == NODE_OTHERS &&
+                                 plan.taskByNode_.count(node) != 0 &&
+                                 plan.taskByNode_[node] == producerId &&
+                                 producer.localNodes.count(node) == 0 &&
+                                 node->assignTree.size() == 1;
+      if (pureProducerMember) {
+        for (Node* input : node->prev) {
+          if (coneSet.count(input) != 0) continue;
+          coneSet.insert(input);
+          stack.push_back(input);
+        }
       }
     }
+    for (Node* node : coneSet) {
+      if (node->type != NODE_OTHERS || plan.taskByNode_.count(node) == 0 ||
+          plan.taskByNode_[node] != producerId ||
+          producer.localNodes.count(node) != 0 || node->assignTree.size() != 1) {
+        continue;
+      }
+      coneNodes.push_back(node);
+    }
+    if (coneNodes.empty()) {
+      *reason = "empty-cone";
+      return -1;
+    }
+    if (static_cast<int>(coneNodes.size()) > nodeBudget) {
+      *reason = "cone-node-budget";
+      return -1;
+    }
+    std::sort(coneNodes.begin(), coneNodes.end(),
+              [](Node* a, Node* b) { return a->order < b->order; });
+    struct MtReplicationConeShim {};
+    (void)sizeof(MtReplicationConeShim);
 
     MtTask replica;
     replica.kind = MtTaskKind::Normal;
@@ -649,7 +677,7 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     const int group = plan.partitionGroupCount_++;
     std::unordered_map<Node*, Node*> replacements;
     std::unordered_map<Node*, Node*> boundaryCopies;
-    std::vector<Node*> ordered(cone.nodes.rbegin(), cone.nodes.rend());  // deps-first
+    std::vector<Node*>& ordered = coneNodes;  // already deps-first by node order
     for (Node* member : ordered) {
       Node* copy = member->dup(member->type,
                                member->name + "$MT_RC$" + std::to_string(sequence++));
@@ -712,12 +740,14 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     // Boundary inputs define the replica's predecessors: every boundary
     // node's owning task (deduplicated, sorted).
     std::set<int> sources;
-    for (Node* boundary : cone.boundaryInputs) {
+    for (Node* member : ordered) {
+      for (Node* boundary : member->prev) {
       if (producer.localNodes.count(boundary) != 0) continue;
       auto found = plan.taskByNode_.find(boundary);
       if (found == plan.taskByNode_.end()) continue;
       if (found->second == producerId) continue;
       sources.insert(found->second);
+      }
     }
     for (Node* member : ordered) {
       for (Node* input : member->prev) {
