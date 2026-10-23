@@ -35,6 +35,14 @@ int resetChunkSize() {
   return end != value && *end == '\0' && parsed >= 256 && parsed <= INT_MAX ? static_cast<int>(parsed) : 0;
 }
 
+bool valueHistogramEnabled() {
+  // Generation-time gate: instrumentation is emitted only when the variable
+  // is set, so unset runs reproduce the baseline byte for byte. The runtime
+  // reads the same variable for its CSV path, keeping one knob for both.
+  const char* value = std::getenv("GSIM_MT_VALUE_HISTOGRAM");
+  return value != nullptr && value[0] != '\0';
+}
+
 void appendValues(std::string& text, const std::vector<int>& values) {
   if (values.empty()) {
     text += "0";
@@ -75,7 +83,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      valueHistogram_(valueHistogramEnabled()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -313,6 +322,26 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           workerCount_);
   fprintf(header, "unsigned long long mtBubbleTaskCalls[%d][kMtBubbleTaskCount] = {};\n",
           workerCount_);
+  if (valueHistogram_) {
+    // Value-gate histogram (GSIM_MT_VALUE_HISTOGRAM): per-task skip counters
+    // plus the last input fingerprint. Each task runs on exactly one worker,
+    // so plain counters are single-writer and need no atomics.
+    fprintf(header, "bool mtValueHistogram = false;\n");
+    fprintf(header, "const char* mtValueHistogramPath = nullptr;\n");
+    fprintf(header, "uint64_t mtValueLastFingerprint[%zu] = {};\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "uint64_t mtValueLastDst[%zu] = {};\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "uint64_t mtValueCalls[%zu] = {};\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "uint64_t mtValueSkipped[%zu] = {};\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "static const uint8_t mtValueTaskFlags[%zu];\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "static const uint16_t mtValueTaskFieldCount[%zu];\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "void mtValueHistogramReport();\n");
+  }
   fprintf(header,
           "unsigned long long mtBubbleFirstTsc = 0, mtBubbleLastTsc = 0;\n"
           "unsigned long long mtBubbleFirstNs = 0, mtBubbleLastNs = 0;\n"
@@ -586,9 +615,170 @@ void CppEmitterMt::emitTask(const Task& task, int indent) {
   emitInstructions(*task.insts, indent);
 }
 
+// Byte width of the storage type widthUType() picks for a scalar of this
+// width; >64-bit scalars become unsigned _BitInt rounded up to 64-bit words.
+static size_t valueFieldBytes(int width) {
+  if (width <= 8) return 1;
+  if (width <= 16) return 2;
+  if (width <= 32) return 4;
+  if (width <= 64) return 8;
+  return static_cast<size_t>((width + 63) / 64) * 8;
+}
+
+// Builds the per-task input fingerprint plan for GSIM_MT_VALUE_HISTOGRAM.
+//
+// Inputs are every node the lowered statement trees read (expression roots)
+// that is not a pure write target (lvalues), a constant, or a task-local
+// temporary. The plan is ordered by node id so identical generator runs emit
+// identical hash sequences (#138 stable order). Memories and inputs wider
+// than the byte budget are marked wide: the task keeps counting calls but is
+// never skipped, because its true input set is not cheaply observable.
+// eventFree marks unconditional state writes (depth-0 mtRegisterDstW or
+// pending-write stores) - the convergence-valve population for a future
+// value gate; sideEffect marks text that must re-execute (prints, randomness,
+// external calls) and likewise disables skipping.
+CppEmitterMt::ValueProbePlan CppEmitterMt::planValueProbe(const Task& task) {
+  ValueProbePlan plan;
+  if (task.kind != MtTaskKind::Normal) plan.sideEffect = true;
+
+  std::set<Node*> reads;
+  std::set<Node*> writes;
+  if (task.insts != nullptr) {
+    for (Node* node : task.members) {
+      for (ExpTree* tree : node->assignTree) {
+        collectReferencedNodes(tree->getRoot(), reads);
+        collectReferencedNodes(tree->getlval(), writes);
+      }
+    }
+  }
+  auto byId = [](const Node* lhs, const Node* rhs) { return lhs->id < rhs->id; };
+  std::set<Node*, decltype(byId)> inputs(byId);
+  for (Node* node : reads) {
+    if (writes.count(node) != 0) continue;
+    if (node->status == CONSTANT_NODE) continue;
+    if (node->status != VALID_NODE) continue;
+    if (task.localNodes.count(node) != 0) continue;
+    inputs.insert(node);
+  }
+
+  struct Field {
+    std::string expr;
+    bool fold;
+  };
+  std::vector<Field> fields;
+  size_t bytes = 0;
+  for (Node* node : inputs) {
+    if (node->type == NODE_MEMORY) {
+      plan.wideInput = true;
+      continue;
+    }
+    std::string expr;
+    if (isPackedRegister(node)) {
+      expr = packedRegisterName(node);
+    } else if (isWorkerLocal(node)) {
+      Assert(workerLocalOwner(node) == task.owner,
+             "task %d reads worker-local %s owned by another worker",
+             task.owner, node->name.c_str());
+      expr = "mtWorkerStateW" + std::to_string(task.owner) + "." + node->name;
+    } else {
+      expr = node->name;
+    }
+    size_t fieldBytes = valueFieldBytes(node->width);
+    for (int dimension : node->dimension) {
+      fieldBytes *= static_cast<size_t>(upperPower2(dimension));
+    }
+    bytes += fieldBytes;
+    fields.push_back({expr, !node->dimension.empty() || node->width > 64});
+  }
+  // The state phase can clobber this task's register destinations between
+  // calls (cycle-start resets write mtRegisterDstW before compute, and the
+  // clobbered value can equal the entry value of an older call). Inputs alone
+  // are therefore not sufficient: the runtime hashes the register-Dst write
+  // targets at entry AND after the body, keeping the last-written image. The
+  // skip fires only when the inputs and the current Dst contents both match
+  // the last executed call, whose rerun would reproduce both exactly.
+  std::set<Node*, decltype(byId)> dstWrites(byId);
+  for (Node* node : writes) {
+    if (node->type == NODE_REG_DST && isPackedRegister(node)) dstWrites.insert(node);
+  }
+  for (Node* node : dstWrites) {
+    const std::string expr = packedRegisterName(node);
+    size_t fieldBytes = valueFieldBytes(node->width);
+    for (int dimension : node->dimension) {
+      fieldBytes *= static_cast<size_t>(upperPower2(dimension));
+    }
+    bytes += fieldBytes;
+    const std::string hash =
+        !node->dimension.empty() || node->width > 64
+            ? "mtVhDst = mtVhDst * 0x9E3779B97F4A7C15ull + mtVhFoldBytes(&" + expr +
+                  ", sizeof(" + expr + "));\n"
+            : "mtVhDst = mtVhDst * 0x9E3779B97F4A7C15ull + (uint64_t)(" + expr + ");\n";
+    plan.dstHashExprs.push_back(hash);
+  }
+  static constexpr size_t kMtValueHashByteBudget = 512;
+  if (bytes > kMtValueHashByteBudget) plan.wideInput = true;
+  if (!plan.wideInput) {
+    for (const Field& field : fields) {
+      plan.hashExprs.push_back(
+          field.fold
+              ? "mtVh = mtVh * 0x9E3779B97F4A7C15ull + mtVhFoldBytes(&" + field.expr +
+                    ", sizeof(" + field.expr + "));\n"
+              : "mtVh = mtVh * 0x9E3779B97F4A7C15ull + (uint64_t)(" + field.expr + ");\n");
+    }
+  }
+
+  if (task.insts != nullptr) {
+    int depth = 0;
+    for (const InstInfo& inst : *task.insts) {
+      switch (inst.infoType) {
+        case SUPER_INFO_IF: ++depth; break;
+        case SUPER_INFO_ELSE: break;
+        case SUPER_INFO_DEDENT: --depth; break;
+        case SUPER_INFO_STR: {
+          const std::string text = mapRegisterNames(inst.inst);
+          for (const char* marker : {"printf", "fwrite", "fflush", "fopen", "fputs",
+                                     "abort", "assert", "random", "urandom", "system("}) {
+            if (text.find(marker) != std::string::npos) plan.sideEffect = true;
+          }
+          if (depth == 0 && !plan.eventFree) {
+            const size_t start = text.find_first_not_of(" \t");
+            if (start != std::string::npos &&
+                (text.compare(start, 14, "mtRegisterDstW") == 0 ||
+                 text.compare(start, 20, "__gsim_mt_mem_write_") == 0)) {
+              plan.eventFree = true;
+            }
+          }
+          break;
+        }
+        default: break;
+      }
+    }
+  }
+  return plan;
+}
+
 void CppEmitterMt::emitDefinitions() {
   if (!enabled()) return;
   const std::string className = "S" + graph_.name;
+
+  if (valueHistogram_) {
+    // File-scope fold helper; must precede the first mtTask definition below.
+    emitText(0, true,
+             "static inline uint64_t mtVhFoldBytes(const void* mtVhData, size_t mtVhBytes) {\n"
+             "  const unsigned char* mtVhP = (const unsigned char*)mtVhData;\n"
+             "  uint64_t mtVhAcc = 0x9E3779B97F4A7C15ull;\n"
+             "  size_t mtVhI = 0;\n"
+             "  for (; mtVhI + 8 <= mtVhBytes; mtVhI += 8) {\n"
+             "    uint64_t mtVhW = 0;\n"
+             "    __builtin_memcpy(&mtVhW, mtVhP + mtVhI, 8);\n"
+             "    mtVhAcc = (mtVhAcc ^ mtVhW) * 0xFF51AFD7ED558CCDull;\n"
+             "  }\n"
+             "  uint64_t mtVhTail = 0;\n"
+             "  if (mtVhI < mtVhBytes) __builtin_memcpy(&mtVhTail, mtVhP + mtVhI, mtVhBytes - mtVhI);\n"
+             "  return (mtVhAcc ^ mtVhTail) * 0xC4CEB9FE1A85EC53ull;\n"
+             "}\n");
+    valueProbes_.assign(tasks_.size(), ValueProbePlan());
+  }
 
   for (const StateUpdate& update : stateTasks_) {
     emitStateUpdateFunction(update);
@@ -622,7 +812,58 @@ void CppEmitterMt::emitDefinitions() {
   }
   for (int taskId : taskEmissionOrder) {
     emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
+    if (valueHistogram_) {
+      const ValueProbePlan& plan =
+          valueProbes_[static_cast<size_t>(taskId)] =
+              planValueProbe(tasks_[static_cast<size_t>(taskId)]);
+      if (plan.wideInput || plan.sideEffect) {
+        // Not cheaply gateable: count entries so the histogram still reports
+        // the full call volume, but never skip the body.
+        emitText(1, false, "if (mtValueHistogram) ++mtValueCalls[" +
+                               std::to_string(taskId) + "];\n");
+      } else {
+        // Skip only when the inputs and the current register-Dst contents
+        // both match the last executed call (first call always runs). Tokens
+        // are published by the dispatcher after the body returns, so outputs
+        // flow whether or not the body ran; every other write target holds
+        // the last computed value, which a same-inputs rerun reproduces.
+        emitText(1, false, "if (mtValueHistogram) {\n");
+        emitText(2, false, "uint64_t mtVh = 0;\n");
+        for (const std::string& hash : plan.hashExprs) emitText(2, false, hash);
+        if (!plan.dstHashExprs.empty()) {
+          emitText(2, false, "uint64_t mtVhDst = 0;\n");
+          for (const std::string& hash : plan.dstHashExprs) emitText(2, false, hash);
+        }
+        emitText(2, false, "++mtValueCalls[" + std::to_string(taskId) + "];\n");
+        std::string guard =
+            "mtValueCalls[" + std::to_string(taskId) + "] > 1 && mtVh == mtValueLastFingerprint[" +
+            std::to_string(taskId) + "]";
+        if (!plan.dstHashExprs.empty()) {
+          guard += " && mtVhDst == mtValueLastDst[" + std::to_string(taskId) + "]";
+        }
+        emitText(2, false, "if (" + guard + ") {\n");
+        emitText(3, false, "++mtValueSkipped[" + std::to_string(taskId) + "];\n");
+        emitText(3, false, "return;\n");
+        emitText(2, false, "}\n");
+        emitText(2, false,
+                 "mtValueLastFingerprint[" + std::to_string(taskId) + "] = mtVh;\n");
+        emitText(1, false, "}\n");
+      }
+    }
     emitTask(tasks_[static_cast<size_t>(taskId)], 1);
+    if (valueHistogram_ && !(valueProbes_[static_cast<size_t>(taskId)].wideInput ||
+                              valueProbes_[static_cast<size_t>(taskId)].sideEffect) &&
+        !valueProbes_[static_cast<size_t>(taskId)].dstHashExprs.empty()) {
+      // Store the register-Dst image this execution wrote; the next call
+      // compares against it to detect state-phase clobbering (resets).
+      const ValueProbePlan& plan = valueProbes_[static_cast<size_t>(taskId)];
+      emitText(1, false, "if (mtValueHistogram) {\n");
+      emitText(2, false, "uint64_t mtVhDst = 0;\n");
+      for (const std::string& hash : plan.dstHashExprs) emitText(2, false, hash);
+      emitText(2, false,
+               "mtValueLastDst[" + std::to_string(taskId) + "] = mtVhDst;\n");
+      emitText(1, false, "}\n");
+    }
     emitText(0, false, "}\n");
   }
 
@@ -714,6 +955,29 @@ void CppEmitterMt::emitDefinitions() {
     emitText(0, true, workerText);
   }
 
+  if (valueHistogram_) {
+    const size_t taskCount = std::max<size_t>(1, tasks_.size());
+    std::string flags = "const uint8_t " + className + "::mtValueTaskFlags[" +
+                        std::to_string(taskCount) + "] = {";
+    std::string fieldCount = "const uint16_t " + className + "::mtValueTaskFieldCount[" +
+                             std::to_string(taskCount) + "] = {";
+    for (size_t id = 0; id < tasks_.size(); ++id) {
+      const ValueProbePlan& plan = valueProbes_[id];
+      const unsigned flag = (plan.eventFree ? 1u : 0u) | (plan.wideInput ? 2u : 0u) |
+                            (plan.sideEffect ? 4u : 0u);
+      flags += (id == 0 ? "" : ",") + std::to_string(flag);
+      fieldCount += (id == 0 ? "" : ",") + std::to_string(plan.hashExprs.size());
+    }
+    if (tasks_.empty()) {
+      flags += "0";
+      fieldCount += "0";
+    }
+    flags += "};\n";
+    fieldCount += "};\n";
+    emitText(0, true, flags);
+    emitText(0, true, fieldCount);
+  }
+
   std::string runtime;
   // Bubble-profiling helpers. mtBpTick is a plain per-worker accumulator: each
   // bucket receives the tsc interval elapsed since the previous tick, so the
@@ -768,8 +1032,18 @@ void CppEmitterMt::emitDefinitions() {
       "      mtBubbleTaskTimesPath = taskTimes;\n"
       "      fprintf(stderr, \"[mt-bubble] per-task timing enabled, CSV -> %s\\n\", taskTimes);\n"
       "    }\n"
-      "  }\n"
-      "  mtEnabled = true;\n}\n";
+      "  }\n";
+  if (valueHistogram_) {
+    runtime +=
+        "  const char* valueHistogram = getenv(\"GSIM_MT_VALUE_HISTOGRAM\");\n"
+        "  mtValueHistogram = valueHistogram != nullptr && *valueHistogram != 0;\n"
+        "  if (mtValueHistogram) {\n"
+        "    mtValueHistogramPath = valueHistogram;\n"
+        "    fprintf(stderr, \"[mt-value] value-gate histogram enabled, CSV -> %s\\n\",\n"
+        "            valueHistogram);\n"
+        "  }\n";
+  }
+  runtime += "  mtEnabled = true;\n}\n";
 
   runtime += "void " + className + "::mtPinWorker(int worker) {\n";
   runtime += "  const char* affinity = getenv(\"GSIM_MT_CPU_AFFINITY\");\n";
@@ -821,6 +1095,9 @@ void CppEmitterMt::emitDefinitions() {
         "  }\n";
   }
   runtime += "  if (mtBubbleProfile) mtBpReport();\n";
+  if (valueHistogram_) {
+    runtime += "  if (mtValueHistogram) mtValueHistogramReport();\n";
+  }
   runtime += "}\n";
   runtime += "void " + className + "::mtWorkerLoop(int worker) {\n";
   runtime +=
@@ -1295,6 +1572,59 @@ void CppEmitterMt::emitDefinitions() {
   }
 }
 )mtbp").substr(1);
+  if (valueHistogram_) {
+    runtime += "\nvoid " + className + "::mtValueHistogramReport() {\n" +
+               std::string(R"mtvh(
+  FILE* csv = fopen(mtValueHistogramPath, "w");
+  if (csv == nullptr) {
+    fprintf(stderr, "[mt-value] cannot open %s; histogram lost\n", mtValueHistogramPath);
+    return;
+  }
+  fprintf(csv, "task_id,calls,skipped,event_free,wide_input,side_effect,hashed_fields\n");
+  unsigned long long totalCalls = 0, totalSkipped = 0;
+  unsigned long long gatedCalls = 0, gatedSkipped = 0;
+  unsigned long long eventFreeCalls = 0, eventFreeSkipped = 0;
+  unsigned long long topSkipped = 0;
+  int topTask = -1;
+  const int taskCount = (int)(sizeof(mtValueCalls) / sizeof(mtValueCalls[0]));
+  for (int t = 0; t < taskCount; ++t) {
+    const uint64_t calls = mtValueCalls[t];
+    const uint64_t skipped = mtValueSkipped[t];
+    const uint8_t flags = mtValueTaskFlags[t];
+    fprintf(csv, "%d,%llu,%llu,%d,%d,%d,%d\n", t,
+            (unsigned long long)calls, (unsigned long long)skipped,
+            (flags & 1) != 0, (flags & 2) != 0, (flags & 4) != 0,
+            (int)mtValueTaskFieldCount[t]);
+    totalCalls += calls;
+    totalSkipped += skipped;
+    if ((flags & 6) == 0) {
+      gatedCalls += calls;
+      gatedSkipped += skipped;
+    }
+    if ((flags & 1) != 0) {
+      eventFreeCalls += calls;
+      eventFreeSkipped += skipped;
+    }
+    if (skipped > topSkipped) {
+      topSkipped = skipped;
+      topTask = t;
+    }
+  }
+  fclose(csv);
+  fprintf(stderr, "[mt-value] tasks=%d calls=%llu skipped=%llu rate=%.2f%%\n",
+          taskCount, totalCalls, totalSkipped,
+          totalCalls > 0 ? 100.0 * (double)totalSkipped / (double)totalCalls : 0.0);
+  fprintf(stderr, "[mt-value] gate-eligible subset: calls=%llu skipped=%llu rate=%.2f%%\n",
+          gatedCalls, gatedSkipped,
+          gatedCalls > 0 ? 100.0 * (double)gatedSkipped / (double)gatedCalls : 0.0);
+  fprintf(stderr, "[mt-value] event-free subset (needs convergence valve): calls=%llu skipped=%llu rate=%.2f%%\n",
+          eventFreeCalls, eventFreeSkipped,
+          eventFreeCalls > 0 ? 100.0 * (double)eventFreeSkipped / (double)eventFreeCalls : 0.0);
+  fprintf(stderr, "[mt-value] top skipper: task %d (%llu skipped)\n", topTask, topSkipped);
+  fprintf(stderr, "[mt-value] histogram written to %s\n", mtValueHistogramPath);
+}
+)mtvh").substr(1);
+  }
   emitText(0, true, runtime);
 }
 

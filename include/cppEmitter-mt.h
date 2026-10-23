@@ -55,6 +55,14 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
                              const std::vector<Reset::Instruction>& body, int chunkCount);
   void emitAsyncResetFunction(const Reset& reset);
   void emitStateUpdateFunction(const StateUpdate& update);
+  struct ValueProbePlan {
+    std::vector<std::string> hashExprs;
+    std::vector<std::string> dstHashExprs;
+    bool wideInput = false;
+    bool eventFree = false;
+    bool sideEffect = false;
+  };
+  ValueProbePlan planValueProbe(const Task& task);
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
   void emitTask(const Task& task, int indent);
   void buildRegisterStorageNames();
@@ -68,6 +76,8 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   int resetChunk_ = 4096;
   int lookaheadWindow_ = 128;
   bool lookaheadStats_ = false;
+  bool valueHistogram_ = false;
+  std::vector<ValueProbePlan> valueProbes_;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
 };
