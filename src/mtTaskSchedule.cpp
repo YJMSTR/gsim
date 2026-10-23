@@ -1217,7 +1217,13 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
               workerPosition[static_cast<size_t>(source)]);
         }
       }
-      if (repcutReport.replicas > 0) {
+      const bool repcutShareSlotsActive =
+          repcutReport.replicas > 0 &&
+          ([]() {
+            const char* env = std::getenv("GSIM_MT_REPCUT_SHARED_SLOTS");
+            return env == nullptr || env[0] != '0';
+          })();
+      if (repcutShareSlotsActive) {
         group.sources = entry.second;
         std::sort(group.sources.begin(), group.sources.end());
       }
