@@ -35,6 +35,18 @@ int resetChunkSize() {
   return end != value && *end == '\0' && parsed >= 256 && parsed <= INT_MAX ? static_cast<int>(parsed) : 0;
 }
 
+bool coneActivityEnabled() {
+  const char* value = std::getenv("GSIM_MT_CONE_ACTIVITY");
+  return value != nullptr && *value != '\0';
+}
+
+std::string coneHex64(uint64_t value) {
+  char buffer[24];
+  std::snprintf(buffer, sizeof(buffer), "%llx",
+                static_cast<unsigned long long>(value));
+  return buffer;
+}
+
 void appendValues(std::string& text, const std::vector<int>& values) {
   if (values.empty()) {
     text += "0";
@@ -75,7 +87,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      coneActivity_(coneActivityEnabled()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -257,6 +270,46 @@ void CppEmitterMt::emitHeaderPreamble(FILE* header) const {
   fprintf(header,
           "#include <atomic>\n#include <cstdio>\n#include <thread>\n#include <sched.h>\n"
           "#include <string>\n#include <utility>\n\n");
+  if (coneActivity_) {
+    // Cone-activity helpers (GSIM_MT_CONE_ACTIVITY). mtConeCommitBlock is a
+    // value-preserving replacement for the whole-block register commit: only
+    // differing 64B chunks are copied, and each touched chunk marks its
+    // dirty bit when the probe is on. mtConeTallyBits counts, per cycle, how
+    // often each bit was set.
+    fprintf(header, "#include <cstddef>\n");
+    fprintf(header,
+            "static inline void mtConeCommitBlock(void* mtCaDst, const void* mtCaSrc,\n"
+            "                                    unsigned mtCaBytes, uint64_t* mtCaDirty,\n"
+            "                                    uint32_t mtCaBitBase, int mtCaActive) {\n"
+            "  unsigned char* mtCaD = (unsigned char*)mtCaDst;\n"
+            "  const unsigned char* mtCaS = (const unsigned char*)mtCaSrc;\n"
+            "  unsigned mtCaOff = 0;\n"
+            "  uint32_t mtCaChunk = 0;\n"
+            "  for (; mtCaOff + 64 <= mtCaBytes; mtCaOff += 64, ++mtCaChunk) {\n"
+            "    if (__builtin_memcmp(mtCaD + mtCaOff, mtCaS + mtCaOff, 64) == 0) continue;\n"
+            "    __builtin_memcpy(mtCaD + mtCaOff, mtCaS + mtCaOff, 64);\n"
+            "    if (mtCaActive) {\n"
+            "      const uint32_t mtCaBit = mtCaBitBase + mtCaChunk;\n"
+            "      mtCaDirty[mtCaBit >> 6] |= (uint64_t)1 << (mtCaBit & 63);\n"
+            "    }\n"
+            "  }\n"
+            "  if (mtCaOff < mtCaBytes) {\n"
+            "    if (__builtin_memcmp(mtCaD + mtCaOff, mtCaS + mtCaOff, mtCaBytes - mtCaOff) != 0) {\n"
+            "      __builtin_memcpy(mtCaD + mtCaOff, mtCaS + mtCaOff, mtCaBytes - mtCaOff);\n"
+            "      if (mtCaActive) {\n"
+            "        const uint32_t mtCaBit = mtCaBitBase + mtCaChunk;\n"
+            "        mtCaDirty[mtCaBit >> 6] |= (uint64_t)1 << (mtCaBit & 63);\n"
+            "      }\n"
+            "    }\n"
+            "  }\n"
+            "}\n"
+            "static inline void mtConeTallyBits(const uint64_t* mtCaDirty,\n"
+            "                                  uint32_t* mtCaSets, uint32_t mtCaBitBegin,\n"
+            "                                  uint32_t mtCaBitCount) {\n"
+            "  for (uint32_t mtCaB = mtCaBitBegin; mtCaB < mtCaBitBegin + mtCaBitCount; ++mtCaB)\n"
+            "    if ((mtCaDirty[mtCaB >> 6] >> (mtCaB & 63)) & (uint64_t)1) ++mtCaSets[mtCaB];\n"
+            "}\n");
+  }
 }
 
 void CppEmitterMt::emitClassMembers(FILE* header) const {
@@ -322,6 +375,42 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           "unsigned long long mtBubbleCycleHist[64] = {};\n");
   fprintf(header, "void mtBpTick(int worker, int bucket);\n");
   fprintf(header, "void mtBpReport();\n");
+  if (coneActivity_) {
+    // Cone-activity probe state (GSIM_MT_CONE_ACTIVITY). Each compute task
+    // runs on exactly one worker, so the per-task counters are single-writer
+    // (the serial async-reset replay runs after the worker join). The dirty
+    // map is partitioned into cache-line-aligned regions owned by one
+    // producer thread each; consumers read only after the state barrier.
+    fprintf(header, "bool mtConeProbe = false;\n");
+    fprintf(header, "const char* mtConeProbePath = nullptr;\n");
+    fprintf(header, "static constexpr int kMtConeBitCount = %u;\n",
+            std::max<uint32_t>(1, cone_.bitCount));
+    fprintf(header, "static constexpr int kMtConeDirtyWords = %u;\n",
+            std::max<uint32_t>(1, cone_.dirtyWords));
+    fprintf(header,
+            "alignas(64) uint64_t mtConeDirty[kMtConeDirtyWords] = {};\n");
+    fprintf(header, "alignas(64) uint32_t mtConeBitSets[kMtConeBitCount] = {};\n");
+    fprintf(header, "unsigned long long mtConeCalls[%zu] = {};\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "unsigned long long mtConeWouldSkip[%zu] = {};\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "unsigned long long mtConeSteps = 0;\n");
+    fprintf(header, "static const uint8_t mtConeTaskFlags[%zu];\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "static const uint16_t mtConeTaskWords[%zu];\n",
+            std::max<size_t>(1, tasks_.size()));
+    fprintf(header, "void mtConeActivityReport();\n");
+    for (size_t index = 0; index < cone_.inputs.size(); ++index) {
+      Node* input = cone_.inputs[index];
+      std::string typeSize = "sizeof(" + widthUType(input->width) + ")";
+      for (int dimension : input->dimension) {
+        typeSize.pop_back();
+        typeSize += "[" + std::to_string(upperPower2(dimension)) + "])";
+      }
+      fprintf(header, "alignas(8) unsigned char mtConeInShadow%zu[%s];\n",
+              index, typeSize.c_str());
+    }
+  }
   for (const StateUpdate& update : stateTasks_) {
     fprintf(header, "struct MtRegisterBlockW%d {\n", update.owner);
     if (update.registers.empty()) {
@@ -333,6 +422,20 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
       }
     }
     fprintf(header, "};\n");
+    if (coneActivity_ && !update.registers.empty()) {
+      // Verify the generator's layout arithmetic against the compiler's
+      // actual struct layout; a mismatch fails the model build. Empty blocks
+      // hold a placeholder byte and have no register chunks.
+      const MtConePlan::WorkerRegion& region = cone_.regions[static_cast<size_t>(update.owner)];
+      fprintf(header, "static_assert(sizeof(MtRegisterBlockW%d) == %zu, "
+                      "\"cone register block layout mismatch\");\n",
+              update.owner, region.regBlockBytes);
+      for (const MtConeRegisterLayout& layout : region.registers) {
+        fprintf(header, "static_assert(offsetof(MtRegisterBlockW%d, %s) == %zu, "
+                        "\"cone register offset mismatch\");\n",
+                update.owner, layout.node->name.c_str(), layout.offset);
+      }
+    }
     fprintf(header, "alignas(64) MtRegisterBlockW%d mtRegisterSrcW%d{};\n",
             update.owner, update.owner);
     fprintf(header, "alignas(64) MtRegisterBlockW%d mtRegisterDstW%d{};\n",
@@ -622,6 +725,30 @@ void CppEmitterMt::emitDefinitions() {
   }
   for (int taskId : taskEmissionOrder) {
     emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
+    if (coneActivity_) {
+      const MtConeTaskPlan& plan = cone_.tasks[static_cast<size_t>(taskId)];
+      const std::string id = std::to_string(taskId);
+      if (plan.always || plan.overCap) {
+        // Hot cone or side effects: count calls, never test.
+        emitText(1, false, "if (mtConeProbe) ++mtConeCalls[" + id + "];\n");
+      } else if (plan.checkEnd > plan.checkBegin) {
+        // Quiet-cone test: count a would-skip when every masked dirty word in
+        // the task's cone is zero. The body always runs afterwards.
+        std::string acc;
+        for (uint32_t index = plan.checkBegin; index < plan.checkEnd; ++index) {
+          const MtConeCheckWord& check = cone_.checks[index];
+          acc += (acc.empty() ? "(mtConeDirty[" : "|(mtConeDirty[") +
+                 std::to_string(check.word) + "]&0x" + coneHex64(check.mask) + "ull)";
+        }
+        emitText(1, false, "if (mtConeProbe) { ++mtConeCalls[" + id +
+                               "]; if ((" + acc + ") == 0) ++mtConeWouldSkip[" + id +
+                               "]; }\n");
+      } else {
+        // Empty cone: outputs are constant; every call would skip.
+        emitText(1, false, "if (mtConeProbe) { ++mtConeCalls[" + id +
+                               "]; ++mtConeWouldSkip[" + id + "]; }\n");
+      }
+    }
     emitTask(tasks_[static_cast<size_t>(taskId)], 1);
     emitText(0, false, "}\n");
   }
@@ -714,6 +841,27 @@ void CppEmitterMt::emitDefinitions() {
     emitText(0, true, workerText);
   }
 
+  if (coneActivity_) {
+    const size_t taskCount = std::max<size_t>(1, tasks_.size());
+    std::string flags = "const uint8_t " + className + "::mtConeTaskFlags[" +
+                        std::to_string(taskCount) + "] = {";
+    std::string words = "const uint16_t " + className + "::mtConeTaskWords[" +
+                        std::to_string(taskCount) + "] = {";
+    for (size_t id = 0; id < tasks_.size(); ++id) {
+      const MtConeTaskPlan& plan = cone_.tasks[id];
+      const unsigned flag = (plan.eventFree ? 1u : 0u) | (plan.always ? 2u : 0u) |
+                            (plan.overCap ? 4u : 0u);
+      flags += (id == 0 ? "" : ",") + std::to_string(flag);
+      words += (id == 0 ? "" : ",") + std::to_string(plan.coneWords);
+    }
+    if (tasks_.empty()) {
+      flags += "0";
+      words += "0";
+    }
+    emitText(0, true, flags + "};\n");
+    emitText(0, true, words + "};\n");
+  }
+
   std::string runtime;
   // Bubble-profiling helpers. mtBpTick is a plain per-worker accumulator: each
   // bucket receives the tsc interval elapsed since the previous tick, so the
@@ -768,8 +916,17 @@ void CppEmitterMt::emitDefinitions() {
       "      mtBubbleTaskTimesPath = taskTimes;\n"
       "      fprintf(stderr, \"[mt-bubble] per-task timing enabled, CSV -> %s\\n\", taskTimes);\n"
       "    }\n"
-      "  }\n"
-      "  mtEnabled = true;\n}\n";
+      "  }\n";
+  if (coneActivity_) {
+    runtime +=
+        "  const char* coneProbe = getenv(\"GSIM_MT_CONE_ACTIVITY\");\n"
+        "  mtConeProbe = coneProbe != nullptr && *coneProbe != 0;\n"
+        "  if (mtConeProbe) {\n"
+        "    mtConeProbePath = coneProbe;\n"
+        "    fprintf(stderr, \"[mt-cone] cone-activity probe enabled, CSV -> %s\\n\", coneProbe);\n"
+        "  }\n";
+  }
+  runtime += "  mtEnabled = true;\n}\n";
 
   runtime += "void " + className + "::mtPinWorker(int worker) {\n";
   runtime += "  const char* affinity = getenv(\"GSIM_MT_CPU_AFFINITY\");\n";
@@ -821,6 +978,7 @@ void CppEmitterMt::emitDefinitions() {
         "  }\n";
   }
   runtime += "  if (mtBubbleProfile) mtBpReport();\n";
+  if (coneActivity_) runtime += "  if (mtConeProbe) mtConeActivityReport();\n";
   runtime += "}\n";
   runtime += "void " + className + "::mtWorkerLoop(int worker) {\n";
   runtime +=
@@ -1034,6 +1192,28 @@ void CppEmitterMt::emitDefinitions() {
           isPackedRegister(node) ? packedRegisterName(node) : node->name;
       runtime += "  " + node->name + "$RESET = " + value + ";\n";
     }
+  }
+  if (coneActivity_) {
+    // Input activity is produced on the main thread before the generation
+    // release; workers acquire the generation before their first read, so
+    // no additional synchronization is needed.
+    runtime += "  if (mtConeProbe) {\n";
+    runtime += "    ++mtConeSteps;\n";
+    for (uint32_t word = 0; word < cone_.inputRegionWords; ++word) {
+      runtime += "    mtConeDirty[" + std::to_string(word) + "] = 0;\n";
+    }
+    for (size_t index = 0; index < cone_.inputs.size(); ++index) {
+      Node* input = cone_.inputs[index];
+      const uint32_t bit = cone_.inputBits[index];
+      runtime += "    if (__builtin_memcmp(&" + input->name + ", mtConeInShadow" +
+                 std::to_string(index) + ", sizeof(" + input->name +
+                 ")) != 0) { __builtin_memcpy(mtConeInShadow" +
+                 std::to_string(index) + ", &" + input->name + ", sizeof(" +
+                 input->name + ")); mtConeDirty[" + std::to_string(bit >> 6) +
+                 "] |= 0x" + coneHex64(static_cast<uint64_t>(1) << (bit & 63)) +
+                 "ull; ++mtConeBitSets[" + std::to_string(bit) + "]; }\n";
+    }
+    runtime += "  }\n";
   }
   runtime +=
       "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
@@ -1295,6 +1475,98 @@ void CppEmitterMt::emitDefinitions() {
   }
 }
 )mtbp").substr(1);
+  if (coneActivity_) {
+    runtime += "\nvoid " + className + "::mtConeActivityReport() {\n" +
+               std::string(R"mtca(
+  FILE* csv = fopen(mtConeProbePath, "w");
+  if (csv == nullptr) {
+    fprintf(stderr, "[mt-cone] cannot open %s; histogram lost\n", mtConeProbePath);
+    return;
+  }
+  fprintf(csv, "task_id,calls,would_skip,event_free,hot_cone,cone_words\n");
+  const int taskCount = (int)(sizeof(mtConeCalls) / sizeof(mtConeCalls[0]));
+  unsigned long long totalCalls = 0, totalSkip = 0;
+  unsigned long long efCalls = 0, efSkip = 0;
+  unsigned long long checkCalls = 0, checkSkip = 0;
+  unsigned long long topSkip = 0;
+  int topTask = -1;
+  for (int t = 0; t < taskCount; ++t) {
+    const unsigned long long calls = mtConeCalls[t];
+    const unsigned long long skip = mtConeWouldSkip[t];
+    const uint8_t flags = mtConeTaskFlags[t];
+    fprintf(csv, "%d,%llu,%llu,%d,%d,%d\n", t,
+            calls, skip, (flags & 1) != 0, (flags & 6) != 0,
+            (int)mtConeTaskWords[t]);
+    totalCalls += calls;
+    totalSkip += skip;
+    if ((flags & 1) != 0) {
+      efCalls += calls;
+      efSkip += skip;
+    }
+    if ((flags & 6) == 0) {
+      checkCalls += calls;
+      checkSkip += skip;
+    }
+    if (skip > topSkip) {
+      topSkip = skip;
+      topTask = t;
+    }
+  }
+  fclose(csv);
+  unsigned long long setTotal = 0;
+  unsigned long long bitsEverSet = 0;
+  int topBits[32];
+  unsigned long long topSets[32];
+  for (int k = 0; k < 32; ++k) { topBits[k] = -1; topSets[k] = 0; }
+  for (int b = 0; b < kMtConeBitCount; ++b) {
+    const unsigned long long sets = mtConeBitSets[b];
+    if (sets == 0) continue;
+    setTotal += sets;
+    ++bitsEverSet;
+    for (int k = 0; k < 32; ++k) {
+      if (topSets[k] >= sets) continue;
+      for (int j = 31; j > k; --j) { topBits[j] = topBits[j - 1]; topSets[j] = topSets[j - 1]; }
+      topBits[k] = b;
+      topSets[k] = sets;
+      break;
+    }
+  }
+  fprintf(stderr, "[mt-cone] tasks=%d calls=%llu would-skip=%llu rate=%.2f%%\n",
+          taskCount, totalCalls, totalSkip,
+          totalCalls > 0 ? 100.0 * (double)totalSkip / (double)totalCalls : 0.0);
+  fprintf(stderr, "[mt-cone] checkable subset: calls=%llu would-skip=%llu rate=%.2f%%\n",
+          checkCalls, checkSkip,
+          checkCalls > 0 ? 100.0 * (double)checkSkip / (double)checkCalls : 0.0);
+  fprintf(stderr, "[mt-cone] event-free subset: calls=%llu would-skip=%llu rate=%.2f%%\n",
+          efCalls, efSkip,
+          efCalls > 0 ? 100.0 * (double)efSkip / (double)efCalls : 0.0);
+  fprintf(stderr, "[mt-cone] top skipper: task %d (%llu would-skip)\n", topTask, topSkip);
+  fprintf(stderr, "[mt-cone] dirty bits: total-sets=%llu bits-ever-set=%d/%d "
+          "avg-bits-per-cycle=%.2f cycles=%llu\n",
+          setTotal, (int)bitsEverSet, (int)kMtConeBitCount,
+          mtConeSteps > 0 ? (double)setTotal / (double)mtConeSteps : 0.0,
+          mtConeSteps);
+  {
+    std::string mtCaPath(mtConeProbePath);
+    mtCaPath += ".bits.csv";
+    FILE* bits = fopen(mtCaPath.c_str(), "w");
+    if (bits != nullptr) {
+      fprintf(bits, "bit,sets\n");
+      for (int b = 0; b < kMtConeBitCount; ++b)
+        fprintf(bits, "%d,%u\n", b, mtConeBitSets[b]);
+      fclose(bits);
+      fprintf(stderr, "[mt-cone] per-bit set counts written to %s\n", mtCaPath.c_str());
+    }
+  }
+  fprintf(stderr, "[mt-cone] hottest bits:");
+  for (int k = 0; k < 8; ++k) {
+    if (topBits[k] < 0) break;
+    fprintf(stderr, " [bit %d: %llu]", topBits[k], topSets[k]);
+  }
+  fprintf(stderr, "\n[mt-cone] histogram written to %s\n", mtConeProbePath);
+}
+)mtca").substr(1);
+  }
   emitText(0, true, runtime);
 }
 

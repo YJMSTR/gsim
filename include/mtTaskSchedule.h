@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 class graph;
@@ -44,6 +46,58 @@ struct MtStateTask : MtTask {
   std::vector<MtReset::Instruction> body;
 };
 
+// Cone-activity probe (GSIM_MT_CONE_ACTIVITY): generation-time layout of the
+// monotone dirty-bit map produced at the state barrier (on-change for packed
+// register 64B chunks, on-write for memory/sparse pending commits, on-change
+// for top-level inputs) plus the per-task check plans derived from the
+// combined cone closure. The probe only counts would-skip; it never alters
+// task execution.
+struct MtConeCheckWord {
+  uint32_t word = 0;
+  uint64_t mask = 0;
+};
+
+struct MtConeTaskPlan {
+  uint16_t sourceBits = 0;
+  uint16_t coneWords = 0;
+  uint32_t checkBegin = 0;
+  uint32_t checkEnd = 0;
+  bool always = false;  // cone contains an always-active source or side effects
+  bool overCap = false; // cone spans more check words than the cap
+  bool eventFree = false;
+};
+
+struct MtConeRegisterLayout {
+  Node* node = nullptr;
+  size_t offset = 0;
+  size_t bytes = 0;
+};
+
+struct MtConePlan {
+  bool enabled = false;
+  uint32_t bitCount = 0;
+  uint32_t dirtyWords = 0;
+  uint32_t inputRegionWords = 0;
+  std::vector<Node*> inputs;              // sorted by node id
+  std::vector<uint32_t> inputBits;        // parallel to inputs
+  struct WorkerRegion {
+    uint32_t wordBegin = 0;
+    uint32_t wordEnd = 0;   // exclusive, padded to whole cache lines
+    uint32_t bitBegin = 0;
+    uint32_t bitCount = 0;
+    size_t regBlockBytes = 0;
+    uint32_t regChunkCount = 0;
+    std::vector<MtConeRegisterLayout> registers;
+  };
+  std::vector<WorkerRegion> regions;
+  std::unordered_map<Node*, uint32_t> bitByWriter;   // memory + sparse writers
+  std::unordered_map<Node*, uint32_t> bitByInput;
+  // Packed register -> contiguous chunk-bit range [bitBegin, bitBegin+bits).
+  std::unordered_map<Node*, std::pair<uint32_t, uint32_t>> regChunkBits;
+  std::vector<MtConeCheckWord> checks;               // flat, indexed by plans
+  std::vector<MtConeTaskPlan> tasks;                 // parallel to compute tasks
+};
+
 struct MtWorkerPlan {
   int readySlotCount_ = 1;
   std::vector<std::vector<int>> workerTasks_;
@@ -56,6 +110,7 @@ struct MtWorkerPlan {
   std::vector<MtStateTask> stateTasks_;
   std::unordered_map<Node*, int> stateTaskByNode_;
   std::vector<MtReset> resets_;
+  MtConePlan cone_;
 };
 
 class MtWorkerBuilder {

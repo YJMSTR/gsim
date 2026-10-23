@@ -6,8 +6,8 @@
 
 #include <algorithm>
 #include <climits>
-#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <numeric>
 #include <queue>
@@ -35,6 +35,39 @@ int mtLoweredTaskCost(const MtTask& task) {
 
 namespace {
 
+bool coneActivityEnabled() {
+  const char* value = std::getenv("GSIM_MT_CONE_ACTIVITY");
+  return value != nullptr && *value != '\0';
+}
+
+std::string coneHex(uint64_t value) {
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%llx",
+                static_cast<unsigned long long>(value));
+  return buffer;
+}
+
+// Object-layout facts for the emitted widthUType declarations. The per-member
+// offsets computed here are verified by static_asserts in the generated
+// header, so any divergence from the compiler's layout fails the build.
+size_t coneTypeAlignBytes(int width) {
+  size_t align = 1;
+  const size_t bytes = static_cast<size_t>(widthBits(width)) / 8;
+  while (align < bytes && align < 16) align <<= 1;
+  return align;
+}
+
+size_t coneMemberBytes(const Node* node) {
+  size_t bytes = std::max<size_t>(1, static_cast<size_t>(widthBits(node->width)) / 8);
+  for (int dimension : node->dimension) {
+    bytes *= static_cast<size_t>(upperPower2(dimension));
+  }
+  return bytes;
+}
+
+}  // namespace
+
+namespace {
 bool taskEmitsCode(const MtTask& task) {
   if (task.insts != nullptr && !task.insts->empty()) return true;
   return task.kind == MtTaskKind::ExtModule;
@@ -258,7 +291,7 @@ size_t memoryWriteStorageBytes(const Node* port) {
   return sizeof(uint64_t) + entries * (std::max<size_t>(1, dataBytes) + 1);
 }
 
-void appendMemoryCommit(MtStateTask& update, Node* port) {
+void appendMemoryCommit(MtStateTask& update, Node* port, const MtConePlan* cone) {
   Assert(port->type == NODE_WRITER || port->type == NODE_READWRITER,
          "invalid staged memory writer %s", port->name.c_str());
   Assert(port->parent != nullptr && port->parent->type == NODE_MEMORY,
@@ -280,6 +313,13 @@ void appendMemoryCommit(MtStateTask& update, Node* port) {
                                   mtMemoryWriteAddressName(port) + "]" + suffix;
   update.body.push_back(
       {static_cast<uint8_t>(SUPER_INFO_IF), "if (" + valid + ") {"});
+  if (cone != nullptr) {
+    const uint32_t bit = cone->bitByWriter.at(port);
+    update.body.push_back(
+        {static_cast<uint8_t>(SUPER_INFO_STR),
+         "if (mtConeProbe) { mtConeDirty[" + std::to_string(bit >> 6) +
+             "] |= 0x" + coneHex(static_cast<uint64_t>(1) << (bit & 63)) + "ull; }"});
+  }
   update.body.push_back(
       {static_cast<uint8_t>(SUPER_INFO_STR), destination + " = " + data + ";"});
   update.body.push_back({static_cast<uint8_t>(SUPER_INFO_DEDENT), "}"});
@@ -289,13 +329,21 @@ void appendMemoryCommit(MtStateTask& update, Node* port) {
   }
 }
 
-void appendSparseRegisterCommit(MtStateTask& update, Node* writer) {
+void appendSparseRegisterCommit(MtStateTask& update, Node* writer,
+                                const MtConePlan* cone) {
   Assert(writer->type == NODE_WRITER && writer->parent != nullptr &&
              writer->parent->type == NODE_REG_SRC,
          "invalid sparse register writer %s", writer->name.c_str());
   update.body.push_back(
       {static_cast<uint8_t>(SUPER_INFO_IF),
        "if (" + mtMemoryWriteValidName(writer) + ") {"});
+  if (cone != nullptr) {
+    const uint32_t bit = cone->bitByWriter.at(writer);
+    update.body.push_back(
+        {static_cast<uint8_t>(SUPER_INFO_STR),
+         "if (mtConeProbe) { mtConeDirty[" + std::to_string(bit >> 6) +
+             "] |= 0x" + coneHex(static_cast<uint64_t>(1) << (bit & 63)) + "ull; }"});
+  }
   update.body.push_back(
       {static_cast<uint8_t>(SUPER_INFO_STR),
        writer->parent->name + "[" + mtMemoryWriteAddressName(writer) + "] = " +
@@ -472,15 +520,6 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
     }
   }
 
-  // These are prior-cycle writes. Apply them before synchronous reset so a
-  // reset asserted at the current edge has the same priority as resetting the
-  // full next-state array before the old memcpy-based commit.
-  for (MtStateTask& update : workers.stateTasks_) {
-    for (Node* writer : update.sparseRegisterWriters) {
-      appendSparseRegisterCommit(update, writer);
-    }
-  }
-
   size_t memoryWriterCount = 0;
   size_t memoryWriteBytes = 0;
   std::vector<std::pair<Node*, std::vector<Node*>>> memoryWriters;
@@ -522,6 +561,92 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
                                 entry.second.end());
     memoryWriterCount += entry.second.size();
     memoryWriteBytes += cost;
+  }
+
+  // Cone-activity layout (GSIM_MT_CONE_ACTIVITY): assign the monotone
+  // dirty-bit indices before commit bodies are emitted so every producer can
+  // mark its bit. Inputs are tracked on-change at step entry; packed register
+  // 64B chunks on-change at the state-barrier commit; memory/sparse pending
+  // commits on-write. Regions are padded to whole cache lines so concurrent
+  // state workers never share a dirty word.
+  MtConePlan& cone = workers.cone_;
+  cone.enabled = coneActivityEnabled();
+  const MtConePlan* conePlan = cone.enabled ? &cone : nullptr;
+  if (cone.enabled) {
+    std::vector<Node*> trackedInputs;
+    for (Node* input : graph.input) {
+      if (input->status != VALID_NODE) continue;
+      trackedInputs.push_back(input);
+    }
+    std::sort(trackedInputs.begin(), trackedInputs.end(),
+              [](const Node* lhs, const Node* rhs) { return lhs->id < rhs->id; });
+    cone.inputs = std::move(trackedInputs);
+    cone.inputBits.clear();
+    uint32_t nextBit = 0;
+    for (Node* input : cone.inputs) {
+      cone.inputBits.push_back(nextBit);
+      cone.bitByInput[input] = nextBit++;
+    }
+    cone.inputRegionWords =
+        static_cast<uint32_t>(((nextBit + 63) / 64 + 7) & ~static_cast<uint32_t>(7));
+    uint32_t wordCursor = cone.inputRegionWords;
+    cone.regions.assign(workers.stateTasks_.size(), MtConePlan::WorkerRegion());
+    for (size_t worker = 0; worker < workers.stateTasks_.size(); ++worker) {
+      MtStateTask& update = workers.stateTasks_[worker];
+      MtConePlan::WorkerRegion& region = cone.regions[worker];
+      size_t offset = 0;
+      for (Node* reg : update.registers) {
+        const size_t align = coneTypeAlignBytes(reg->width);
+        offset = (offset + align - 1) & ~(align - 1);
+        const size_t bytes = coneMemberBytes(reg);
+        region.registers.push_back({reg, offset, bytes});
+        offset += bytes;
+      }
+      // The block struct itself carries no padding: only its instances are
+      // 64B-aligned, so the commit size is the unrounded member sum.
+      region.regBlockBytes = offset;
+      region.regChunkCount =
+          static_cast<uint32_t>((region.regBlockBytes + 63) / 64);
+      const uint32_t regionBits = region.regChunkCount +
+          static_cast<uint32_t>(update.memoryWriters.size()) +
+          static_cast<uint32_t>(update.sparseRegisterWriters.size());
+      region.bitBegin = nextBit;
+      region.bitCount = regionBits;
+      region.wordBegin = wordCursor;
+      region.wordEnd = wordCursor +
+          static_cast<uint32_t>(((regionBits + 63) / 64 + 7) & ~static_cast<uint32_t>(7));
+      for (const MtConeRegisterLayout& layout : region.registers) {
+        const uint32_t first =
+            region.bitBegin + static_cast<uint32_t>(layout.offset / 64);
+        const uint32_t last = region.bitBegin +
+            static_cast<uint32_t>((layout.offset + layout.bytes + 63) / 64);
+        Assert(cone.regChunkBits.emplace(layout.node, std::make_pair(first, last - first)).second,
+               "duplicate cone chunk range for register %s", layout.node->name.c_str());
+      }
+      for (Node* writer : update.memoryWriters) {
+        Assert(cone.bitByWriter.emplace(writer, nextBit).second,
+               "duplicate cone bit for memory writer %s", writer->name.c_str());
+        ++nextBit;
+      }
+      for (Node* writer : update.sparseRegisterWriters) {
+        Assert(cone.bitByWriter.emplace(writer, nextBit).second,
+               "duplicate cone bit for sparse writer %s", writer->name.c_str());
+        ++nextBit;
+      }
+      nextBit = region.bitBegin + regionBits;
+      wordCursor = region.wordEnd;
+    }
+    cone.bitCount = nextBit;
+    cone.dirtyWords = wordCursor;
+  }
+
+  // These are prior-cycle writes. Apply them before synchronous reset so a
+  // reset asserted at the current edge has the same priority as resetting the
+  // full next-state array before the old memcpy-based commit.
+  for (MtStateTask& update : workers.stateTasks_) {
+    for (Node* writer : update.sparseRegisterWriters) {
+      appendSparseRegisterCommit(update, writer, conePlan);
+    }
   }
 
   struct SyncResetGroup {
@@ -584,14 +709,52 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
 
   for (int worker = 0; worker < workerCount; ++worker) {
     MtStateTask& update = workers.stateTasks_[static_cast<size_t>(worker)];
+    if (cone.enabled) {
+      const MtConePlan::WorkerRegion& region = cone.regions[static_cast<size_t>(worker)];
+      // Reset this worker's dirty region before any producer marks a bit.
+      // Other workers only read these words after the state barrier, which
+      // already orders this store against the previous cycle's consumers.
+      if (region.wordEnd > region.wordBegin) {
+        update.body.insert(
+            update.body.begin(),
+            {{static_cast<uint8_t>(SUPER_INFO_IF), "if (mtConeProbe) {"},
+             {static_cast<uint8_t>(SUPER_INFO_STR),
+              "for (unsigned mtCaW = " + std::to_string(region.wordBegin) +
+                  "; mtCaW < " + std::to_string(region.wordEnd) +
+                  "; ++mtCaW) mtConeDirty[mtCaW] = 0;"},
+             {static_cast<uint8_t>(SUPER_INFO_DEDENT), "}"}});
+      }
+    }
     if (!update.registers.empty()) {
       const std::string source = "mtRegisterSrcW" + std::to_string(worker);
       const std::string destination = "mtRegisterDstW" + std::to_string(worker);
-      update.body.push_back(
-          {static_cast<uint8_t>(SUPER_INFO_STR),
-           "memcpy(&" + source + ", &" + destination + ", sizeof(" + source + "));"});
+      if (cone.enabled) {
+        const MtConePlan::WorkerRegion& region = cone.regions[static_cast<size_t>(worker)];
+        // On-change commit: only differing 64B chunks are copied (bit-identical
+        // to the whole-block memcpy) and each touched chunk marks its bit.
+        update.body.push_back(
+            {static_cast<uint8_t>(SUPER_INFO_STR),
+             "mtConeCommitBlock(&" + source + ", &" + destination + ", (unsigned)sizeof(" +
+                 source + "), mtConeDirty, " +
+                 std::to_string(region.bitBegin) + "u, mtConeProbe);"});
+        update.body.push_back(
+            {static_cast<uint8_t>(SUPER_INFO_IF), "if (mtConeProbe) {"});
+        update.body.push_back(
+            {static_cast<uint8_t>(SUPER_INFO_STR),
+             "mtConeTallyBits(mtConeDirty, mtConeBitSets, " +
+                 std::to_string(cone.regions[static_cast<size_t>(worker)].bitBegin) +
+                 "u, " +
+                 std::to_string(cone.regions[static_cast<size_t>(worker)].bitCount) +
+                 "u);"});
+        update.body.push_back(
+            {static_cast<uint8_t>(SUPER_INFO_DEDENT), "}"});
+      } else {
+        update.body.push_back(
+            {static_cast<uint8_t>(SUPER_INFO_STR),
+             "memcpy(&" + source + ", &" + destination + ", sizeof(" + source + "));"});
+      }
     }
-    for (Node* writer : update.memoryWriters) appendMemoryCommit(update, writer);
+    for (Node* writer : update.memoryWriters) appendMemoryCommit(update, writer, conePlan);
     update.chunkCount = countResetChunks(update.body, chunkSize);
     // The state-task body is lowered separately to preserve commit/reset
     // ordering and packed memcpy. Expose the same instruction representation
@@ -638,6 +801,269 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
           "[cppEmitter-mt] memory-commits writers=%zu pending-bytes=%zu "
           "min-worker-state-bytes=%zu max-worker-state-bytes=%zu\n",
           memoryWriterCount, memoryWriteBytes, *stateLimits.first, *stateLimits.second);
+}
+
+// Builds the per-task combined cone closure for the cone-activity probe.
+// Activity sources are exactly the dirty-bit producers: top-level inputs
+// (on-change), packed register 64B chunks (on-change at the state barrier),
+// and memory/sparse pending commits (on-write). A compute task is quiet for a
+// cycle only when every source in its transitive combinational fan-in was
+// quiet; the probe counts those cycles as would-skip without acting on them.
+void buildConeActivity(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& workers) {
+  MtConePlan& cone = workers.cone_;
+  const size_t taskCount = tasks.tasks_.size();
+  cone.tasks.assign(taskCount, MtConeTaskPlan());
+  if (!cone.enabled || taskCount == 0) return;
+
+  // Check-cost cap: a task whose cone spans more masked dirty words than this
+  // is reported hot and only counts calls.
+  constexpr uint32_t kConeWordCap = 16;
+
+  std::vector<std::vector<uint64_t>> words(taskCount,
+                                           std::vector<uint64_t>(cone.dirtyWords, 0));
+  std::vector<uint8_t> always(taskCount, 0);
+  std::vector<uint8_t> sideEffect(taskCount, 0);
+  std::vector<std::vector<int>> deps(taskCount);
+  size_t unclassified = 0;
+  size_t memArrayReads = 0;
+  size_t memPortReads = 0;
+  std::set<int> memPortReaders;
+
+  for (size_t taskId = 0; taskId < taskCount; ++taskId) {
+    const MtTask& task = tasks.tasks_[taskId];
+    if (task.kind != MtTaskKind::Normal) {
+      sideEffect[taskId] = 1;
+      continue;
+    }
+    // Lowered-text side effects must re-execute every cycle (prints,
+    // randomness, external calls); such tasks are never skip candidates.
+    if (task.insts != nullptr) {
+      for (const InstInfo& inst : *task.insts) {
+        if (inst.infoType != SUPER_INFO_STR) continue;
+        for (const char* marker : {"printf", "fwrite", "fflush", "fopen", "fputs",
+                                   "abort", "assert", "random", "urandom", "system(",
+                                   "mtDeferAssert", "gprintf"}) {
+          if (inst.inst.find(marker) != std::string::npos) {
+            sideEffect[taskId] = 1;
+            break;
+          }
+        }
+      }
+    }
+
+    // Direct references of the task body, deterministically ordered.
+    auto byId = [](const Node* lhs, const Node* rhs) { return lhs->id < rhs->id; };
+    std::set<Node*, decltype(byId)> refs(byId);
+    std::vector<ENode*> pending;
+    for (Node* member : task.members) {
+      for (ExpTree* tree : member->assignTree) {
+        if (tree->getRoot() == nullptr) continue;
+        pending.push_back(tree->getRoot());
+        while (!pending.empty()) {
+          ENode* current = pending.back();
+          pending.pop_back();
+          if (current->nodePtr != nullptr) refs.insert(current->nodePtr);
+          for (ENode* child : current->child) {
+            if (child != nullptr) pending.push_back(child);
+          }
+        }
+      }
+    }
+
+    auto markBit = [&](uint32_t bit) {
+      words[taskId][bit >> 6] |= static_cast<uint64_t>(1) << (bit & 63);
+    };
+    auto markWriters = [&](Node* memory) {
+      Assert(memory != nullptr && memory->type == NODE_MEMORY,
+             "cone memory source %s is not a memory", memory->name.c_str());
+      for (Node* port : memory->member) {
+        if (port->type != NODE_WRITER && port->type != NODE_READWRITER) continue;
+        auto bit = cone.bitByWriter.find(port);
+        if (bit == cone.bitByWriter.end()) continue;
+        markBit(bit->second);
+      }
+    };
+
+    for (Node* node : refs) {
+      if (node->status == CONSTANT_NODE || node->status != VALID_NODE) continue;
+      // Sparse register arrays: activity is a pending write committing.
+      if (tasks.sparseRegisterBySource_.count(node) != 0) {
+        const MtSparseRegister& sparse =
+            tasks.sparseRegisters_[tasks.sparseRegisterBySource_.at(node)];
+        for (Node* writer : sparse.writers) markBit(cone.bitByWriter.at(writer));
+        continue;
+      }
+      // Memory reads: the array content changes only through its staged
+      // writer ports at the previous boundary; the address cone flows through
+      if (node->type == NODE_MEMORY) {
+        markWriters(node);
+        ++memArrayReads;
+        continue;
+      }
+      if (node->type == NODE_INP) {
+        auto bit = cone.bitByInput.find(node);
+        if (bit != cone.bitByInput.end()) {
+          markBit(bit->second);
+        } else {
+          always[taskId] = 1;
+        }
+        continue;
+      }
+      if (node->isExt()) {
+        always[taskId] = 1;
+        continue;
+      }
+      if (workers.stateTaskByNode_.count(node) != 0) {
+        if (node->type == NODE_REG_SRC) {
+          // Packed register current value: on-change at the barrier commit.
+          const auto& range = cone.regChunkBits.at(node);
+          for (uint32_t bit = range.first; bit < range.first + range.second; ++bit) {
+            markBit(bit);
+          }
+        } else if (node->type == NODE_REG_RESET) {
+          Node* reg = node->getResetSrc();
+          if (tasks.sparseRegisterBySource_.count(reg) != 0) {
+            const MtSparseRegister& sparse =
+                tasks.sparseRegisters_[tasks.sparseRegisterBySource_.at(reg)];
+            for (Node* writer : sparse.writers) markBit(cone.bitByWriter.at(writer));
+          } else {
+            const auto& range = cone.regChunkBits.at(reg);
+            for (uint32_t bit = range.first; bit < range.first + range.second; ++bit) {
+              markBit(bit);
+            }
+          }
+        }
+        continue;
+      }
+      auto owner = tasks.taskByNode_.find(node);
+      if (owner != tasks.taskByNode_.end()) {
+        // Combinational value computed by another MTask (or this task):
+        // activity flows through the producer's cone. Reader ports also
+        // depend on the memory content behind them.
+        if (node->type == NODE_READER || node->type == NODE_READWRITER) {
+          markWriters(node->parent);
+          ++memPortReads;
+          memPortReaders.insert(node->id);
+        }
+        if (static_cast<int>(taskId) != owner->second) {
+          Assert(owner->second < static_cast<int>(taskId),
+                 "cone dependency %d is not forward for task %zu",
+                 owner->second, taskId);
+          deps[taskId].push_back(owner->second);
+        }
+        continue;
+      }
+      ++unclassified;
+      always[taskId] = 1;
+    }
+  }
+
+  // Task ids are topological, so one ascending pass folds producer cones
+  // into consumers.
+  for (size_t taskId = 0; taskId < taskCount; ++taskId) {
+    MtConeTaskPlan& plan = cone.tasks[taskId];
+    const MtTask& task = tasks.tasks_[taskId];
+    for (int dep : deps[taskId]) {
+      const std::vector<uint64_t>& source = words[static_cast<size_t>(dep)];
+      for (uint32_t w = 0; w < cone.dirtyWords; ++w) words[taskId][w] |= source[w];
+      always[taskId] |= always[static_cast<size_t>(dep)];
+    }
+    uint32_t checkWords = 0;
+    uint32_t sourceBits = 0;
+    for (uint32_t w = 0; w < cone.dirtyWords; ++w) {
+      if (words[taskId][w] == 0) continue;
+      ++checkWords;
+      sourceBits += static_cast<uint32_t>(__builtin_popcountll(words[taskId][w]));
+    }
+    plan.coneWords = static_cast<uint16_t>(std::min<uint32_t>(checkWords, 65535));
+    plan.sourceBits = static_cast<uint16_t>(std::min<uint32_t>(sourceBits, 65535));
+    plan.always = always[taskId] != 0 || sideEffect[taskId] != 0 ||
+                  task.kind == MtTaskKind::ExtModule;
+    plan.overCap = checkWords > kConeWordCap;
+    // Event-free = the body has no observable events of its own; its cone may
+    // still be always-hot through external producers.
+    plan.eventFree = sideEffect[taskId] == 0 && task.kind == MtTaskKind::Normal;
+    if (plan.always || plan.overCap) continue;
+    plan.checkBegin = static_cast<uint32_t>(cone.checks.size());
+    for (uint32_t w = 0; w < cone.dirtyWords; ++w) {
+      if (words[taskId][w] == 0) continue;
+      cone.checks.push_back({w, words[taskId][w]});
+    }
+    plan.checkEnd = static_cast<uint32_t>(cone.checks.size());
+  }
+
+  size_t hotAlways = 0;
+  size_t overCap = 0;
+  unsigned long long checkWordTotal = 0;
+  size_t checkable = 0;
+  for (const MtConeTaskPlan& plan : cone.tasks) {
+    if (plan.always) ++hotAlways;
+    if (plan.overCap) ++overCap;
+    if (!plan.always && !plan.overCap) {
+      ++checkable;
+      checkWordTotal += plan.checkEnd - plan.checkBegin;
+    }
+  }
+  fprintf(stderr,
+          "[cppEmitter-mt] cone-activity bits=%u dirty-words=%u inputs=%zu "
+          "tasks=%zu hot-always=%zu over-cap=%zu checkable=%zu "
+          "avg-check-words=%.1f word-cap=%u unclassified=%zu\n",
+          cone.bitCount, cone.dirtyWords, cone.inputs.size(), taskCount, hotAlways,
+          overCap, checkable,
+          checkable > 0 ? static_cast<double>(checkWordTotal) / static_cast<double>(checkable)
+                        : 0.0,
+          kConeWordCap, unclassified);
+  fprintf(stderr,
+          "[cppEmitter-mt] cone-memory-reads array-refs=%zu port-refs=%zu "
+          "distinct-reader-ports=%zu\n",
+          memArrayReads, memPortReads, memPortReaders.size());
+
+
+  if (!globalConfig.OutputDir.empty()) {
+    FILE* bits = std::fopen((globalConfig.OutputDir + "/mt-cone-bits.json").c_str(), "w");
+    Assert(bits != nullptr, "cannot write cone bit metadata");
+    fprintf(bits, "{\n  \"bit_count\": %u,\n  \"dirty_words\": %u,\n  \"bits\": [\n",
+            cone.bitCount, cone.dirtyWords);
+    bool first = true;
+    auto entry = [&](const char* kind, uint32_t bit, int worker, const std::string& node) {
+      fprintf(bits, "%s    {\"bit\": %u, \"kind\": \"%s\", \"worker\": %d, \"node\": \"%s\"}",
+              first ? "" : ",\n", bit, kind, worker, node.c_str());
+      first = false;
+    };
+    for (size_t index = 0; index < cone.inputs.size(); ++index) {
+      entry("input", cone.inputBits[index], 0, cone.inputs[index]->name);
+    }
+    std::vector<std::pair<uint32_t, Node*>> writersByBit;
+    writersByBit.reserve(cone.bitByWriter.size());
+    for (const auto& writer : cone.bitByWriter) {
+      writersByBit.emplace_back(writer.second, writer.first);
+    }
+    std::sort(writersByBit.begin(), writersByBit.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    for (const auto& writer : writersByBit) {
+      entry(writer.second->type == NODE_WRITER && writer.second->parent != nullptr &&
+                    writer.second->parent->type == NODE_REG_SRC
+                ? "sparse_writer"
+                : "mem_writer",
+            writer.first, -1, writer.second->name);
+    }
+    std::vector<std::pair<uint32_t, Node*>> regsByBit;
+    regsByBit.reserve(cone.regChunkBits.size());
+    for (const auto& reg : cone.regChunkBits) {
+      regsByBit.emplace_back(reg.second.first, reg.first);
+    }
+    std::sort(regsByBit.begin(), regsByBit.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+    for (const auto& reg : regsByBit) {
+      fprintf(bits,
+              "%s    {\"bit\": %u, \"kind\": \"reg_chunk\", \"node\": \"%s\", \"bits\": %u}",
+              first ? "" : ",\n", reg.first, reg.second->name.c_str(),
+              cone.regChunkBits.at(reg.second).second);
+      first = false;
+    }
+    fprintf(bits, "\n  ]\n}\n");
+    Assert(std::fclose(bits) == 0, "cannot finish cone bit metadata");
+  }
 }
 
 using ScheduledInterval = MtScheduledInterval;
@@ -773,7 +1199,6 @@ WorkerSchedule scheduleList(const MtTaskPlan& tasks, int workerCount,
   WorkerSchedule result;
   result.owner.assign(static_cast<size_t>(taskCount), -1);
   result.start.assign(static_cast<size_t>(taskCount), 0);
-  result.finish.assign(static_cast<size_t>(taskCount), 0);
   result.chains.assign(static_cast<size_t>(workerCount), std::vector<int>());
 
   std::vector<int> remaining(static_cast<size_t>(taskCount), 0);
@@ -1133,6 +1558,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   }
 
   buildStateUpdates(graph, tasks, workers, workerCount, resetChunk);
+  buildConeActivity(graph, tasks, workers);
 
   // Async reset is checked after the speculative task pass. Its body is kept
   // independent of worker ownership because the rare replay path is serial.
