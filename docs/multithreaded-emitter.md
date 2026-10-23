@@ -650,8 +650,12 @@ cycle k:
 
 ### 5.4 每 worker 唤醒行与批量 join（GSIM_MT_WAKEUP_PERWORKER）
 
-设置生成期环境变量 `GSIM_MT_WAKEUP_PERWORKER=1`（默认关闭）后，唤醒/join
-协议从两条共享热行改为点对点通信：
+设置生成期环境变量 `GSIM_MT_WAKEUP_PERWORKER`（默认关闭，`0`/未设置）：
+
+- `1`：每 worker 唤醒行 + 批量 join 扫描（完整机制）；
+- `join`：仅批量 join 扫描，唤醒保持共享 `mtGeneration` 行（消融模式）。
+
+完整机制（`1`）：
 
 - 新增 `MtWakeSlot mtWakeSlots[kMtWorkerCount]`（每槽独占 64 字节行，
   内含 atomic `uint64_t` generation）。worker 只自旋读自己的一行，
@@ -665,9 +669,10 @@ cycle k:
   控制依赖、可在乱序核上并行发出），无进展才 `pause`。语义仍是
   "所有 done parity == 当前 parity"，acquire 语义逐 flag 保持。
 
-该模式只改变唤醒传播与完成检测的缓存行拓扑，不改变代际、奇偶或 token
+`join` 消融模式只替换 join 扫描（第三条），唤醒路径与默认完全相同，
+用于把两种机制的贡献拆开测量。两种取值都不改变代际、奇偶或 token
 语义（5.2/5.3 的全部不变量保持）。关闭该开关时生成的模型与不包含本
-功能的版本逐字节相同；开启后小模型 trace 与关闭侧逐字节相等
+功能的版本逐字节相同；任一取值下小模型 trace 与关闭侧逐字节相等
 （`test_wakeup_perworker_trace_equivalence`，运行超时即活性门）。
 
 
@@ -834,7 +839,7 @@ task 内局部中间量使用 `T value{};` 值初始化。部分 external/memory
 | `--mt-lookahead-window=N` | `16` | 队头 token 阻塞时最多检查的后继任务数；`0` 恢复严格顺序 |
 | `--mt-lookahead-stats=on|off` | `off` | 生成 per-worker lookahead calls/scanned/found/fullmiss 统计 |
 | `GSIM_EMIT_RESET_CHUNK` | `4096` | reset 函数目标语句数；`0` 禁用 |
-| `GSIM_MT_WAKEUP_PERWORKER` | `0` | `1` 时启用每 worker 唤醒行 + 批量 join 扫描（见 5.4） |
+| `GSIM_MT_WAKEUP_PERWORKER` | `0` | `1` 每 worker 唤醒行+批量 join；`join` 仅批量 join（见 5.4） |
 | `--supernode-max-size=N` | 项目默认值 | 上游图划分粒度，会影响 task 数和并行度 |
 | `--cpp-max-size-KB=N` | 项目默认值 | 生成 C++ 文件切分大小 |
 

@@ -167,7 +167,7 @@ class StateTasksTest(unittest.TestCase):
         baseline = None
         for workers in (1, 2, 4):
             for lookahead in (0, 16, 64):
-                for wakeup in (None, '1'):
+                for wakeup in (None, '1', 'join'):
                     with self.subTest(workers=workers, lookahead=lookahead,
                                       wakeup=wakeup), \
                             tempfile.TemporaryDirectory(
@@ -184,7 +184,7 @@ class StateTasksTest(unittest.TestCase):
         # mt-memory-commit exercises real cross-worker token groups plus the
         # full wake/join cycle with 4 workers.
         signatures = []
-        for wakeup in (None, '1'):
+        for wakeup in (None, '1', 'join'):
             with tempfile.TemporaryDirectory(
                     prefix='mt-wakeup-pp-mem-') as directory:
                 out = Path(directory)

@@ -68,7 +68,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   int resetChunk_ = 4096;
   int lookaheadWindow_ = 128;
   bool lookaheadStats_ = false;
-  bool wakeupPerWorker_ = false;
+  int wakeupMode_ = 0;  // 0 off, 1 wake+join, 2 join-only
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
 };

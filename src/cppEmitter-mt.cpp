@@ -26,9 +26,14 @@ int positiveEnv(const char* name, int fallback) {
              ? static_cast<int>(parsed)
              : fallback;
 }
-int flagEnvIsOn(const char* name) {
-  const char* value = std::getenv(name);
-  return value != nullptr && value[0] == '1' && value[1] == '\0';
+int wakeupModeEnv() {
+  // 0 = off (default), 1 = per-worker wake slots + bitmap join,
+  // 2 = bitmap join scan only (shared-line wakeup kept).
+  const char* value = std::getenv("GSIM_MT_WAKEUP_PERWORKER");
+  if (value == nullptr) return 0;
+  if (value[0] == '1' && value[1] == '\0') return 1;
+  if (std::strcmp(value, "join") == 0) return 2;
+  return 0;
 }
 
 int resetChunkSize() {
@@ -80,7 +85,7 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
       lookaheadStats_(globalConfig.MtLookaheadStats),
-      wakeupPerWorker_(flagEnvIsOn("GSIM_MT_WAKEUP_PERWORKER")) {}
+      wakeupMode_(wakeupModeEnv()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -282,7 +287,7 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "alignas(64) std::atomic<uint64_t> mtGeneration{0};\n");
   fprintf(header, "alignas(64) std::atomic<int> mtReadyWorkers{0};\n");
   fprintf(header, "alignas(64) std::atomic<bool> mtStop{false};\n");
-  if (wakeupPerWorker_) {
+  if (wakeupMode_ == 1) {
     fprintf(header,
             "struct alignas(64) MtWakeSlot { std::atomic<uint64_t> generation{0}; };\n"
             "MtWakeSlot mtWakeSlots[kMtWorkerCount];\n");
@@ -811,7 +816,7 @@ void CppEmitterMt::emitDefinitions() {
       "}\n";
 
   runtime += "void " + className + "::mtStopWorkers() {\n";
-  if (wakeupPerWorker_) {
+  if (wakeupMode_ == 1) {
     runtime +=
         "  if (mtThreads.empty()) return;\n"
         "  mtStop.store(true, std::memory_order_release);\n"
@@ -845,7 +850,7 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "  if (mtBubbleProfile) mtBpReport();\n";
   runtime += "}\n";
   runtime += "void " + className + "::mtWorkerLoop(int worker) {\n";
-  if (wakeupPerWorker_) {
+  if (wakeupMode_ == 1) {
     runtime +=
         "  mtPinWorker(worker);\n"
         "  if (mtBubbleProfile) mtBubble[worker].lastTsc = mtBubbleStartTsc[worker] = mtBpRdtsc();\n"
@@ -1090,7 +1095,7 @@ void CppEmitterMt::emitDefinitions() {
       runtime += "  " + node->name + "$RESET = " + value + ";\n";
     }
   }
-  if (wakeupPerWorker_) {
+  if (wakeupMode_ == 1) {
     runtime +=
         "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
         "  uint8_t parity = static_cast<uint8_t>(generation & 1);\n"
@@ -1104,7 +1109,7 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "  mtRunWorker(0, parity);\n";
   runtime +=
       "  mtDeferredEventsByWorker[0] = mtTakeDeferredEvents();\n";
-  if (wakeupPerWorker_) {
+  if (wakeupMode_ >= 1) {
     runtime +=
         "  for (uint64_t pending = (uint64_t{1} << (kMtWorkerCount - 1)) - 1; pending != 0; ) {\n"
         "    uint64_t remaining = 0;\n"
