@@ -431,6 +431,24 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
       *reason = "multi-writer-memory";
       return -1;
     }
+    // Upstream dev-mt replication invariant: only pure data cones may be
+    // replicated. Register-destination members compile to packed-state
+    // side-effect writes (mtRegisterDstW*), and OTHER tasks can read that
+    // next-value node mid-cycle. A replica never re-writes the packed field
+    // (it is excluded from copying), so a consumer rewired to the replica
+    // could read the field before the original producer's write lands.
+    // Producers whose side-effect members have cross-task readers stay
+    // unreplicated.
+    for (Node* member : producer.members) {
+      if (member->type != NODE_REG_DST) continue;
+      for (Node* reader : member->next) {
+        auto owner = plan.taskByNode_.find(reader);
+        if (owner != plan.taskByNode_.end() && owner->second != producerId) {
+          *reason = "side-effect-read-member";
+          return -1;
+        }
+      }
+    }
     bool hasValueStatement = false;
     for (const InstInfo& instruction : *producer.insts) {
       if (instruction.infoType != SUPER_INFO_STR ||

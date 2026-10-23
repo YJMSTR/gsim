@@ -62,7 +62,7 @@ case "${1:-}" in
     for spec in "coremark 50000 67944" "linux 30000 86469"; do
       set -- $spec
       (cd "$READY" && GSIM_MT_EXECUTOR=dense GSIM_THREADS=32 GSIM_MT_CPU_AFFINITY=auto \
-        taskset -c 48-79 "$EMU" -i $1.bin --diff riscv64-nemu-interpreter-so \
+        taskset -c 48-79 "$EMU" -i $( [ "$1" = coremark ] && echo coremark-2-iteration.bin || echo linux.bin ) --diff riscv64-nemu-interpreter-so \
         -b 0 -e 0 -C $2 -I $3 > /tmp/repcut7-$1-gate.log 2>&1) || true
       if grep -q "HIT GOOD TRAP" /tmp/repcut7-$1-gate.log; then echo "$1: GOOD"; else echo "$1: FAIL"; tail -3 /tmp/repcut7-$1-gate.log; fi
     done

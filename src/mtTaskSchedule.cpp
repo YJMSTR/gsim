@@ -1272,15 +1272,22 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   // inherits its producer's predecessors, so its token groups have exactly
   // the producer's sources and reuse the token the protocol already
   // publishes — targeted replication then never adds ready-token slots.
+  // GSIM_MT_REPCUT_SHARED_SLOTS=0 disables sharing (each group its own
+  // slot): the divergence-isolation variant for the kunminghu instr-count
+  // triage.
+  const char* sharedSlotsEnv = std::getenv("GSIM_MT_REPCUT_SHARED_SLOTS");
+  const bool repcutSharedSlots =
+      repcutReport.replicas > 0 &&
+      (sharedSlotsEnv == nullptr || sharedSlotsEnv[0] != '0');
   int nextSlot = 0;
-  int repcutSharedSlots = 0;
+  int repcutSharedSlotCount = 0;
   int repcutReplicaNewSlots = 0;
   std::map<std::pair<int, std::vector<int>>, int> slotBySources;
   for (const auto& bank : groupsByOwnerPair) {
     nextSlot = (nextSlot + 63) & ~63;
     for (int groupId : bank.second) {
       TokenGroup& group = groups[static_cast<size_t>(groupId)];
-      if (!group.sources.empty() || repcutReport.replicas > 0) {
+      if (!group.sources.empty() || repcutSharedSlots) {
         if (group.sources.empty()) {
           for (int predecessor : tasks.tasks_[static_cast<size_t>(group.consumer)].predecessors) {
             if (tasks.tasks_[static_cast<size_t>(predecessor)].owner == group.producerOwner) {
@@ -1293,7 +1300,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
         auto existing = slotBySources.find(key);
         if (existing != slotBySources.end()) {
           group.slot = existing->second;
-          ++repcutSharedSlots;
+          ++repcutSharedSlotCount;
           continue;
         }
         group.slot = nextSlot++;
@@ -1339,7 +1346,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     // Honest token delta of the transform: groups whose last producer-worker
     // source was replicated away disappear; replica groups reuse existing
     // slots unless their source set is new (depth tier rewrites them).
-    repcutTokens = " repcut-tokens-deduped=" + std::to_string(repcutSharedSlots) +
+    repcutTokens = " repcut-tokens-deduped=" + std::to_string(repcutSharedSlotCount) +
                    " repcut-tokens-new=" + std::to_string(repcutReplicaNewSlots) +
                    " repcut-tokens-net=" +
                    std::to_string(repcutReport.killedGroups - repcutReplicaNewSlots);
