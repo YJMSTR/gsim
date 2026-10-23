@@ -591,6 +591,10 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
         static_cast<uint32_t>(((nextBit + 63) / 64 + 7) & ~static_cast<uint32_t>(7));
     uint32_t wordCursor = cone.inputRegionWords;
     cone.regions.assign(workers.stateTasks_.size(), MtConePlan::WorkerRegion());
+    // Single-owner bits (inputs, writer ports) must be unique. Register
+    // chunk ranges may legitimately share a 64B chunk with a neighbour; the
+    // structural guarantee is that writer bits start after all chunk bits of
+    // their region, and regions are disjoint by word alignment.
     std::set<uint32_t> assignedBits;
     auto assignBit = [&](uint32_t bit) {
       Assert(assignedBits.insert(bit).second, "cone bit %u assigned twice", bit);
@@ -630,7 +634,10 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
             static_cast<uint32_t>((layout.offset + layout.bytes + 63) / 64);
         Assert(cone.regChunkBits.emplace(layout.node, std::make_pair(first, last - first)).second,
                "duplicate cone chunk range for register %s", layout.node->name.c_str());
-        for (uint32_t bit = first; bit < last; ++bit) assignBit(bit);
+        for (uint32_t bit = first; bit < last; ++bit) {
+          Assert(bit >= region.bitBegin && bit < region.bitBegin + region.regChunkCount,
+                 "register %s chunk bit outside its region", layout.node->name.c_str());
+        }
       }
       nextBit = region.bitBegin + region.regChunkCount;
       for (Node* writer : update.memoryWriters) {
