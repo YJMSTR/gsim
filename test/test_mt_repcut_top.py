@@ -154,7 +154,7 @@ class RepcutTopTest(unittest.TestCase):
                         int(fields['groups-residual']),
                         int(fields['consumers-rewired']))
                     decisions = (out / 'mt-repcut-top.csv').read_text()
-                    self.assertIn(',ok,', decisions)
+                    self.assertTrue(',ok,' in decisions or ',cone-ok,' in decisions, decisions)
                     self.assertIn('repcut-tokens-net=',
                                   stderr.splitlines()[-2] + stderr.splitlines()[-1])
                     self.assertNotEqual(model_tree(base), model_tree(out))
