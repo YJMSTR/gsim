@@ -62,6 +62,7 @@ struct Report {
   int killedGroups = 0;      // consumer groups whose last Wp source was P
   int residualGroups = 0;    // consumer groups keeping a shorter Wp token
   int depthReplicas = 0;     // replicas added by the depth-1 tier
+  int splitPureConsumers = 0;  // pure-only consumers addressable by split publication
   long long replicaCost = 0; // summed replica static cost
   long long totalCost = 0;   // summed original task static cost
   double costPct = 0.0;      // replicaCost / totalCost * 100
