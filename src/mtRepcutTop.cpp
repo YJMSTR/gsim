@@ -441,13 +441,8 @@ Report applyRepcutTop(graph& g, MtTaskPlan& plan, std::vector<int>& owners,
     // unreplicated.
     for (Node* member : producer.members) {
       if (member->type != NODE_REG_DST) continue;
-      for (Node* reader : member->next) {
-        auto owner = plan.taskByNode_.find(reader);
-        if (owner != plan.taskByNode_.end() && owner->second != producerId) {
-          *reason = "side-effect-read-member";
-          return -1;
-        }
-      }
+      *reason = "side-effect-write-member";
+      return -1;
     }
     bool hasValueStatement = false;
     for (const InstInfo& instruction : *producer.insts) {
