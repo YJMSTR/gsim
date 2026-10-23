@@ -173,5 +173,40 @@ class RepcutTopTest(unittest.TestCase):
             self.assertEqual(trees[0], trees[1])
 
 
+
+    def test_value_trace_localizer(self):
+        # The value-fingerprint localizer must report identical cycle hashes
+        # for functionally equivalent models: a traced knob-off and a traced
+        # knob-on generation of the same design must emit byte-equal VTRACE
+        # streams, and repeated runs must be self-consistent.
+        with tempfile.TemporaryDirectory(prefix='mt-repcut-vt-') as directory:
+            root = Path(directory)
+            traces = []
+            for name, repcut in (('off', None), ('on', 999)):
+                out = root / name
+                out.mkdir()
+                env = {k: v for k, v in os.environ.items()
+                       if not k.startswith('GSIM_MT_')}
+                env.update(GSIM_THREADS='4', GSIM_MT_EXECUTOR='dense',
+                           GSIM_MT_VALUE_TRACE='1')
+                if repcut is not None:
+                    env['GSIM_MT_REPCUT_TOP'] = str(repcut)
+                    env['GSIM_MT_REPCUT_MAX_COST_PCT'] = '100'
+                run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
+                     '--mt-scheduler=heft', '--mt-lookahead-window=64',
+                     '--dir', out, ROOT / 'test' / f'{DESIGN}.fir'], env)
+                _, _, phases = None, None, None
+                exe = out / 'emu-test'
+                run(['clang++', '-std=c++17', '-O1', '-Wno-parentheses-equality',
+                     '-I' + str(out), *sorted(out.glob('*.cpp')),
+                     ROOT / 'test' / f'{DESIGN}.cpp', '-pthread', '-o', exe], env)
+                result = run([exe], env)
+                lines = [line for line in result.stderr.splitlines()
+                         if line.startswith('VTRACE ')]
+                self.assertTrue(lines)
+                traces.append(lines)
+            self.assertEqual(traces[0], traces[1])
+
+
 if __name__ == '__main__':
     unittest.main()

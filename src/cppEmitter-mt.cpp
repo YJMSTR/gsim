@@ -68,9 +68,20 @@ std::string nodeDeclaration(Node* node) {
 
 }  // namespace
 
+namespace {
+// Generate-time switch for the value-fingerprint localizer. Emission is
+// inert unless the runtime knob also enables it, so traced cells behave
+// identically to untraced ones by default.
+bool valueTraceEmissionEnabled() {
+  const char* value = std::getenv("GSIM_MT_VALUE_TRACE");
+  return value != nullptr && value[0] == '1';
+}
+}  // namespace
+
 CppEmitterMt::CppEmitterMt(graph& graph)
     : graph_(graph),
       enabled_(globalConfig.MtMode),
+      valueTrace_(valueTraceEmissionEnabled()),
       workerCount_(positiveEnv("GSIM_THREADS", 1)),
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
@@ -377,6 +388,12 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "bool mtAnyAsyncResetAsserted();\n");
   fprintf(header, "void mtApplyAsyncResets();\n");
   fprintf(header, "void mtReplayAfterAsyncReset();\n");
+  if (valueTrace_) {
+    fprintf(header, "bool mtValueTraceOn = false;\n");
+    fprintf(header, "uint64_t mtTraceHash[%zu] = {};\n", tasks_.size());
+    fprintf(header, "uint64_t mtTraceCycle = 0;\n");
+    fprintf(header, "uint64_t mtTraceWindowBegin = 0; uint64_t mtTraceWindowEnd = 0;\n");
+  }
   for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) fprintf(header, "void mtTask%zu();\n", taskId);
   fprintf(header, "~S%s();\n", graph_.name.c_str());
 }
@@ -505,7 +522,7 @@ void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, i
   Assert(indent == initialIndent, "unbalanced MTask instruction tree");
 }
 
-void CppEmitterMt::emitTask(const Task& task, int indent) {
+void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
   Assert(task.insts != nullptr, "MTask has no lowered instruction stream");
   Assert(!task.members.empty(), "cannot emit an empty MTask");
 
@@ -544,6 +561,37 @@ void CppEmitterMt::emitTask(const Task& task, int indent) {
   }
 
   emitInstructions(*task.insts, indent);
+
+  if (valueTrace_) {
+    // Value fingerprint: fold every plain-storage member the task wrote.
+    // Packed registers, pending slots and worker-local values are excluded
+    // (their storage names are transformed at emission); timing-sensitive
+    // compute nodes are exactly the NODE_OTHERS globals tracked here.
+    emitText(indent, false, "if (mtValueTraceOn) { uint64_t mtVtH = mtTraceHash[" +
+               std::to_string(taskId) + "];\n");
+    for (Node* node : task.members) {
+      if (node->type != NODE_OTHERS || task.localNodes.count(node) != 0) continue;
+      if (isWorkerLocal(node)) continue;
+      std::string ref = node->name;
+      if (!node->dimension.empty()) {
+        std::string loops, close, index;
+        for (size_t d = 0; d < node->dimension.size(); ++d) {
+          const std::string i = "__vt_i" + std::to_string(d);
+          loops += "for (int " + i + " = 0; " + i + " < " +
+                   std::to_string(node->dimension[d]) + "; ++" + i + ") {";
+          close += "} ";
+          index += "[" + i + "]";
+        }
+        emitText(indent + 1, false, loops + " mtVtH = mtVtH * 1099511628211ULL + " +
+                   ref + index + "; " + close + "\n");
+      } else {
+        emitText(indent + 1, false,
+                 "mtVtH = mtVtH * 1099511628211ULL + " + ref + ";\n");
+      }
+    }
+    emitText(indent + 1, false, "mtTraceHash[" + std::to_string(taskId) +
+               "] = mtVtH; }\n");
+  }
 }
 
 void CppEmitterMt::emitDefinitions() {
@@ -582,7 +630,7 @@ void CppEmitterMt::emitDefinitions() {
   }
   for (int taskId : taskEmissionOrder) {
     emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
-    emitTask(tasks_[static_cast<size_t>(taskId)], 1);
+    emitTask(tasks_[static_cast<size_t>(taskId)], static_cast<size_t>(taskId), 1);
     emitText(0, false, "}\n");
   }
 
@@ -659,7 +707,18 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "  char* end = nullptr; long count = threads ? strtol(threads, &end, 10) : 1;\n";
   runtime += "  if (!threads || end == threads || *end != '\\0' || count != kMtWorkerCount) {\n";
   runtime += "    fprintf(stderr, \"[gsim-mt] runtime GSIM_THREADS must equal generated width %d\\n\", kMtWorkerCount); abort();\n";
-  runtime += "  }\n  mtEnabled = true;\n}\n";
+  runtime += "  }\n  mtEnabled = true;\n";
+  if (valueTrace_) {
+    runtime +=
+        "  const char* mtVt = getenv(\"GSIM_MT_VALUE_TRACE\");\n"
+        "  mtValueTraceOn = mtVt != nullptr && mtVt[0] == '1';\n"
+        "  const char* mtVtW = getenv(\"GSIM_MT_VALUE_TRACE_WINDOW\");\n"
+        "  if (mtVtW != nullptr) { char* mtVtEnd = nullptr;\n"
+        "    mtTraceWindowBegin = strtoull(mtVtW, &mtVtEnd, 10);\n"
+        "    if (mtVtEnd != nullptr && *mtVtEnd == ',')\n"
+        "      mtTraceWindowEnd = strtoull(mtVtEnd + 1, nullptr, 10); }\n";
+  }
+  runtime += "}\n";
 
   runtime += "void " + className + "::mtPinWorker(int worker) {\n";
   runtime += "  const char* affinity = getenv(\"GSIM_MT_CPU_AFFINITY\");\n";
@@ -904,7 +963,25 @@ void CppEmitterMt::emitDefinitions() {
       "    assert(!\"deferred RTL assertion failure\");\n"
       "    abort();\n"
       "  }\n";
-  runtime += "  ++cycles;\n}\n";
+  runtime += "  ++cycles;\n";
+  if (valueTrace_) {
+    runtime +=
+        "  if (mtValueTraceOn) {\n"
+        "    uint64_t mtVtC = 1469598103934665603ULL;\n"
+        "    for (size_t mtVtI = 0; mtVtI < sizeof(mtTraceHash)/sizeof(mtTraceHash[0]); ++mtVtI)\n"
+        "      mtVtC = (mtVtC ^ mtTraceHash[mtVtI]) * 1099511628211ULL;\n"
+        "    if (mtTraceWindowBegin <= cycles && cycles <= mtTraceWindowEnd) {\n"
+        "      for (size_t mtVtI = 0; mtVtI < sizeof(mtTraceHash)/sizeof(mtTraceHash[0]); ++mtVtI)\n"
+        "        fprintf(stderr, \"VTRACE_T %llu %zu %llu\\n\",\n"
+        "                (unsigned long long)cycles, mtVtI,\n"
+        "                (unsigned long long)mtTraceHash[mtVtI]);\n"
+        "    }\n"
+        "    fprintf(stderr, \"VTRACE %llu %llu\\n\",\n"
+        "            (unsigned long long)cycles, (unsigned long long)mtVtC);\n"
+        "    if (mtTraceWindowEnd != 0 && cycles > mtTraceWindowEnd) mtValueTraceOn = false;\n"
+        "  }\n";
+  }
+  runtime += "}\n";
   emitText(0, true, runtime);
 }
 
