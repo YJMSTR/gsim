@@ -602,26 +602,23 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
     for (uint32_t bit : cone.inputBits) assignBit(bit);
     for (size_t worker = 0; worker < workers.stateTasks_.size(); ++worker) {
       MtStateTask& update = workers.stateTasks_[worker];
-      MtConePlan::WorkerRegion& region = cone.regions[worker];
       size_t offset = 0;
+      size_t maxAlign = 1;
       for (Node* reg : update.registers) {
         const size_t align = coneTypeAlignBytes(reg->width);
+        maxAlign = std::max(maxAlign, align);
         offset = (offset + align - 1) & ~(align - 1);
         const size_t bytes = coneMemberBytes(reg);
         region.registers.push_back({reg, offset, bytes});
         offset += bytes;
       }
-      // The block struct itself carries no padding: only its instances are
-      // 64B-aligned, so the commit size is the unrounded member sum.
-      region.regBlockBytes = offset;
+      // The block struct itself carries no inter-member padding beyond the
+      // alignment each member needs; only its instances are 64B-aligned. The
+      // commit size is the member sum rounded up to the struct's own
+      // alignment (tail padding), matching sizeof exactly.
+      region.regBlockBytes = (offset + maxAlign - 1) & ~(maxAlign - 1);
       region.regChunkCount =
           static_cast<uint32_t>((region.regBlockBytes + 63) / 64);
-      const uint32_t regionBits = region.regChunkCount +
-          static_cast<uint32_t>(update.memoryWriters.size()) +
-          static_cast<uint32_t>(update.sparseRegisterWriters.size());
-      // Regions are word-aligned in BOTH spaces: bit b always lives in dirty
-      // word b >> 6, each dirty word has exactly one owning producer thread,
-      // and the per-region clear loop covers precisely [wordBegin, wordEnd).
       region.bitBegin = wordCursor * 64;
       region.bitCount = regionBits;
       region.wordBegin = wordCursor;
