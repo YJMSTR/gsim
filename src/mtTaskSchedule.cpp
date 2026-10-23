@@ -602,6 +602,7 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
     for (uint32_t bit : cone.inputBits) assignBit(bit);
     for (size_t worker = 0; worker < workers.stateTasks_.size(); ++worker) {
       MtStateTask& update = workers.stateTasks_[worker];
+      MtConePlan::WorkerRegion& region = cone.regions[worker];
       size_t offset = 0;
       size_t maxAlign = 1;
       for (Node* reg : update.registers) {
