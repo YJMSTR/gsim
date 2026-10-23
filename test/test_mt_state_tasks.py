@@ -66,10 +66,13 @@ def run(command, env):
 
 
 class StateTasksTest(unittest.TestCase):
-    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=()):
+    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=(),
+                 wakeup=None):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
+        if wakeup is not None:
+            env['GSIM_MT_WAKEUP_PERWORKER'] = wakeup
         run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
              '--mt-scheduler=' + scheduler, f'--mt-lookahead-window={lookahead}',
              *extra, '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
@@ -149,6 +152,58 @@ class StateTasksTest(unittest.TestCase):
                 out = root / f'la64-r{run_index}'
                 out.mkdir()
                 self.generate(out, 'mt-state-tasks', 4, lookahead=64)
+                trees.append({path.name: path.read_bytes()
+                              for path in sorted(out.iterdir())})
+            self.assertEqual(trees[0], trees[1])
+
+    def test_wakeup_perworker_trace_equivalence(self):
+        # GSIM_MT_WAKEUP_PERWORKER=1 replaces the single shared generation
+        # line with one 64-byte wake slot per worker (main fans the new
+        # generation out with plain release stores) and turns the in-order
+        # join into a bitmap batch scan. Neither change may alter any
+        # observable trace on either executor path; a lost wakeup or a
+        # missed done-flag would hang the model and fail the run timeout
+        # (the liveness gate for this protocol change).
+        baseline = None
+        for workers in (1, 2, 4):
+            for lookahead in (0, 16, 64):
+                for wakeup in (None, '1'):
+                    with self.subTest(workers=workers, lookahead=lookahead,
+                                      wakeup=wakeup), \
+                            tempfile.TemporaryDirectory(
+                                prefix='mt-wakeup-pp-') as directory:
+                        out = Path(directory)
+                        env, _ = self.generate(out, 'mt-state-tasks', workers,
+                                               lookahead=lookahead,
+                                               wakeup=wakeup)
+                        trace = self.trace(out, 'mt-state-tasks', env)
+                        if baseline is None:
+                            baseline = trace
+                            self.assertTrue(baseline)
+                        self.assertEqual(trace, baseline)
+        # mt-memory-commit exercises real cross-worker token groups plus the
+        # full wake/join cycle with 4 workers.
+        signatures = []
+        for wakeup in (None, '1'):
+            with tempfile.TemporaryDirectory(
+                    prefix='mt-wakeup-pp-mem-') as directory:
+                out = Path(directory)
+                env, _ = self.generate(out, 'mt-memory-commit', 4,
+                                       lookahead=16, wakeup=wakeup)
+                signatures.append(self.simulate(out, 'mt-memory-commit', env))
+        self.assertEqual(len(set(signatures)), 1, signatures)
+
+    def test_wakeup_perworker_generation_determinism(self):
+        # Repeated knob-on generation must stay byte-deterministic.
+        with tempfile.TemporaryDirectory(
+                prefix='mt-wakeup-pp-det-') as directory:
+            root = Path(directory)
+            trees = []
+            for run_index in (0, 1):
+                out = root / f'wakeup-r{run_index}'
+                out.mkdir()
+                self.generate(out, 'mt-state-tasks', 4, lookahead=64,
+                              wakeup='1')
                 trees.append({path.name: path.read_bytes()
                               for path in sorted(out.iterdir())})
             self.assertEqual(trees[0], trees[1])

@@ -26,6 +26,10 @@ int positiveEnv(const char* name, int fallback) {
              ? static_cast<int>(parsed)
              : fallback;
 }
+int flagEnvIsOn(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
 
 int resetChunkSize() {
   const char* value = std::getenv("GSIM_EMIT_RESET_CHUNK");
@@ -75,7 +79,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      wakeupPerWorker_(flagEnvIsOn("GSIM_MT_WAKEUP_PERWORKER")) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -277,6 +282,11 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "alignas(64) std::atomic<uint64_t> mtGeneration{0};\n");
   fprintf(header, "alignas(64) std::atomic<int> mtReadyWorkers{0};\n");
   fprintf(header, "alignas(64) std::atomic<bool> mtStop{false};\n");
+  if (wakeupPerWorker_) {
+    fprintf(header,
+            "struct alignas(64) MtWakeSlot { std::atomic<uint64_t> generation{0}; };\n"
+            "MtWakeSlot mtWakeSlots[kMtWorkerCount];\n");
+  }
   fprintf(header, "bool mtEnabled = false;\n");
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     fprintf(header, "struct alignas(64) MtLookaheadStats { uint64_t calls{}, scanned{}, found{}, fullMiss{}; };\n");
@@ -801,13 +811,25 @@ void CppEmitterMt::emitDefinitions() {
       "}\n";
 
   runtime += "void " + className + "::mtStopWorkers() {\n";
-  runtime +=
-      "  if (mtThreads.empty()) return;\n"
-      "  mtStop.store(true, std::memory_order_release);\n"
-      "  mtGeneration.fetch_add(1, std::memory_order_release);\n"
-      "  for (std::thread& thread : mtThreads) if (thread.joinable()) thread.join();\n"
-      "  mtThreads.clear();\n"
-      "}\n";
+  if (wakeupPerWorker_) {
+    runtime +=
+        "  if (mtThreads.empty()) return;\n"
+        "  mtStop.store(true, std::memory_order_release);\n"
+        "  const uint64_t stopGeneration = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
+        "  for (int worker = 1; worker < kMtWorkerCount; ++worker)\n"
+        "    mtWakeSlots[worker].generation.store(stopGeneration, std::memory_order_release);\n"
+        "  for (std::thread& thread : mtThreads) if (thread.joinable()) thread.join();\n"
+        "  mtThreads.clear();\n"
+        "}\n";
+  } else {
+    runtime +=
+        "  if (mtThreads.empty()) return;\n"
+        "  mtStop.store(true, std::memory_order_release);\n"
+        "  mtGeneration.fetch_add(1, std::memory_order_release);\n"
+        "  for (std::thread& thread : mtThreads) if (thread.joinable()) thread.join();\n"
+        "  mtThreads.clear();\n"
+        "}\n";
+  }
   runtime += className + "::~" + className + "() {\n  mtStopWorkers();\n";
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     runtime +=
@@ -823,36 +845,69 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "  if (mtBubbleProfile) mtBpReport();\n";
   runtime += "}\n";
   runtime += "void " + className + "::mtWorkerLoop(int worker) {\n";
-  runtime +=
-      "  mtPinWorker(worker);\n"
-      "  if (mtBubbleProfile) mtBubble[worker].lastTsc = mtBubbleStartTsc[worker] = mtBpRdtsc();\n"
-      "  uint64_t seen = mtGeneration.load(std::memory_order_acquire);\n"
-      "  mtReadyWorkers.fetch_add(1, std::memory_order_release);\n"
-      "  for (;;) {\n"
-      "    MTBP_TICK(worker, mtBpProtocolOther);\n"
-      "    uint64_t generation;\n"
-      "    do {\n"
-      "      generation = mtGeneration.load(std::memory_order_acquire);\n"
-      "      if (mtStop.load(std::memory_order_acquire)) {\n"
-      "        MTBP_TICK(worker, mtBpSpinGenIdle);\n"
-      "        if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
-      "        return;\n"
-      "      }\n"
-      "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    } while (generation == seen);\n"
-      "    MTBP_TICK(worker, mtBpSpinGenIdle);\n"
-      "    if (mtStop.load(std::memory_order_acquire)) {\n"
-      "      MTBP_TICK(worker, mtBpProtocolOther);\n"
-      "      if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
-      "      return;\n"
-      "    }\n"
-      "    mtRunWorker(worker, static_cast<uint8_t>(generation & 1));\n"
-      "    mtDeferredEventsByWorker[worker] = mtTakeDeferredEvents();\n"
-      "    mtDoneFlags[worker - 1].parity.store(static_cast<uint8_t>(generation & 1),\n"
-      "                                         std::memory_order_release);\n"
-      "    seen = generation;\n"
-      "  }\n"
-      "}\n";
+  if (wakeupPerWorker_) {
+    runtime +=
+        "  mtPinWorker(worker);\n"
+        "  if (mtBubbleProfile) mtBubble[worker].lastTsc = mtBubbleStartTsc[worker] = mtBpRdtsc();\n"
+        "  uint64_t seen = mtWakeSlots[worker].generation.load(std::memory_order_acquire);\n"
+        "  mtReadyWorkers.fetch_add(1, std::memory_order_release);\n"
+        "  for (;;) {\n"
+        "    MTBP_TICK(worker, mtBpProtocolOther);\n"
+        "    uint64_t generation;\n"
+        "    do {\n"
+        "      generation = mtWakeSlots[worker].generation.load(std::memory_order_acquire);\n"
+        "      if (mtStop.load(std::memory_order_acquire)) {\n"
+        "        MTBP_TICK(worker, mtBpSpinGenIdle);\n"
+        "        if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
+        "        return;\n"
+        "      }\n"
+        "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    } while (generation == seen);\n"
+        "    MTBP_TICK(worker, mtBpSpinGenIdle);\n"
+        "    if (mtStop.load(std::memory_order_acquire)) {\n"
+        "      MTBP_TICK(worker, mtBpProtocolOther);\n"
+        "      if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
+        "      return;\n"
+        "    }\n"
+        "    mtRunWorker(worker, static_cast<uint8_t>(generation & 1));\n"
+        "    mtDeferredEventsByWorker[worker] = mtTakeDeferredEvents();\n"
+        "    mtDoneFlags[worker - 1].parity.store(static_cast<uint8_t>(generation & 1),\n"
+        "                                         std::memory_order_release);\n"
+        "    seen = generation;\n"
+        "  }\n"
+        "}\n";
+  } else {
+    runtime +=
+        "  mtPinWorker(worker);\n"
+        "  if (mtBubbleProfile) mtBubble[worker].lastTsc = mtBubbleStartTsc[worker] = mtBpRdtsc();\n"
+        "  uint64_t seen = mtGeneration.load(std::memory_order_acquire);\n"
+        "  mtReadyWorkers.fetch_add(1, std::memory_order_release);\n"
+        "  for (;;) {\n"
+        "    MTBP_TICK(worker, mtBpProtocolOther);\n"
+        "    uint64_t generation;\n"
+        "    do {\n"
+        "      generation = mtGeneration.load(std::memory_order_acquire);\n"
+        "      if (mtStop.load(std::memory_order_acquire)) {\n"
+        "        MTBP_TICK(worker, mtBpSpinGenIdle);\n"
+        "        if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
+        "        return;\n"
+        "      }\n"
+        "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    } while (generation == seen);\n"
+        "    MTBP_TICK(worker, mtBpSpinGenIdle);\n"
+        "    if (mtStop.load(std::memory_order_acquire)) {\n"
+        "      MTBP_TICK(worker, mtBpProtocolOther);\n"
+        "      if (mtBubbleProfile) mtBubbleEndTsc[worker] = mtBubble[worker].lastTsc;\n"
+        "      return;\n"
+        "    }\n"
+        "    mtRunWorker(worker, static_cast<uint8_t>(generation & 1));\n"
+        "    mtDeferredEventsByWorker[worker] = mtTakeDeferredEvents();\n"
+        "    mtDoneFlags[worker - 1].parity.store(static_cast<uint8_t>(generation & 1),\n"
+        "                                         std::memory_order_release);\n"
+        "    seen = generation;\n"
+        "  }\n"
+        "}\n";
+  }
 
   if (lookaheadWindow_ > 0) {
     size_t maxWorkerTasks = 1;
@@ -1035,18 +1090,42 @@ void CppEmitterMt::emitDefinitions() {
       runtime += "  " + node->name + "$RESET = " + value + ";\n";
     }
   }
-  runtime +=
-      "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
-      "  uint8_t parity = static_cast<uint8_t>(generation & 1);\n";
+  if (wakeupPerWorker_) {
+    runtime +=
+        "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
+        "  uint8_t parity = static_cast<uint8_t>(generation & 1);\n"
+        "  for (int worker = 1; worker < kMtWorkerCount; ++worker)\n"
+        "    mtWakeSlots[worker].generation.store(generation, std::memory_order_release);\n";
+  } else {
+    runtime +=
+        "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"
+        "  uint8_t parity = static_cast<uint8_t>(generation & 1);\n";
+  }
   runtime += "  mtRunWorker(0, parity);\n";
   runtime +=
       "  mtDeferredEventsByWorker[0] = mtTakeDeferredEvents();\n";
-  runtime +=
-      "  for (int worker = 1; worker < kMtWorkerCount; ++worker) {\n"
-      "    while (mtDoneFlags[worker - 1].parity.load(std::memory_order_acquire) != parity)\n"
-      "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "  }\n"
-      "  MTBP_TICK(0, mtBpSpinJoin);\n";
+  if (wakeupPerWorker_) {
+    runtime +=
+        "  for (uint64_t pending = (uint64_t{1} << (kMtWorkerCount - 1)) - 1; pending != 0; ) {\n"
+        "    uint64_t remaining = 0;\n"
+        "    for (uint64_t bits = pending; bits != 0; ) {\n"
+        "      const int flag = __builtin_ctzll(bits);\n"
+        "      bits &= bits - 1;\n"
+        "      if (mtDoneFlags[flag].parity.load(std::memory_order_acquire) != parity)\n"
+        "        remaining |= uint64_t{1} << flag;\n"
+        "    }\n"
+        "    if (remaining == pending) __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    pending = remaining;\n"
+        "  }\n"
+        "  MTBP_TICK(0, mtBpSpinJoin);\n";
+  } else {
+    runtime +=
+        "  for (int worker = 1; worker < kMtWorkerCount; ++worker) {\n"
+        "    while (mtDoneFlags[worker - 1].parity.load(std::memory_order_acquire) != parity)\n"
+        "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "  }\n"
+        "  MTBP_TICK(0, mtBpSpinJoin);\n";
+  }
   runtime +=
       "  if (mtAnyAsyncResetAsserted()) {\n"
       "    for (int worker = 0; worker < kMtWorkerCount; ++worker)\n"

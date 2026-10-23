@@ -648,6 +648,29 @@ cycle k:
 
 破坏第 2 或第 5 条会重现早期 XiangShan 乱序问题；破坏第 3、4 或第 6 条会形成数据竞争、旧值读取或死锁。
 
+### 5.4 每 worker 唤醒行与批量 join（GSIM_MT_WAKEUP_PERWORKER）
+
+设置生成期环境变量 `GSIM_MT_WAKEUP_PERWORKER=1`（默认关闭）后，唤醒/join
+协议从两条共享热行改为点对点通信：
+
+- 新增 `MtWakeSlot mtWakeSlots[kMtWorkerCount]`（每槽独占 64 字节行，
+  内含 atomic `uint64_t` generation）。worker 只自旋读自己的一行，
+  不再全核轮询同一 `mtGeneration`；
+  `stepMt()` 在运行 worker 0 之前，把新 generation 用普通 release store
+  逐槽扇出（每行只有一个读者，读侧分散到不同 L3 slice）；
+- `mtGeneration.fetch_add` 退化为无共享者的计数器（仅主线程读写），
+  停止路径 `mtStopWorkers()` 同样先递增计数再逐槽扇出唤醒；
+- join 从严格按 worker 序的嵌套 while 改为位图批量扫描：主线程每轮
+  load 全部未完成 done flag（各 flag 本就独占 64 字节行，load 之间无
+  控制依赖、可在乱序核上并行发出），无进展才 `pause`。语义仍是
+  "所有 done parity == 当前 parity"，acquire 语义逐 flag 保持。
+
+该模式只改变唤醒传播与完成检测的缓存行拓扑，不改变代际、奇偶或 token
+语义（5.2/5.3 的全部不变量保持）。关闭该开关时生成的模型与不包含本
+功能的版本逐字节相同；开启后小模型 trace 与关闭侧逐字节相等
+（`test_wakeup_perworker_trace_equivalence`，运行超时即活性门）。
+
+
 ## 6. 固定线程池
 
 模型构造顺序为：
@@ -811,6 +834,7 @@ task 内局部中间量使用 `T value{};` 值初始化。部分 external/memory
 | `--mt-lookahead-window=N` | `16` | 队头 token 阻塞时最多检查的后继任务数；`0` 恢复严格顺序 |
 | `--mt-lookahead-stats=on|off` | `off` | 生成 per-worker lookahead calls/scanned/found/fullmiss 统计 |
 | `GSIM_EMIT_RESET_CHUNK` | `4096` | reset 函数目标语句数；`0` 禁用 |
+| `GSIM_MT_WAKEUP_PERWORKER` | `0` | `1` 时启用每 worker 唤醒行 + 批量 join 扫描（见 5.4） |
 | `--supernode-max-size=N` | 项目默认值 | 上游图划分粒度，会影响 task 数和并行度 |
 | `--cpp-max-size-KB=N` | 项目默认值 | 生成 C++ 文件切分大小 |
 
