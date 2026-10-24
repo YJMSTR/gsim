@@ -81,6 +81,8 @@ Config::Config() {
   MtScheduler = "heft";
   MtReplicationMaxOps = 3;
   MtReplicationMinFanout = 2;
+  MtCostOverrideCsv = "";
+  MtConeCommit = false;
   MtLookaheadWindow = 0;
   MtLookaheadStats = false;
   MtSparseRegisterMinBytes = 1024;
@@ -470,6 +472,20 @@ int main(int argc, char** argv) {
   graph* g = NULL;
   static int dumpIdx = 0;
   const char *InputFileName = parseCommandLine(argc, argv);
+
+  // GSIM_MT_COST_OVERRIDE=<csv>: replace the analytic HEFT task costs with
+  // measured means (task_id,calls,total_ns rows, e.g. from
+  // GSIM_MT_BUBBLE_TASKTIMES) before scheduling. Empty/unset keeps the
+  // analytic model, so the knob is off by default.
+  if (const char* costOverride = std::getenv("GSIM_MT_COST_OVERRIDE")) {
+    if (costOverride[0] != '\0') globalConfig.MtCostOverrideCsv = costOverride;
+  }
+  // GSIM_MT_CONE_ACTIVITY=1: replace the whole-block register commit memcpy
+  // with a dirty-chunk commit (only differing 64B chunks are copied,
+  // bit-identical results). Stats stay off; this is the commit-block reuse.
+  if (const char* coneActivity = std::getenv("GSIM_MT_CONE_ACTIVITY")) {
+    globalConfig.MtConeCommit = coneActivity[0] == '1';
+  }
 
   size_t size = 0, mapSize = 0;
   char *strbuf;

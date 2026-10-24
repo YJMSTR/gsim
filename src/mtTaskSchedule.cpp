@@ -589,7 +589,10 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
       const std::string destination = "mtRegisterDstW" + std::to_string(worker);
       update.body.push_back(
           {static_cast<uint8_t>(SUPER_INFO_STR),
-           "memcpy(&" + source + ", &" + destination + ", sizeof(" + source + "));"});
+           globalConfig.MtConeCommit
+               ? "mtConeCommitBlock(&" + source + ", &" + destination +
+                     ", (unsigned)sizeof(" + source + "), nullptr, 0u, 0);"
+               : "memcpy(&" + source + ", &" + destination + ", sizeof(" + source + "));"});
     }
     for (Node* writer : update.memoryWriters) appendMemoryCommit(update, writer);
     update.chunkCount = countResetChunks(update.body, chunkSize);
