@@ -817,11 +817,110 @@ void CppEmitterMt::writeSparseAudit() const {
   };
   runClosure(gateV01, untrackedV01, reasonsV01, false);
 
-  // ---- v0.2 closure: REG_DST-only writes allowed; mapped REG_SRC tracked. ----
-  std::vector<char> gateV02(taskCount, 1);
+  // ---- v0.2 co-fixpoint (Main-defined, replaces the invalid single-rule
+  // closure): A = gate OR source. Each round uses the previous round's
+  // A/gate/source:
+  //   gate[i]   = no memory/DPI effect bit
+  //               && has an active predecessor (predecessor in A)
+  //               && no direct untracked input (INP/MEMORY/EXT-unowned/
+  //                  unmapped REG_SRC)
+  //               && every value input's producer is in A
+  //               && no wide/array value input (comparable outputs only)
+  //   source[i] = !gate[i] && some successor j has gate[j]
+  //               && every output i feeds that gate j with is a narrow
+  //                  comparable scalar
+  //   A[i]      = gate[i] || source[i]
+  // Nodes without active predecessors cannot gate but can be sources;
+  // sources with no gate successor are removed by construction.
+  std::vector<char> gateV02(taskCount, 0);
+  std::vector<char> sourceV02(taskCount, 0);
+  std::vector<char> activeV02(taskCount, 1);
   std::vector<size_t> untrackedV02(taskCount, 0);
   std::vector<std::string> reasonsV02(taskCount);
-  runClosure(gateV02, untrackedV02, reasonsV02, true);
+  {
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < static_cast<int>(taskCount) + 4) {
+      changed = false;
+      std::vector<char> nextGate(taskCount, 0);
+      std::vector<char> nextSource(taskCount, 0);
+      std::vector<size_t> nextUntracked(taskCount, 0);
+      std::vector<std::string> nextReasons(taskCount);
+      for (size_t id = 0; id < taskCount; ++id) {
+        const bool dqEffect = (effectMask[id] & 2) != 0 || (effectMask[id] & 4) != 0;
+        bool activePred = false;
+        for (int predecessor : tasks_[id].predecessors) {
+          if (activeV02[static_cast<size_t>(predecessor)]) activePred = true;
+        }
+        size_t untracked = 0;
+        bool wide = false;
+        std::map<std::string, size_t> reasonCounts;
+        for (const InputRef& input : inputs[id]) {
+          if (input.node->type == NODE_REG_SRC) {
+            if (regOffset.find(input.node) != regOffset.end()) continue;  // stateActive
+            ++untracked;
+            ++reasonCounts["REG_SRC-UNMAPPED"];
+            continue;
+          }
+          if (input.node->type == NODE_MEMORY || input.node->type == NODE_INP) {
+            ++untracked;
+            ++reasonCounts[input.node->type == NODE_MEMORY ? "MEMORY" : "INP"];
+            continue;
+          }
+          if (input.producer < 0) {
+            ++untracked;
+            ++reasonCounts["EXT/UNOWNED"];
+            continue;
+          }
+          if (input.producer == static_cast<int>(id)) continue;
+          if (!activeV02[static_cast<size_t>(input.producer)]) {
+            ++untracked;
+            ++reasonCounts["PRODUCER-NOT-ACTIVE"];
+            continue;
+          }
+          if (input.wide) wide = true;
+        }
+        nextUntracked[id] = untracked;
+        std::string reasons;
+        for (const auto& entry : reasonCounts) {
+          reasons += (reasons.empty() ? "" : ";") + entry.first + ":" +
+                     std::to_string(entry.second);
+        }
+        if (wide) reasons += reasons.empty() ? "WIDE-INPUT" : ";WIDE-INPUT";
+        if (!activePred) reasons += reasons.empty() ? "NO-ACTIVE-PRED" : ";NO-ACTIVE-PRED";
+        if (dqEffect) reasons += reasons.empty() ? "MEM/DPI" : ";MEM/DPI";
+        nextReasons[id] = reasons;
+        nextGate[id] = !dqEffect && activePred && untracked == 0 && !wide;
+      }
+      // source: non-gate with >=1 gate successor reachable via narrow outputs
+      for (size_t id = 0; id < taskCount; ++id) {
+        if (nextGate[id]) continue;
+        bool feedsGate = false;
+        for (int successor : tasks_[id].successors) {
+          if (!nextGate[static_cast<size_t>(successor)]) continue;
+          // every output this task feeds that gate with must be narrow
+          bool narrow = true;
+          for (const InputRef& input : inputs[static_cast<size_t>(successor)]) {
+            if (input.producer == static_cast<int>(id) && input.wide) narrow = false;
+          }
+          if (narrow) feedsGate = true;
+        }
+        nextSource[id] = feedsGate;
+      }
+      for (size_t id = 0; id < taskCount; ++id) {
+        const char nextActive = nextGate[id] || nextSource[id];
+        if (nextGate[id] != gateV02[id] || nextSource[id] != sourceV02[id] ||
+            nextActive != activeV02[id]) {
+          changed = true;
+        }
+        gateV02[id] = nextGate[id];
+        sourceV02[id] = nextSource[id];
+        activeV02[id] = nextActive;
+        untrackedV02[id] = nextUntracked[id];
+        reasonsV02[id] = nextReasons[id];
+      }
+    }
+  }
 
   // Consumers of each produced value node.
   std::map<Node*, std::vector<int>> consumersOf;
@@ -878,16 +977,7 @@ void CppEmitterMt::writeSparseAudit() const {
     const Task& task = tasks_[id];
     const bool isGate = gateV01[id] != 0;
     const bool isGateV02 = gateV02[id] != 0;
-    bool feedsGate = false;
-    if (!isGateV02) {
-      for (Node* node : writesByTask[id]) {
-        auto consumers = consumersOf.find(node);
-        if (consumers == consumersOf.end()) continue;
-        for (int consumer : consumers->second) {
-          if (gateV02[static_cast<size_t>(consumer)]) feedsGate = true;
-        }
-      }
-    }
+    const bool feedsGate = sourceV02[id] != 0;
     std::string preds, succs;
     for (int p : task.predecessors) preds += (preds.empty() ? "" : "+") + std::to_string(p);
     for (int p : task.successors) succs += (succs.empty() ? "" : "+") + std::to_string(p);
