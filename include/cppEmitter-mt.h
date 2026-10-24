@@ -63,6 +63,8 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
     bool sideEffect = false;
   };
   ValueProbePlan planValueProbe(const Task& task);
+  void registerStoreCensusSites();
+  int nextStoreCensusSite(const std::string& name, const std::string& text);
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
   void emitTask(const Task& task, int indent);
   void buildRegisterStorageNames();
@@ -78,6 +80,9 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   bool lookaheadStats_ = false;
   bool valueHistogram_ = false;
   std::vector<ValueProbePlan> valueProbes_;
+  bool storeCensus_ = false;
+  std::vector<std::string> storeCensusSites_;
+  std::map<std::string, int> storeCensusSiteIndex_;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
 };

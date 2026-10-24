@@ -35,6 +35,14 @@ int resetChunkSize() {
   return end != value && *end == '\0' && parsed >= 256 && parsed <= INT_MAX ? static_cast<int>(parsed) : 0;
 }
 
+bool storeCensusEnabled() {
+  // GSIM_MT_STORE_CENSUS: instrument state-phase register writebacks with
+  // per-site changed/unchanged counters (the store-elision census). Unset
+  // reproduces the baseline byte for byte.
+  const char* value = std::getenv("GSIM_MT_STORE_CENSUS");
+  return value != nullptr && value[0] != '\0';
+}
+
 bool valueHistogramEnabled() {
   // Generation-time gate: instrumentation is emitted only when the variable
   // is set, so unset runs reproduce the baseline byte for byte. The runtime
@@ -84,7 +92,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
       lookaheadStats_(globalConfig.MtLookaheadStats),
-      valueHistogram_(valueHistogramEnabled()) {}
+      valueHistogram_(valueHistogramEnabled()),
+      storeCensus_(storeCensusEnabled()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -96,7 +105,39 @@ void CppEmitterMt::prepare() {
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
   buildRegisterStorageNames();
+  if (storeCensus_) registerStoreCensusSites();
   writeTaskPhaseReport();
+}
+
+// Walks the state-update bodies in emission order and registers every
+// mtRegisterDstW store site, so the header-side counter arrays are sized
+// before any function body is emitted. nextStoreCensusSite() replays the
+// same order during emission; chunk splits never break a store statement.
+void CppEmitterMt::registerStoreCensusSites() {
+  storeCensusSites_.clear();
+  storeCensusSiteIndex_.clear();
+  for (const StateUpdate& update : stateTasks_) {
+    const std::string name = "mtUpdateStateW" + std::to_string(update.owner);
+    for (const auto& instruction : update.body) {
+      if (instruction.type != SUPER_INFO_STR) continue;
+      const std::string line = mapRegisterNames(instruction.text);
+      const size_t assign = line.find(" = ");
+      if (assign == std::string::npos || line.compare(0, 14, "mtRegisterDstW", 14) != 0) {
+        continue;
+      }
+      const size_t dot = line.find('.');
+      const std::string reg = line.substr(dot + 1, assign - dot - 1);
+      storeCensusSiteIndex_[name + "/" + instruction.text] =
+          static_cast<int>(storeCensusSites_.size());
+      storeCensusSites_.push_back(std::to_string(update.owner) + "," + reg);
+    }
+  }
+  fprintf(stderr, "[cppEmitter-mt] store-census sites=%zu\n", storeCensusSites_.size());
+}
+
+int CppEmitterMt::nextStoreCensusSite(const std::string& name, const std::string& text) {
+  auto found = storeCensusSiteIndex_.find(name + "/" + text);
+  return found == storeCensusSiteIndex_.end() ? -1 : found->second;
 }
 
 void CppEmitterMt::writeTaskPhaseReport() const {
@@ -266,6 +307,24 @@ void CppEmitterMt::emitHeaderPreamble(FILE* header) const {
   fprintf(header,
           "#include <atomic>\n#include <cstdio>\n#include <thread>\n#include <sched.h>\n"
           "#include <string>\n#include <utility>\n\n");
+  if (storeCensus_) {
+    // Register-store compare helper: narrow scalars compare directly, wide
+    // scalars and arrays fold to 64 bits (census fidelity is enough).
+    fprintf(header,
+            "static inline unsigned long long mtSeFold(const void* d, size_t n) {\n"
+            "  const unsigned char* p = (const unsigned char*)d;\n"
+            "  unsigned long long a = 0x9E3779B97F4A7C15ull;\n"
+            "  size_t i = 0;\n"
+            "  for (; i + 8 <= n; i += 8) {\n"
+            "    unsigned long long w = 0;\n"
+            "    __builtin_memcpy(&w, p + i, 8);\n"
+            "    a = (a ^ w) * 0xFF51AFD7ED558CCDull;\n"
+            "  }\n"
+            "  unsigned long long t = 0;\n"
+            "  if (i < n) __builtin_memcpy(&t, p + i, n - i);\n"
+            "  return (a ^ t) * 0xC4CEB9FE1A85EC53ull;\n"
+            "}\n");
+  }
   if (valueHistogram_) {
     // Fold helper lives in the header so every split model file sees it.
     fprintf(header,
@@ -358,6 +417,19 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
     fprintf(header, "static const uint16_t mtValueTaskFieldCount[%zu];\n",
             std::max<size_t>(1, tasks_.size()));
     fprintf(header, "void mtValueHistogramReport();\n");
+  }
+  if (storeCensus_) {
+    fprintf(header, "bool mtStoreCensus = false;\n");
+    fprintf(header, "const char* mtStoreCensusPath = nullptr;\n");
+    fprintf(header, "static const int kMtStoreCensusSiteCount = %zu;\n",
+            storeCensusSites_.size());
+    fprintf(header, "unsigned long long mtStoreCalls[%zu] = {};\n",
+            std::max<size_t>(1, storeCensusSites_.size()));
+    fprintf(header, "unsigned long long mtStoreUnchanged[%zu] = {};\n",
+            std::max<size_t>(1, storeCensusSites_.size()));
+    fprintf(header, "void mtStoreCensusReport();\n");
+    fprintf(header, "static const char* const mtStoreCensusSiteNames[%zu];\n",
+            std::max<size_t>(1, storeCensusSites_.size()));
   }
   fprintf(header,
           "unsigned long long mtBubbleFirstTsc = 0, mtBubbleLastTsc = 0;\n"
@@ -547,9 +619,32 @@ void CppEmitterMt::emitResetBodyFunction(const std::string& name, const std::str
         emitText(--indent, false, mapRegisterNames(instruction.text) + "\n");
         --nesting;
         break;
-      case SUPER_INFO_STR:
-        emitText(indent, false, mapRegisterNames(instruction.text) + "\n");
+      case SUPER_INFO_STR: {
+        std::string line = mapRegisterNames(instruction.text);
+        const size_t assign = line.find(" = ");
+        const bool isStateStore =
+            storeCensus_ && name.compare(0, 14, "mtUpdateStateW") == 0 &&
+            assign != std::string::npos && line.compare(0, 14, "mtRegisterDstW", 14) == 0;
+        if (isStateStore) {
+          // Census: evaluate the RHS once at the same point, count unchanged
+          // writes via byte folds, then store unconditionally (behavior and
+          // value semantics unchanged). Site index comes from the prepare()
+          // pre-scan, so header-side counter arrays are sized correctly.
+          const std::string lvalue = line.substr(0, assign);
+          std::string rhs = line.substr(assign + 3);
+          while (!rhs.empty() && (rhs.back() == ';' || rhs.back() == ' ')) rhs.pop_back();
+          const int site = nextStoreCensusSite(name, instruction.text);
+          Assert(site >= 0, "unregistered store-census site in %s", name.c_str());
+          emitText(indent, false,
+                   "{ const auto mtSeV = (" + rhs + "); ++mtStoreCalls[" +
+                       std::to_string(site) + "]; mtStoreUnchanged[" + std::to_string(site) +
+                       "] += mtSeFold(&mtSeV, sizeof(mtSeV)) == mtSeFold(&" + lvalue +
+                       ", sizeof(" + lvalue + ")); " + lvalue + " = mtSeV; }\n");
+        } else {
+          emitText(indent, false, line + "\n");
+        }
         break;
+      }
       case SUPER_INFO_ASSIGN_BEG:
       case SUPER_INFO_ASSIGN_END: break;
     }
@@ -1043,6 +1138,15 @@ void CppEmitterMt::emitDefinitions() {
         "            valueHistogram);\n"
         "  }\n";
   }
+  if (storeCensus_) {
+    runtime +=
+        "  const char* storeCensus = getenv(\"GSIM_MT_STORE_CENSUS\");\n"
+        "  mtStoreCensus = storeCensus != nullptr && *storeCensus != 0;\n"
+        "  if (mtStoreCensus) {\n"
+        "    mtStoreCensusPath = storeCensus;\n"
+        "    fprintf(stderr, \"[mt-store-census] enabled, CSV -> %s\\n\", storeCensus);\n"
+        "  }\n";
+  }
   runtime += "  mtEnabled = true;\n}\n";
 
   runtime += "void " + className + "::mtPinWorker(int worker) {\n";
@@ -1097,6 +1201,9 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "  if (mtBubbleProfile) mtBpReport();\n";
   if (valueHistogram_) {
     runtime += "  if (mtValueHistogram) mtValueHistogramReport();\n";
+  }
+  if (storeCensus_) {
+    runtime += "  if (mtStoreCensus) mtStoreCensusReport();\n";
   }
   runtime += "}\n";
   runtime += "void " + className + "::mtWorkerLoop(int worker) {\n";
@@ -1624,6 +1731,43 @@ void CppEmitterMt::emitDefinitions() {
   fprintf(stderr, "[mt-value] histogram written to %s\n", mtValueHistogramPath);
 }
 )mtvh").substr(1);
+  }
+  if (storeCensus_) {
+    runtime += "\nvoid " + className + "::mtStoreCensusReport() {\n" + std::string(R"mtsc(
+  FILE* csv = fopen(mtStoreCensusPath, "w");
+  if (csv == nullptr) {
+    fprintf(stderr, "[mt-store-census] cannot open %s; census lost\n", mtStoreCensusPath);
+    return;
+  }
+  fprintf(csv, "site,worker,reg,calls,unchanged\n");
+  unsigned long long calls = 0, unchanged = 0;
+  for (int i = 0; i < kMtStoreCensusSiteCount; ++i) {
+    fprintf(csv, "%d,%s,%llu,%llu\n", i, mtStoreCensusSiteNames[i],
+            mtStoreCalls[i], mtStoreUnchanged[i]);
+    calls += mtStoreCalls[i];
+    unchanged += mtStoreUnchanged[i];
+  }
+  fclose(csv);
+  fprintf(stderr, "[mt-store-census] sites=%d calls=%llu unchanged=%llu rate=%.2f%%\n",
+          kMtStoreCensusSiteCount, calls, unchanged,
+          calls > 0 ? 100.0 * (double)unchanged / (double)calls : 0.0);
+  fprintf(stderr, "[mt-store-census] histogram written to %s\n", mtStoreCensusPath);
+}
+)mtsc").substr(1);
+    // Site names "worker,reg" are baked into the model for the report.
+    runtime += "const char* const " + className + "::mtStoreCensusSiteNames[] = {";
+    for (size_t i = 0; i < storeCensusSites_.size(); ++i) {
+      runtime += (i ? "," : "");
+      runtime += '"';
+      runtime += storeCensusSites_[i];
+      runtime += '"';
+    }
+    if (storeCensusSites_.empty()) {
+      runtime += '"';
+      runtime += '"';
+    }
+    runtime += "};";
+    runtime += '\n';
   }
   emitText(0, true, runtime);
 }
