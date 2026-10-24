@@ -27,6 +27,10 @@ int positiveEnv(const char* name, int fallback) {
              : fallback;
 }
 
+bool flagEnv(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
 int resetChunkSize() {
   const char* value = std::getenv("GSIM_EMIT_RESET_CHUNK");
   if (value == nullptr || value[0] == '\0') return 4096;
@@ -75,10 +79,10 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      readyWords_(flagEnv("GSIM_MT_READY_WORDS")) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
-
 
 void CppEmitterMt::prepare() {
   if (!enabled()) return;
@@ -263,11 +267,22 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   if (!enabled()) return;
   fprintf(header, "static constexpr int kMtWorkerCount = %d;\n", workerCount_);
   fprintf(header, "static constexpr int kMtStateTaskCount = %zu;\n", stateTasks_.size());
-  fprintf(header, "struct MtReadyToken { std::atomic<uint8_t> value{0}; };\n");
+  // GSIM_MT_READY_WORDS=1 packs the ready tokens 64 per uint64_t word with
+  // one exclusive publisher per word; the default layout keeps one atomic
+  // byte per slot.
+  if (readyWords_) {
+    fprintf(header, "struct MtReadyWord { std::atomic<uint64_t> value{0}; };\n");
+  } else {
+    fprintf(header, "struct MtReadyToken { std::atomic<uint8_t> value{0}; };\n");
+  }
   fprintf(header, "struct alignas(64) MtDoneFlag { std::atomic<uint8_t> parity{0}; };\n");
   fprintf(header, "struct MtDispatch { void (S%s::*fn)(); uint32_t taskId, waitBegin, waitEnd, storeBegin, storeEnd, localWaitBegin, localWaitEnd; };\n",
           graph_.name.c_str());
-  fprintf(header, "alignas(64) MtReadyToken mtReadyTokens[%d];\n", readySlotCount_);
+  if (readyWords_) {
+    fprintf(header, "alignas(64) MtReadyWord mtReadyWords[%d];\n", readyWordCount_);
+  } else {
+    fprintf(header, "alignas(64) MtReadyToken mtReadyTokens[%d];\n", readySlotCount_);
+  }
   fprintf(header, "MtDoneFlag mtDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "std::vector<MtDeferredEvent> mtDeferredEventsByWorker[%d];\n",
           workerCount_);
@@ -320,13 +335,15 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           "  unsigned long long taskCalls;\n"
           "};\n");
   fprintf(header, "MtBubbleCounters mtBubble[kMtWorkerCount];\n");
+  // Profiling index space: per slot by default, per ready word in word mode.
+  const int profIndexCount = readyWords_ ? readyWordCount_ : readySlotCount_;
   fprintf(header,
           "alignas(64) std::atomic<unsigned long long> mtBubbleSpinBySlot[%d];\n",
-          readySlotCount_);
+          profIndexCount);
   fprintf(header,
           "alignas(64) std::atomic<unsigned long long> mtBubbleSpinWorkerMask[%d];\n",
-          readySlotCount_);
-  fprintf(header, "static const int mtBubbleSlotTask[%d];\n", readySlotCount_);
+          profIndexCount);
+  fprintf(header, "static const int mtBubbleSlotTask[%d];\n", profIndexCount);
   fprintf(header, "static const uint8_t mtBubbleTaskWorker[%zu];\n",
           std::max<size_t>(1, tasks_.size()));
   fprintf(header, "static constexpr int kMtBubbleTaskCount = %zu;\n",
@@ -410,8 +427,17 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
     fprintf(header, "};\n");
     fprintf(header, "alignas(64) MtWorkerStateW%d mtWorkerStateW%d{};\n", worker, worker);
   }
-  fprintf(header, "static const uint32_t mtWaitSlots[%zu];\n", std::max<size_t>(1, waitSlots_.size()));
-  fprintf(header, "static const uint32_t mtStoreSlots[%zu];\n", std::max<size_t>(1, storeSlots_.size()));
+  if (readyWords_) {
+    fprintf(header, "static const uint32_t mtWaitWords[%zu];\n",
+            std::max<size_t>(1, waitWords_.size()));
+    fprintf(header, "static const uint64_t mtWaitMasks[%zu];\n",
+            std::max<size_t>(1, waitMasks_.size()));
+    fprintf(header, "static const uint32_t mtStoreWords[%zu];\n",
+            std::max<size_t>(1, storeWords_.size()));
+  } else {
+    fprintf(header, "static const uint32_t mtWaitSlots[%zu];\n", std::max<size_t>(1, waitSlots_.size()));
+    fprintf(header, "static const uint32_t mtStoreSlots[%zu];\n", std::max<size_t>(1, storeSlots_.size()));
+  }
   fprintf(header, "static const uint32_t mtLocalWaitSlots[%zu];\n",
           std::max<size_t>(1, localWaitSlots_.size()));
   for (int worker = 0; worker < workerCount_; ++worker) {
@@ -688,8 +714,31 @@ void CppEmitterMt::emitDefinitions() {
     text += "};\n";
     emitText(0, true, text);
   };
-  emitArray("uint32_t", "mtWaitSlots", waitSlots_);
-  emitArray("uint32_t", "mtStoreSlots", storeSlots_);
+  auto emitMaskArray = [&](const std::string& name, const std::vector<uint64_t>& values) {
+    std::string text = "const uint64_t " + className + "::" + name + "[" +
+                       std::to_string(std::max<size_t>(1, values.size())) + "] = {";
+    if (values.empty()) {
+      text += "0";
+    } else {
+      char buffer[24];
+      for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) text += ',';
+        std::snprintf(buffer, sizeof(buffer), "0x%llx",
+                      static_cast<unsigned long long>(values[i]));
+        text += buffer;
+      }
+    }
+    text += "};\n";
+    emitText(0, true, text);
+  };
+  if (readyWords_) {
+    emitArray("uint32_t", "mtWaitWords", waitWords_);
+    emitMaskArray("mtWaitMasks", waitMasks_);
+    emitArray("uint32_t", "mtStoreWords", storeWords_);
+  } else {
+    emitArray("uint32_t", "mtWaitSlots", waitSlots_);
+    emitArray("uint32_t", "mtStoreSlots", storeSlots_);
+  }
   emitArray("uint32_t", "mtLocalWaitSlots", localWaitSlots_);
 
   for (int worker = 0; worker < workerCount_; ++worker) {
@@ -716,18 +765,21 @@ void CppEmitterMt::emitDefinitions() {
   }
 
   {
-    // Bubble profiling lookup tables: producer task per ready-token slot and
-    // owner worker per task. Padding slots keep -1.
-    std::vector<int> slotTask(static_cast<size_t>(readySlotCount_), -1);
+    // Bubble profiling lookup tables: producer task per ready-token index
+    // (slot, or ready word in word mode) and owner worker per task. Padding
+    // entries keep -1.
+    const int profIndexCount = readyWords_ ? readyWordCount_ : readySlotCount_;
+    std::vector<int> slotTask(static_cast<size_t>(profIndexCount), -1);
     std::vector<int> taskWorker(std::max<size_t>(1, tasks_.size()), 0);
     for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) {
       taskWorker[taskId] = tasks_[taskId].owner;
       for (int slot : tasks_[taskId].stores) {
-        slotTask[static_cast<size_t>(slot)] = static_cast<int>(taskId);
+        const int index = readyWords_ ? (slot >> 6) : slot;
+        slotTask[static_cast<size_t>(index)] = static_cast<int>(taskId);
       }
     }
     std::string slotText = "const int " + className + "::mtBubbleSlotTask[" +
-                           std::to_string(readySlotCount_) + "] = {";
+                           std::to_string(profIndexCount) + "] = {";
     for (int value : slotTask) slotText += std::to_string(value) + ",";
     slotText += "};\n";
     emitText(0, true, slotText);
@@ -887,27 +939,53 @@ void CppEmitterMt::emitDefinitions() {
     runtime += "void " + className +
                "::mtRunLookaheadTail(const MtDispatch* entries, uint32_t count, "
                "uint32_t head, uint8_t parity, int worker) {\n";
-    if (lookaheadStats_) runtime += "  ++mtLookaheadStats[worker].calls;\n";
+    if (readyWords_) {
+      runtime +=
+          "  uint64_t doneBits[" + std::to_string(doneWordCount) + "]{};\n"
+          "  const uint64_t mtPublish = 0ull - (uint64_t)parity;\n"
+          "  auto remoteReady = [&](const MtDispatch& candidate) {\n"
+          "    for (uint32_t i = candidate.waitBegin; i < candidate.waitEnd; ++i) {\n"
+          "      const uint64_t mtMask = mtWaitMasks[i];\n"
+          "      if ((mtReadyWords[mtWaitWords[i]].value.load(std::memory_order_acquire) & mtMask) != (mtPublish & mtMask)) return false;\n"
+          "    }\n"
+          "    return true;\n"
+          "  };\n";
+    } else {
+      runtime +=
+          "  uint64_t doneBits[" + std::to_string(doneWordCount) + "]{};\n"
+          "  auto remoteReady = [&](const MtDispatch& candidate) {\n"
+          "    for (uint32_t i = candidate.waitBegin; i < candidate.waitEnd; ++i)\n"
+          "      if (mtReadyTokens[mtWaitSlots[i]].value.load(std::memory_order_acquire) != parity) return false;\n"
+          "    return true;\n"
+          "  };\n";
+    }
     runtime +=
-        "  uint64_t doneBits[" + std::to_string(doneWordCount) + "]{};\n"
-        "  auto remoteReady = [&](const MtDispatch& candidate) {\n"
-        "    for (uint32_t i = candidate.waitBegin; i < candidate.waitEnd; ++i)\n"
-        "      if (mtReadyTokens[mtWaitSlots[i]].value.load(std::memory_order_acquire) != parity) return false;\n"
-        "    return true;\n"
-        "  };\n"
         "  auto candidateReady = [&](const MtDispatch& candidate, uint32_t currentHead) {\n"
         "    for (uint32_t i = candidate.localWaitBegin; i < candidate.localWaitEnd; ++i)\n"
         "      { const uint32_t predecessor = mtLocalWaitSlots[i];\n"
         "        if (predecessor >= currentHead && (doneBits[predecessor >> 6] & (uint64_t{1} << (predecessor & 63))) == 0) return false; }\n"
         "    return remoteReady(candidate);\n"
-        "  };\n"
-        "  auto runTask = [&](const MtDispatch& entry) {\n"
-        "    MTBP_TICK(worker, mtBpLookahead);\n"
-        "    (this->*entry.fn)();\n"
-        "    MTBP_TASK_ID(worker, entry.taskId);\n"
-        "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
-        "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
-        "  };\n"
+        "  };\n";
+    if (readyWords_) {
+      runtime +=
+          "  auto runTask = [&](const MtDispatch& entry) {\n"
+          "    MTBP_TICK(worker, mtBpLookahead);\n"
+          "    (this->*entry.fn)();\n"
+          "    MTBP_TASK_ID(worker, entry.taskId);\n"
+          "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
+          "      mtReadyWords[mtStoreWords[i]].value.store(mtPublish, std::memory_order_release);\n"
+          "  };\n";
+    } else {
+      runtime +=
+          "  auto runTask = [&](const MtDispatch& entry) {\n"
+          "    MTBP_TICK(worker, mtBpLookahead);\n"
+          "    (this->*entry.fn)();\n"
+          "    MTBP_TASK_ID(worker, entry.taskId);\n"
+          "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
+          "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
+          "  };\n";
+    }
+    runtime +=
         "  while (head < count) {\n"
         "    while (head < count && (doneBits[head >> 6] & (uint64_t{1} << (head & 63))) != 0) {\n"
         "      doneBits[head >> 6] &= ~(uint64_t{1} << (head & 63));\n"
@@ -919,40 +997,88 @@ void CppEmitterMt::emitDefinitions() {
         "      runTask(headEntry);\n"
         "      ++head;\n"
         "      continue;\n"
-        "    }\n"
-        "    bool progressed = false;\n"
-        "    uint32_t scanEnd = head + 1u + " + std::to_string(lookaheadWindow_) + ";\n"
-        "    if (scanEnd > count) scanEnd = count;\n"
-        "    for (uint32_t position = head + 1; position < scanEnd; ++position) {\n";
-    if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].scanned;\n";
-    runtime +=
-        "      if ((doneBits[position >> 6] & (uint64_t{1} << (position & 63))) != 0) continue;\n"
-        "      const MtDispatch& candidate = entries[position];\n"
-        "      if (!candidateReady(candidate, head)) continue;\n"
-        "      runTask(candidate);\n"
-        "      doneBits[position >> 6] |= uint64_t{1} << (position & 63);\n";
-    if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].found;\n";
-    runtime +=
-        "      progressed = true;\n"
-        "      break;\n"
-        "    }\n"
-        "    if (progressed) continue;\n";
-    if (lookaheadStats_) runtime += "    ++mtLookaheadStats[worker].fullMiss;\n";
-    runtime +=
-        "    for (uint32_t i = headEntry.waitBegin; i < headEntry.waitEnd; ++i) {\n"
-        "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
-        "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
-        "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity)\n"
-        "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-        "      if (mtBubbleProfile) {\n"
-        "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
-        "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
-        "      }\n"
-        "    }\n"
-        "    MTBP_TICK(worker, mtBpSpinReady);\n"
-        "  }\n"
-        "  MTBP_TICK(worker, mtBpLookahead);\n"
-        "}\n";
+        "    }\n";
+    if (readyWords_) {
+      // ctz scan: jump straight to the next not-done candidate instead of
+      // re-testing doneBits for every skipped position.
+      runtime +=
+          "    bool progressed = false;\n"
+          "    uint32_t scanEnd = head + 1u + " + std::to_string(lookaheadWindow_) + ";\n"
+          "    if (scanEnd > count) scanEnd = count;\n"
+          "    uint32_t position = head + 1;\n"
+          "    while (position < scanEnd) {\n"
+          "      const uint32_t mtBase = position & ~63u;\n"
+          "      uint64_t mtTodo = ~doneBits[mtBase >> 6] >> (position & 63u);\n"
+          "      const uint32_t mtSpan = scanEnd - position < 64u ? scanEnd - position : 64u;\n"
+          "      if (mtSpan < 64u) mtTodo &= (uint64_t{1} << mtSpan) - 1;\n"
+          "      if (mtTodo == 0) { position = mtBase + 64u; continue; }\n"
+          "      position = mtBase + (position & 63u) + (uint32_t)__builtin_ctzll(mtTodo);\n";
+      if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].scanned;\n";
+      runtime +=
+          "      const MtDispatch& candidate = entries[position];\n"
+          "      if (!candidateReady(candidate, head)) { ++position; continue; }\n"
+          "      runTask(candidate);\n"
+          "      doneBits[position >> 6] |= uint64_t{1} << (position & 63);\n";
+      if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].found;\n";
+      runtime +=
+          "      progressed = true;\n"
+          "      break;\n"
+          "    }\n"
+          "    if (progressed) continue;\n";
+      if (lookaheadStats_) runtime += "    ++mtLookaheadStats[worker].fullMiss;\n";
+      runtime +=
+          "    for (uint32_t i = headEntry.waitBegin; i < headEntry.waitEnd; ++i) {\n"
+          "      const uint32_t mtBpSlot = mtWaitWords[i];\n"
+          "      const uint64_t mtBpMask = mtWaitMasks[i];\n"
+          "      const uint64_t mtBpWant = mtPublish & mtBpMask;\n"
+          "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
+          "      while ((mtReadyWords[mtBpSlot].value.load(std::memory_order_acquire) & mtBpMask) != mtBpWant)\n"
+          "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+          "      if (mtBubbleProfile) {\n"
+          "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
+          "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
+          "      }\n"
+          "    }\n"
+          "    MTBP_TICK(worker, mtBpSpinReady);\n"
+          "  }\n"
+          "  MTBP_TICK(worker, mtBpLookahead);\n"
+          "}\n";
+    } else {
+      runtime +=
+          "    bool progressed = false;\n"
+          "    uint32_t scanEnd = head + 1u + " + std::to_string(lookaheadWindow_) + ";\n"
+          "    if (scanEnd > count) scanEnd = count;\n"
+          "    for (uint32_t position = head + 1; position < scanEnd; ++position) {\n";
+      if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].scanned;\n";
+      runtime +=
+          "      if ((doneBits[position >> 6] & (uint64_t{1} << (position & 63))) != 0) continue;\n"
+          "      const MtDispatch& candidate = entries[position];\n"
+          "      if (!candidateReady(candidate, head)) continue;\n"
+          "      runTask(candidate);\n"
+          "      doneBits[position >> 6] |= uint64_t{1} << (position & 63);\n";
+      if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].found;\n";
+      runtime +=
+          "      progressed = true;\n"
+          "      break;\n"
+          "    }\n"
+          "    if (progressed) continue;\n";
+      if (lookaheadStats_) runtime += "    ++mtLookaheadStats[worker].fullMiss;\n";
+      runtime +=
+          "    for (uint32_t i = headEntry.waitBegin; i < headEntry.waitEnd; ++i) {\n"
+          "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
+          "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
+          "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity)\n"
+          "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+          "      if (mtBubbleProfile) {\n"
+          "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
+          "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
+          "      }\n"
+          "    }\n"
+          "    MTBP_TICK(worker, mtBpSpinReady);\n"
+          "  }\n"
+          "  MTBP_TICK(worker, mtBpLookahead);\n"
+          "}\n";
+    }
   }
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
   runtime += "  MTBP_TICK(worker, mtBpProtocolOther);\n";
@@ -988,39 +1114,77 @@ void CppEmitterMt::emitDefinitions() {
                  "; break;\n";
     }
     runtime += "    default: abort();\n  }\n";
-    runtime +=
-        "  for (uint32_t position = 0; position < count; ++position) {\n"
-        "    const MtDispatch& entry = entries[position];\n"
-        "    for (uint32_t i = entry.waitBegin; i < entry.waitEnd; ++i) {\n"
-        "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
-        "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
-        "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity)\n"
-        "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-        "      if (mtBubbleProfile) {\n"
-        "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
-        "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
-        "      }\n"
-        "    }\n"
-        "    MTBP_TICK(worker, mtBpSpinReady);\n"
-        "    (this->*entry.fn)();\n"
-        "    MTBP_TASK_ID(worker, entry.taskId);\n"
-        "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
-        "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
-        "  }\n"
-        "}\n";
+    if (readyWords_) {
+      runtime +=
+          "  const uint64_t mtPublish = 0ull - (uint64_t)parity;\n"
+          "  for (uint32_t position = 0; position < count; ++position) {\n"
+          "    const MtDispatch& entry = entries[position];\n"
+          "    for (uint32_t i = entry.waitBegin; i < entry.waitEnd; ++i) {\n"
+          "      const uint32_t mtBpSlot = mtWaitWords[i];\n"
+          "      const uint64_t mtBpMask = mtWaitMasks[i];\n"
+          "      const uint64_t mtBpWant = mtPublish & mtBpMask;\n"
+          "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
+          "      while ((mtReadyWords[mtBpSlot].value.load(std::memory_order_acquire) & mtBpMask) != mtBpWant)\n"
+          "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+          "      if (mtBubbleProfile) {\n"
+          "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
+          "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
+          "      }\n"
+          "    }\n"
+          "    MTBP_TICK(worker, mtBpSpinReady);\n"
+          "    (this->*entry.fn)();\n"
+          "    MTBP_TASK_ID(worker, entry.taskId);\n"
+          "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
+          "      mtReadyWords[mtStoreWords[i]].value.store(mtPublish, std::memory_order_release);\n"
+          "  }\n"
+          "}\n";
+    } else {
+      runtime +=
+          "  for (uint32_t position = 0; position < count; ++position) {\n"
+          "    const MtDispatch& entry = entries[position];\n"
+          "    for (uint32_t i = entry.waitBegin; i < entry.waitEnd; ++i) {\n"
+          "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
+          "      const unsigned long long mtBpT0 = mtBubbleProfile ? mtBpRdtsc() : 0;\n"
+          "      while (mtReadyTokens[mtBpSlot].value.load(std::memory_order_acquire) != parity)\n"
+          "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+          "      if (mtBubbleProfile) {\n"
+          "        mtBubbleSpinBySlot[mtBpSlot].fetch_add(mtBpRdtsc() - mtBpT0, std::memory_order_relaxed);\n"
+          "        mtBubbleSpinWorkerMask[mtBpSlot].fetch_or(worker < 64 ? 1ull << worker : 0, std::memory_order_relaxed);\n"
+          "      }\n"
+          "    }\n"
+          "    MTBP_TICK(worker, mtBpSpinReady);\n"
+          "    (this->*entry.fn)();\n"
+          "    MTBP_TASK_ID(worker, entry.taskId);\n"
+          "    for (uint32_t i = entry.storeBegin; i < entry.storeEnd; ++i)\n"
+          "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
+          "  }\n"
+          "}\n";
+    }
   } else {
     runtime += "  switch (worker) {\n";
     for (int worker = 0; worker < workerCount_; ++worker) {
       const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
       runtime += "    case " + std::to_string(worker) + ": {\n";
+      if (readyWords_) runtime += "      const uint64_t mtPublish = 0ull - (uint64_t)parity;\n";
       for (size_t position = 0; position < chain.size(); ++position) {
         const int taskId = chain[position];
         const Task& task = tasks_[static_cast<size_t>(taskId)];
         if (!task.waits.empty()) {
           runtime += "      { bool ready = true;\n";
-          for (int slot : task.waits) {
-            runtime += "        ready &= mtReadyTokens[" + std::to_string(slot) +
-                       "].value.load(std::memory_order_acquire) == parity;\n";
+          if (readyWords_) {
+            char maskText[24];
+            for (uint32_t i = task.waitBegin; i < task.waitEnd; ++i) {
+              std::snprintf(maskText, sizeof(maskText), "0x%llx",
+                            static_cast<unsigned long long>(waitMasks_[i]));
+              runtime += "        ready &= (mtReadyWords[" + std::to_string(waitWords_[i]) +
+                         "].value.load(std::memory_order_acquire) & " + maskText +
+                         "ull) == (mtPublish & " + maskText + "ull);\n";
+            }
+          } else {
+            for (int slot : task.waits) {
+              runtime += "        ready &= mtReadyTokens[" + std::to_string(slot) +
+                         "].value.load(std::memory_order_acquire) == parity;\n";
+            }
           }
           runtime += "        if (!ready) { mtRunLookaheadTail(mtDispatchW" +
                      std::to_string(worker) + ", " + std::to_string(chain.size()) +
@@ -1029,9 +1193,16 @@ void CppEmitterMt::emitDefinitions() {
         }
         runtime += "      mtTask" + std::to_string(taskId) + "();\n";
         runtime += "      MTBP_TASK_ID(worker, " + std::to_string(taskId) + ");\n";
-        for (int slot : task.stores) {
-          runtime += "      mtReadyTokens[" + std::to_string(slot) +
-                     "].value.store(parity, std::memory_order_release);\n";
+        if (readyWords_) {
+          for (uint32_t i = task.storeBegin; i < task.storeEnd; ++i) {
+            runtime += "      mtReadyWords[" + std::to_string(storeWords_[i]) +
+                       "].value.store(mtPublish, std::memory_order_release);\n";
+          }
+        } else {
+          for (int slot : task.stores) {
+            runtime += "      mtReadyTokens[" + std::to_string(slot) +
+                       "].value.store(parity, std::memory_order_release);\n";
+          }
         }
       }
       runtime += "      return;\n    }\n";

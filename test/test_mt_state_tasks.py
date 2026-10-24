@@ -66,10 +66,13 @@ def run(command, env):
 
 
 class StateTasksTest(unittest.TestCase):
-    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=()):
+    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=(),
+                 ready_words=None):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
+        if ready_words is not None:
+            env['GSIM_MT_READY_WORDS'] = ready_words
         run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
              '--mt-scheduler=' + scheduler, f'--mt-lookahead-window={lookahead}',
              *extra, '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
@@ -138,6 +141,61 @@ class StateTasksTest(unittest.TestCase):
                 self.assertEqual(value_async, 0x56,
                                  f'cycle {cycle}: async-reset register did not '
                                  f'commit the reset value synchronously')
+
+    def test_ready_words_trace_equivalence(self):
+        # GSIM_MT_READY_WORDS=1 packs the ready tokens 64 per uint64_t word
+        # with publisher-exclusive words: publishing becomes one release store
+        # per word and waiting becomes one acquire load plus a mask-parity
+        # compare per word. The repacking must not change any observable
+        # trace on either executor path (strict and lookahead, including the
+        # ctz candidate scan), and repeated knob-on generation must stay
+        # byte-deterministic.
+        baseline = None
+        for workers in (1, 2, 4):
+            for lookahead in (0, 16, 64):
+                for words in (None, '1'):
+                    with self.subTest(workers=workers, lookahead=lookahead,
+                                      words=words), \
+                            tempfile.TemporaryDirectory(
+                                prefix='mt-ready-words-') as directory:
+                        out = Path(directory)
+                        env, _ = self.generate(out, 'mt-state-tasks', workers,
+                                               lookahead=lookahead,
+                                               ready_words=words)
+                        trace = self.trace(out, 'mt-state-tasks', env)
+                        if baseline is None:
+                            baseline = trace
+                            self.assertTrue(baseline)
+                        self.assertEqual(trace, baseline)
+        # mt-memory-commit adds real cross-worker token groups (memory
+        # pending-write producers on another worker), so the word packing,
+        # publisher-exclusive stores and mask waits actually execute here.
+        signatures = []
+        for workers in (1, 2, 4):
+            for lookahead in (0, 16, 64):
+                for words in (None, '1'):
+                    with self.subTest(workers=workers, lookahead=lookahead,
+                                      words=words), \
+                            tempfile.TemporaryDirectory(
+                                prefix='mt-ready-mem-') as directory:
+                        out = Path(directory)
+                        env, _ = self.generate(out, 'mt-memory-commit', workers,
+                                               lookahead=lookahead,
+                                               ready_words=words)
+                        signatures.append(
+                            self.simulate(out, 'mt-memory-commit', env))
+        self.assertEqual(len(set(signatures)), 1, signatures)
+        with tempfile.TemporaryDirectory(prefix='mt-ready-det-') as directory:
+            root = Path(directory)
+            trees = []
+            for run_index in (0, 1):
+                out = root / f'words-r{run_index}'
+                out.mkdir()
+                self.generate(out, 'mt-state-tasks', 4, lookahead=64,
+                              ready_words='1')
+                trees.append({path.name: path.read_bytes()
+                              for path in sorted(out.iterdir())})
+            self.assertEqual(trees[0], trees[1])
 
     def test_lookahead_generation_determinism(self):
         # Identical invocations must emit byte-identical models (the worker

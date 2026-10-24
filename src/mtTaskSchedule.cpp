@@ -8,6 +8,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <numeric>
 #include <queue>
@@ -1036,6 +1037,73 @@ std::vector<int> reorderHeftTasks(MtTaskPlan& tasks, WorkerSchedule& schedule) {
   schedule = std::move(remapped);
   return ids;
 }
+bool readyWordsEnabled() {
+  const char* value = std::getenv("GSIM_MT_READY_WORDS");
+  return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+// Plan-B liveness gate, ported from wt-repcut7 bd16a33: an event-driven
+// simulation that advances one in-order cursor per worker chain and runs a
+// task only once every DAG predecessor has run. The runtime protocol waits on
+// token-group publishers, and every publisher is a predecessor of its
+// consumer, so "all predecessors ran" implies "all tokens arrived"; a
+// simulation that drains every chain therefore proves the runtime cannot
+// deadlock under any interleaving. Word-mask packing only changes the token
+// representation, never the dependency structure, so this gate covers both
+// layouts unchanged.
+void checkWorkerChainLiveness(const MtTaskPlan& tasks,
+                              const std::vector<std::vector<int>>& chains) {
+  const size_t taskCount = tasks.tasks_.size();
+  std::vector<uint8_t> hasRun(taskCount, 0);
+  std::vector<size_t> cursor(chains.size(), 0);
+  size_t completed = 0;
+  bool progress = true;
+  while (completed < taskCount && progress) {
+    progress = false;
+    for (size_t worker = 0; worker < chains.size(); ++worker) {
+      while (cursor[worker] < chains[worker].size()) {
+        const size_t taskId = static_cast<size_t>(chains[worker][cursor[worker]]);
+        bool ready = true;
+        for (int predecessor : tasks.tasks_[taskId].predecessors) {
+          if (!hasRun[static_cast<size_t>(predecessor)]) {
+            ready = false;
+            break;
+          }
+        }
+        if (!ready) break;
+        hasRun[taskId] = 1;
+        ++cursor[worker];
+        ++completed;
+        progress = true;
+      }
+    }
+  }
+  if (completed == taskCount) return;
+  std::vector<size_t> positionByTask(taskCount, 0);
+  for (size_t worker = 0; worker < chains.size(); ++worker) {
+    for (size_t position = 0; position < chains[worker].size(); ++position) {
+      positionByTask[static_cast<size_t>(chains[worker][position])] = position;
+    }
+  }
+  fprintf(stderr,
+          "[cppEmitter-mt] liveness gate: only %zu/%zu mtasks are runnable; "
+          "stuck workers (position, task, unfinished predecessors):\n",
+          completed, taskCount);
+  for (size_t worker = 0; worker < chains.size(); ++worker) {
+    if (cursor[worker] >= chains[worker].size()) continue;
+    const size_t taskId = static_cast<size_t>(chains[worker][cursor[worker]]);
+    fprintf(stderr, "  worker %zu position %zu task %zu blocked on:", worker,
+            cursor[worker], taskId);
+    for (int predecessor : tasks.tasks_[taskId].predecessors) {
+      if (hasRun[static_cast<size_t>(predecessor)]) continue;
+      fprintf(stderr, " task %d (worker %d, position %zu)", predecessor,
+              tasks.tasks_[static_cast<size_t>(predecessor)].owner,
+              positionByTask[static_cast<size_t>(predecessor)]);
+    }
+    fprintf(stderr, "\n");
+  }
+  Assert(false, "mt worker chains are not live: dependency cycle or misordered chain");
+}
 
 }  // namespace
 
@@ -1251,13 +1319,46 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
         static_cast<int>(groupId));
   }
 
+  workers.readyWords_ = readyWordsEnabled();
   int nextSlot = 0;
   for (const auto& bank : groupsByOwnerPair) {
     nextSlot = (nextSlot + 63) & ~63;
-    for (int groupId : bank.second) groups[static_cast<size_t>(groupId)].slot = nextSlot++;
+    if (!workers.readyWords_) {
+      for (int groupId : bank.second) groups[static_cast<size_t>(groupId)].slot = nextSlot++;
+    } else {
+      // Word mode: order the bank's groups by publisher chain position so
+      // every publisher's slots form one contiguous run, and start each run
+      // at a 64-slot word boundary. A run therefore never crosses a word
+      // boundary and never shares a word with another publisher's run, so
+      // every word is written by exactly one publish task and publishing is a
+      // single release store per word. A publisher with more than 64 groups
+      // in a bank spans several exclusive words.
+      std::vector<int> ordered = bank.second;
+      std::sort(ordered.begin(), ordered.end(), [&](int lhs, int rhs) {
+        const int lhsPosition = workerPosition[static_cast<size_t>(groups[static_cast<size_t>(lhs)].publisher)];
+        const int rhsPosition = workerPosition[static_cast<size_t>(groups[static_cast<size_t>(rhs)].publisher)];
+        if (lhsPosition != rhsPosition) return lhsPosition < rhsPosition;
+        return lhs < rhs;
+      });
+      size_t begin = 0;
+      while (begin < ordered.size()) {
+        size_t end = begin;
+        const int publisher = groups[static_cast<size_t>(ordered[begin])].publisher;
+        while (end < ordered.size() &&
+               groups[static_cast<size_t>(ordered[end])].publisher == publisher) {
+          ++end;
+        }
+        nextSlot = (nextSlot + 63) & ~63;
+        for (size_t index = begin; index < end; ++index) {
+          groups[static_cast<size_t>(ordered[index])].slot = nextSlot++;
+        }
+        begin = end;
+      }
+    }
     nextSlot = (nextSlot + 63) & ~63;
   }
   workers.readySlotCount_ = std::max(1, nextSlot);
+  workers.readyWordCount_ = (workers.readySlotCount_ + 63) / 64;
   for (const TokenGroup& group : groups) {
     tasks.tasks_[static_cast<size_t>(group.consumer)].waits.push_back(group.slot);
     tasks.tasks_[static_cast<size_t>(group.publisher)].stores.push_back(group.slot);
@@ -1267,12 +1368,33 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     std::sort(task.localWaits.begin(), task.localWaits.end());
     task.localWaits.erase(std::unique(task.localWaits.begin(), task.localWaits.end()),
                           task.localWaits.end());
-    task.waitBegin = workers.waitSlots_.size();
-    workers.waitSlots_.insert(workers.waitSlots_.end(), task.waits.begin(), task.waits.end());
-    task.waitEnd = workers.waitSlots_.size();
-    task.storeBegin = workers.storeSlots_.size();
-    workers.storeSlots_.insert(workers.storeSlots_.end(), task.stores.begin(), task.stores.end());
-    task.storeEnd = workers.storeSlots_.size();
+    if (workers.readyWords_) {
+      // Word mode: waits collapse to one (word, mask) pair per touched word and
+      // stores collapse to the sorted set of exclusively owned words. The
+      // per-task ranges index the word tables instead of the slot tables.
+      std::map<int, uint64_t> waitMaskByWord;
+      for (int slot : task.waits) {
+        waitMaskByWord[slot >> 6] |= uint64_t{1} << (slot & 63);
+      }
+      std::set<int> storeWordSet;
+      for (int slot : task.stores) storeWordSet.insert(slot >> 6);
+      task.waitBegin = static_cast<uint32_t>(workers.waitWords_.size());
+      for (const auto& entry : waitMaskByWord) {
+        workers.waitWords_.push_back(entry.first);
+        workers.waitMasks_.push_back(entry.second);
+      }
+      task.waitEnd = static_cast<uint32_t>(workers.waitWords_.size());
+      task.storeBegin = static_cast<uint32_t>(workers.storeWords_.size());
+      for (int word : storeWordSet) workers.storeWords_.push_back(word);
+      task.storeEnd = static_cast<uint32_t>(workers.storeWords_.size());
+    } else {
+      task.waitBegin = workers.waitSlots_.size();
+      workers.waitSlots_.insert(workers.waitSlots_.end(), task.waits.begin(), task.waits.end());
+      task.waitEnd = workers.waitSlots_.size();
+      task.storeBegin = workers.storeSlots_.size();
+      workers.storeSlots_.insert(workers.storeSlots_.end(), task.stores.begin(), task.stores.end());
+      task.storeEnd = workers.storeSlots_.size();
+    }
     task.localWaitBegin = workers.localWaitSlots_.size();
     workers.localWaitSlots_.insert(workers.localWaitSlots_.end(), task.localWaits.begin(),
                                    task.localWaits.end());
@@ -1289,4 +1411,9 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
           "transitive-edges-removed=%zu\n",
           workerCount, groupCount, tasks.tasks_.size(), edgeCount, groups.size(),
           uncompressedTokenGroups, localEdgeCount, transitiveEdgesRemoved);
+  if (workers.readyWords_) {
+    fprintf(stderr, "[cppEmitter-mt] ready-words=%d wait-entries=%zu store-entries=%zu\n",
+            workers.readyWordCount_, workers.waitWords_.size(), workers.storeWords_.size());
+  }
+  checkWorkerChainLiveness(tasks, workers.workerTasks_);
 }
