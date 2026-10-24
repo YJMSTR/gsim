@@ -1199,7 +1199,43 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   std::map<int, std::vector<int>> earlyConsumersByGroup;
   std::set<int> splitProducers;
   const char* splitEnv = std::getenv("GSIM_MT_REPCUT_SPLIT_PUBLISH");
-  const bool splitPublish = splitEnv != nullptr && splitEnv[0] == '1';
+  bool splitPublish = splitEnv != nullptr && splitEnv[0] == '1';
+  // Design scope: only the attribution top-16 hot producers split. Without
+  // a hot-set CSV the knob stays off — the unbounded split doubled the
+  // token count (6248 -> 11859) and regressed every workload ~2x.
+  std::set<int> splitHotSet;
+  if (splitPublish) {
+    const char* hotPath = std::getenv("GSIM_MT_REPCUT_TIMING_CSV");
+    if (hotPath == nullptr || hotPath[0] == '\0') {
+      splitPublish = false;
+    } else {
+      FILE* hotFile = std::fopen(hotPath, "r");
+      if (hotFile == nullptr) {
+        splitPublish = false;
+      } else {
+        char line[4096];
+        bool hotHeader = true;
+        int hotRank = 0;
+        while (std::fgets(line, sizeof(line), hotFile) != nullptr) {
+          if (hotHeader) { hotHeader = false; continue; }
+          if (++hotRank > 16) break;
+          int column = 0;
+          const char* cursor = line;
+          while (column < 2 && cursor != nullptr) {
+            cursor = std::strchr(cursor, ',');
+            if (cursor != nullptr) ++cursor;
+            ++column;
+          }
+          if (cursor == nullptr) continue;
+          char* end = nullptr;
+          const long task = std::strtol(cursor, &end, 10);
+          if (end != cursor && task >= 0) splitHotSet.insert(static_cast<int>(task));
+        }
+        std::fclose(hotFile);
+        if (splitHotSet.empty()) splitPublish = false;
+      }
+    }
+  }
   auto producerPureMembers = [](const MtTask& producer) {
     std::set<Node*> pure;
     for (Node* member : producer.members) {
@@ -1261,6 +1297,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     for (size_t producerId = 0; producerId < tasks.tasks_.size(); ++producerId) {
       MtTask& producer = tasks.tasks_[producerId];
       if (producer.kind != MtTaskKind::Normal) continue;
+      if (splitHotSet.count(static_cast<int>(producerId)) == 0) continue;
       const std::set<Node*> pure = producerPureMembers(producer);
       if (pure.empty()) continue;
       std::map<int, std::vector<int>> pureOnlyByOwner;

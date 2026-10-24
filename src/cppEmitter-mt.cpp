@@ -414,7 +414,9 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "bool mtAnyAsyncResetAsserted();\n");
   fprintf(header, "void mtApplyAsyncResets();\n");
   fprintf(header, "void mtReplayAfterAsyncReset();\n");
-  fprintf(header, "uint8_t mtCurParity = 0;\n");
+  if (!splitEarlyStoreSlots_.empty()) {
+    fprintf(header, "uint8_t mtCurParity = 0;\n");
+  }
   if (!timingHot_.empty()) {
     fprintf(header,
             "static inline unsigned long long mtTmRdtsc() { unsigned int lo, hi;\n"
@@ -1073,7 +1075,9 @@ void CppEmitterMt::emitDefinitions() {
   }
 
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
-  runtime += "  mtCurParity = parity;\n";
+  if (!splitEarlyStoreSlots_.empty()) {
+    runtime += "  mtCurParity = parity;\n";
+  }
   runtime += "  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {
     runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +
