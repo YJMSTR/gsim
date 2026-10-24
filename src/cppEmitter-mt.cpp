@@ -657,7 +657,8 @@ void CppEmitterMt::writeSparseAudit() const {
                "side_effect_kind,untracked_input_count,untracked_reasons,"
                "gate_candidate,activity_source,wide_input_disqualify,"
                "activity_relevant_output_nodes,"
-               "output_compare_count,output_compare_bytes,remote_groups\n");
+               "output_compare_count,output_compare_bytes,remote_groups,"
+               "state_input_blocks\n");
   const size_t taskCount = tasks_.size();
 
   // Read/write sets and effect kinds.
@@ -834,10 +835,32 @@ void CppEmitterMt::writeSparseAudit() const {
     }
   }
 
+  // Section 3.4 statistics: map each packed register to its Src block byte
+  // offset and 64B chunk. Layout model mirrors the emitter declaration
+  // order and the alignment rules (uint8/16/32/64 natural, _BitInt(N>64)
+  // aligned 8 - commit 49d6ebb caps cone type alignment at 8). Registers
+  // that are not members of a packed block (sparse arrays) are UNMAPPED.
+  std::map<Node*, std::pair<int, long long>> regOffset;  // node -> (owner, byte offset)
+  std::map<int, long long> blockSize;
+  for (const StateUpdate& update : stateTasks_) {
+    long long offset = 0;
+    for (Node* reg : update.registers) {
+      const int width = reg->width;
+      int align = width <= 8 ? 1 : width <= 16 ? 2 : width <= 32 ? 4 : 8;
+      offset = (offset + align - 1) / align * align;
+      regOffset[reg] = {update.owner, offset};
+      offset += (width + 7) / 8;
+    }
+    blockSize[update.owner] = offset;
+  }
+
   size_t gateCount = 0;
   long long gateBodyCost = 0;
   size_t compareCount = 0;
   long long compareBytes = 0;
+  size_t stateDqGates = 0;
+  size_t mappedStateInputs = 0;
+  size_t unmappedStateInputs = 0;
   for (size_t id = 0; id < taskCount; ++id) {
     const Task& task = tasks_[id];
     const bool isGate = gate[id] != 0;
@@ -878,14 +901,41 @@ void CppEmitterMt::writeSparseAudit() const {
     for (const std::string& group : groupsByConsumer[id]) {
       groups += (groups.empty() ? "" : " | ") + group;
     }
-    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%s,%zu,%s,%d,%d,%d,%s,%zu,%lld,%s\n",
+    std::string stateInputs;
+    size_t unmappedHere = 0;
+    for (const InputRef& input : inputs[id]) {
+      if (input.node->type != NODE_REG_SRC) continue;
+      auto mapped = regOffset.find(input.node);
+      if (mapped == regOffset.end()) {
+        ++unmappedHere;
+        stateInputs += (stateInputs.empty() ? "" : "+") + input.node->name + ":UNMAPPED";
+        continue;
+      }
+      const long long chunk = mapped->second.second / 64;
+      stateInputs += (stateInputs.empty() ? "" : "+") + input.node->name + ":W" +
+                     std::to_string(mapped->second.first) + "+off" +
+                     std::to_string(mapped->second.second) + "/chunk" +
+                     std::to_string(chunk);
+    }
+    if (!isGate) {
+      bool stateDq = false;
+      for (const InputRef& input : inputs[id]) {
+        if (input.node->type == NODE_REG_SRC) stateDq = true;
+      }
+      if (stateDq) ++stateDqGates;
+    }
+    mappedStateInputs += stateInputs.empty() ? 0 :
+        (stateInputs.find("UNMAPPED") == std::string::npos ? 1 : 0);
+    unmappedStateInputs += unmappedHere;
+    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%s,%zu,%s,%d,%d,%d,%s,%zu,%lld,%s,%s\n",
             id, task.owner, task.cost,
             task.insts != nullptr ? task.insts->size() : 0,
             preds.c_str(), succs.c_str(), kEffectNames[effectKind[id]],
             untrackedCount[id],
             (untrackedReasons[id].empty() ? "-" : untrackedReasons[id]).c_str(),
             isGate ? 1 : 0, activitySource ? 1 : 0, wideDisqualify[id] ? 1 : 0,
-            relevant.c_str(), compares, bytes, groups.c_str());
+            relevant.c_str(), compares, bytes, groups.c_str(),
+            (stateInputs.empty() ? "-" : stateInputs).c_str());
     if (isGate) {
       ++gateCount;
       gateBodyCost += task.cost;
@@ -897,8 +947,12 @@ void CppEmitterMt::writeSparseAudit() const {
   fprintf(stderr,
           "[cppEmitter-mt] sparse-audit: tasks=%zu gate_candidates=%zu "
           "gate_body_cost=%lld output_compares=%zu output_compare_bytes=%lld "
-          "(DPI/special detection is a text-marker heuristic)\n",
-          taskCount, gateCount, gateBodyCost, compareCount, compareBytes);
+          "state-dq-tasks=%zu state-input-mapped-rows=%zu unmapped-state-inputs=%zu "
+          "(DPI/special detection is a text-marker heuristic; chunk offsets "
+          "follow the emitter declaration order and the 49d6ebb alignment "
+          "rules, sparse arrays are UNMAPPED)\n",
+          taskCount, gateCount, gateBodyCost, compareCount, compareBytes,
+          stateDqGates, mappedStateInputs, unmappedStateInputs);
 }
 
 void CppEmitterMt::emitDefinitions() {
