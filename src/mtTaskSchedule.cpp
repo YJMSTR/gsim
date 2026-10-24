@@ -1053,6 +1053,9 @@ WorkerSchedule scheduleHeft(MtTaskPlan& tasks, int workerCount,
           tasks, communicationNodes, taskId, worker, result.owner, completion, readyAt);
 
       long long start = readyAt;
+      if (worker < static_cast<int>(workerFloor.size())) {
+        start = std::max(start, static_cast<long long>(workerFloor[static_cast<size_t>(worker)]));
+      }
       auto& timeline = timelines[static_cast<size_t>(worker)];
       auto next = timeline.lower_bound(start);
       if (next != timeline.begin()) {
@@ -1065,9 +1068,6 @@ WorkerSchedule scheduleHeft(MtTaskPlan& tasks, int workerCount,
       while (next != timeline.end() && start + duration > next->second.start) {
         start = std::max(start, next->second.finish);
         ++next;
-      }
-      if (worker < static_cast<int>(workerFloor.size())) {
-        start = std::max(start, static_cast<long long>(workerFloor[static_cast<size_t>(worker)]));
       }
       MtHeftPlacement placement;
       placement.task = taskId;
