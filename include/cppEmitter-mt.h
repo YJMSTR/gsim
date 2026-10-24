@@ -56,8 +56,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitAsyncResetFunction(const Reset& reset);
   void emitStateUpdateFunction(const StateUpdate& update);
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
-  void emitInstruction(const InstInfo& inst, int indent);
-  void emitTask(const Task& task, size_t taskId, int indent);
+  void emitTask(const Task& task, int indent);
   void buildRegisterStorageNames();
   void writeTaskPhaseReport() const;
   std::string mapRegisterNames(const std::string& text) const;
@@ -69,6 +68,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   int resetChunk_ = 4096;
   int lookaheadWindow_ = 128;
   bool lookaheadStats_ = false;
+  bool laCounters_ = false;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
 };

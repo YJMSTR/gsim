@@ -1182,57 +1182,6 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     int consumer = -1;
     int publisher = -1;
     int slot = -1;
-    bool early = false;  // published at the producer's pure-prefix end
-  };
-  // V6a split publication (default off): GSIM_MT_REPCUT_SPLIT_PUBLISH=1 plus
-  // a hot-set CSV (GSIM_MT_REPCUT_TIMING_CSV, top-16 rows). Hot producers
-  // publish one early ready-token per pure-only consumer owner, stored right
-  // after the last pure assignment in the task body; those consumers swap
-  // the full-body wait for the early token.
-  std::map<int, std::vector<int>> earlyConsumersByGroup;
-  const char* splitEnv = std::getenv("GSIM_MT_REPCUT_SPLIT_PUBLISH");
-  bool splitPublish = splitEnv != nullptr && splitEnv[0] == '1';
-  std::set<int> splitHotSet;
-  if (splitPublish) {
-    const char* hotPath = std::getenv("GSIM_MT_REPCUT_TIMING_CSV");
-    if (hotPath == nullptr || hotPath[0] == '\0') {
-      splitPublish = false;
-    } else {
-      FILE* hotFile = std::fopen(hotPath, "r");
-      if (hotFile == nullptr) {
-        splitPublish = false;
-      } else {
-        char line[4096];
-        bool hotHeader = true;
-        int hotRank = 0;
-        while (std::fgets(line, sizeof(line), hotFile) != nullptr) {
-          if (hotHeader) { hotHeader = false; continue; }
-          if (++hotRank > 16) break;
-          int column = 0;
-          const char* cursor = line;
-          while (column < 2 && cursor != nullptr) {
-            cursor = std::strchr(cursor, ',');
-            if (cursor != nullptr) ++cursor;
-            ++column;
-          }
-          if (cursor == nullptr) continue;
-          char* end = nullptr;
-          const long task = std::strtol(cursor, &end, 10);
-          if (end != cursor && task >= 0) splitHotSet.insert(static_cast<int>(task));
-        }
-        std::fclose(hotFile);
-        if (splitHotSet.empty()) splitPublish = false;
-      }
-    }
-  }
-  auto producerPureMembers = [](const MtTask& producer) {
-    std::set<Node*> pure;
-    for (Node* member : producer.members) {
-      if (member->type == NODE_OTHERS && producer.localNodes.count(member) == 0) {
-        pure.insert(member);
-      }
-    }
-    return pure;
   };
   std::vector<TokenGroup> groups;
   for (size_t consumer = 0; consumer < tasks.tasks_.size(); ++consumer) {
@@ -1266,51 +1215,6 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     }
   }
 
-  if (splitPublish) {
-    for (size_t producerId = 0; producerId < tasks.tasks_.size(); ++producerId) {
-      const MtTask& producer = tasks.tasks_[producerId];
-      if (producer.kind != MtTaskKind::Normal) continue;
-      if (splitHotSet.count(static_cast<int>(producerId)) == 0) continue;
-      const std::set<Node*> pure = producerPureMembers(producer);
-      if (pure.empty()) continue;
-      std::map<int, std::vector<int>> pureOnlyByOwner;
-      for (int consumer : producer.successors) {
-        if (tasks.tasks_[static_cast<size_t>(consumer)].owner == producer.owner) continue;
-        bool pureOnly = false;
-        for (Node* member : tasks.tasks_[static_cast<size_t>(consumer)].members) {
-          for (Node* input : member->prev) {
-            if (pure.count(input) != 0) { pureOnly = true; break; }
-          }
-          if (pureOnly) break;
-        }
-        if (!pureOnly) continue;
-        for (Node* member : tasks.tasks_[static_cast<size_t>(consumer)].members) {
-          for (Node* input : member->prev) {
-            auto owner = tasks.taskByNode_.find(input);
-            if (owner == tasks.taskByNode_.end() ||
-                owner->second != static_cast<int>(producerId)) continue;
-            if (pure.count(input) == 0) { pureOnly = false; break; }
-          }
-          if (!pureOnly) break;
-        }
-        if (pureOnly) {
-          pureOnlyByOwner[tasks.tasks_[static_cast<size_t>(consumer)].owner].push_back(consumer);
-        }
-      }
-      for (const auto& entry : pureOnlyByOwner) {
-        TokenGroup early;
-        early.producerOwner = producer.owner;
-        early.consumerOwner = entry.first;
-        early.publisher = static_cast<int>(producerId);
-        early.early = true;
-        const int earlyGroupId = static_cast<int>(groups.size());
-        groups.push_back(early);
-        for (int consumer : entry.second) {
-          earlyConsumersByGroup[earlyGroupId].push_back(consumer);
-        }
-      }
-    }
-  }
   const size_t uncompressedTokenGroups = groups.size();
   if (globalConfig.MtLookaheadWindow == 0) {
     std::vector<std::vector<int>> groupsByConsumer(tasks.tasks_.size());
@@ -1355,35 +1259,8 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   }
   workers.readySlotCount_ = std::max(1, nextSlot);
   for (const TokenGroup& group : groups) {
-    tasks.tasks_[static_cast<size_t>(group.publisher)].stores.push_back(group.slot);
-    if (group.early) {
-      // Early tokens store mid-body (emitter splits at the last pure
-      // assignment); the emitter looks the slots up via the worker plan.
-      workers.splitEarlyStoreSlots_[group.publisher].push_back(group.slot);
-      continue;
-    }
     tasks.tasks_[static_cast<size_t>(group.consumer)].waits.push_back(group.slot);
-  }
-  // Early consumers swap the producer's full-body wait for the early token.
-  for (size_t groupId = 0; groupId < groups.size(); ++groupId) {
-    if (!groups[groupId].early) continue;
-    const int earlySlot = groups[groupId].slot;
-    const int producerId = groups[groupId].publisher;
-    for (int consumer : earlyConsumersByGroup[static_cast<int>(groupId)]) {
-      auto& waits = tasks.tasks_[static_cast<size_t>(consumer)].waits;
-      auto& producerStores = tasks.tasks_[static_cast<size_t>(producerId)].stores;
-      for (int slot : producerStores) {
-        // only non-early slots count as full-body waits
-        bool isEarly = false;
-        for (int early : workers.splitEarlyStoreSlots_[producerId]) {
-          if (early == slot) { isEarly = true; break; }
-        }
-        if (isEarly) continue;
-        auto position = std::find(waits.begin(), waits.end(), slot);
-        if (position != waits.end()) { waits.erase(position); break; }
-      }
-      waits.push_back(earlySlot);
-    }
+    tasks.tasks_[static_cast<size_t>(group.publisher)].stores.push_back(group.slot);
   }
 
   for (MtTask& task : tasks.tasks_) {

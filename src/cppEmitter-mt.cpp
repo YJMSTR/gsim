@@ -75,7 +75,9 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      laCounters_(std::getenv("GSIM_MT_LA_COUNTERS") != nullptr &&
+                  std::getenv("GSIM_MT_LA_COUNTERS")[0] == '1') {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -268,9 +270,6 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "struct MtDispatch { void (S%s::*fn)(); uint32_t taskId, waitBegin, waitEnd, storeBegin, storeEnd, localWaitBegin, localWaitEnd; };\n",
           graph_.name.c_str());
   fprintf(header, "alignas(64) MtReadyToken mtReadyTokens[%d];\n", readySlotCount_);
-  if (!splitEarlyStoreSlots_.empty()) {
-    fprintf(header, "uint8_t mtCurParity = 0;\n");
-  }
   fprintf(header, "MtDoneFlag mtDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "std::vector<MtDeferredEvent> mtDeferredEventsByWorker[%d];\n",
           workerCount_);
@@ -308,6 +307,13 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     fprintf(header, "struct alignas(64) MtLookaheadStats { uint64_t calls{}, scanned{}, found{}, fullMiss{}; };\n");
     fprintf(header, "MtLookaheadStats mtLookaheadStats[%d];\n", workerCount_);
+  }
+  if (laCounters_ && lookaheadWindow_ > 0) {
+    fprintf(header, "bool mtLaCountersOn = false;\n");
+    fprintf(header, "alignas(64) unsigned long long mtLaTailCalls[%d] = {};\n", workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtLaFullMiss[%d] = {};\n", workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtLaScanDepth[%d] = {};\n", workerCount_);
+    fprintf(header, "alignas(64) unsigned long long mtLaScanLoads[%d] = {};\n", workerCount_);
   }
   // Bubble profiling: default off, enabled at runtime with GSIM_MT_BUBBLE_PROFILE=1.
   // The knob only gates rdtsc accounting; control flow and output are unchanged.
@@ -553,21 +559,6 @@ void CppEmitterMt::emitStateUpdateFunction(const StateUpdate& update) {
                         update.body, update.chunkCount);
 }
 
-void CppEmitterMt::emitInstruction(const InstInfo& inst, int indent) {
-  switch (inst.infoType) {
-      case SUPER_INFO_IF: emitText(indent++, false, mapRegisterNames(inst.inst) + "\n"); break;
-      case SUPER_INFO_ELSE:
-        emitText(indent - 1, false, mapRegisterNames(inst.inst) + "\n");
-        break;
-      case SUPER_INFO_DEDENT:
-        emitText(--indent, false, mapRegisterNames(inst.inst) + "\n");
-        break;
-      case SUPER_INFO_STR: emitText(indent, false, mapRegisterNames(inst.inst) + "\n"); break;
-      case SUPER_INFO_ASSIGN_BEG:
-      case SUPER_INFO_ASSIGN_END: break;
-  }
-}
-
 void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, int indent) {
   const int initialIndent = indent;
   for (const InstInfo& inst : instructions) {
@@ -587,7 +578,7 @@ void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, i
   Assert(indent == initialIndent, "unbalanced MTask instruction tree");
 }
 
-void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
+void CppEmitterMt::emitTask(const Task& task, int indent) {
   Assert(task.insts != nullptr, "MTask has no lowered instruction stream");
   Assert(!task.members.empty(), "cannot emit an empty MTask");
 
@@ -625,49 +616,7 @@ void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
     }
   }
 
-  if (!splitEarlyStoreSlots_.empty()) {
-    auto found = splitEarlyStoreSlots_.find(static_cast<int>(taskId));
-    if (found != splitEarlyStoreSlots_.end()) {
-      // Publish the early tokens right after the last pure assignment, in
-      // the original instruction order (census prefix definition).
-      int lastPure = -1;
-      std::vector<std::string> pureNames;
-      for (Node* member : task.members) {
-        if (member->type == NODE_OTHERS && task.localNodes.count(member) == 0) {
-          pureNames.push_back(member->name);
-        }
-      }
-      for (size_t i = 0; i < task.insts->size(); ++i) {
-        const std::string& text = (*task.insts)[i].inst;
-        const size_t begin = text.find_first_not_of(" \t");
-        if (begin == std::string::npos) continue;
-        for (const std::string& name : pureNames) {
-          if (text.compare(begin, name.size(), name) != 0) continue;
-          const char next = begin + name.size() < text.size()
-                                ? text[begin + name.size()]
-                                : '\0';
-          if (next == ' ' || next == '[' || next == '=') {
-            lastPure = static_cast<int>(i);
-            break;
-          }
-        }
-      }
-      for (size_t i = 0; i < task.insts->size(); ++i) {
-        if (static_cast<int>(i) == lastPure + 1) {
-          for (int slot : found->second) {
-            emitText(indent, false,
-                     "mtReadyTokens[" + std::to_string(slot) +
-                         "].value.store(mtCurParity, std::memory_order_release);\n");
-          }
-        }
-        emitInstruction((*task.insts)[i], indent);
-      }
-    } else {
-      emitInstructions(*task.insts, indent);
-    }
-  } else {
   emitInstructions(*task.insts, indent);
-  }
 }
 
 void CppEmitterMt::emitDefinitions() {
@@ -706,7 +655,7 @@ void CppEmitterMt::emitDefinitions() {
   }
   for (int taskId : taskEmissionOrder) {
     emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
-    emitTask(tasks_[static_cast<size_t>(taskId)], static_cast<size_t>(taskId), 1);
+    emitTask(tasks_[static_cast<size_t>(taskId)], 1);
     emitText(0, false, "}\n");
   }
 
@@ -853,7 +802,12 @@ void CppEmitterMt::emitDefinitions() {
       "      fprintf(stderr, \"[mt-bubble] per-task timing enabled, CSV -> %s\\n\", taskTimes);\n"
       "    }\n"
       "  }\n"
-      "  mtEnabled = true;\n}\n";
+      "  mtEnabled = true;\n";
+  if (laCounters_) {
+    runtime += "  const char* mtLc = getenv(\"GSIM_MT_LA_COUNTERS\");\n";
+    runtime += "  mtLaCountersOn = mtLc != nullptr && mtLc[0] == '1';\n";
+  }
+  runtime += "}\n";
 
   runtime += "void " + className + "::mtPinWorker(int worker) {\n";
   runtime += "  const char* affinity = getenv(\"GSIM_MT_CPU_AFFINITY\");\n";
@@ -893,6 +847,20 @@ void CppEmitterMt::emitDefinitions() {
       "  mtThreads.clear();\n"
       "}\n";
   runtime += className + "::~" + className + "() {\n  mtStopWorkers();\n";
+  if (laCounters_) {
+    runtime +=
+        "  if (mtLaCountersOn) {\n"
+        "    unsigned long long mtLcC=0, mtLcM=0, mtLcD=0, mtLcL=0;\n"
+        "    for (int w = 0; w < kMtWorkerCount; ++w) {\n"
+        "      mtLcC += mtLaTailCalls[w]; mtLcM += mtLaFullMiss[w];\n"
+        "      mtLcD += mtLaScanDepth[w]; mtLcL += mtLaScanLoads[w];\n"
+        "    }\n"
+        "    fprintf(stderr, \"[la-counters] tail-calls=%llu full-miss=%llu avg-scan-depth=%.1f est-scan-loads=%llu avg=%.1f/call\\n\",\n"
+        "            (unsigned long long)mtLcC, (unsigned long long)mtLcM,\n"
+        "            mtLcC ? (double)mtLcD / (double)mtLcC : 0.0,\n"
+        "            (unsigned long long)mtLcL, mtLcC ? (double)mtLcL / (double)mtLcC : 0.0);\n"
+        "  }\n";
+  }
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     runtime +=
         "  for (int worker = 0; worker < kMtWorkerCount; ++worker) {\n"
@@ -948,7 +916,10 @@ void CppEmitterMt::emitDefinitions() {
                "::mtRunLookaheadTail(const MtDispatch* entries, uint32_t count, "
                "uint32_t head, uint8_t parity, int worker) {\n";
     if (lookaheadStats_) runtime += "  ++mtLookaheadStats[worker].calls;\n";
-    runtime +=
+      if (laCounters_) {
+    runtime += "  if (mtLaCountersOn) ++mtLaTailCalls[worker];\n";
+  }
+runtime +=
         "  uint64_t doneBits[" + std::to_string(doneWordCount) + "]{};\n"
         "  auto remoteReady = [&](const MtDispatch& candidate) {\n"
         "    for (uint32_t i = candidate.waitBegin; i < candidate.waitEnd; ++i)\n"
@@ -987,7 +958,14 @@ void CppEmitterMt::emitDefinitions() {
     if (lookaheadStats_) runtime += "      ++mtLookaheadStats[worker].scanned;\n";
     runtime +=
         "      if ((doneBits[position >> 6] & (uint64_t{1} << (position & 63))) != 0) continue;\n"
-        "      const MtDispatch& candidate = entries[position];\n"
+        "      const MtDispatch& candidate = entries[position];\n";
+    if (laCounters_) {
+      runtime +=
+          "      if (mtLaCountersOn) { ++mtLaScanDepth[worker];\n"
+          "        mtLaScanLoads[worker] += (candidate.waitEnd - candidate.waitBegin)\n"
+          "                             + (candidate.localWaitEnd - candidate.localWaitBegin); }\n";
+    }
+    runtime +=
         "      if (!candidateReady(candidate, head)) continue;\n"
         "      runTask(candidate);\n"
         "      doneBits[position >> 6] |= uint64_t{1} << (position & 63);\n";
@@ -998,6 +976,7 @@ void CppEmitterMt::emitDefinitions() {
         "    }\n"
         "    if (progressed) continue;\n";
     if (lookaheadStats_) runtime += "    ++mtLookaheadStats[worker].fullMiss;\n";
+    if (laCounters_) runtime += "    if (mtLaCountersOn) ++mtLaFullMiss[worker];\n";
     runtime +=
         "    for (uint32_t i = headEntry.waitBegin; i < headEntry.waitEnd; ++i) {\n"
         "      const uint32_t mtBpSlot = mtWaitSlots[i];\n"
@@ -1015,9 +994,6 @@ void CppEmitterMt::emitDefinitions() {
         "}\n";
   }
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
-  if (!splitEarlyStoreSlots_.empty()) {
-    runtime += "  mtCurParity = parity;\n";
-  }
   runtime += "  MTBP_TICK(worker, mtBpProtocolOther);\n";
   runtime += "  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {
