@@ -35,6 +35,13 @@ int resetChunkSize() {
   return end != value && *end == '\0' && parsed >= 256 && parsed <= INT_MAX ? static_cast<int>(parsed) : 0;
 }
 
+bool storeElisionEnabled() {
+  // GSIM_MT_STORE_ELISION: emit conditional per-register state writebacks
+  // (store only when the value changed). Unset reproduces the baseline.
+  const char* value = std::getenv("GSIM_MT_STORE_ELISION");
+  return value != nullptr && value[0] != '\0';
+}
+
 bool storeCensusEnabled() {
   // GSIM_MT_STORE_CENSUS: instrument state-phase register writebacks with
   // per-site changed/unchanged counters (the store-elision census). Unset
@@ -93,7 +100,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
       lookaheadStats_(globalConfig.MtLookaheadStats),
       valueHistogram_(valueHistogramEnabled()),
-      storeCensus_(storeCensusEnabled()) {}
+      storeCensus_(storeCensusEnabled()),
+      storeElision_(storeElisionEnabled()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -105,7 +113,7 @@ void CppEmitterMt::prepare() {
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
   buildRegisterStorageNames();
-  if (storeCensus_) registerStoreCensusSites();
+  if (storeCensus_ || storeElision_) registerStoreCensusSites();
   writeTaskPhaseReport();
 }
 
@@ -632,11 +640,24 @@ void CppEmitterMt::emitResetBodyFunction(const std::string& name, const std::str
         std::string line = mapRegisterNames(instruction.text);
         const size_t assign = line.find(" = ");
         const int censusSite =
-            storeCensus_ && name.compare(0, 14, "mtUpdateStateW") == 0 &&
+            (storeCensus_ || storeElision_) && name.compare(0, 14, "mtUpdateStateW") == 0 &&
                     assign != std::string::npos &&
                     line.compare(0, 14, "mtRegisterDstW", 14) == 0
                 ? nextStoreCensusSite(name, instruction.text)
                 : -1;
+        if (storeElision_ && !storeCensus_ && censusSite >= 0) {
+          // Store elision: keep the write only when the value moved. The
+          // register keeps the (identical) old value otherwise, so the Dst
+          // block, the commit memcpy, and every reader see byte-identical
+          // state; only the store disappears.
+          const std::string lvalue = line.substr(0, assign);
+          std::string rhs = line.substr(assign + 3);
+          while (!rhs.empty() && (rhs.back() == ';' || rhs.back() == ' ')) rhs.pop_back();
+          emitText(indent, false,
+                   "{ const auto mtSeV = (" + rhs + "); if (" + lvalue + " != mtSeV) " +
+                       lvalue + " = mtSeV; }\n");
+          break;
+        }
         if (censusSite >= 0) {
           // Census: evaluate the RHS once at the same point, count unchanged
           // writes via byte folds, then store unconditionally (behavior and

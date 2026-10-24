@@ -81,6 +81,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   bool valueHistogram_ = false;
   std::vector<ValueProbePlan> valueProbes_;
   bool storeCensus_ = false;
+  bool storeElision_ = false;
   std::vector<std::string> storeCensusSites_;
   std::map<std::string, int> storeCensusSiteIndex_;
   std::map<Node*, std::string> packedRegisterNames_;
