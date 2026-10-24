@@ -477,7 +477,8 @@ bool parseUniformFillElement(const std::string& text, std::string& base,
   }
   rhs = text.substr(pos + 3, text.size() - pos - 4);
   if (rhs.find(';') != std::string::npos ||
-      rhs.find('\n') != std::string::npos) {
+      rhs.find('\n') != std::string::npos ||
+      rhs.find("__gsim_uf_i") != std::string::npos) {
     return false;
   }
   index = value;
@@ -485,7 +486,9 @@ bool parseUniformFillElement(const std::string& text, std::string& base,
 }
 
 /* Rewrites insts in place, replacing each qualifying run with one loop
-   entry. A no-op (not even a reorder) when the knob is off. */
+   entry. A no-op (not even a reorder) when the knob is off. Called from
+   MtWorkerBuilder::build AFTER costs, placement, and token planning so the
+   knob never shifts scheduling - it only changes emitted body shape. */
 void mergeUniformFillRuns(std::vector<InstInfo>& insts) {
   if (!uniformFillEnabled()) return;
   size_t write = 0;
@@ -559,7 +562,7 @@ void buildTaskTree(MtTask& task, const MtTaskPlan& plan) {
   }
   task.insts = new std::vector<InstInfo>();
   task.stmtTree->compute(*task.insts);
-  mergeUniformFillRuns(*task.insts);
+
 }
 
 void buildResetTree(SuperNode* super) {
@@ -624,4 +627,11 @@ void MtTaskLowerer::generateStmtTrees(graph& graph, MtTaskPlan& plan) {
   // Reset SuperNodes are invoked outside normal MTask dispatch and retain the
   // same lowering used by the active implementation.
   for (SuperNode* super : graph.allReset) buildResetTree(super);
+}
+
+/* Exported post-scheduling entry: MtWorkerBuilder::build calls this after
+   costs, placement, and token planning so GSIM_MT_UNIFORM_FILL changes only
+   emitted body shape, never scheduling. */
+void mtMergeUniformFillRuns(std::vector<InstInfo>& insts) {
+  mergeUniformFillRuns(insts);
 }

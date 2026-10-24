@@ -1,5 +1,7 @@
 #include "mtTaskSchedule.h"
 
+#include "mtTaskLowering.h"
+
 #include "common.h"
 #include "mtCostModel.h"
 #include "mtReplicationSchedule.h"
@@ -1289,4 +1291,10 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
           "transitive-edges-removed=%zu\n",
           workerCount, groupCount, tasks.tasks_.size(), edgeCount, groups.size(),
           uncompressedTokenGroups, localEdgeCount, transitiveEdgesRemoved);
+
+  // Uniform-fill run merge runs AFTER every cost/placement/token decision:
+  // GSIM_MT_UNIFORM_FILL changes emitted body shape only, never scheduling.
+  for (MtTask& task : tasks.tasks_) {
+    if (task.insts != nullptr) mtMergeUniformFillRuns(*task.insts);
+  }
 }
