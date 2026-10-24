@@ -88,6 +88,15 @@ void CppEmitterMt::prepare() {
                          workerCount_, resetChunk_);
   buildRegisterStorageNames();
   writeTaskPhaseReport();
+  // GSIM_MT_SPARSE_AUDIT: generation-time audit CSV only. The knob never
+  // touches emission; it adds one report file next to the phase CSVs.
+  {
+    const char* sparseAudit = std::getenv("GSIM_MT_SPARSE_AUDIT");
+    if (sparseAudit != nullptr && sparseAudit[0] != '\0' &&
+        !(sparseAudit[0] == '0' && sparseAudit[1] == '\0')) {
+      writeSparseAudit();
+    }
+  }
 }
 
 void CppEmitterMt::writeTaskPhaseReport() const {
@@ -608,6 +617,244 @@ void CppEmitterMt::emitTask(const Task& task, int indent) {
   }
 
   emitInstructions(*task.insts, indent);
+}
+
+
+// GSIM_MT_SPARSE_AUDIT export: a generation-time census of every compute
+// task's eligibility for activity-gated sparse execution. Report-only; the
+// emitted model is untouched.
+//
+// Field semantics (derived from the lowered plan only; no runtime guesses):
+// - side_effect_kind: state-write (writes a register Dst), memory-write
+//   (writes a memory pending slot / writer node), DPI/special/ext (ExtModule
+//   task or instruction text matching side-effect markers - HEURISTIC text
+//   scan, flagged as such), else none.
+// - Inputs are the expression-tree reads minus pure write targets. An input
+//   is UNTRACKED when it is a REG_SRC field, a MEMORY, a primary INP, an
+//   EXT/special node, or is produced by a task that is not an activity
+//   source (see closure below). Constants and task-local temporaries are
+//   excluded.
+// - Closure: start with every task a candidate. Iteratively disqualify any
+//   task that (a) has a side effect, (b) has a direct untracked input
+//   (state/memory/INP/EXT), or (c) reads a value node whose producer task is
+//   disqualified, or (d) reads a value node whose producer is a gate that
+//   publishes a wide (>64b) or array output. Remaining tasks are
+//   gate_candidates; disqualified tasks that still always execute are
+//   activity sources (they can produce changed values for downstream
+//   gates).
+// - activity_relevant_output_nodes: a candidate's plain value outputs
+//   (width<=64, non-array) whose every consumer is a gate candidate.
+// - output_compare_count/bytes: count and bytes of those outputs (the
+//   boundary compares downstream gates would perform).
+// - remote_group: for each cross-worker token group the task takes part in
+//   (publisher or consumer): producerOwner->consumerOwner with publisher
+//   task and the source-task set.
+void CppEmitterMt::writeSparseAudit() const {
+  const std::string path = globalConfig.OutputDir + "/mt-sparse-audit.csv";
+  FILE* out = std::fopen(path.c_str(), "w");
+  Assert(out != nullptr, "cannot open sparse audit CSV");
+  fprintf(out, "task,worker,cost,instructions,predecessors,successors,"
+               "side_effect_kind,untracked_input_count,gate_candidate,"
+               "activity_source,activity_relevant_output_nodes,"
+               "output_compare_count,output_compare_bytes,remote_groups\n");
+  const size_t taskCount = tasks_.size();
+
+  // Read/write sets and effect kinds.
+  std::vector<std::set<Node*>> readsByTask(taskCount);
+  std::vector<std::set<Node*>> writesByTask(taskCount);
+  std::vector<int> effectKind(taskCount, 0);  // 0 none, 1 state, 2 mem, 3 dpi/ext
+  static const char* kEffectNames[] = {"none", "state-write", "memory-write",
+                                       "DPI/special/ext"};
+  for (size_t id = 0; id < taskCount; ++id) {
+    const Task& task = tasks_[id];
+    if (task.kind != MtTaskKind::Normal) effectKind[id] = 3;
+    if (task.insts != nullptr && effectKind[id] != 3) {
+      for (const InstInfo& inst : *task.insts) {
+        if (inst.infoType != SUPER_INFO_STR) continue;
+        const std::string text = mapRegisterNames(inst.inst);
+        for (const char* marker : {"printf", "fwrite", "fflush", "fopen",
+                                   "fputs", "abort", "assert", "random",
+                                   "urandom", "system("}) {
+          if (text.find(marker) != std::string::npos) {
+            effectKind[id] = 3;  // heuristic text marker
+            break;
+          }
+        }
+        if (effectKind[id] == 3) break;
+      }
+    }
+    for (Node* node : task.members) {
+      for (ExpTree* tree : node->assignTree) {
+        collectReferencedNodes(tree->getRoot(), readsByTask[id]);
+        collectReferencedNodes(tree->getlval(), writesByTask[id]);
+      }
+    }
+    if (effectKind[id] != 0) continue;
+    for (Node* node : writesByTask[id]) {
+      if (node->type == NODE_REG_DST) { effectKind[id] = 1; break; }
+      if (node->type == NODE_WRITER || node->type == NODE_READWRITER ||
+          node->type == NODE_MEMORY) { effectKind[id] = 2; break; }
+    }
+  }
+
+  const std::unordered_map<Node*, int>& byNode = taskByNode_;
+  auto producerOf = [&](Node* node) -> int {
+    auto found = byNode.find(node);
+    return found == byNode.end() ? -1 : found->second;
+  };
+
+  // Value inputs of a task: reads minus pure write targets, minus constants
+  // and task-local temporaries. Returns per-input classification.
+  struct InputRef { Node* node; int producer; bool directUntracked; bool wide; };
+  std::vector<std::vector<InputRef>> inputs(taskCount);
+  for (size_t id = 0; id < taskCount; ++id) {
+    const Task& task = tasks_[id];
+    for (Node* node : readsByTask[id]) {
+      if (writesByTask[id].count(node) != 0) continue;
+      if (node->status == CONSTANT_NODE) continue;
+      if (task.localNodes.count(node) != 0) continue;
+      const int producer = producerOf(node);
+      const bool direct = node->type == NODE_REG_SRC || node->type == NODE_MEMORY ||
+                          node->type == NODE_INP || producer < 0;
+      inputs[id].push_back({node, producer, direct,
+                            node->width > 64 || !node->dimension.empty()});
+    }
+  }
+
+  // Gate-candidate fixpoint. A task stays a candidate only when it has no
+  // side effect, at least one predecessor, no direct untracked input, and
+  // every value input comes from a task that itself is not disqualified
+  // (i.e. an always-executing activity source) and is not a wide/array
+  // output. Direct state/memory/INP/EXT inputs always disqualify - a gate
+  // can only consume activity-derivable values.
+  std::vector<char> gate(taskCount, 1);
+  std::vector<size_t> untrackedCount(taskCount, 0);
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (size_t id = 0; id < taskCount; ++id) {
+      if (!gate[id]) continue;
+      bool bad = effectKind[id] != 0 || tasks_[id].predecessors.empty();
+      size_t untracked = 0;
+      for (const InputRef& input : inputs[id]) {
+        if (input.directUntracked) { ++untracked; continue; }
+        if (input.producer == static_cast<int>(id)) continue;
+        if (!gate[static_cast<size_t>(input.producer)]) { ++untracked; continue; }
+        if (input.wide) bad = true;  // downstream compare the model forbids
+      }
+      untrackedCount[id] = untracked;
+      if (bad || untracked > 0) {
+        gate[id] = 0;
+        changed = true;
+      }
+    }
+  }
+
+  // Consumers of each produced value node (for relevant-output classification).
+  std::map<Node*, std::vector<int>> consumersOf;
+  for (size_t id = 0; id < taskCount; ++id) {
+    for (const InputRef& input : inputs[id]) {
+      if (input.producer >= 0 && input.producer != static_cast<int>(id)) {
+        consumersOf[input.node].push_back(static_cast<int>(id));
+      }
+    }
+  }
+
+  // Remote token groups: mirror build()'s grouping. For each consumer and
+  // each cross-worker producer owner, the group records the publisher task
+  // (latest same-owner source in the consumer-visible owner chain order =
+  // the maximum task id is NOT the publisher; build() picks the source with
+  // the largest worker position in the producer's chain; we reconstruct via
+  // chain order) and the full source-task set.
+  std::vector<int> chainPositionOfTask(taskCount, -1);
+  for (int worker = 0; worker < workerCount_; ++worker) {
+    const auto& chain = workerTasks_[static_cast<size_t>(worker)];
+    for (size_t position = 0; position < chain.size(); ++position) {
+      chainPositionOfTask[static_cast<size_t>(chain[position])] =
+          static_cast<int>(position);
+    }
+  }
+  std::map<size_t, std::vector<std::string>> groupsByConsumer;
+  for (size_t consumer = 0; consumer < taskCount; ++consumer) {
+    std::map<int, std::vector<int>> sourcesByOwner;
+    for (int predecessor : tasks_[consumer].predecessors) {
+      const int owner = tasks_[static_cast<size_t>(predecessor)].owner;
+      if (owner != tasks_[consumer].owner) {
+        sourcesByOwner[owner].push_back(predecessor);
+      }
+    }
+    for (auto& entry : sourcesByOwner) {
+      int publisher = entry.second.front();
+      for (int source : entry.second) {
+        if (chainPositionOfTask[static_cast<size_t>(source)] >
+            chainPositionOfTask[static_cast<size_t>(publisher)]) {
+          publisher = source;
+        }
+      }
+      std::string sources;
+      for (int source : entry.second) {
+        sources += (sources.empty() ? "" : "+") + std::to_string(source);
+      }
+      groupsByConsumer[consumer].push_back(
+          "owner" + std::to_string(entry.first) + "->owner" +
+          std::to_string(tasks_[consumer].owner) + ";pub=" +
+          std::to_string(publisher) + ";src=" + sources);
+    }
+  }
+
+  size_t gateCount = 0;
+  long long gateBodyCost = 0;
+  size_t compareCount = 0;
+  long long compareBytes = 0;
+  for (size_t id = 0; id < taskCount; ++id) {
+    const Task& task = tasks_[id];
+    const bool isGate = gate[id] != 0;
+    const bool activitySource = !isGate;  // every non-gate always executes
+    std::string preds, succs;
+    for (int p : task.predecessors) preds += (preds.empty() ? "" : "+") + std::to_string(p);
+    for (int p : task.successors) succs += (succs.empty() ? "" : "+") + std::to_string(p);
+    std::string relevant;
+    size_t compares = 0;
+    long long bytes = 0;
+    if (isGate) {
+      for (Node* node : writesByTask[id]) {
+        if (node->status == CONSTANT_NODE) continue;
+        if (node->width > 64 || !node->dimension.empty()) continue;
+        auto consumers = consumersOf.find(node);
+        if (consumers == consumersOf.end()) continue;
+        bool allGates = true;
+        for (int consumer : consumers->second) {
+          if (!gate[static_cast<size_t>(consumer)]) allGates = false;
+        }
+        if (!allGates) continue;
+        relevant += (relevant.empty() ? "" : "+") + node->name;
+        ++compares;
+        bytes += (node->width + 7) / 8;
+      }
+    }
+    std::string groups;
+    for (const std::string& group : groupsByConsumer[id]) {
+      groups += (groups.empty() ? "" : " | ") + group;
+    }
+    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%s,%zu,%d,%d,%s,%zu,%lld,%s\n",
+            id, task.owner, task.cost,
+            task.insts != nullptr ? task.insts->size() : 0,
+            preds.c_str(), succs.c_str(), kEffectNames[effectKind[id]],
+            untrackedCount[id], isGate ? 1 : 0, activitySource ? 1 : 0,
+            relevant.c_str(), compares, bytes, groups.c_str());
+    if (isGate) {
+      ++gateCount;
+      gateBodyCost += task.cost;
+      compareCount += compares;
+      compareBytes += bytes;
+    }
+  }
+  Assert(std::fclose(out) == 0, "cannot finish sparse audit CSV");
+  fprintf(stderr,
+          "[cppEmitter-mt] sparse-audit: tasks=%zu gate_candidates=%zu "
+          "gate_body_cost=%lld output_compares=%zu output_compare_bytes=%lld "
+          "(DPI/special detection is a text-marker heuristic)\n",
+          taskCount, gateCount, gateBodyCost, compareCount, compareBytes);
 }
 
 void CppEmitterMt::emitDefinitions() {

@@ -59,6 +59,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitTask(const Task& task, int indent);
   void buildRegisterStorageNames();
   void writeTaskPhaseReport() const;
+  void writeSparseAudit() const;
   std::string mapRegisterNames(const std::string& text) const;
 
   graph& graph_;
