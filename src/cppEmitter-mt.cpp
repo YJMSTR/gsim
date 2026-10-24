@@ -122,9 +122,18 @@ void CppEmitterMt::registerStoreCensusSites() {
       if (instruction.type != SUPER_INFO_STR) continue;
       const std::string line = mapRegisterNames(instruction.text);
       const size_t assign = line.find(" = ");
-      if (assign == std::string::npos || line.compare(0, 14, "mtRegisterDstW", 14) != 0) {
+      if (assign == std::string::npos || line.compare(0, 14, "mtRegisterDstW", 14) != 0 ||
+          instruction.text.find('\n') != std::string::npos) {
         continue;
       }
+      const std::string candidateLvalue = line.substr(0, assign);
+      if (candidateLvalue.find('[') != std::string::npos) continue;  // array-element store
+      std::string candidateRhs = line.substr(assign + 3);
+      while (!candidateRhs.empty() &&
+             (candidateRhs.back() == ';' || candidateRhs.back() == ' ')) {
+        candidateRhs.pop_back();
+      }
+      if (candidateRhs.empty() || candidateRhs.find(';') != std::string::npos) continue;
       const size_t dot = line.find('.');
       const std::string reg = line.substr(dot + 1, assign - dot - 1);
       storeCensusSiteIndex_[name + "/" + instruction.text] =
@@ -622,10 +631,13 @@ void CppEmitterMt::emitResetBodyFunction(const std::string& name, const std::str
       case SUPER_INFO_STR: {
         std::string line = mapRegisterNames(instruction.text);
         const size_t assign = line.find(" = ");
-        const bool isStateStore =
+        const int censusSite =
             storeCensus_ && name.compare(0, 14, "mtUpdateStateW") == 0 &&
-            assign != std::string::npos && line.compare(0, 14, "mtRegisterDstW", 14) == 0;
-        if (isStateStore) {
+                    assign != std::string::npos &&
+                    line.compare(0, 14, "mtRegisterDstW", 14) == 0
+                ? nextStoreCensusSite(name, instruction.text)
+                : -1;
+        if (censusSite >= 0) {
           // Census: evaluate the RHS once at the same point, count unchanged
           // writes via byte folds, then store unconditionally (behavior and
           // value semantics unchanged). Site index comes from the prepare()
@@ -633,8 +645,7 @@ void CppEmitterMt::emitResetBodyFunction(const std::string& name, const std::str
           const std::string lvalue = line.substr(0, assign);
           std::string rhs = line.substr(assign + 3);
           while (!rhs.empty() && (rhs.back() == ';' || rhs.back() == ' ')) rhs.pop_back();
-          const int site = nextStoreCensusSite(name, instruction.text);
-          Assert(site >= 0, "unregistered store-census site in %s", name.c_str());
+          const int site = censusSite;
           emitText(indent, false,
                    "{ const auto mtSeV = (" + rhs + "); ++mtStoreCalls[" +
                        std::to_string(site) + "]; mtStoreUnchanged[" + std::to_string(site) +
