@@ -654,23 +654,36 @@ void CppEmitterMt::writeSparseAudit() const {
   FILE* out = std::fopen(path.c_str(), "w");
   Assert(out != nullptr, "cannot open sparse audit CSV");
   fprintf(out, "task,worker,cost,instructions,predecessors,successors,"
-               "side_effect_kind,untracked_input_count,untracked_reasons,"
+               "effect_mask,effect_kind,untracked_input_count,untracked_reasons,"
                "gate_candidate,activity_source,wide_input_disqualify,"
-               "activity_relevant_output_nodes,"
-               "output_compare_count,output_compare_bytes,remote_groups,"
-               "state_input_blocks\n");
+               "activity_relevant_output_nodes,output_compare_count,"
+               "output_compare_bytes,remote_groups,state_input_blocks,"
+               "v02_gate_candidate,v02_untracked_input_count,"
+               "v02_untracked_reasons,v02_output_compare_count,"
+               "v02_output_compare_bytes\n");
   const size_t taskCount = tasks_.size();
 
-  // Read/write sets and effect kinds.
+  // Read/write sets per task from the lowered statement trees.
   std::vector<std::set<Node*>> readsByTask(taskCount);
   std::vector<std::set<Node*>> writesByTask(taskCount);
-  std::vector<int> effectKind(taskCount, 0);  // 0 none, 1 state, 2 mem, 3 dpi/ext
-  static const char* kEffectNames[] = {"none", "state-write", "memory-write",
-                                       "DPI/special/ext"};
+  for (size_t id = 0; id < taskCount; ++id) {
+    for (Node* node : tasks_[id].members) {
+      for (ExpTree* tree : node->assignTree) {
+        collectReferencedNodes(tree->getRoot(), readsByTask[id]);
+        collectReferencedNodes(tree->getlval(), writesByTask[id]);
+      }
+    }
+  }
+
+  // Effect BITMASK over every write target and every instruction; no
+  // first-match short-circuit. bit1 REG_DST next-state write, bit2 memory/
+  // sparse pending write, bit4 DPI/special/ext (ExtModule kind or a
+  // text-marker heuristic on the lowered instruction stream).
+  std::vector<int> effectMask(taskCount, 0);
   for (size_t id = 0; id < taskCount; ++id) {
     const Task& task = tasks_[id];
-    if (task.kind != MtTaskKind::Normal) effectKind[id] = 3;
-    if (task.insts != nullptr && effectKind[id] != 3) {
+    if (task.kind != MtTaskKind::Normal) effectMask[id] |= 4;
+    if (task.insts != nullptr) {
       for (const InstInfo& inst : *task.insts) {
         if (inst.infoType != SUPER_INFO_STR) continue;
         const std::string text = mapRegisterNames(inst.inst);
@@ -678,26 +691,30 @@ void CppEmitterMt::writeSparseAudit() const {
                                    "fputs", "abort", "assert", "random",
                                    "urandom", "system("}) {
           if (text.find(marker) != std::string::npos) {
-            effectKind[id] = 3;  // heuristic text marker
+            effectMask[id] |= 4;  // heuristic text marker, flagged as such
             break;
           }
         }
-        if (effectKind[id] == 3) break;
       }
     }
-    for (Node* node : task.members) {
-      for (ExpTree* tree : node->assignTree) {
-        collectReferencedNodes(tree->getRoot(), readsByTask[id]);
-        collectReferencedNodes(tree->getlval(), writesByTask[id]);
-      }
-    }
-    if (effectKind[id] != 0) continue;
     for (Node* node : writesByTask[id]) {
-      if (node->type == NODE_REG_DST) { effectKind[id] = 1; break; }
+      if (node->type == NODE_REG_DST) effectMask[id] |= 1;
       if (node->type == NODE_WRITER || node->type == NODE_READWRITER ||
-          node->type == NODE_MEMORY) { effectKind[id] = 2; break; }
+          node->type == NODE_MEMORY) {
+        effectMask[id] |= 2;
+      }
     }
   }
+  auto effectName = [](int mask) -> const char* {
+    if (mask == 0) return "none";
+    if (mask == 1) return "state-write";
+    if (mask == 2) return "memory-write";
+    if (mask == 4) return "DPI/special/ext";
+    if ((mask & 5) == 5) return "state+DPI";
+    if ((mask & 3) == 3) return "state+memory-write";
+    if ((mask & 6) == 6) return "memory+DPI";
+    return "mixed";
+  };
 
   const std::unordered_map<Node*, int>& byNode = taskByNode_;
   auto producerOf = [&](Node* node) -> int {
@@ -705,9 +722,8 @@ void CppEmitterMt::writeSparseAudit() const {
     return found == byNode.end() ? -1 : found->second;
   };
 
-  // Value inputs of a task: reads minus pure write targets, minus constants
-  // and task-local temporaries. Returns per-input classification.
-  struct InputRef { Node* node; int producer; bool directUntracked; bool wide; };
+  // Value inputs: reads minus pure write targets, constants, and task-locals.
+  struct InputRef { Node* node; int producer; bool direct; bool wide; };
   std::vector<std::vector<InputRef>> inputs(taskCount);
   for (size_t id = 0; id < taskCount; ++id) {
     const Task& task = tasks_[id];
@@ -716,74 +732,98 @@ void CppEmitterMt::writeSparseAudit() const {
       if (node->status == CONSTANT_NODE) continue;
       if (task.localNodes.count(node) != 0) continue;
       const int producer = producerOf(node);
-      const bool direct = node->type == NODE_REG_SRC || node->type == NODE_MEMORY ||
-                          node->type == NODE_INP || producer < 0;
-      inputs[id].push_back({node, producer, direct,
+      inputs[id].push_back({node, producer, producer < 0,
                             node->width > 64 || !node->dimension.empty()});
     }
   }
 
-  // Gate-candidate fixpoint. A task stays a candidate only when it has no
-  // side effect, at least one predecessor, no direct untracked input, and
-  // every value input comes from a task that itself is not disqualified
-  // (i.e. an always-executing activity source) and is not a wide/array
-  // output. Direct state/memory/INP/EXT inputs always disqualify - a gate
-  // can only consume activity-derivable values.
-  std::vector<char> gate(taskCount, 1);
-  std::vector<size_t> untrackedCount(taskCount, 0);
-  std::vector<std::string> untrackedReasons(taskCount);
-  std::vector<char> wideDisqualify(taskCount, 0);
-  auto reasonTag = [&](Node* node, int producer) -> std::string {
-    if (node->type == NODE_REG_SRC) return std::string("REG_SRC");
-    if (node->type == NODE_MEMORY) return std::string("MEMORY");
-    if (node->type == NODE_INP) return std::string("INP");
-    if (producer < 0) return std::string("EXT/UNOWNED");
-    return std::string("INACTIVE-PRODUCER");
-  };
-  bool changed = true;
-  while (changed) {
-    changed = false;
-    for (size_t id = 0; id < taskCount; ++id) {
-      if (!gate[id]) continue;
-      bool noPred = tasks_[id].predecessors.empty();
-      bool wide = false;
-      size_t untracked = 0;
-      std::map<std::string, size_t> reasonCounts;
-      for (const InputRef& input : inputs[id]) {
-        if (input.directUntracked) {
-          ++untracked;
-          ++reasonCounts[reasonTag(input.node, input.producer)];
-          continue;
-        }
-        if (input.producer == static_cast<int>(id)) continue;
-        if (!gate[static_cast<size_t>(input.producer)]) {
-          ++untracked;
-          ++reasonCounts["INACTIVE-PRODUCER"];
-          continue;
-        }
-        if (input.wide) wide = true;  // forbidden downstream compare
-      }
-      untrackedCount[id] = untracked;
-      std::string reasons;
-      for (const auto& entry : reasonCounts) {
-        reasons += (reasons.empty() ? "" : ";") + entry.first + ":" +
-                   std::to_string(entry.second);
-      }
-      if (wide) reasons += reasons.empty() ? "WIDE-INPUT" : ";WIDE-INPUT";
-      if (noPred) reasons += reasons.empty() ? "NO-PRED" : ";NO-PRED";
-      if (effectKind[id] != 0) {
-        reasons += reasons.empty() ? "SIDE-EFFECT" : ";SIDE-EFFECT";
-      }
-      untrackedReasons[id] = reasons;
-      wideDisqualify[id] = wide;
-      if (effectKind[id] != 0 || noPred || wide || untracked > 0) {
-        gate[id] = 0;
-        changed = true;
-      }
+  // Register-block byte offsets (declaration order; alignment 1/2/4/8 and
+  // _BitInt(N>64) aligned 8 per 49d6ebb). Sparse arrays are UNMAPPED.
+  std::map<Node*, std::pair<int, long long>> regOffset;
+  for (const StateUpdate& update : stateTasks_) {
+    long long offset = 0;
+    for (Node* reg : update.registers) {
+      const int width = reg->width;
+      const int align = width <= 8 ? 1 : width <= 16 ? 2 : width <= 32 ? 4 : 8;
+      offset = (offset + align - 1) / align * align;
+      regOffset[reg] = {update.owner, offset};
+      offset += (width + 7) / 8;
     }
   }
 
-  // Consumers of each produced value node (for relevant-output classification).
+  // ---- v0.1 closure: every effect bit disqualifies; direct REG_SRC,
+  // MEMORY, INP, EXT/unowned inputs are untracked; wide inputs dq. ----
+  std::vector<char> gateV01(taskCount, 1);
+  std::vector<size_t> untrackedV01(taskCount, 0);
+  std::vector<std::string> reasonsV01(taskCount);
+  std::vector<char> wideDq(taskCount, 0);
+  auto runClosure = [&](std::vector<char>& gate, std::vector<size_t>& untrackedOut,
+                        std::vector<std::string>& reasonsOut, bool v02Rules) {
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (size_t id = 0; id < taskCount; ++id) {
+        if (!gate[id]) continue;
+        const bool dqEffect = v02Rules ? ((effectMask[id] & 2) != 0 ||
+                                          (effectMask[id] & 4) != 0)
+                                       : effectMask[id] != 0;
+        const bool noPred = tasks_[id].predecessors.empty();
+        bool wide = false;
+        size_t untracked = 0;
+        std::map<std::string, size_t> reasonCounts;
+        for (const InputRef& input : inputs[id]) {
+          if (input.node->type == NODE_REG_SRC) {
+            if (v02Rules && regOffset.find(input.node) != regOffset.end()) {
+              continue;  // mapped register tracks via the dirty bitmap
+            }
+            ++untracked;
+            ++reasonCounts[v02Rules ? "REG_SRC-UNMAPPED" : "REG_SRC"];
+            continue;
+          }
+          if (input.node->type == NODE_MEMORY || input.node->type == NODE_INP ||
+              input.producer < 0) {
+            ++untracked;
+            ++reasonCounts[input.node->type == NODE_MEMORY
+                               ? "MEMORY"
+                               : (input.node->type == NODE_INP ? "INP"
+                                                               : "EXT/UNOWNED")];
+            continue;
+          }
+          if (input.producer == static_cast<int>(id)) continue;
+          if (!gate[static_cast<size_t>(input.producer)]) {
+            ++untracked;
+            ++reasonCounts["INACTIVE-PRODUCER"];
+            continue;
+          }
+          if (input.wide) wide = true;
+        }
+        untrackedOut[id] = untracked;
+        std::string reasons;
+        for (const auto& entry : reasonCounts) {
+          reasons += (reasons.empty() ? "" : ";") + entry.first + ":" +
+                     std::to_string(entry.second);
+        }
+        if (wide) reasons += reasons.empty() ? "WIDE-INPUT" : ";WIDE-INPUT";
+        if (noPred) reasons += reasons.empty() ? "NO-PRED" : ";NO-PRED";
+        if (dqEffect) reasons += reasons.empty() ? "EFFECT" : ";EFFECT";
+        reasonsOut[id] = reasons;
+        if (v02Rules) wideDq[id] = wide ? 1 : wideDq[id];
+        if (dqEffect || noPred || wide || untracked > 0) {
+          gate[id] = 0;
+          changed = true;
+        }
+      }
+    }
+  };
+  runClosure(gateV01, untrackedV01, reasonsV01, false);
+
+  // ---- v0.2 closure: REG_DST-only writes allowed; mapped REG_SRC tracked. ----
+  std::vector<char> gateV02(taskCount, 1);
+  std::vector<size_t> untrackedV02(taskCount, 0);
+  std::vector<std::string> reasonsV02(taskCount);
+  runClosure(gateV02, untrackedV02, reasonsV02, true);
+
+  // Consumers of each produced value node.
   std::map<Node*, std::vector<int>> consumersOf;
   for (size_t id = 0; id < taskCount; ++id) {
     for (const InputRef& input : inputs[id]) {
@@ -793,18 +833,12 @@ void CppEmitterMt::writeSparseAudit() const {
     }
   }
 
-  // Remote token groups: mirror build()'s grouping. For each consumer and
-  // each cross-worker producer owner, the group records the publisher task
-  // (latest same-owner source in the consumer-visible owner chain order =
-  // the maximum task id is NOT the publisher; build() picks the source with
-  // the largest worker position in the producer's chain; we reconstruct via
-  // chain order) and the full source-task set.
-  std::vector<int> chainPositionOfTask(taskCount, -1);
+  // Remote token groups (owner pair, publisher by chain position, sources).
+  std::vector<int> chainPosition(taskCount, -1);
   for (int worker = 0; worker < workerCount_; ++worker) {
     const auto& chain = workerTasks_[static_cast<size_t>(worker)];
     for (size_t position = 0; position < chain.size(); ++position) {
-      chainPositionOfTask[static_cast<size_t>(chain[position])] =
-          static_cast<int>(position);
+      chainPosition[static_cast<size_t>(chain[position])] = static_cast<int>(position);
     }
   }
   std::map<size_t, std::vector<std::string>> groupsByConsumer;
@@ -819,8 +853,8 @@ void CppEmitterMt::writeSparseAudit() const {
     for (auto& entry : sourcesByOwner) {
       int publisher = entry.second.front();
       for (int source : entry.second) {
-        if (chainPositionOfTask[static_cast<size_t>(source)] >
-            chainPositionOfTask[static_cast<size_t>(publisher)]) {
+        if (chainPosition[static_cast<size_t>(source)] >
+            chainPosition[static_cast<size_t>(publisher)]) {
           publisher = source;
         }
       }
@@ -835,42 +869,22 @@ void CppEmitterMt::writeSparseAudit() const {
     }
   }
 
-  // Section 3.4 statistics: map each packed register to its Src block byte
-  // offset and 64B chunk. Layout model mirrors the emitter declaration
-  // order and the alignment rules (uint8/16/32/64 natural, _BitInt(N>64)
-  // aligned 8 - commit 49d6ebb caps cone type alignment at 8). Registers
-  // that are not members of a packed block (sparse arrays) are UNMAPPED.
-  std::map<Node*, std::pair<int, long long>> regOffset;  // node -> (owner, byte offset)
-  std::map<int, long long> blockSize;
-  for (const StateUpdate& update : stateTasks_) {
-    long long offset = 0;
-    for (Node* reg : update.registers) {
-      const int width = reg->width;
-      int align = width <= 8 ? 1 : width <= 16 ? 2 : width <= 32 ? 4 : 8;
-      offset = (offset + align - 1) / align * align;
-      regOffset[reg] = {update.owner, offset};
-      offset += (width + 7) / 8;
-    }
-    blockSize[update.owner] = offset;
-  }
-
-  size_t gateCount = 0;
-  long long gateBodyCost = 0;
-  size_t compareCount = 0;
-  long long compareBytes = 0;
-  size_t stateDqGates = 0;
-  size_t mappedStateInputs = 0;
-  size_t unmappedStateInputs = 0;
+  size_t gateCountV01 = 0, gateCountV02 = 0;
+  long long gateCostV02 = 0;
+  size_t cmpCountV02 = 0;
+  long long cmpBytesV02 = 0;
+  size_t stateDqTasks = 0, mappedStateInputs = 0, unmappedStateInputs = 0;
   for (size_t id = 0; id < taskCount; ++id) {
     const Task& task = tasks_[id];
-    const bool isGate = gate[id] != 0;
-    bool activitySource = false;
-    if (!isGate) {
+    const bool isGate = gateV01[id] != 0;
+    const bool isGateV02 = gateV02[id] != 0;
+    bool feedsGate = false;
+    if (!isGateV02) {
       for (Node* node : writesByTask[id]) {
         auto consumers = consumersOf.find(node);
         if (consumers == consumersOf.end()) continue;
         for (int consumer : consumers->second) {
-          if (gate[static_cast<size_t>(consumer)]) activitySource = true;
+          if (gateV02[static_cast<size_t>(consumer)]) feedsGate = true;
         }
       }
     }
@@ -880,21 +894,31 @@ void CppEmitterMt::writeSparseAudit() const {
     std::string relevant;
     size_t compares = 0;
     long long bytes = 0;
-    if (isGate) {
+    if (isGateV02) {
       for (Node* node : writesByTask[id]) {
         if (node->status == CONSTANT_NODE) continue;
+        if (node->type == NODE_REG_DST) {
+          // v0.2: next-state outputs compare against the previous cycle's
+          // next-state value; only narrow scalars are comparable.
+          if (node->width > 64 || !node->dimension.empty()) continue;
+          ++compares;
+          bytes += (node->width + 7) / 8;
+          relevant += (relevant.empty() ? "" : "+") + node->name + ":" +
+                      std::to_string(node->width);
+          continue;
+        }
         if (node->width > 64 || !node->dimension.empty()) continue;
         auto consumers = consumersOf.find(node);
         if (consumers == consumersOf.end()) continue;
         bool allGates = true;
         for (int consumer : consumers->second) {
-          if (!gate[static_cast<size_t>(consumer)]) allGates = false;
+          if (!gateV02[static_cast<size_t>(consumer)]) allGates = false;
         }
         if (!allGates) continue;
-        relevant += (relevant.empty() ? "" : "+") + node->name + ":" +
-                    std::to_string(node->width);
         ++compares;
         bytes += (node->width + 7) / 8;
+        relevant += (relevant.empty() ? "" : "+") + node->name + ":" +
+                    std::to_string(node->width);
       }
     }
     std::string groups;
@@ -902,57 +926,61 @@ void CppEmitterMt::writeSparseAudit() const {
       groups += (groups.empty() ? "" : " | ") + group;
     }
     std::string stateInputs;
-    size_t unmappedHere = 0;
     for (const InputRef& input : inputs[id]) {
       if (input.node->type != NODE_REG_SRC) continue;
       auto mapped = regOffset.find(input.node);
       if (mapped == regOffset.end()) {
-        ++unmappedHere;
+        ++unmappedStateInputs;
         stateInputs += (stateInputs.empty() ? "" : "+") + input.node->name + ":UNMAPPED";
         continue;
       }
-      const long long chunk = mapped->second.second / 64;
+      ++mappedStateInputs;
       stateInputs += (stateInputs.empty() ? "" : "+") + input.node->name + ":W" +
                      std::to_string(mapped->second.first) + "+off" +
                      std::to_string(mapped->second.second) + "/chunk" +
-                     std::to_string(chunk);
+                     std::to_string(mapped->second.second / 64);
     }
-    if (!isGate) {
-      bool stateDq = false;
+    if (!isGateV02) {
       for (const InputRef& input : inputs[id]) {
-        if (input.node->type == NODE_REG_SRC) stateDq = true;
+        if (input.node->type == NODE_REG_SRC) {
+          ++stateDqTasks;
+          break;
+        }
       }
-      if (stateDq) ++stateDqGates;
     }
-    mappedStateInputs += stateInputs.empty() ? 0 :
-        (stateInputs.find("UNMAPPED") == std::string::npos ? 1 : 0);
-    unmappedStateInputs += unmappedHere;
-    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%s,%zu,%s,%d,%d,%d,%s,%zu,%lld,%s,%s\n",
+    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%d,%s,%zu,%s,%d,%d,%d,%s,%zu,%lld,%s,%s,"
+                 "%d,%zu,%s,%zu,%lld\n",
             id, task.owner, task.cost,
             task.insts != nullptr ? task.insts->size() : 0,
-            preds.c_str(), succs.c_str(), kEffectNames[effectKind[id]],
-            untrackedCount[id],
-            (untrackedReasons[id].empty() ? "-" : untrackedReasons[id]).c_str(),
-            isGate ? 1 : 0, activitySource ? 1 : 0, wideDisqualify[id] ? 1 : 0,
-            relevant.c_str(), compares, bytes, groups.c_str(),
-            (stateInputs.empty() ? "-" : stateInputs).c_str());
-    if (isGate) {
-      ++gateCount;
-      gateBodyCost += task.cost;
-      compareCount += compares;
-      compareBytes += bytes;
+            preds.c_str(), succs.c_str(), effectMask[id],
+            effectName(effectMask[id]),
+            untrackedV01[id],
+            (reasonsV01[id].empty() ? "-" : reasonsV01[id]).c_str(),
+            isGate ? 1 : 0, feedsGate ? 1 : 0, wideDq[id] ? 1 : 0,
+            (relevant.empty() ? "-" : relevant).c_str(), compares, bytes,
+            (groups.empty() ? "-" : groups).c_str(),
+            (stateInputs.empty() ? "-" : stateInputs).c_str(),
+            isGateV02 ? 1 : 0, untrackedV02[id],
+            (reasonsV02[id].empty() ? "-" : reasonsV02[id]).c_str(),
+            compares, bytes);
+    if (isGate) ++gateCountV01;
+    if (isGateV02) {
+      ++gateCountV02;
+      gateCostV02 += task.cost;
+      cmpCountV02 += compares;
+      cmpBytesV02 += bytes;
     }
   }
   Assert(std::fclose(out) == 0, "cannot finish sparse audit CSV");
   fprintf(stderr,
-          "[cppEmitter-mt] sparse-audit: tasks=%zu gate_candidates=%zu "
-          "gate_body_cost=%lld output_compares=%zu output_compare_bytes=%lld "
-          "state-dq-tasks=%zu state-input-mapped-rows=%zu unmapped-state-inputs=%zu "
-          "(DPI/special detection is a text-marker heuristic; chunk offsets "
-          "follow the emitter declaration order and the 49d6ebb alignment "
-          "rules, sparse arrays are UNMAPPED)\n",
-          taskCount, gateCount, gateBodyCost, compareCount, compareBytes,
-          stateDqGates, mappedStateInputs, unmappedStateInputs);
+          "[cppEmitter-mt] sparse-audit: tasks=%zu v01_gates=%zu "
+          "v02_gates=%zu v02_gate_cost=%lld v02_compares=%zu "
+          "v02_compare_bytes=%lld state-dq-tasks=%zu mapped-state-inputs=%zu "
+          "unmapped-state-inputs=%zu (DPI detection is a text-marker "
+          "heuristic; chunk offsets follow emitter declaration order under "
+          "the 49d6ebb alignment rules; sparse arrays are UNMAPPED)\n",
+          taskCount, gateCountV01, gateCountV02, gateCostV02, cmpCountV02,
+          cmpBytesV02, stateDqTasks, mappedStateInputs, unmappedStateInputs);
 }
 
 void CppEmitterMt::emitDefinitions() {
