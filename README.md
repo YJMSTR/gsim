@@ -1,87 +1,139 @@
-# GSIM: A Fast RTL Simulator for Large-Scale Designs
+# gsim-mt Champion Delivery: cptopdown + dirty-chunk
 
-GSIM accepts chirrtl, and compiles it to C++
+This branch contains the currently verified champion implementation: **cptopdown + dirty-chunk**.
 
-## Prerequisites
+Measured results (independent rebuild, 45/45 rc=0):
 
-+ Install [GMP](https://gmplib.org/), [clang 19(+)](https://clang.llvm.org/).
+- coremark 50k: **4.43 s**
+- linux 300k: **27.46 s**
+- linux 1M: **91.51 s**
+- fulltrap: **27.05 s**
+- vs. official Verilator 5.052-32t: **3.99× coremark**, **3.61–3.68× linux**
 
-## Quike Start
+## What changed
 
-+ GSIM provides 4 RISC-V cores ready for simulation: [ysyx3](https://ysyx.oscc.cc/), [Rocket](https://github.com/chipsalliance/rocket-chip), [BOOM](https://github.com/riscv-boom/riscv-boom), [XiangShan](https://github.com/OpenXiangShan/XiangShan).
+### 1. cptopdown
 
-+ To try GSIM, using
-    ```
-    $ make init
-    $ make run dutName=core
-    ```
-+ Set core to `ysyx3`, `rocket`, `small-boom`, `large-boom`, `minimal-xiangshan` or `default-xiangshan`
+`topdown_iq_info_dpic` was rewritten from an O(N²) scalar loop into a rank-space bitset plus valid-entry filtering and popcount. This removes the measured critical-path task t1129 from the busiest worker.
 
-## Usage
+The change lives in **YJMSTR/difftest**, branch **`opt/topdown-iq-bitset`**, commit `c71a7bc0a`.
 
-+ Run `make build-gsim` to build GSIM
-+ Build a static binary locally with `make STATIC=1 build-gsim` (CI artifacts are built statically).
-+ Run `build/gsim/gsim $(chirrtl-file)` to compile chirrtl to C++
-+ Refer to `build/gsim/gsim --help` for more information
-+ See [C++ harness example](https://github.com/jaypiper/simulator/blob/master/emu/emu.cpp) to know how it interacts with the emitted C++ code.
+### 2. dirty-chunk register commit
 
-### Multithreaded emitter
+With `GSIM_MT_CONE_ACTIVITY=1`, the whole-block state commit `memcpy(Src,Dst)` is replaced by a **64-byte chunk comparison and copy of only the chunks that changed**. Most scalar values do not change between cycles, so most chunks no longer need to be written back, substantially reducing state-update cost.
 
-`make build-gsim` builds one compiler containing both emitters. The default and
-`--mt-mode=off` select the single-thread active emitter; `--mt-mode=on` selects
-the multithreaded dense emitter. Generate an MT model with a fixed worker count:
+The gsim-side change is commit `41c7fe8`.
 
+## Dependencies
+
+- Linux x86_64 (validated on AMD EPYC)
+- A C++17 compiler; **clang++ is recommended**
+- GNU make and Python 3
+- **YJMSTR/difftest, branch `opt/topdown-iq-bitset`** (required for the cptopdown optimization)
+- Frozen kunminghu-v3 FIRRTL (`SimTop.fir`; this document uses `/home/zhangyangjie/test/rtl-kunminghu-v3-frozen/SimTop.fir` as an example)
+- NEMU: `riscv64-nemu-interpreter-so`
+- Workloads: `coremark-2-iteration.bin` and `linux.bin`
+
+## Quick start
+
+### 1. Build the generator
+
+```bash
+make build-gsim -j
 ```
-GSIM_THREADS=4 \
-  build/gsim/gsim --mt-mode=on --mt-target-tasks=256 \
-  --dir out/model design.fir
-```
 
-Compile the emitted C++ with `-pthread`, then run it with
-`GSIM_THREADS=4 GSIM_MT_EXECUTOR=dense`. The runtime worker count must match generation.
-Multithreaded test sources are kept under `test/`; they are intentionally not exposed as dedicated
-Makefile targets. Per-signal comparison uses an independently generated single-thread active model.
+### 2. Generate the model (champion recipe)
 
-Recommended T32 configuration for large designs (validated on XiangShan
-kunminghu-v3): keep the packed-state architecture's coarse HEFT chains and
-enable a lookahead window so workers fill true-dependency stalls:
+```bash
+export CELL=$PWD/out/champion
+mkdir -p $CELL/gsim-compile/model
 
-```
-GSIM_THREADS=32 \
-  build/gsim/gsim --mt-mode=on --mt-target-tasks=2400 --mt-scheduler=heft \
+GSIM_THREADS=32 GSIM_MT_CONE_ACTIVITY=1 \
+  build/gsim/gsim \
+  --mt-mode=on \
+  --mt-target-tasks=2400 \
+  --mt-scheduler=heft \
   --mt-lookahead-window=64 \
-  --sep-mod=__DOT__ --sep-aggr=__DOT__ --dir out/model SimTop.fir
+  --cpp-max-size-KB=4096 \
+  --sep-mod=__DOT__ --sep-aggr=__DOT__ \
+  --dir $CELL/gsim-compile/model \
+  /home/zhangyangjie/test/rtl-kunminghu-v3-frozen/SimTop.fir
 ```
 
-Generation thread count changes the partition result (worker-chain shaping),
-so always generate with the same `GSIM_THREADS` as the runtime (32 here).
-The emitted files are split at 4096 KB by default (`--cpp-max-size-KB`); a
-six-way split scan on kunminghu (2048/4096/8192/16384/32768 KB vs single
-file) measured 4096 KB fastest on all three gates (coremark 8.55 vs 8.86 s,
-linux 5.27 vs 5.43 s, fulltrap ~54.2 vs ~55.7 s against the no-split build).
-Finer `--mt-target-tasks` or larger windows measured slower on this design
-(2,242-task chains with window 64 are the measured optimum); see
-docs/multithreaded-emitter.md before changing them.
+For a dirty-chunk-off control, omit `GSIM_MT_CONE_ACTIVITY=1` and keep all other arguments unchanged. The knob-off output must remain byte-identical to the baseline.
 
-See [Multithreaded C++ Emitter Design and Usage](docs/multithreaded-emitter.md) for the scheduler,
-runtime synchronization protocol, XiangShan workflow, correctness tests, and tuning guidance.
+### 3. Build the emulator
 
-For an end-to-end description of the simulator, including CHIRRTL parsing, graph optimization,
-the single-thread active backend, and the multithreaded dense backend, see
-[GSIM Simulator Work Principle](docs/simulator-work-principle.md).
+Run this in your XiangShan/difftest directory:
 
-## Debug logs & dumps
+```bash
+make gsim-build-emu -j48 \
+  BUILD_DIR=$CELL \
+  RTL_DIR=/home/zhangyangjie/test/rtl-kunminghu-v3-frozen \
+  NOOP_HOME=/home/zhangyangjie/test/XiangShan \
+  EMU_THREADS=32 \
+  EMU_OPTIMIZE='-O3 -march=znver4 -DCPU_XIANGSHAN -DGSIM_MT_DENSE_OWNER_READY_FLAGS_COMPILE=1' \
+  WITH_CHISELDB=0 WITH_CONSTANTIN=0 OBJCACHE=
+```
 
-+ By default `gsim` runs quietly (`LogLevel=0`, dump disabled). Enable lightweight stage logs with `--log-level=1` (prints pass begin/end). Use `--log-level=2` for verbose constant-analysis traces; expect a lot more stderr.
-+ Graph dumps: `--dump` turns on both DOT and JSON dumps for every stage; `--dump-json` / `--dump-dot` turn on a single format. Combine with `--dump-stages=a,b,c` to limit which stages emit (e.g., `AfterSplitNodes,ConstantAnalysis`). Set `--dir=tmp-out/gsim-dumps` to choose the output directory.
-+ Extra debugging artifacts: `--dump-assign-tree` includes assignTree structure in JSON dumps; `--dump-const-status` writes `<name>_<stage>_ConstStatus.json` with per-node constant-analysis status.
-+ Example: `build/gsim/gsim --dir tmp-out/gsim-dumps --dump --dump-stages=AfterSplitNodes,ConstantAnalysis --dump-assign-tree --log-level=1 ready-to-run/TestHarness-rocket.fir`
+Adjust `NOOP_HOME`, `BUILD_DIR`, and `RTL_DIR` if your XiangShan checkout is elsewhere.
 
+### 4. Run and verify
 
-## Papers and Presentations
-### GSIM: Accelerating RTL Simulation for Large-Scale Design
-Lu Chen, Dingyi Zhao, Zihao Yu, Ninghui Sun, Yungang Bao
+Run these commands from the workload directory:
 
-Design Automation Conference (DAC), 2025
+```bash
+export GSIM_THREADS=32
+export GSIM_MT_EXECUTOR=dense
+export GSIM_MT_CPU_AFFINITY=auto
+export NEMU_HOME=/path/to/nemu
 
-[Paper PDF](https://github.com/jaypiper/simulator/blob/master/docs/dac-gsim.pdf) | [Slides](https://github.com/jaypiper/simulator/blob/master/docs/2025-6-26-dac.pdf) | [Chinese Slides](https://github.com/jaypiper/simulator/blob/master/docs/2025-4-9.pdf)
+# coremark 50k
+$CELL/gsim-compile/emu -i coremark-2-iteration.bin \
+  --diff riscv64-nemu-interpreter-so -b 0 -e 0 -C 50000 -I 67944
+
+# linux steady-state window, 300k cycles
+$CELL/gsim-compile/emu -i linux.bin \
+  --diff riscv64-nemu-interpreter-so -b 0 -e 0 -C 300000
+
+# fulltrap (natural GOOD TRAP at ~304k cycles)
+$CELL/gsim-compile/emu -i coremark-2-iteration.bin \
+  --diff riscv64-nemu-interpreter-so -C 700000
+```
+
+Example CPU pinning for 32 threads:
+
+```bash
+taskset -c 48-79 $CELL/gsim-compile/emu ...
+```
+
+**The generation thread count must match the runtime thread count.** If you change the worker count, regenerate the model. A useful task-count starting point is `75 × workers` (T16=1200, T32=2400, T48=3600, T64=4800).
+
+## Validation results
+
+Independent rebuild (no reused `.o` files and no hardlinks; 45/45 runs returned rc=0):
+
+| Workload | cone2c (champion) | base2c (dirty-chunk off) | Official Verilator 5.052-32t |
+|---|---:|---:|---:|
+| coremark 50k | 4.43 s | 5.33 s | 17.677 s |
+| linux 300k | 27.46 s | 32.80 s | 99.294 s |
+| linux 1M | 91.51 s | 109.15 s | 336.952 s |
+| fulltrap | 27.05 s | 32.54 s | 108.98 s |
+
+Correctness gates:
+
+- coremark: `67944/50000`
+- linux: `86469/30000`; long-window endpoints `1,687,494/300,000` and `5,552,703/1,000,000`
+- fulltrap: `GOOD TRAP pc=0x80001ca0`, `663758/304246`
+
+## Evidence and materials
+
+All build, generation, run, and validation instructions are contained in this README. No external design documents are required to reproduce the champion. The validation table above is the authoritative result for this branch.
+
+## Notes
+
+- `GSIM_MT_CONE_ACTIVITY` is off by default; **enable it explicitly for the champion configuration**. Leave it off only for control runs.
+- Use the generator built from this branch. Do not mix models generated by other branches or generators.
+- Keep `--supernode-max-size` at its default (35) and `--cpp-max-size-KB` at 4096.
+- Topdown computation is part of the simulated design, not optional debug-only code. Do not remove it merely to speed up the simulator; it still affects simulation behavior.
+- The pre-fix t48/t64 scaling results are not the champion reference. This branch is the authoritative champion configuration.
