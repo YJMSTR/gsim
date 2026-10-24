@@ -268,6 +268,9 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "struct MtDispatch { void (S%s::*fn)(); uint32_t taskId, waitBegin, waitEnd, storeBegin, storeEnd, localWaitBegin, localWaitEnd; };\n",
           graph_.name.c_str());
   fprintf(header, "alignas(64) MtReadyToken mtReadyTokens[%d];\n", readySlotCount_);
+  if (!splitEarlyStoreSlots_.empty()) {
+    fprintf(header, "uint8_t mtCurParity = 0;\n");
+  }
   fprintf(header, "MtDoneFlag mtDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "std::vector<MtDeferredEvent> mtDeferredEventsByWorker[%d];\n",
           workerCount_);
@@ -550,6 +553,21 @@ void CppEmitterMt::emitStateUpdateFunction(const StateUpdate& update) {
                         update.body, update.chunkCount);
 }
 
+void CppEmitterMt::emitInstruction(const InstInfo& inst, int indent) {
+  switch (inst.infoType) {
+      case SUPER_INFO_IF: emitText(indent++, false, mapRegisterNames(inst.inst) + "\n"); break;
+      case SUPER_INFO_ELSE:
+        emitText(indent - 1, false, mapRegisterNames(inst.inst) + "\n");
+        break;
+      case SUPER_INFO_DEDENT:
+        emitText(--indent, false, mapRegisterNames(inst.inst) + "\n");
+        break;
+      case SUPER_INFO_STR: emitText(indent, false, mapRegisterNames(inst.inst) + "\n"); break;
+      case SUPER_INFO_ASSIGN_BEG:
+      case SUPER_INFO_ASSIGN_END: break;
+  }
+}
+
 void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, int indent) {
   const int initialIndent = indent;
   for (const InstInfo& inst : instructions) {
@@ -569,7 +587,7 @@ void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, i
   Assert(indent == initialIndent, "unbalanced MTask instruction tree");
 }
 
-void CppEmitterMt::emitTask(const Task& task, int indent) {
+void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
   Assert(task.insts != nullptr, "MTask has no lowered instruction stream");
   Assert(!task.members.empty(), "cannot emit an empty MTask");
 
@@ -607,7 +625,49 @@ void CppEmitterMt::emitTask(const Task& task, int indent) {
     }
   }
 
+  if (!splitEarlyStoreSlots_.empty()) {
+    auto found = splitEarlyStoreSlots_.find(static_cast<int>(taskId));
+    if (found != splitEarlyStoreSlots_.end()) {
+      // Publish the early tokens right after the last pure assignment, in
+      // the original instruction order (census prefix definition).
+      int lastPure = -1;
+      std::vector<std::string> pureNames;
+      for (Node* member : task.members) {
+        if (member->type == NODE_OTHERS && task.localNodes.count(member) == 0) {
+          pureNames.push_back(member->name);
+        }
+      }
+      for (size_t i = 0; i < task.insts->size(); ++i) {
+        const std::string& text = (*task.insts)[i].inst;
+        const size_t begin = text.find_first_not_of(" \t");
+        if (begin == std::string::npos) continue;
+        for (const std::string& name : pureNames) {
+          if (text.compare(begin, name.size(), name) != 0) continue;
+          const char next = begin + name.size() < text.size()
+                                ? text[begin + name.size()]
+                                : '\0';
+          if (next == ' ' || next == '[' || next == '=') {
+            lastPure = static_cast<int>(i);
+            break;
+          }
+        }
+      }
+      for (size_t i = 0; i < task.insts->size(); ++i) {
+        if (static_cast<int>(i) == lastPure + 1) {
+          for (int slot : found->second) {
+            emitText(indent, false,
+                     "mtReadyTokens[" + std::to_string(slot) +
+                         "].value.store(mtCurParity, std::memory_order_release);\n");
+          }
+        }
+        emitInstruction((*task.insts)[i], indent);
+      }
+    } else {
+      emitInstructions(*task.insts, indent);
+    }
+  } else {
   emitInstructions(*task.insts, indent);
+  }
 }
 
 void CppEmitterMt::emitDefinitions() {
@@ -646,7 +706,7 @@ void CppEmitterMt::emitDefinitions() {
   }
   for (int taskId : taskEmissionOrder) {
     emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
-    emitTask(tasks_[static_cast<size_t>(taskId)], 1);
+    emitTask(tasks_[static_cast<size_t>(taskId)], static_cast<size_t>(taskId), 1);
     emitText(0, false, "}\n");
   }
 
@@ -955,6 +1015,9 @@ void CppEmitterMt::emitDefinitions() {
         "}\n";
   }
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
+  if (!splitEarlyStoreSlots_.empty()) {
+    runtime += "  mtCurParity = parity;\n";
+  }
   runtime += "  MTBP_TICK(worker, mtBpProtocolOther);\n";
   runtime += "  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {

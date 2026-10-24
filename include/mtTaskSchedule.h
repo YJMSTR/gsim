@@ -56,6 +56,8 @@ struct MtWorkerPlan {
   std::vector<MtStateTask> stateTasks_;
   std::unordered_map<Node*, int> stateTaskByNode_;
   std::vector<MtReset> resets_;
+  // V6a: task -> ready-token slots stored at the pure-prefix end.
+  std::map<int, std::vector<int>> splitEarlyStoreSlots_;
 };
 
 class MtWorkerBuilder {
