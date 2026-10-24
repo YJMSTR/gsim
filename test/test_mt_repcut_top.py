@@ -36,7 +36,8 @@ def model_tree(out):
 
 class RepcutTopTest(unittest.TestCase):
     def generate(self, out, workers, lookahead, repcut=None, csv_path=None,
-                 depth=None, max_cost_pct=None, cone=None, max_ops=None):
+                 depth=None, max_cost_pct=None, cone=None, max_ops=None,
+                 split=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
         if repcut is not None:
@@ -49,6 +50,8 @@ class RepcutTopTest(unittest.TestCase):
             env['GSIM_MT_REPCUT_MAX_COST_PCT'] = str(max_cost_pct)
         if cone is not None:
             env['GSIM_MT_REPCUT_MODE'] = str(cone)
+        if split is not None:
+            env['GSIM_MT_REPCUT_SPLIT_PUBLISH'] = str(split)
         if max_ops is not None:
             env['GSIM_MT_REPCUT_MAX_OPS'] = str(max_ops)
         result = run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
@@ -115,7 +118,9 @@ class RepcutTopTest(unittest.TestCase):
         for workers, lookahead, depth in ((2, 0, None), (4, 0, None),
                                           (4, 64, None), (4, 64, 1),
                                           (4, 16, 1), (8, 64, None),
-                                          (4, 64, 'cone'), (8, 64, 'cone')):
+                                          (4, 64, 'cone'), (8, 64, 'cone'),
+                                          (4, 64, 'split'), (2, 0, 'split'),
+                                          (8, 64, 'split')):
             with self.subTest(workers=workers, lookahead=lookahead,
                               depth=depth), tempfile.TemporaryDirectory(
                     prefix='mt-repcut-on-') as directory:
@@ -132,10 +137,12 @@ class RepcutTopTest(unittest.TestCase):
                 out = root / 'repcut'
                 out.mkdir()
                 cone_mode = 1 if depth == 'cone' else None
+                split_mode = 1 if depth == 'split' else None
                 depth_arg = None if depth == 'cone' else depth
                 env, stderr, on_phases = self.generate(
                     out, workers, lookahead, repcut=top, csv_path=csv_path,
-                    depth=depth_arg, max_cost_pct=100, cone=cone_mode)
+                    depth=depth_arg, max_cost_pct=100, cone=cone_mode,
+                    split=split_mode)
                 summary = [line for line in stderr.splitlines()
                            if 'repcut-top' in line]
                 self.assertEqual(len(summary), 1, summary)

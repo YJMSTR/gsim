@@ -414,6 +414,7 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "bool mtAnyAsyncResetAsserted();\n");
   fprintf(header, "void mtApplyAsyncResets();\n");
   fprintf(header, "void mtReplayAfterAsyncReset();\n");
+  fprintf(header, "uint8_t mtCurParity = 0;\n");
   if (!timingHot_.empty()) {
     fprintf(header,
             "static inline unsigned long long mtTmRdtsc() { unsigned int lo, hi;\n"
@@ -611,6 +612,54 @@ void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
     }
   }
 
+  const std::vector<int>* earlySlots = nullptr;
+  if (!splitEarlyStoreSlots_.empty()) {
+    auto found = splitEarlyStoreSlots_.find(static_cast<int>(taskId));
+    if (found != splitEarlyStoreSlots_.end()) earlySlots = &found->second;
+  }
+  if (earlySlots != nullptr) {
+    // Publish the early tokens right after the last pure assignment, in the
+    // original instruction order (census used the same prefix definition).
+    int lastPure = -1;
+    std::vector<std::string> pureNames;
+    for (Node* member : task.members) {
+      if (member->type == NODE_OTHERS && task.localNodes.count(member) == 0) {
+        pureNames.push_back(member->name);
+      }
+    }
+    for (size_t i = 0; i < task.insts->size(); ++i) {
+      const std::string& text = (*task.insts)[i].inst;
+      const size_t begin = text.find_first_not_of(" \t");
+      if (begin == std::string::npos) continue;
+      for (const std::string& name : pureNames) {
+        if (text.compare(begin, name.size(), name) != 0) continue;
+        const char next = begin + name.size() < text.size()
+                              ? text[begin + name.size()]
+                              : '\0';
+        if (next == ' ' || next == '[' || next == '=') {
+          lastPure = static_cast<int>(i);
+          break;
+        }
+      }
+    }
+    for (size_t i = 0; i < task.insts->size(); ++i) {
+      if (static_cast<int>(i) == lastPure + 1) {
+        for (int slot : *earlySlots) {
+          emitText(indent, false,
+                   "mtReadyTokens[" + std::to_string(slot) +
+                       "].value.store(mtCurParity, std::memory_order_release);\n");
+        }
+      }
+      emitInstruction((*task.insts)[i], indent);
+    }
+    if (lastPure < 0) {
+      for (int slot : *earlySlots) {
+        emitText(indent, false,
+                 "mtReadyTokens[" + std::to_string(slot) +
+                     "].value.store(mtCurParity, std::memory_order_release);\n");
+      }
+    }
+  } else {
   const bool timingHotProducer =
       !timingHot_.empty() && timingHot_.count(static_cast<int>(taskId)) != 0;
   int timingHotPred = -1;
@@ -736,6 +785,7 @@ void CppEmitterMt::emitTask(const Task& task, size_t taskId, int indent) {
     }
     emitText(indent + 1, false, "mtTraceHash[" + std::to_string(taskId) +
                "] = mtVtH; }\n");
+  }
   }
 }
 
@@ -1023,6 +1073,7 @@ void CppEmitterMt::emitDefinitions() {
   }
 
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
+  runtime += "  mtCurParity = parity;\n";
   runtime += "  switch (worker) {\n";
   for (int worker = 0; worker < workerCount_; ++worker) {
     runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +

@@ -1187,7 +1187,27 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     int consumer = -1;
     int publisher = -1;
     int slot = -1;
+    bool early = false;        // published at the producer's pure-prefix end
     std::vector<int> sources;  // set only while repcut-top slot sharing is on
+  };
+  // V6a split publication: producers with cross-worker pure-only consumers
+  // publish one extra early token per consumer owner; those consumers wait
+  // the early token instead of the full-body one. The emitter reorders each
+  // split producer's body pure-first and stores the early slots right after
+  // the last pure assignment.
+  // splitEarlyStoreSlots_ lives in MtWorkerPlan (emitter reads it)
+  std::map<int, std::vector<int>> earlyConsumersByGroup;
+  std::set<int> splitProducers;
+  const char* splitEnv = std::getenv("GSIM_MT_REPCUT_SPLIT_PUBLISH");
+  const bool splitPublish = splitEnv != nullptr && splitEnv[0] == '1';
+  auto producerPureMembers = [](const MtTask& producer) {
+    std::set<Node*> pure;
+    for (Node* member : producer.members) {
+      if (member->type == NODE_OTHERS && producer.localNodes.count(member) == 0) {
+        pure.insert(member);
+      }
+    }
+    return pure;
   };
   std::vector<TokenGroup> groups;
   for (size_t consumer = 0; consumer < tasks.tasks_.size(); ++consumer) {
@@ -1237,6 +1257,56 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
     }
   }
 
+  if (splitPublish) {
+    for (size_t producerId = 0; producerId < tasks.tasks_.size(); ++producerId) {
+      MtTask& producer = tasks.tasks_[producerId];
+      if (producer.kind != MtTaskKind::Normal) continue;
+      const std::set<Node*> pure = producerPureMembers(producer);
+      if (pure.empty()) continue;
+      std::map<int, std::vector<int>> pureOnlyByOwner;
+      for (int consumer : producer.successors) {
+        if (tasks.tasks_[static_cast<size_t>(consumer)].owner == producer.owner) continue;
+        bool pureOnly = false;  // requires at least one read of the producer
+        for (Node* member : tasks.tasks_[static_cast<size_t>(consumer)].members) {
+          for (Node* input : member->prev) {
+            if (pure.count(input) != 0) { pureOnly = true; break; }
+          }
+          if (pureOnly) break;
+        }
+        if (!pureOnly) continue;
+        // all producer reads of this consumer must be pure
+        for (Node* member : tasks.tasks_[static_cast<size_t>(consumer)].members) {
+          for (Node* input : member->prev) {
+            auto owner = tasks.taskByNode_.find(input);
+            if (owner == tasks.taskByNode_.end() ||
+                owner->second != static_cast<int>(producerId)) continue;
+            if (pure.count(input) == 0) { pureOnly = false; break; }
+          }
+          if (!pureOnly) break;
+        }
+        if (pureOnly) {
+          pureOnlyByOwner[tasks.tasks_[static_cast<size_t>(consumer)].owner].push_back(consumer);
+        }
+      }
+      for (const auto& entry : pureOnlyByOwner) {
+        TokenGroup early;
+        early.producerOwner = producer.owner;
+        early.consumerOwner = entry.first;
+        early.publisher = static_cast<int>(producerId);
+        early.early = true;
+        early.sources.push_back(static_cast<int>(producerId));
+        const int earlyGroupId = static_cast<int>(groups.size());
+        groups.push_back(early);
+        for (int consumer : entry.second) {
+          // The consumer's full-body group of this producer is replaced by
+          // the early token: handled after groups/slots are finalized by
+          // rewriting waits below; record membership now.
+          earlyConsumersByGroup[earlyGroupId].push_back(consumer);
+        }
+        splitProducers.insert(static_cast<int>(producerId));
+      }
+    }
+  }
   const size_t uncompressedTokenGroups = groups.size();
   if (globalConfig.MtLookaheadWindow == 0) {
     std::vector<std::vector<int>> groupsByConsumer(tasks.tasks_.size());
@@ -1323,8 +1393,35 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   }
   workers.readySlotCount_ = std::max(1, nextSlot);
   for (const TokenGroup& group : groups) {
+    if (group.early) {
+      // Early token: the producer stores it mid-body (emitter reorders the
+      // body pure-first); no full-body store for it. Consumers were given
+      // the wait during the rewrite below in the previous pass — handled by
+      // earlyConsumersByGroup.
+      tasks.tasks_[static_cast<size_t>(group.publisher)].stores.push_back(group.slot);
+      workers.splitEarlyStoreSlots_[group.publisher].push_back(group.slot);
+      continue;
+    }
     tasks.tasks_[static_cast<size_t>(group.consumer)].waits.push_back(group.slot);
     tasks.tasks_[static_cast<size_t>(group.publisher)].stores.push_back(group.slot);
+  }
+  // Rewire early consumers: drop the full-body slot of the split producer
+  // and add the early slot instead.
+  for (size_t groupId = 0; groupId < groups.size(); ++groupId) {
+    if (!groups[groupId].early) continue;
+    const int earlySlot = groups[groupId].slot;
+    const int producerId = groups[groupId].publisher;
+    for (int consumer : earlyConsumersByGroup[static_cast<int>(groupId)]) {
+      auto& waits = tasks.tasks_[static_cast<size_t>(consumer)].waits;
+      // remove one wait entry pointing at a full-body slot of producerId:
+      // find slots this consumer waits that the producer stores (non-early)
+      auto& producerStores = tasks.tasks_[static_cast<size_t>(producerId)].stores;
+      for (int slot : producerStores) {
+        auto position = std::find(waits.begin(), waits.end(), slot);
+        if (position != waits.end()) { waits.erase(position); break; }
+      }
+      waits.push_back(earlySlot);
+    }
   }
 
   for (MtTask& task : tasks.tasks_) {

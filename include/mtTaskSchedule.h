@@ -56,6 +56,9 @@ struct MtWorkerPlan {
   std::vector<MtStateTask> stateTasks_;
   std::unordered_map<Node*, int> stateTaskByNode_;
   std::vector<MtReset> resets_;
+  // V6a split publication: task -> ready-token slots stored at the
+  // producer's pure-prefix end (mid-body), after a pure-first reorder.
+  std::map<int, std::vector<int>> splitEarlyStoreSlots_;
 };
 
 class MtWorkerBuilder {
