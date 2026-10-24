@@ -117,7 +117,13 @@ void loadEmittedIdMap(const std::string& csvPath, std::unordered_map<int, int>* 
 // order, and emission stay untouched. Rows without a matching pre-schedule
 // task (replicas appended during scheduling) and tasks without a row are
 // counted on stderr so misaligned dumps are visible, never silent.
-void applyCostOverride(MtTaskPlan& tasks) {
+//
+// Rows whose id lands past the compute tasks address the pinned per-worker
+// state task instead (id - computeCount = worker). Those costs do not touch
+// task.cost; they seed the register-distribution baseline load and a worker
+// floor in the schedulers, so worker load = Sum(compute) + state.
+void applyCostOverride(MtTaskPlan& tasks, int workerCount,
+                       std::vector<int>* stateCosts) {
   std::vector<CostOverrideRow> rows;
   size_t malformed = 0;
   if (!loadCostOverrideRows(globalConfig.MtCostOverrideCsv, &rows, &malformed)) {
@@ -138,7 +144,8 @@ void applyCostOverride(MtTaskPlan& tasks) {
     auto remapped = emittedToPre.find(taskId);
     if (remapped != emittedToPre.end()) taskId = remapped->second;
     if (taskId < 0 || taskId >= static_cast<int>(tasks.tasks_.size())) {
-      ++unmappedRows;
+      // Rows past the compute tasks are state-task rows, counted separately.
+      if (taskId - static_cast<int>(tasks.tasks_.size()) >= workerCount) ++unmappedRows;
       continue;
     }
     MtTask& task = tasks.tasks_[static_cast<size_t>(taskId)];
@@ -146,12 +153,25 @@ void applyCostOverride(MtTaskPlan& tasks) {
     task.cost = static_cast<int>(mean > 0 ? mean : 1);
     ++applied;
   }
+  size_t stateApplied = 0;
+  if (stateCosts != nullptr) {
+    for (const CostOverrideRow& row : rows) {
+      const int stateWorker = row.taskId - static_cast<int>(tasks.tasks_.size());
+      if (row.calls == 0 || stateWorker < 0 || stateWorker >= workerCount) continue;
+      const unsigned long long mean = (row.totalNs + row.calls / 2) / row.calls;
+      (*stateCosts)[static_cast<size_t>(stateWorker)] =
+          static_cast<int>(mean > 0 ? mean : 1);
+      ++stateApplied;
+    }
+  }
   const size_t keptOriginal = tasks.tasks_.size() - std::min(applied, tasks.tasks_.size());
   fprintf(stderr,
           "[cppEmitter-mt] cost-override: csv=%s rows=%zu applied=%zu "
-          "kept-analytic=%zu unmapped-or-replica-rows=%zu malformed=%zu id-map=%s\n",
+          "kept-analytic=%zu unmapped-or-replica-rows=%zu malformed=%zu id-map=%s "
+          "state-tasks=%zu\n",
           globalConfig.MtCostOverrideCsv.c_str(), rows.size(), applied, keptOriginal,
-          unmappedRows, malformed, emittedToPre.empty() ? "none" : "loaded");
+          unmappedRows, malformed, emittedToPre.empty() ? "none" : "loaded",
+          stateApplied);
 }
 
 void compactEmptyTasks(MtTaskPlan& plan) {
@@ -440,7 +460,8 @@ int countResetChunks(const std::vector<Instruction>& body, int chunkSize) {
 }
 
 void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
-                       MtWorkerPlan& workers, int workerCount, int chunkSize) {
+                       MtWorkerPlan& workers, int workerCount, int chunkSize,
+                       const std::vector<int>& stateCosts = {}) {
   workers.stateTasks_.assign(static_cast<size_t>(workerCount), MtStateTask());
   workers.stateTaskByNode_.clear();
   for (int worker = 0; worker < workerCount; ++worker) {
@@ -505,6 +526,14 @@ void buildStateUpdates(graph& graph, const MtTaskPlan& tasks,
   // average register-byte target. An indivisible register larger than the
   // target may occupy an otherwise empty preferred worker.
   std::vector<size_t> baselineLoad(static_cast<size_t>(workerCount), 0);
+  // Measured state-task cost (if provided) biases register ownership away
+  // from workers already paying a heavier state-update phase.
+  for (int worker = 0; worker < workerCount; ++worker) {
+    if (worker < static_cast<int>(stateCosts.size())) {
+      baselineLoad[static_cast<size_t>(worker)] +=
+          static_cast<size_t>(stateCosts[static_cast<size_t>(worker)]);
+    }
+  }
   size_t baselineLocalRegisters = 0;
   size_t baselineLocalBytes = 0;
   for (size_t index = 0; index < registers.size(); ++index) {
@@ -882,7 +911,8 @@ size_t actualCrossWorkerCommunicationNodes(
 }
 
 WorkerSchedule scheduleList(const MtTaskPlan& tasks, int workerCount,
-                            const EdgeCommunicationNodes& communicationNodes) {
+                            const EdgeCommunicationNodes& communicationNodes,
+                            const std::vector<int>& workerFloor = {}) {
   const int taskCount = static_cast<int>(tasks.tasks_.size());
   WorkerSchedule result;
   result.owner.assign(static_cast<size_t>(taskCount), -1);
@@ -893,6 +923,9 @@ WorkerSchedule scheduleList(const MtTaskPlan& tasks, int workerCount,
   std::vector<int> remaining(static_cast<size_t>(taskCount), 0);
   std::vector<long long> completion(static_cast<size_t>(taskCount), 0);
   std::vector<long long> workerAvailable(static_cast<size_t>(workerCount), 0);
+  for (size_t worker = 0; worker < workerAvailable.size(); ++worker) {
+    if (worker < workerFloor.size()) workerAvailable[worker] = workerFloor[worker];
+  }
   std::vector<long long> priority(static_cast<size_t>(taskCount), 0);
   for (int taskId = taskCount - 1; taskId >= 0; --taskId) {
     long long successorPriority = 0;
@@ -962,7 +995,8 @@ WorkerSchedule scheduleList(const MtTaskPlan& tasks, int workerCount,
 
 WorkerSchedule scheduleHeft(MtTaskPlan& tasks, int workerCount,
                             const EdgeCommunicationNodes& communicationNodes,
-                            MtHeftReplication* replication = nullptr) {
+                            MtHeftReplication* replication = nullptr,
+                            const std::vector<int>& workerFloor = {}) {
   const int taskCount = static_cast<int>(tasks.tasks_.size());
   WorkerSchedule result;
   result.owner.assign(static_cast<size_t>(taskCount), -1);
@@ -1031,6 +1065,9 @@ WorkerSchedule scheduleHeft(MtTaskPlan& tasks, int workerCount,
       while (next != timeline.end() && start + duration > next->second.start) {
         start = std::max(start, next->second.finish);
         ++next;
+      }
+      if (worker < static_cast<int>(workerFloor.size())) {
+        start = std::max(start, static_cast<long long>(workerFloor[static_cast<size_t>(worker)]));
       }
       MtHeftPlacement placement;
       placement.task = taskId;
@@ -1155,7 +1192,10 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   const int groupCount = tasks.partitionGroupCount_;
   compactEmptyTasks(tasks);
   for (MtTask& task : tasks.tasks_) task.cost = mtLoweredTaskCost(task);
-  if (!globalConfig.MtCostOverrideCsv.empty()) applyCostOverride(tasks);
+  std::vector<int> stateCosts(static_cast<size_t>(std::max(workerCount, 1)), 0);
+  if (!globalConfig.MtCostOverrideCsv.empty()) {
+    applyCostOverride(tasks, workerCount, &stateCosts);
+  }
   EdgeCommunicationNodes communicationNodes = buildEdgeCommunicationNodes(tasks);
   size_t communicationEdges = 0;
   long long communicationUnits = 0;
@@ -1167,10 +1207,10 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   std::unique_ptr<MtHeftReplication> replication;
   if (replicationAware) replication = std::make_unique<MtHeftReplication>(graph, tasks, workerCount);
   WorkerSchedule schedule = replicationAware
-      ? scheduleHeft(tasks, workerCount, communicationNodes, replication.get())
+      ? scheduleHeft(tasks, workerCount, communicationNodes, replication.get(), stateCosts)
       : (globalConfig.MtScheduler == "list"
-          ? scheduleList(tasks, workerCount, communicationNodes)
-          : scheduleHeft(tasks, workerCount, communicationNodes));
+          ? scheduleList(tasks, workerCount, communicationNodes, stateCosts)
+          : scheduleHeft(tasks, workerCount, communicationNodes, nullptr, stateCosts));
   if (replicationAware) {
     // New replica tasks can precede old task IDs. Restore a forward DAG for
     // transitive reduction, including the selected worker order.
@@ -1264,7 +1304,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
                           task.localWaits.end());
   }
 
-  buildStateUpdates(graph, tasks, workers, workerCount, resetChunk);
+  buildStateUpdates(graph, tasks, workers, workerCount, resetChunk, stateCosts);
 
   // Async reset is checked after the speculative task pass. Its body is kept
   // independent of worker ownership because the rare replay path is serial.
