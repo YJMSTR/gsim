@@ -654,8 +654,9 @@ void CppEmitterMt::writeSparseAudit() const {
   FILE* out = std::fopen(path.c_str(), "w");
   Assert(out != nullptr, "cannot open sparse audit CSV");
   fprintf(out, "task,worker,cost,instructions,predecessors,successors,"
-               "side_effect_kind,untracked_input_count,gate_candidate,"
-               "activity_source,activity_relevant_output_nodes,"
+               "side_effect_kind,untracked_input_count,untracked_reasons,"
+               "gate_candidate,activity_source,wide_input_disqualify,"
+               "activity_relevant_output_nodes,"
                "output_compare_count,output_compare_bytes,remote_groups\n");
   const size_t taskCount = tasks_.size();
 
@@ -729,21 +730,52 @@ void CppEmitterMt::writeSparseAudit() const {
   // can only consume activity-derivable values.
   std::vector<char> gate(taskCount, 1);
   std::vector<size_t> untrackedCount(taskCount, 0);
+  std::vector<std::string> untrackedReasons(taskCount);
+  std::vector<char> wideDisqualify(taskCount, 0);
+  auto reasonTag = [&](Node* node, int producer) -> std::string {
+    if (node->type == NODE_REG_SRC) return std::string("REG_SRC");
+    if (node->type == NODE_MEMORY) return std::string("MEMORY");
+    if (node->type == NODE_INP) return std::string("INP");
+    if (producer < 0) return std::string("EXT/UNOWNED");
+    return std::string("INACTIVE-PRODUCER");
+  };
   bool changed = true;
   while (changed) {
     changed = false;
     for (size_t id = 0; id < taskCount; ++id) {
       if (!gate[id]) continue;
-      bool bad = effectKind[id] != 0 || tasks_[id].predecessors.empty();
+      bool noPred = tasks_[id].predecessors.empty();
+      bool wide = false;
       size_t untracked = 0;
+      std::map<std::string, size_t> reasonCounts;
       for (const InputRef& input : inputs[id]) {
-        if (input.directUntracked) { ++untracked; continue; }
+        if (input.directUntracked) {
+          ++untracked;
+          ++reasonCounts[reasonTag(input.node, input.producer)];
+          continue;
+        }
         if (input.producer == static_cast<int>(id)) continue;
-        if (!gate[static_cast<size_t>(input.producer)]) { ++untracked; continue; }
-        if (input.wide) bad = true;  // downstream compare the model forbids
+        if (!gate[static_cast<size_t>(input.producer)]) {
+          ++untracked;
+          ++reasonCounts["INACTIVE-PRODUCER"];
+          continue;
+        }
+        if (input.wide) wide = true;  // forbidden downstream compare
       }
       untrackedCount[id] = untracked;
-      if (bad || untracked > 0) {
+      std::string reasons;
+      for (const auto& entry : reasonCounts) {
+        reasons += (reasons.empty() ? "" : ";") + entry.first + ":" +
+                   std::to_string(entry.second);
+      }
+      if (wide) reasons += reasons.empty() ? "WIDE-INPUT" : ";WIDE-INPUT";
+      if (noPred) reasons += reasons.empty() ? "NO-PRED" : ";NO-PRED";
+      if (effectKind[id] != 0) {
+        reasons += reasons.empty() ? "SIDE-EFFECT" : ";SIDE-EFFECT";
+      }
+      untrackedReasons[id] = reasons;
+      wideDisqualify[id] = wide;
+      if (effectKind[id] != 0 || noPred || wide || untracked > 0) {
         gate[id] = 0;
         changed = true;
       }
@@ -809,7 +841,16 @@ void CppEmitterMt::writeSparseAudit() const {
   for (size_t id = 0; id < taskCount; ++id) {
     const Task& task = tasks_[id];
     const bool isGate = gate[id] != 0;
-    const bool activitySource = !isGate;  // every non-gate always executes
+    bool activitySource = false;
+    if (!isGate) {
+      for (Node* node : writesByTask[id]) {
+        auto consumers = consumersOf.find(node);
+        if (consumers == consumersOf.end()) continue;
+        for (int consumer : consumers->second) {
+          if (gate[static_cast<size_t>(consumer)]) activitySource = true;
+        }
+      }
+    }
     std::string preds, succs;
     for (int p : task.predecessors) preds += (preds.empty() ? "" : "+") + std::to_string(p);
     for (int p : task.successors) succs += (succs.empty() ? "" : "+") + std::to_string(p);
@@ -827,7 +868,8 @@ void CppEmitterMt::writeSparseAudit() const {
           if (!gate[static_cast<size_t>(consumer)]) allGates = false;
         }
         if (!allGates) continue;
-        relevant += (relevant.empty() ? "" : "+") + node->name;
+        relevant += (relevant.empty() ? "" : "+") + node->name + ":" +
+                    std::to_string(node->width);
         ++compares;
         bytes += (node->width + 7) / 8;
       }
@@ -836,11 +878,13 @@ void CppEmitterMt::writeSparseAudit() const {
     for (const std::string& group : groupsByConsumer[id]) {
       groups += (groups.empty() ? "" : " | ") + group;
     }
-    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%s,%zu,%d,%d,%s,%zu,%lld,%s\n",
+    fprintf(out, "%zu,%d,%d,%zu,%s,%s,%s,%zu,%s,%d,%d,%d,%s,%zu,%lld,%s\n",
             id, task.owner, task.cost,
             task.insts != nullptr ? task.insts->size() : 0,
             preds.c_str(), succs.c_str(), kEffectNames[effectKind[id]],
-            untrackedCount[id], isGate ? 1 : 0, activitySource ? 1 : 0,
+            untrackedCount[id],
+            (untrackedReasons[id].empty() ? "-" : untrackedReasons[id]).c_str(),
+            isGate ? 1 : 0, activitySource ? 1 : 0, wideDisqualify[id] ? 1 : 0,
             relevant.c_str(), compares, bytes, groups.c_str());
     if (isGate) {
       ++gateCount;
