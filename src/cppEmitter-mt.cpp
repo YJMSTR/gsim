@@ -324,6 +324,30 @@ void CppEmitterMt::emitHeaderPreamble(FILE* header) const {
   fprintf(header,
           "#include <atomic>\n#include <cstdio>\n#include <thread>\n#include <sched.h>\n"
           "#include <string>\n#include <utility>\n\n");
+  if (globalConfig.MtConeCommit) {
+    // Dirty-chunk register commit: value-preserving replacement for the
+    // whole-block memcpy (only differing 64B chunks are copied). Ported from
+    // experiment/cone-activity; dirty-bit parameters stay in the signature
+    // and are passed inactive, so no counter storage is emitted.
+    fprintf(header,
+            "static inline void mtConeCommitBlock(void* mtCaDst, const void* mtCaSrc,\n"
+            "                                    unsigned mtCaBytes, uint64_t* mtCaDirty,\n"
+            "                                    uint32_t mtCaBitBase, int mtCaActive) {\n"
+            "  unsigned char* mtCaD = (unsigned char*)mtCaDst;\n"
+            "  const unsigned char* mtCaS = (const unsigned char*)mtCaSrc;\n"
+            "  unsigned mtCaOff = 0;\n"
+            "  for (; mtCaOff + 64 <= mtCaBytes; mtCaOff += 64) {\n"
+            "    if (__builtin_memcmp(mtCaD + mtCaOff, mtCaS + mtCaOff, 64) == 0) continue;\n"
+            "    __builtin_memcpy(mtCaD + mtCaOff, mtCaS + mtCaOff, 64);\n"
+            "    if (mtCaActive) mtCaDirty[(mtCaBitBase + (mtCaOff >> 6)) >> 6] |=\n"
+            "        (uint64_t)1 << ((mtCaBitBase + (mtCaOff >> 6)) & 63);\n"
+            "  }\n"
+            "  if (mtCaOff < mtCaBytes &&\n"
+            "      __builtin_memcmp(mtCaD + mtCaOff, mtCaS + mtCaOff, mtCaBytes - mtCaOff) != 0) {\n"
+            "    __builtin_memcpy(mtCaD + mtCaOff, mtCaS + mtCaOff, mtCaBytes - mtCaOff);\n"
+            "  }\n"
+            "}\n");
+  }
   if (storeCensus_) {
     // Register-store compare helper: narrow scalars compare directly, wide
     // scalars and arrays fold to 64 bits (census fidelity is enough).

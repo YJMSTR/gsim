@@ -29,6 +29,7 @@ struct Config {
   int MtReplicationMinFanout;
   int MtLookaheadWindow;
   std::string MtCostOverrideCsv;
+  bool MtConeCommit = false;
   bool MtLookaheadStats;
   int MtSparseRegisterMinBytes;
   int MtSparseRegisterMaxWrites;
