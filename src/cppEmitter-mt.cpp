@@ -1,6 +1,7 @@
 #include "cppEmitter-mt.h"
 
 #include "common.h"
+#include "mtNodeSink.h"
 #include "mtTaskLowering.h"
 #include "util.h"
 
@@ -76,7 +77,8 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       targetTasks_(globalConfig.MtTargetTasks),
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
-      lookaheadStats_(globalConfig.MtLookaheadStats) {}
+      lookaheadStats_(globalConfig.MtLookaheadStats),
+      nodeSinkEmission_(MtNodeSinkPlanner::enabled()) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -88,7 +90,7 @@ void CppEmitterMt::prepare() {
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
   buildRegisterStorageNames();
-  if (eventGeneration_) buildActivationPlan();
+  if (eventGeneration_ || nodeSinkEmission_) buildActivationPlan();
   writeTaskPhaseReport();
 }
 
@@ -154,6 +156,34 @@ void CppEmitterMt::buildActivationPlan() {
     std::vector<int>& consumers = entry.second;
     std::sort(consumers.begin(), consumers.end());
     consumers.erase(std::unique(consumers.begin(), consumers.end()), consumers.end());
+  }
+  if (nodeSinkEmission_) {
+    eventTaskPhase_.assign(tasks_.size(), 0);
+    eventPhaseCount_ = tasks_.empty() ? 0 : 1;
+    std::vector<int> indegree(tasks_.size(), 0);
+    std::set<int> ready;
+    for (size_t task = 0; task < tasks_.size(); ++task) {
+      indegree[task] = static_cast<int>(tasks_[task].predecessors.size());
+      if (indegree[task] == 0) ready.insert(static_cast<int>(task));
+    }
+    size_t visited = 0;
+    while (!ready.empty()) {
+      const int task = *ready.begin();
+      ready.erase(ready.begin());
+      ++visited;
+      for (int successor : tasks_[static_cast<size_t>(task)].successors) {
+        const int cross = tasks_[static_cast<size_t>(successor)].owner !=
+                          tasks_[static_cast<size_t>(task)].owner;
+        int& next = eventTaskPhase_[static_cast<size_t>(successor)];
+        next = std::max(next, eventTaskPhase_[static_cast<size_t>(task)] + cross);
+        eventPhaseCount_ = std::max(eventPhaseCount_, next + 1);
+        if (--indegree[static_cast<size_t>(successor)] == 0) ready.insert(successor);
+      }
+    }
+    Assert(visited == tasks_.size(), "cycle while measuring node-sink phases");
+    eventPhaseCap_ = positiveEnv("GSIM_MT_NODE_SINK_PHASE_CAP", 0);
+    fprintf(stderr, "[cppEmitter-mt] node-sink cross-phases=%d cap=%d\n",
+            eventPhaseCount_, eventPhaseCap_);
   }
 }
 void CppEmitterMt::writeTaskPhaseReport() const {
@@ -355,6 +385,14 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           std::max<size_t>(1, tasks_.size()));
   fprintf(header, "uint64_t mtEventExecuted[kMtEventTaskCount] = {};\n");
   fprintf(header, "uint8_t mtSpecialHot[kMtEventTaskCount] = {};\n");
+  if (nodeSinkEmission_) {
+    fprintf(header, "static constexpr int kMtEventPhaseCount = %d;\n",
+            std::max(1, eventPhaseCap_ > 0
+                            ? std::min(eventPhaseCap_, eventPhaseCount_)
+                            : eventPhaseCount_));
+    fprintf(header, "alignas(64) std::atomic<uint32_t> mtEventPhaseRemaining{0};\n");
+    fprintf(header, "alignas(64) std::atomic<uint32_t> mtEventPhaseGeneration{0};\n");
+  }
   std::vector<Node*> inputNodes;
   for (const auto& entry : inputActivationTasks_) inputNodes.push_back(entry.first);
   std::sort(inputNodes.begin(), inputNodes.end(), [](const Node* lhs, const Node* rhs) {
@@ -367,6 +405,14 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
     }
       fprintf(header, "uint8_t mtInputOld%d[%zu] = {};\n", input->id, bytes);
     }
+  }
+  if (nodeSinkEmission_ && !eventGeneration_) {
+    fprintf(header, "static constexpr int kMtEventPhaseCount = %d;\n",
+            std::max(1, eventPhaseCap_ > 0
+                            ? std::min(eventPhaseCap_, eventPhaseCount_)
+                            : eventPhaseCount_));
+    fprintf(header, "alignas(64) std::atomic<uint32_t> mtEventPhaseRemaining{0};\n");
+    fprintf(header, "alignas(64) std::atomic<uint32_t> mtEventPhaseGeneration{0};\n");
   }
   if (globalConfig.MtConeCommit) {
     // Dirty-chunk register commit: value-preserving replacement for the
@@ -538,7 +584,13 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "bool mtAnyAsyncResetAsserted();\n");
   fprintf(header, "void mtApplyAsyncResets();\n");
   fprintf(header, "void mtReplayAfterAsyncReset();\n");
-  for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) fprintf(header, "void mtTask%zu();\n", taskId);
+  for (size_t taskId = 0; taskId < tasks_.size(); ++taskId)
+    fprintf(header, "void mtTask%zu();\n", taskId);
+  if (nodeSinkEmission_ && lookaheadWindow_ <= 0) {
+    for (int worker = 0; worker < workerCount_; ++worker)
+      fprintf(header, "void mtRunWorkerChainW%d(int worker, uint8_t parity);\n",
+              worker);
+  }
   fprintf(header, "~S%s();\n", graph_.name.c_str());
 }
 
@@ -858,6 +910,95 @@ void CppEmitterMt::emitTask(const Task& task, int taskId, int indent) {
   }
 }
 
+void CppEmitterMt::emitWorkerChainFunction(const std::string& className,
+                                            int worker) {
+  emitText(0, true, "void " + className + "::mtRunWorkerChainW" +
+                        std::to_string(worker) +
+                        "(int worker, uint8_t parity) {\n");
+  emitText(1, false, "(void)parity;\n");
+  const auto& chain = workerTasks_[static_cast<size_t>(worker)];
+  const int phaseCount = eventPhaseCap_ > 0
+      ? std::min(eventPhaseCap_, eventPhaseCount_) : eventPhaseCount_;
+  auto cappedPhase = [&](int taskId) {
+    return eventPhaseCap_ > 0
+        ? std::min(eventTaskPhase_[static_cast<size_t>(taskId)], eventPhaseCap_ - 1)
+        : eventTaskPhase_[static_cast<size_t>(taskId)];
+  };
+  for (int phase = 0; phase < phaseCount; ++phase) {
+    std::vector<int> phaseChain;
+    for (int taskId : chain) {
+      if (cappedPhase(taskId) == phase) phaseChain.push_back(taskId);
+    }
+    for (size_t begin = 0; begin < phaseChain.size(); begin += 32) {
+      const size_t end = std::min(begin + 32, phaseChain.size());
+      std::set<int> actWords, waitSlots, storeSlots;
+      bool needsReady = false;
+      for (size_t position = begin; position < end; ++position) {
+        const Task& task = tasks_[static_cast<size_t>(phaseChain[position])];
+        actWords.insert(phaseChain[position] >> 5);
+        if (eventPhaseCap_ > 0 &&
+            eventTaskPhase_[static_cast<size_t>(phaseChain[position])] >= eventPhaseCap_ - 1) {
+          needsReady = true;
+          waitSlots.insert(task.waits.begin(), task.waits.end());
+        }
+        storeSlots.insert(task.stores.begin(), task.stores.end());
+      }
+      if (needsReady) {
+        for (int slot : waitSlots) {
+          emitText(1, false, "while (mtReadyTokens[" + std::to_string(slot) +
+                                 "].value.load(std::memory_order_acquire) != parity)\n");
+          emitText(1, false, "  __asm__ __volatile__(\"pause\" ::: \"memory\");\n");
+        }
+        emitText(1, false,
+                 "do { if (mtBubbleProfile) mtBpTick(worker, mtBpSpinReady); } while (0);\n");
+      }
+      const std::string groupActive = "mtGroupActive" + std::to_string(phase) + "_" +
+                                      std::to_string(begin);
+      if (eventGeneration_) {
+        emitText(1, false, "bool " + groupActive + " = !mtEventEnabled;\n");
+        for (int word : actWords) {
+          emitText(1, false, groupActive + " |= (mtAct[" + std::to_string(worker) + "][" +
+                                 std::to_string(word) + "] | mtRemoteAct[" +
+                                 std::to_string(worker) + "][" + std::to_string(word) +
+                                 "].load(std::memory_order_acquire)) != 0;\n");
+        }
+      } else {
+        emitText(1, false, "const bool " + groupActive + " = true;\n");
+      }
+      emitText(1, false, "if (" + groupActive + ") {\n");
+      for (size_t position = begin; position < end; ++position) {
+        const int taskId = phaseChain[position];
+        emitText(2, false, "mtTask" + std::to_string(taskId) + "();\n");
+        emitText(2, false,
+                 "do { if (mtBubbleProfile) { mtBubble[worker].taskCalls++; "
+                 "const unsigned long long mtBpTaskT0 = mtBubble[worker].lastTsc; "
+                 "mtBpTick(worker, mtBpTaskCompute); if (mtBubbleTaskTimes) { "
+                 "++mtBubbleTaskCalls[worker][" + std::to_string(taskId) +
+                 "]; mtBubbleTaskTsc[worker][" + std::to_string(taskId) +
+                 "] += mtBubble[worker].lastTsc - mtBpTaskT0; } } } while (0);\n");
+      }
+      emitText(1, false, "}\n");
+      if (eventPhaseCap_ > 0) {
+        for (int slot : storeSlots) {
+          emitText(1, false, "mtReadyTokens[" + std::to_string(slot) +
+                                 "].value.store(parity, std::memory_order_release);\n");
+        }
+      }
+    }
+    if (phase + 1 < phaseCount) {
+      emitText(1, false, "if (mtEventPhaseRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {\n");
+      emitText(2, false, "mtEventPhaseRemaining.store(kMtWorkerCount, std::memory_order_relaxed);\n");
+      emitText(2, false, "mtEventPhaseGeneration.fetch_add(1, std::memory_order_release);\n");
+      emitText(1, false, "} else {\n");
+      emitText(2, false, "while (mtEventPhaseGeneration.load(std::memory_order_acquire) == " +
+                             std::to_string(phase) + ")\n");
+      emitText(2, false, "  __asm__ __volatile__(\"pause\" ::: \"memory\");\n");
+      emitText(1, false, "}\n");
+    }
+  }
+  emitText(0, false, "}\n");
+}
+
 void CppEmitterMt::emitDefinitions() {
   if (!enabled()) return;
   const std::string className = "S" + graph_.name;
@@ -866,13 +1007,14 @@ void CppEmitterMt::emitDefinitions() {
     emitStateUpdateFunction(update);
   }
 
+
   for (const Reset& reset : resets_) {
     emitAsyncResetFunction(reset);
   }
 
   std::vector<int> taskEmissionOrder;
   taskEmissionOrder.reserve(tasks_.size());
-  if (lookaheadWindow_ > 0) {
+  if (lookaheadWindow_ > 0 || nodeSinkEmission_) {
     std::vector<uint8_t> emitted(tasks_.size(), 0);
     for (const std::vector<int>& chain : workerTasks_) {
       for (int taskId : chain) {
@@ -892,10 +1034,28 @@ void CppEmitterMt::emitDefinitions() {
       taskEmissionOrder.push_back(static_cast<int>(taskId));
     }
   }
-  for (int taskId : taskEmissionOrder) {
-    emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
-    emitTask(tasks_[static_cast<size_t>(taskId)], taskId, 1);
-    emitText(0, false, "}\n");
+  if (nodeSinkEmission_ && lookaheadWindow_ <= 0) {
+    // Node sink LA0: each worker's direct-call chain dispatcher is emitted
+    // immediately before its task definitions, so one translation unit holds
+    // both and the per-task calls inline. (Plain definitions, not `inline`:
+    // file splitting puts callers and callees in different TUs, where an
+    // inline definition that its own TU does not use fails to link.)
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      emitWorkerChainFunction(className, worker);
+      for (int taskId : workerTasks_[static_cast<size_t>(worker)]) {
+        emitText(0, true, "void " + className + "::mtTask" +
+                              std::to_string(taskId) + "() {\n");
+        emitTask(tasks_[static_cast<size_t>(taskId)], taskId, 1);
+        emitText(0, false, "}\n");
+      }
+    }
+  } else {
+    for (int taskId : taskEmissionOrder) {
+      emitText(0, true, "void " + className + "::mtTask" +
+                            std::to_string(taskId) + "() {\n");
+      emitTask(tasks_[static_cast<size_t>(taskId)], taskId, 1);
+      emitText(0, false, "}\n");
+    }
   }
 
   emitText(0, true, "bool " + className + "::mtAnyAsyncResetAsserted() {\n");
@@ -1011,7 +1171,8 @@ void CppEmitterMt::emitDefinitions() {
       "  unsigned int lo, hi;\n"
       "  __asm__ __volatile__(\"rdtsc\" : \"=a\"(lo), \"=d\"(hi));\n"
       "  return (static_cast<unsigned long long>(hi) << 32) | lo;\n"
-      "}\n"
+      "}\n";
+  runtime +=
       "static inline unsigned long long mtBpMonoNs() {\n"
       "  struct timespec mtBpTs;\n"
       "  clock_gettime(CLOCK_MONOTONIC, &mtBpTs);\n"
@@ -1026,8 +1187,11 @@ void CppEmitterMt::emitDefinitions() {
       "       const unsigned long long mtBpTaskT0 = mtBubble[w].lastTsc; \\\n"
       "       mtBpTick(w, mtBpTaskCompute); \\\n"
       "       if (mtBubbleTaskTimes) { ++mtBubbleTaskCalls[w][t]; \\\n"
-      "         mtBubbleTaskTsc[w][t] += mtBubble[w].lastTsc - mtBpTaskT0; } } } while (0)\n"
-      "inline void " + className + "::mtBpTick(int worker, int bucket) {\n"
+      "         mtBubbleTaskTsc[w][t] += mtBubble[w].lastTsc - mtBpTaskT0; } } } while (0)\n";
+  runtime += std::string(nodeSinkEmission_ && lookaheadWindow_ <= 0
+                             ? "void "
+                             : "inline void ") +
+          className + "::mtBpTick(int worker, int bucket) {\n"
       "  MtBubbleCounters* mtBpBp = &mtBubble[worker];\n"
       "  const unsigned long long mtBpNow = mtBpRdtsc();\n"
       "  mtBpBp->bucket[bucket] += mtBpNow - mtBpBp->lastTsc;\n"
@@ -1281,7 +1445,7 @@ void CppEmitterMt::emitDefinitions() {
       "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
       "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
       "  }\n";
-  if (lookaheadWindow_ <= 0) {
+  if (lookaheadWindow_ <= 0 && !nodeSinkEmission_) {
     // Strict fixed-order fast path. This is the baseline protocol and avoids
     // all per-task ready scanning when lookahead is disabled.
     runtime += "  const MtDispatch* entries = nullptr; uint32_t count = 0;\n  switch (worker) {\n";
@@ -1312,6 +1476,15 @@ void CppEmitterMt::emitDefinitions() {
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
         "  }\n"
         "}\n";
+  } else if (lookaheadWindow_ <= 0) {
+    // Node sink strict path: one direct call into the per-worker chain
+    // function that was emitted beside its task definitions.
+    runtime += "  switch (worker) {\n";
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      runtime += "    case " + std::to_string(worker) + ": mtRunWorkerChainW" +
+                 std::to_string(worker) + "(worker, parity); return;\n";
+    }
+    runtime += "    default: abort();\n  }\n}\n";
   } else {
     runtime += "  switch (worker) {\n";
     for (int worker = 0; worker < workerCount_; ++worker) {
@@ -1385,6 +1558,10 @@ void CppEmitterMt::emitDefinitions() {
           isPackedRegister(node) ? packedRegisterName(node) : node->name;
       runtime += "  " + node->name + "$RESET = " + value + ";\n";
     }
+  }
+  if (nodeSinkEmission_) {
+    runtime += "  mtEventPhaseRemaining.store(kMtWorkerCount, std::memory_order_relaxed);\n";
+    runtime += "  mtEventPhaseGeneration.store(0, std::memory_order_relaxed);\n";
   }
   runtime +=
       "  uint64_t generation = mtGeneration.fetch_add(1, std::memory_order_release) + 1;\n"

@@ -58,6 +58,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitInstructions(const std::vector<InstInfo>& instructions, int indent,
                         int specialTaskId = -1);
   void emitTask(const Task& task, int taskId, int indent);
+  void emitWorkerChainFunction(const std::string& className, int worker);
   void buildRegisterStorageNames();
   void buildActivationPlan();
   void writeTaskPhaseReport() const;
@@ -72,6 +73,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   int resetChunk_ = 4096;
   int lookaheadWindow_ = 128;
   bool lookaheadStats_ = false;
+  bool nodeSinkEmission_ = false;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
   struct ActivationWatch {
@@ -82,6 +84,9 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   std::unordered_map<Node*, std::vector<int>> stateNodeActivationTasks_;
   std::unordered_map<Node*, std::vector<int>> inputActivationTasks_;
   std::vector<uint8_t> taskAlwaysActive_;
+  std::vector<int> eventTaskPhase_;
+  int eventPhaseCount_ = 0;
+  int eventPhaseCap_ = 0;
 };
 
 #endif

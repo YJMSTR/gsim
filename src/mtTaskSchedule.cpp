@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "mtCostModel.h"
+#include "mtNodeSink.h"
 #include "mtReplicationSchedule.h"
 
 #include <algorithm>
@@ -1042,6 +1043,19 @@ std::vector<int> reorderHeftTasks(MtTaskPlan& tasks, WorkerSchedule& schedule) {
 void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& workers,
                             int workerCount, int resetChunk) {
   const int groupCount = tasks.partitionGroupCount_;
+  WorkerSchedule schedule;
+  if (MtNodeSinkPlanner::enabled()) {
+    // Node-level sink planning replaces the MTask formation; the state
+    // updates, ready tokens and local waits below stay shared.
+    MtNodeSinkSchedule planned;
+    MtNodeSinkPlanner::plan(graph, tasks, workerCount, planned);
+    schedule.owner = std::move(planned.owner);
+    schedule.chains = std::move(planned.chains);
+    schedule.makespan = planned.makespan;
+    for (size_t taskId = 0; taskId < tasks.tasks_.size(); ++taskId) {
+      tasks.tasks_[taskId].owner = schedule.owner[taskId];
+    }
+  } else {
   compactEmptyTasks(tasks);
   for (MtTask& task : tasks.tasks_) task.cost = mtLoweredTaskCost(task);
   EdgeCommunicationNodes communicationNodes = buildEdgeCommunicationNodes(tasks);
@@ -1054,7 +1068,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
   const bool replicationAware = globalConfig.MtScheduler == "rheft" && workerCount > 1;
   std::unique_ptr<MtHeftReplication> replication;
   if (replicationAware) replication = std::make_unique<MtHeftReplication>(graph, tasks, workerCount);
-  WorkerSchedule schedule = replicationAware
+  schedule = replicationAware
       ? scheduleHeft(tasks, workerCount, communicationNodes, replication.get())
       : (globalConfig.MtScheduler == "list"
           ? scheduleList(tasks, workerCount, communicationNodes)
@@ -1100,6 +1114,7 @@ void MtWorkerBuilder::build(graph& graph, MtTaskPlan& tasks, MtWorkerPlan& worke
           globalConfig.MtScheduler.c_str(), schedule.makespan, communicationEdges,
           communicationUnits, actualCrossWorkerNodes,
           globalConfig.MtScheduleCommNodeWeight);
+  }
 
   const size_t transitiveEdgesRemoved = transitivelyReduceTaskEdges(tasks);
 

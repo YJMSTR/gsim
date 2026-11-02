@@ -1,0 +1,136 @@
+# 节点级 Sink 闭包执行器设计
+
+## 目标与验收
+
+目标是让 event T32 先达到 p2sim 同一量级，再争取超过，而不是继续在 HEFT/token
+上做局部微调。
+
+里程碑顺序固定：
+
+1. 小模型 dense/event 全差分：reset、queue read-after-write、memory pending、
+   multiwriter 同地址顺序、重复 printf。
+2. BOOM 50k 三次全寄存器哈希与 dense 一致。
+3. BOOM 500k 正确性后，与 p2sim 同会话五轮交错测速；先在 1.20× 内，再争取
+   1.05× 以上优势。
+4. KMH difftest on/off 各三轮哈希、五轮测速，并记录 EVENT_STATS 实际稀疏度。
+
+任何性能结论必须来自同一 T32、CPU 48-79、同一镜像和同会话配对；dense-only
+使用独立生成二进制，不能把携带 event 代码的弱 dense 当作基线。
+
+## 已证伪的前置方案
+
+- MTask/细 MTask 的零跨边闭包会把绝大多数成本吸入单分量，不能实现负载均衡。
+- 有界 MTask 闭包在 BOOM 上仍产生 1,078,125 的静态 makespan，远高于 HEFT
+  169,961，不能进入编译验收。
+- per-source plain activation bank 在 50k 后存在非确定性竞态，禁止使用。
+- ready-CHG generation 可以消除该类竞态，但实测没有性能收益，只作为后续残余
+  跨核边的可选安全机制，不作为主线优化。
+
+因此新工作必须直接下到节点级任务形成，不再给 MTask 分区器增加模式。
+
+## 任务形成与纯度判定
+
+### 钉死的副作用微任务
+
+以下节点各自形成独立、唯一、不可复制的微任务；除状态提交外，不与其他计算
+合并：
+
+- `NODE_SPECIAL`：printf/assert，保留原 serialOrder 和 hot/cold 语义。
+- `NODE_WRITER` / `NODE_READWRITER`：memory pending 写与 readwriter forwarding。
+- `NODE_REG_RESET` 与 async/sync reset 发布。
+- `NODE_EXT` / `NODE_EXT_IN` / `NODE_EXT_OUT` 与 host-visible output。
+- 状态提交：REG_SRC/REG_DST 的 canonical current/next 更新、memory preCommit、
+  sparse register commit。它们只能有唯一 commitOwner。
+
+这些节点是 sink。它们可以读取纯组合副本，但其副作用和写状态顺序必须与原图一致。
+
+### 可复制纯组合节点
+
+同时满足以下条件才允许复制：
+
+- 类型为 `NODE_OTHERS` 或 `NODE_INFER`，无 printf/assert/ext/memory side effect。
+- 不写 REG_DST、memory、reset、host output。
+- 标量或总元素数不超过 32 的数组；更大数组钉住，避免复制成本和 cache 放大。
+- 输入只能是顶层输入、cycle-start 稳定状态、同 worker 纯组合值或同 worker
+  唯一微任务输出。跨 worker 的非常规输入必须使用残余跨核边协议。
+
+`NODE_READER` 的存储器读取本身是否可复制由该读是否引用 canonical memory 决定：
+readwriter 同端口 write-first 一律不可复制；普通 reader 只在读取 cycle-start 稳定
+快照且提交顺序已证安全时允许作为边界输入，不复制存储器本体。
+
+## Sink 闭包与节点图
+
+1. 使用前端原始 Node 图，不使用 `MtTask` 作为纯度或复制单位。
+2. 保留全局拓扑序。组合数据依赖是本周期边；REG_SRC 当前态和 canonical memory
+   是 cycle-start 边界，不能误当成需要复制的组合生产者。
+3. sink 包括所有副作用微任务以及没有本周期后继的节点。
+4. 逆拓扑计算每个纯节点的可达 sink 集。纯节点可以复制到每个需要它的 worker，
+   但复制不是强制闭包：必须同时通过成本与预算检查。
+5. 每个 worker 的链是全局拓扑序过滤后的子序列。链内只使用本地激活掩码，
+   不发 ready token。
+
+## 复制代价模型
+
+对候选纯节点 `n` 和目标 worker `w`：
+
+```text
+cloneCost(n,w) = lowered_instruction_cost(n)
+               + clone_watch_cost(n)
+               + per_worker_activation_cost(n,w)
+               + estimated_cache_cost(n,w)
+
+saved(n,w) = removed_ready_tokens(n,w) * (tokenLatency + remoteCheck + remotePublish)
+           + removed_remote_activation_RMW(n,w)
+           + removed_spin_estimate(n,w)
+```
+
+只有满足以下条件才复制：
+
+- `saved(n,w) > cloneCost(n,w)`，且确实删除至少一条跨核边；
+- 目标 worker 总成本不超过 `cap × ceil(total_original_cost / workerCount)`；
+- 首个 cap 固定为 1.25，预算以复制前总成本计算，禁止用新增复制成本继续抬高预算；
+- 不复制 always/side-effect 微任务、大数组、多写者状态和 canonical commit；
+- 合并或复制不得改变全局拓扑序、reset 顺序和 side-effect serialOrder。
+
+接受残余跨核边。零跨边不是目标，也不允许为了达到零跨边而牺牲负载均衡。
+
+## Worker 链与激活
+
+- 每个 worker 使用 plain 本地 activation mask；首周期全置位，reset 按现有协议重放。
+- 纯组合写使用 WritePre/WritePost CHG：小 fanout 无分支传播，大 fanout 条件传播。
+- 本地消费者按拓扑序在后续链位置执行，不需要 ready token。
+- 副作用微任务保持 hot/cold：触发 printf/assert 时置 hot，hot 期间每周期执行，
+  冷任务只在输入变化时执行。
+- canonical state 提交保持 dense 的 current/next、pending 和 reset 语义；不得把
+  canonical write 挪到普通 worker compute 阶段。
+- host-visible output 从本周期 producing worker 读取，不读下一周期 mailbox。
+
+## 残余跨核边
+
+优先使用每条 producer→consumer 边的 ready-CHG generation：
+
+- producer 完成时写 ready parity；只有实际 CHG 时才写 generation。
+- consumer 先等 ready，再比较 generation，保证数据就绪和变化语义分离。
+- generation 单调递增，避免 parity 重用造成假激活。
+- 没有对应 ready slot 的边回退到原子 remote activation mask，不允许 plain bank。
+
+当后续某区域真正达到零跨边时，可改为 p2sim 的双屏障 pull/step/push，但这不是
+首个里程碑的前置条件。
+
+## 与 dense 的隔离
+
+- 基线为 `experiment/node-sink`，从 `ca1f141` 的干净工作树开始。
+- dense/vcontract 路径保持零行为改动；默认 `GSIM_MT_EVENT_GENERATE=0`。
+- 新任务形成使用独立 `mtNodeSink` 数据结构和发射器，不修改 `MtTaskPlan`、
+  HEFT、dense scheduler 或 dense state update。
+- event 仅由 `GSIM_MT_EVENT_GENERATE=1` 生成；节点 sink 再由独立
+  `GSIM_MT_NODE_SINK=1` 选择，便于同图对照。
+- 重活一次一件；builder 实现、reviewer 审查；被拒绝探针完整删除，不保留死代码。
+
+## 实施顺序
+
+1. 建立节点纯度、微任务和全局拓扑报告，先验证不生成模型时的分类与成本。
+2. 实现单 worker 节点链，再做受预算约束的复制和残余跨核协议。
+3. 小模型差分通过后，才允许 BOOM 生成和 50k 哈希。
+4. BOOM 500k 达到 1.20× p2sim 后才进入 KMH；未达标继续按阶段画像定位，不能
+  用 KMH 或较弱 dense 掩盖 BOOM 差距。
