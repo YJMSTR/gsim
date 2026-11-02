@@ -5,7 +5,6 @@
 #include <cstdlib>
 
 int main() {
-  setenv("GSIM_MT_EXECUTOR", "dense", 1);
   SMtMemoryCommit dut;
   uint64_t signature = 1469598103934665603ULL;
   for (unsigned cycle = 0; cycle < 10000; ++cycle) {

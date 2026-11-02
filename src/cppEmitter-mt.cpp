@@ -87,9 +87,74 @@ void CppEmitterMt::prepare() {
   MtWorkerBuilder::build(graph_, static_cast<MtTaskPlan&>(*this), static_cast<MtWorkerPlan&>(*this),
                          workerCount_, resetChunk_);
   buildRegisterStorageNames();
+  buildActivationPlan();
   writeTaskPhaseReport();
 }
 
+void CppEmitterMt::buildActivationPlan() {
+  activationWatches_.clear();
+  activationWatches_.resize(tasks_.size());
+  taskAlwaysActive_.assign(tasks_.size(), 0);
+  stateNodeActivationTasks_.clear();
+  inputActivationTasks_.clear();
+
+  for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) {
+    const Task& task = tasks_[taskId];
+    taskAlwaysActive_[taskId] = task.kind == MtTaskKind::ExtModule ? 2 : 0;
+    std::set<Node*> references;
+    std::set<Node*> writtenNodes;
+    for (Node* node : task.members) {
+      if (node->type == NODE_SPECIAL) taskAlwaysActive_[taskId] = 1;
+      for (ExpTree* tree : node->assignTree) {
+        collectReferencedNodes(tree->getRoot(), references);
+        collectReferencedNodes(tree->getlval(), references);
+        if (tree->getlval() != nullptr && tree->getlval()->nodePtr != nullptr) {
+          writtenNodes.insert(tree->getlval()->nodePtr);
+        }
+      }
+    }
+    for (Node* written : writtenNodes) {
+      ActivationWatch watch;
+      watch.node = written;
+      for (Node* consumerNode : written->next) {
+        auto consumer = taskByNode_.find(consumerNode);
+        if (consumer == taskByNode_.end() || consumer->second == static_cast<int>(taskId)) {
+          continue;
+        }
+        watch.consumers.push_back(consumer->second);
+      }
+      std::sort(watch.consumers.begin(), watch.consumers.end());
+      watch.consumers.erase(std::unique(watch.consumers.begin(), watch.consumers.end()),
+                            watch.consumers.end());
+      if (!watch.consumers.empty()) activationWatches_[taskId].push_back(std::move(watch));
+    }
+    for (Node* reference : references) {
+      if (reference->type == NODE_INP) {
+        inputActivationTasks_[reference].push_back(static_cast<int>(taskId));
+        continue;
+      }
+      Node* stateNode = reference;
+      if ((reference->type == NODE_READER || reference->type == NODE_READWRITER ||
+           reference->type == NODE_WRITER) && reference->parent != nullptr &&
+          reference->parent->type == NODE_MEMORY) {
+        stateNode = reference->parent;
+      }
+      auto state = stateTaskByNode_.find(stateNode);
+      if (state == stateTaskByNode_.end()) continue;
+      stateNodeActivationTasks_[stateNode].push_back(static_cast<int>(taskId));
+    }
+  }
+  for (auto& entry : stateNodeActivationTasks_) {
+    std::vector<int>& consumers = entry.second;
+    std::sort(consumers.begin(), consumers.end());
+    consumers.erase(std::unique(consumers.begin(), consumers.end()), consumers.end());
+  }
+  for (auto& entry : inputActivationTasks_) {
+    std::vector<int>& consumers = entry.second;
+    std::sort(consumers.begin(), consumers.end());
+    consumers.erase(std::unique(consumers.begin(), consumers.end()), consumers.end());
+  }
+}
 void CppEmitterMt::writeTaskPhaseReport() const {
   const std::string phasesPath = globalConfig.OutputDir + "/mt-task-phases.csv";
   const std::string membersPath = globalConfig.OutputDir + "/mt-state-task-members.csv";
@@ -255,7 +320,7 @@ void CppEmitterMt::emitText(int indent, bool canStartFile, const std::string& te
 void CppEmitterMt::emitHeaderPreamble(FILE* header) const {
   if (!enabled()) return;
   fprintf(header,
-          "#include <atomic>\n#include <cstdio>\n#include <thread>\n#include <sched.h>\n"
+          "#include <atomic>\n#include <cstdio>\n#include <cstring>\n#include <thread>\n#include <sched.h>\n"
           "#include <string>\n#include <utility>\n\n");
 }
 
@@ -278,6 +343,28 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "alignas(64) std::atomic<int> mtReadyWorkers{0};\n");
   fprintf(header, "alignas(64) std::atomic<bool> mtStop{false};\n");
   fprintf(header, "bool mtEnabled = false;\n");
+  fprintf(header, "bool mtEventEnabled = false;\n");
+  fprintf(header, "static constexpr size_t kMtActWords = %zu;\n",
+          std::max<size_t>(1, (tasks_.size() + 31) / 32));
+  fprintf(header, "alignas(64) uint32_t mtAct[kMtWorkerCount][kMtActWords] = {};\n");
+  fprintf(header,
+          "alignas(64) std::atomic<uint32_t> mtRemoteAct[kMtWorkerCount][kMtActWords] = {};\n");
+  fprintf(header, "static constexpr size_t kMtEventTaskCount = %zu;\n",
+          std::max<size_t>(1, tasks_.size()));
+  fprintf(header, "uint64_t mtEventExecuted[kMtEventTaskCount] = {};\n");
+  fprintf(header, "uint8_t mtSpecialHot[kMtEventTaskCount] = {};\n");
+  std::vector<Node*> inputNodes;
+  for (const auto& entry : inputActivationTasks_) inputNodes.push_back(entry.first);
+  std::sort(inputNodes.begin(), inputNodes.end(), [](const Node* lhs, const Node* rhs) {
+    return lhs->id < rhs->id;
+  });
+  for (Node* input : inputNodes) {
+    size_t bytes = static_cast<size_t>(widthBits(input->width)) / 8;
+    for (int dimension : input->dimension) {
+      bytes *= static_cast<size_t>(upperPower2(dimension));
+    }
+    fprintf(header, "uint8_t mtInputOld%d[%zu] = {};\n", input->id, bytes);
+  }
   if (globalConfig.MtConeCommit) {
     // Dirty-chunk register commit: value-preserving replacement for the
     // whole-block memcpy (only differing 64B chunks are copied). Ported from
@@ -428,8 +515,9 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
   fprintf(header, "void mtPinWorker(int worker);\nvoid stepMt();\n");
   for (const StateUpdate& update : stateTasks_) {
     fprintf(header, "void mtUpdateStateW%d();\n", update.owner);
+    fprintf(header, "void mtUpdateStateW%d_body();\n", update.owner);
     for (int chunk = 1; chunk <= update.chunkCount; ++chunk) {
-      fprintf(header, "void mtUpdateStateW%d_c%d();\n", update.owner, chunk);
+      fprintf(header, "void mtUpdateStateW%d_body_c%d();\n", update.owner, chunk);
     }
   }
   for (const Reset& reset : resets_) {
@@ -545,23 +633,104 @@ void CppEmitterMt::emitAsyncResetFunction(const Reset& reset) {
                         reset.body, reset.chunkCount);
 }
 
-void CppEmitterMt::emitStateUpdateFunction(const StateUpdate& update) {
-  emitResetBodyFunction("mtUpdateStateW" + std::to_string(update.owner), "",
-                        update.body, update.chunkCount);
+void CppEmitterMt::emitTaskActivation(const std::vector<int>& consumers,
+                                      int sourceWorker, int indent) {
+  for (int consumerId : consumers) {
+    const Task& consumer = tasks_[static_cast<size_t>(consumerId)];
+    const std::string word = std::to_string(consumerId >> 5);
+    const std::string bit = "uint32_t{1} << " + std::to_string(consumerId & 31);
+    if (consumer.owner == sourceWorker) {
+      emitText(indent, false, "mtAct[" + std::to_string(consumer.owner) + "][" + word +
+                                  "] |= " + bit + ";\n");
+    } else {
+      emitText(indent, false, "mtRemoteAct[" + std::to_string(consumer.owner) + "][" + word +
+                                  "].fetch_or(" + bit + ", std::memory_order_release);\n");
+    }
+  }
 }
 
-void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, int indent) {
+void CppEmitterMt::emitStateUpdateFunction(const StateUpdate& update) {
+  const std::string base = "mtUpdateStateW" + std::to_string(update.owner);
+  emitResetBodyFunction(base + "_body", "", update.body, update.chunkCount);
+
+  const std::string className = "S" + graph_.name;
+  emitText(0, true, "void " + className + "::" + base + "() {\n");
+  emitText(1, false, "if (mtEventEnabled) {\n");
+  auto consumersOf = [&](Node* node) -> const std::vector<int>& {
+    static const std::vector<int> empty;
+    auto found = stateNodeActivationTasks_.find(node);
+    return found == stateNodeActivationTasks_.end() ? empty : found->second;
+  };
+  for (Node* reg : update.registers) {
+    const std::vector<int>& consumers = consumersOf(reg);
+    if (consumers.empty()) continue;
+    const std::string source = packedRegisterName(reg);
+    const std::string destination = packedRegisterName(reg->getDst());
+    emitText(2, false, "if (__builtin_memcmp(&" + source + ", &" + destination +
+                           ", sizeof(" + source + ")) != 0) {\n");
+    emitTaskActivation(consumers, update.owner, 3);
+    emitText(2, false, "}\n");
+  }
+  auto emitValidWake = [&](Node* writer, Node* state) {
+    const std::vector<int>& consumers = consumersOf(state);
+    if (consumers.empty()) return;
+    const std::string valid = mtMemoryWriteValidName(writer);
+    const std::string changed = "mtWriteValid" + std::to_string(writer->id);
+    emitText(2, false, "bool " + changed + " = false;\n");
+    emitText(2, false, "for (size_t i = 0; i < sizeof(" + valid + "); ++i) " + changed +
+                           " |= reinterpret_cast<const uint8_t*>(&" + valid + ")[i] != 0;\n");
+    emitText(2, false, "if (" + changed + ") {\n");
+    emitTaskActivation(consumers, update.owner, 3);
+    emitText(2, false, "}\n");
+  };
+  for (Node* writer : update.memoryWriters) emitValidWake(writer, writer->parent);
+  for (Node* writer : update.sparseRegisterWriters) emitValidWake(writer, writer->parent);
+  for (Node* reset : update.members) {
+    if (reset->type != NODE_REG_RESET) continue;
+    Node* reg = reset->getResetSrc();
+    const std::vector<int>& consumers = consumersOf(reg);
+    if (consumers.empty()) continue;
+    Node* resetNode = reset->super->resetNode;
+    const std::string condition = isPackedRegister(resetNode)
+                                      ? packedRegisterName(resetNode) : resetNode->name;
+    emitText(2, false, "if (unlikely(" + condition + ")) {\n");
+    emitTaskActivation(consumers, update.owner, 3);
+    emitTaskActivation(consumersOf(reset), update.owner, 3);
+    auto producer = taskByNode_.find(reg->getDst());
+    if (producer != taskByNode_.end()) {
+      emitTaskActivation({producer->second}, update.owner, 3);
+    }
+    emitText(2, false, "}\n");
+  }
+  emitText(1, false, "}\n");
+  emitText(1, false, base + "_body();\n");
+  emitText(0, false, "}\n");
+}
+
+void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, int indent,
+                                    int specialTaskId) {
   const int initialIndent = indent;
   for (const InstInfo& inst : instructions) {
+    std::string instruction = inst.inst;
+    if (specialTaskId >= 0) {
+      const std::string call = "gprintf(";
+      const std::string wrapped = "(mtSpecialHot[" + std::to_string(specialTaskId) +
+                                  "] = 1, gprintf)(";
+      size_t position = 0;
+      while ((position = instruction.find(call, position)) != std::string::npos) {
+        instruction.replace(position, call.size(), wrapped);
+        position += wrapped.size();
+      }
+    }
     switch (inst.infoType) {
-      case SUPER_INFO_IF: emitText(indent++, false, mapRegisterNames(inst.inst) + "\n"); break;
+      case SUPER_INFO_IF: emitText(indent++, false, mapRegisterNames(instruction) + "\n"); break;
       case SUPER_INFO_ELSE:
-        emitText(indent - 1, false, mapRegisterNames(inst.inst) + "\n");
+        emitText(indent - 1, false, mapRegisterNames(instruction) + "\n");
         break;
       case SUPER_INFO_DEDENT:
-        emitText(--indent, false, mapRegisterNames(inst.inst) + "\n");
+        emitText(--indent, false, mapRegisterNames(instruction) + "\n");
         break;
-      case SUPER_INFO_STR: emitText(indent, false, mapRegisterNames(inst.inst) + "\n"); break;
+      case SUPER_INFO_STR: emitText(indent, false, mapRegisterNames(instruction) + "\n"); break;
       case SUPER_INFO_ASSIGN_BEG:
       case SUPER_INFO_ASSIGN_END: break;
     }
@@ -569,9 +738,38 @@ void CppEmitterMt::emitInstructions(const std::vector<InstInfo>& instructions, i
   Assert(indent == initialIndent, "unbalanced MTask instruction tree");
 }
 
-void CppEmitterMt::emitTask(const Task& task, int indent) {
+void CppEmitterMt::emitTask(const Task& task, int taskId, int indent) {
   Assert(task.insts != nullptr, "MTask has no lowered instruction stream");
   Assert(!task.members.empty(), "cannot emit an empty MTask");
+
+  const uint8_t activationKind = taskAlwaysActive_[static_cast<size_t>(taskId)];
+  if (activationKind != 2) {
+    const std::string owner = std::to_string(task.owner);
+    const std::string word = std::to_string(taskId >> 5);
+    const std::string bit = "uint32_t{1} << " + std::to_string(taskId & 31);
+    emitText(indent++, false, "if (mtEventEnabled) {\n");
+    emitText(indent, false, "const uint32_t mtLocalBits = mtAct[" + owner + "][" + word + "];\n");
+    emitText(indent++, false, "if ((mtLocalBits & (" + bit + ")) == 0) {\n");
+    emitText(indent, false, "const uint32_t mtRemoteBits = mtRemoteAct[" + owner + "][" + word +
+                                "].load(std::memory_order_acquire);\n");
+    std::string inactive = "(mtRemoteBits & (" + bit + ")) == 0";
+    if (activationKind == 1) {
+      inactive += " && mtSpecialHot[" + std::to_string(taskId) + "] == 0";
+    }
+    emitText(indent, false, "if (" + inactive + ") return;\n");
+    emitText(indent, false, "if ((mtRemoteBits & (" + bit + ")) != 0) mtRemoteAct[" + owner +
+                                "][" + word + "].fetch_and(~(" + bit +
+                                "), std::memory_order_acq_rel);\n");
+    emitText(--indent, false, "}\n");
+    emitText(indent, false, "mtAct[" + owner + "][" + word + "] = mtLocalBits & ~(" + bit + ");\n");
+    if (activationKind == 1) {
+      emitText(indent, false, "mtSpecialHot[" + std::to_string(taskId) + "] = 0;\n");
+    }
+    emitText(--indent, false, "}\n");
+  }
+
+  emitText(indent, false, "if (mtEventEnabled) ++mtEventExecuted[" +
+                              std::to_string(taskId) + "];\n");
 
   for (Node* node : task.members) {
     if (task.localNodes.count(node) != 0) {
@@ -607,7 +805,38 @@ void CppEmitterMt::emitTask(const Task& task, int indent) {
     }
   }
 
-  emitInstructions(*task.insts, indent);
+  const auto& watches = activationWatches_[static_cast<size_t>(taskId)];
+  for (const ActivationWatch& watch : watches) {
+    size_t bytes = static_cast<size_t>(widthBits(watch.node->width)) / 8;
+    for (int dimension : watch.node->dimension) {
+      bytes *= static_cast<size_t>(upperPower2(dimension));
+    }
+    if (bytes == 0 || bytes > 256) continue;
+    const std::string name = mapRegisterNames(watch.node->name);
+    emitText(indent, false, "uint8_t __mtOld" + std::to_string(taskId) + "_" +
+                                std::to_string(watch.node->id) + "[sizeof(" + name + ")];\n");
+    emitText(indent, false, "if (mtEventEnabled) __builtin_memcpy(__mtOld" +
+                                std::to_string(taskId) + "_" + std::to_string(watch.node->id) +
+                                ", &" + name + ", sizeof(" + name + "));\n");
+  }
+
+  emitInstructions(*task.insts, indent, activationKind == 1 ? taskId : -1);
+
+  for (const ActivationWatch& watch : watches) {
+    size_t bytes = static_cast<size_t>(widthBits(watch.node->width)) / 8;
+    for (int dimension : watch.node->dimension) {
+      bytes *= static_cast<size_t>(upperPower2(dimension));
+    }
+    const std::string name = mapRegisterNames(watch.node->name);
+    std::string condition = "mtEventEnabled";
+    if (bytes != 0 && bytes <= 256) {
+      condition += " && __builtin_memcmp(__mtOld" + std::to_string(taskId) + "_" +
+                   std::to_string(watch.node->id) + ", &" + name + ", sizeof(" + name + ")) != 0";
+    }
+    emitText(indent++, false, "if (" + condition + ") {\n");
+    emitTaskActivation(watch.consumers, task.owner, indent);
+    emitText(--indent, false, "}\n");
+  }
 }
 
 void CppEmitterMt::emitDefinitions() {
@@ -646,7 +875,7 @@ void CppEmitterMt::emitDefinitions() {
   }
   for (int taskId : taskEmissionOrder) {
     emitText(0, true, "void " + className + "::mtTask" + std::to_string(taskId) + "() {\n");
-    emitTask(tasks_[static_cast<size_t>(taskId)], 1);
+    emitTask(tasks_[static_cast<size_t>(taskId)], taskId, 1);
     emitText(0, false, "}\n");
   }
 
@@ -675,6 +904,19 @@ void CppEmitterMt::emitDefinitions() {
   emitText(0, false, "}\n");
 
   emitText(0, true, "void " + className + "::mtReplayAfterAsyncReset() {\n");
+  emitText(1, false, "if (mtEventEnabled) {\n");
+  emitText(2, false, "for (int w = 0; w < kMtWorkerCount; ++w) {\n");
+  emitText(3, false, "for (size_t i = 0; i < kMtActWords; ++i) {\n");
+  emitText(4, false, "mtAct[w][i] = 0;\n");
+  emitText(4, false, "mtRemoteAct[w][i].store(0, std::memory_order_relaxed);\n");
+  emitText(3, false, "}\n");
+  emitText(2, false, "}\n");
+  emitText(2, false, "__builtin_memset(mtSpecialHot, 0, sizeof(mtSpecialHot));\n");
+  emitText(2, false, "for (size_t task = 0; task < kMtBubbleTaskCount; ++task) {\n");
+  emitText(3, false, "const int w = mtBubbleTaskWorker[task];\n");
+  emitText(3, false, "mtAct[w][task >> 5] |= uint32_t{1} << (task & 31);\n");
+  emitText(2, false, "}\n");
+  emitText(1, false, "}\n");
   for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) {
     if (tasks_[taskId].kind == MtTaskKind::ExtModule) continue;
     emitText(1, false, "mtTask" + std::to_string(taskId) + "();\n");
@@ -773,7 +1015,20 @@ void CppEmitterMt::emitDefinitions() {
   runtime += "void " + className + "::mtInit() {\n";
   runtime += "  const char* executor = getenv(\"GSIM_MT_EXECUTOR\");\n";
   runtime += "  if (executor == nullptr) return;\n";
-  runtime += "  if (strcmp(executor, \"dense\") != 0) return;\n";
+  runtime += "  mtEventEnabled = strcmp(executor, \"event\") == 0;\n";
+  runtime += "  if (!mtEventEnabled && strcmp(executor, \"dense\") != 0) return;\n";
+  runtime += "  if (mtEventEnabled) {\n";
+  runtime += "    for (int w = 0; w < kMtWorkerCount; ++w) {\n";
+  runtime += "      for (size_t i = 0; i < kMtActWords; ++i) {\n";
+  runtime += "        mtAct[w][i] = 0;\n";
+  runtime += "        mtRemoteAct[w][i].store(0, std::memory_order_relaxed);\n";
+  runtime += "      }\n";
+  runtime += "    }\n";
+  runtime += "    for (size_t task = 0; task < kMtBubbleTaskCount; ++task) {\n";
+  runtime += "      const int w = mtBubbleTaskWorker[task];\n";
+  runtime += "      mtAct[w][task >> 5] |= uint32_t{1} << (task & 31);\n";
+  runtime += "    }\n";
+  runtime += "  }\n";
   runtime += "  const char* threads = getenv(\"GSIM_THREADS\");\n";
   runtime += "  char* end = nullptr; long count = threads ? strtol(threads, &end, 10) : 1;\n";
   runtime += "  if (!threads || end == threads || *end != '\\0' || count != kMtWorkerCount) {\n";
@@ -845,6 +1100,14 @@ void CppEmitterMt::emitDefinitions() {
         "  }\n";
   }
   runtime += "  if (mtBubbleProfile) mtBpReport();\n";
+  runtime += "  if (const char* eventStats = getenv(\"GSIM_MT_EVENT_STATS\")) {\n";
+  runtime += "    FILE* out = fopen(eventStats, \"w\");\n";
+  runtime += "    if (out != nullptr) {\n";
+  runtime += "      for (int task = 0; task < kMtEventTaskCount; ++task)\n";
+  runtime += "        fprintf(out, \"%d,%llu\\n\", task, (unsigned long long)mtEventExecuted[task]);\n";
+  runtime += "      fclose(out);\n";
+  runtime += "    }\n";
+  runtime += "  }\n";
   runtime += "}\n";
   runtime += "void " + className + "::mtWorkerLoop(int worker) {\n";
   runtime +=
@@ -1040,6 +1303,27 @@ void CppEmitterMt::emitDefinitions() {
   }
 
   runtime += "void " + className + "::stepMt() {\n";
+  runtime += "  if (mtEventEnabled) {\n";
+  std::vector<Node*> eventInputs;
+  for (const auto& entry : inputActivationTasks_) eventInputs.push_back(entry.first);
+  std::sort(eventInputs.begin(), eventInputs.end(), [](const Node* lhs, const Node* rhs) {
+    return lhs->id < rhs->id;
+  });
+  for (Node* input : eventInputs) {
+    const std::string old = "mtInputOld" + std::to_string(input->id);
+    runtime += "    if (__builtin_memcmp(" + old + ", &" + input->name + ", sizeof(" +
+               input->name + ")) != 0) {\n";
+    for (int consumerId : inputActivationTasks_[input]) {
+      const Task& consumer = tasks_[static_cast<size_t>(consumerId)];
+      runtime += "      mtAct[" + std::to_string(consumer.owner) + "][" +
+                 std::to_string(consumerId >> 5) + "] |= uint32_t{1} << " +
+                 std::to_string(consumerId & 31) + ";\n";
+    }
+    runtime += "    }\n";
+    runtime += "    __builtin_memcpy(" + old + ", &" + input->name + ", sizeof(" +
+               input->name + "));\n";
+  }
+  runtime += "  }\n";
   runtime +=
       "  unsigned long long mtBpStepStart = 0;\n"
       "  if (mtBubbleProfile) {\n"
@@ -1328,7 +1612,7 @@ void CppEmitterMt::emitStep() {
   emitText(0, true, "void " + className + "::step() {\n");
   emitText(1, false,
            "if (!mtEnabled) { fprintf(stderr, \"[gsim-mt] this model requires "
-           "GSIM_MT_EXECUTOR=dense and matching GSIM_THREADS\\n\"); abort(); }\n");
+           "GSIM_MT_EXECUTOR=dense|event and matching GSIM_THREADS\\n\"); abort(); }\n");
   emitText(1, false, "stepMt();\n");
   emitText(0, false, "}\n");
 }

@@ -55,11 +55,14 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
                              const std::vector<Reset::Instruction>& body, int chunkCount);
   void emitAsyncResetFunction(const Reset& reset);
   void emitStateUpdateFunction(const StateUpdate& update);
-  void emitInstructions(const std::vector<InstInfo>& instructions, int indent);
-  void emitTask(const Task& task, int indent);
+  void emitInstructions(const std::vector<InstInfo>& instructions, int indent,
+                        int specialTaskId = -1);
+  void emitTask(const Task& task, int taskId, int indent);
   void buildRegisterStorageNames();
+  void buildActivationPlan();
   void writeTaskPhaseReport() const;
   std::string mapRegisterNames(const std::string& text) const;
+  void emitTaskActivation(const std::vector<int>& consumers, int sourceWorker, int indent);
 
   graph& graph_;
   bool enabled_ = false;
@@ -70,6 +73,14 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   bool lookaheadStats_ = false;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
+  struct ActivationWatch {
+    Node* node = nullptr;
+    std::vector<int> consumers;
+  };
+  std::vector<std::vector<ActivationWatch>> activationWatches_;
+  std::unordered_map<Node*, std::vector<int>> stateNodeActivationTasks_;
+  std::unordered_map<Node*, std::vector<int>> inputActivationTasks_;
+  std::vector<uint8_t> taskAlwaysActive_;
 };
 
 #endif

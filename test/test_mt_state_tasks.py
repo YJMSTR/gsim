@@ -185,6 +185,29 @@ class StateTasksTest(unittest.TestCase):
                     signatures.append(self.simulate(out, design, env))
             self.assertEqual(len(set(signatures)), 1, (design, signatures))
 
+    def test_event_executor_matches_dense(self):
+        cases = (
+            ('mt-state-tasks', 4, ()),
+            ('mt-memory-commit', 4, ()),
+            ('mt-special-hot', 2, ()),
+            ('mt-sparse-register-reset', 2,
+             ('--mt-sparse-register-min-bytes=1', '--mt-sparse-register-max-writes=8')),
+            ('mt-sparse-register-async-reset', 2,
+             ('--mt-sparse-register-min-bytes=1', '--mt-sparse-register-max-writes=8')),
+        )
+        for design, workers, extra in cases:
+            with self.subTest(design=design), tempfile.TemporaryDirectory(
+                    prefix='mt-event-rewrite-') as directory:
+                out = Path(directory)
+                dense_env, _ = self.generate(out, design, workers, lookahead=64,
+                                             extra=extra)
+                event_env = dense_env.copy()
+                event_env['GSIM_MT_EXECUTOR'] = 'event'
+                run_model = self.trace if design == 'mt-state-tasks' else self.simulate
+                dense = run_model(out, design, dense_env)
+                event = run_model(out, design, event_env)
+                self.assertEqual(event, dense)
+
 
 if __name__ == '__main__':
     unittest.main()
