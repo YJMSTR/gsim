@@ -153,3 +153,38 @@ token/queue/phase 微调替代该工作。复制后仍按 50k 哈希、500k 五�
 独立工程补丁已生成：`/home/zhangyangjie/test/engineering-fixes.patch`（880334 字节），
 包含旧工作树中的 thread_local、头文件拆分、索引化和 reset/commit 修复，与当前干净
 重写分支分离。
+
+### 香山 KMHV3 CoreMark 50k（2026-11-02）
+
+使用冻结 RTL `rtl-kunminghu-v3-frozen/SimTop.fir`，与 dense 冠军相同的 HEFT、
+LA64、supernode30、T32 和 O3 编译参数；CPU 48-79，同一
+`coremark-2-iteration.bin`。没有为追求正收益调整参数。模型/日志位于
+`/tmp/kmh-event-rewrite`，测量脚本 `/tmp/measure-kmh-event-rewrite.py`，完整结果为
+`results.json`。pure-comb 分区工作在本测量前后串行排队，没有并发重编译。
+
+构建事实：
+
+- 生成 960s，250 个模型 TU，模型源码 2,448,388,398 字节。
+- difftest-on 完整编译约 305s，difftest-off（`NO_DIFF=1`）302s；on 使用
+  `--diff riscv64-nemu-interpreter-so`，off 不加载 reference。
+- on 的 NEMU 端点每次均为 67,944 instructions / 50,000 cycles。
+
+正确性：on/off 各自 dense/event 同轮三次、32 个 canonical register block 全哈希对照。
+on 三轮双方均为 `c2513ddc1ca2a78d`，off 三轮双方均为 `ee7c29c70bb6befe`。
+两种口径哈希不同是 difftest 状态不同所致，各自内部完全一致。
+
+性能（同会话交错五轮，外部 wall，秒）：
+
+| 口径 | dense median/min/max | event median/min/max | event/dense |
+|---|---|---|---|
+| difftest-on | 5.830 / 5.781 / 5.880 | 7.334 / 7.285 / 7.385 | 1.258× |
+| difftest-off | 5.780 / 5.728 / 5.829 | 7.333 / 7.283 / 7.334 | 1.269× |
+
+on/off 的 wall 差异很小；收益为负，event 比同模型 dense 慢约 26%。已知 dense
+冠军口径 4.43s 未被当前干净 dense 模型复现（本次约 5.78s），因此这里只作同模型
+对照，不把 event 与 4.43s 直接拼成晋升结论。
+
+稀疏度来自独立的 `GSIM_MT_EVENT_STATS` 诊断运行，不混入上述测速：on 执行
+53,265,078 个 task-body，off 执行 53,260,673 个；按 2242 个 MTask、50k cycles
+计算，实际任务稀疏度分别为 **47.52% / 47.51%**，高于预期约 25%。这与本次负收益
+一致，未通过关闭统计或选择其他 workload 美化结果。

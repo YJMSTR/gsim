@@ -1088,6 +1088,20 @@ void CppEmitterMt::emitDefinitions() {
       "  mtThreads.clear();\n"
       "}\n";
   runtime += className + "::~" + className + "() {\n  mtStopWorkers();\n";
+  runtime += "  if (getenv(\"GSIM_MT_STATE_HASH\") != nullptr) {\n";
+  runtime += "    uint64_t mtHashTotal = 1469598103934665603ULL;\n";
+  for (const StateUpdate& update : stateTasks_) {
+    const std::string block = "mtRegisterDstW" + std::to_string(update.owner);
+    runtime += "    {\n";
+    runtime += "      const uint8_t* mtHashData = reinterpret_cast<const uint8_t*>(&" + block + ");\n";
+    runtime += "      uint64_t mtHash = 1469598103934665603ULL;\n";
+    runtime += "      for (size_t i = 0; i < sizeof(" + block + "); ++i) { mtHash ^= mtHashData[i]; mtHash *= 1099511628211ULL; }\n";
+    runtime += "      mtHashTotal ^= mtHash + 0x9e3779b97f4a7c15ULL + (mtHashTotal << 6) + (mtHashTotal >> 2);\n";
+    runtime += "      std::printf(\"state_hash_w" + std::to_string(update.owner) + "=%016llx\\n\", (unsigned long long)mtHash);\n";
+    runtime += "    }\n";
+  }
+  runtime += "    std::printf(\"state_hash_total=%016llx\\n\", (unsigned long long)mtHashTotal);\n";
+  runtime += "  }\n";
   if (lookaheadStats_ && lookaheadWindow_ > 0) {
     runtime +=
         "  for (int worker = 0; worker < kMtWorkerCount; ++worker) {\n"
