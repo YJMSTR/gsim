@@ -223,3 +223,34 @@ KMH LA0 也已完成：生成 995s、编译 253s，三轮哈希均为 `ee7c29c70
 目前保留的最佳实现仍是 LA64 + 原始 hot/cold。唯一有结构依据的后续方向是先把
 monitor/side-effect 与纯组合计算拆成更细任务，再重新评估 sink 闭包；在粗粒度任务上
 继续复制、调度或自适应都已用数据否定。
+
+### 生成期 dense/event 分离与最终验收（2026-11-02）
+
+细粒度 sink 复核进一步表明：9280 个任务中 2270 个纯任务，但零跨边约束经
+unique-pred×succ 连通把 99.4% 成本吸收到单一 worker，estimated-makespan 5,546,806，
+且没有实际复制收益。该约束模型在当前任务图上不成立，实现和 CLI 已完整移除，不再
+作为后续方向。
+
+弱基线的一个实际来源是 dense 模型也被迫携带 event guard/watch/CHG。新增生成期
+`GSIM_MT_EVENT_GENERATE=1`：默认生成完全 dense-only 模型，只有显式开启才生成
+event 代码；event 模型仍保留运行时 dense/event 切换用于正确性对照。小模型 5/5
+回归通过，dense-only 与 event 模型分开验证。
+
+香山 dense-only 源码 2,097,562,159B（event 2,448,388,398B，减少 14.3%），off 编译
+117s（event 302s）。与既有 event 独立二进制做三轮哈希和五轮 off 交错：三轮哈希
+均为 `ee7c29c70bb6befe`；dense-only wall 中位数/min/max 为
+**5.130 / 5.128 / 5.180s**，event 为 **7.284 / 7.235 / 7.335s**，真实 event/dense
+为 **1.420×**。相比旧同模型 5.780s 基线，dense-only 确实更快，但仍未复现 4.43s
+冠军，不能宣称赶超。结果：`/tmp/kmh-dense-only/results.json`。
+
+BOOM 双模型最终结果（`/tmp/eventRewriteEventGen/dual-results.json`）：
+
+- 50k 三轮 dense/event 哈希均为 `3957d36ff148eced`；500k 均为
+  `0906f44ae933cb55`。
+- 500k 五轮 wall 中位数/min/max：dense-only **19.263 / 19.066 / 19.467s**，
+  event **15.507 / 15.457 / 15.654s**，p2sim **3.173 / 3.123 / 3.174s**。
+- event 仍约 4.89× p2sim，未对齐；event 快于 dense-only 不构成超过 p2sim 的证据。
+
+最终决策：保留 LA64 + 原始 hot/cold + 生成期分离，不晋升任何 sink、自适应或 LA0
+实验。后续若重启闭包复制，必须先拆分 monitor/side-effect 与纯组合任务并放宽
+零跨边约束，不能复用当前已证伪的粗粒度方案。

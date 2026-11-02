@@ -66,10 +66,13 @@ def run(command, env):
 
 
 class StateTasksTest(unittest.TestCase):
-    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=()):
+    def generate(self, out, design, workers, scheduler='heft', lookahead=0, extra=(),
+                 event=False):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
+        if event:
+            env['GSIM_MT_EVENT_GENERATE'] = '1'
         run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
              '--mt-scheduler=' + scheduler, f'--mt-lookahead-window={lookahead}',
              *extra, '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
@@ -200,7 +203,7 @@ class StateTasksTest(unittest.TestCase):
                     prefix='mt-event-rewrite-') as directory:
                 out = Path(directory)
                 dense_env, _ = self.generate(out, design, workers, lookahead=64,
-                                             extra=extra)
+                                             extra=extra, event=True)
                 event_env = dense_env.copy()
                 event_env['GSIM_MT_EXECUTOR'] = 'event'
                 run_model = self.trace if design == 'mt-state-tasks' else self.simulate
