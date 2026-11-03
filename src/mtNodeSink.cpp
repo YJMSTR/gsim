@@ -32,6 +32,13 @@
 // edge cost, with at most nodeSinkBlockMaxInsts() statements per block.
 // Side-effect/ext/memory/reset microtasks stay isolated singletons so reset,
 // pending-write and side-effect ordering is preserved.
+//
+// GSIM_MT_NODE_SINK_BLOCK_V2=1 (default off) widens the DP's mergeable set
+// with unique plain-assignment microtasks: REG_DST next-value writes and
+// pinned pure-combinational nodes. Merged blocks stay single-instance (never
+// cloned), so the unique state-commit owner, memory pending order, reset and
+// printf/assert ordering are untouched; only the per-microtask token/task
+// boundary between same-worker neighbours disappears.
 
 namespace {
 
@@ -50,6 +57,22 @@ bool nodeSinkRebalanceEnabled() {
 bool coarsenEnabled() {
   const char* value = std::getenv("GSIM_MT_NODE_SINK_COARSEN");
   return value == nullptr || value[0] != '0';
+}
+
+// Block formation v2, default off. Extends the coarsening DP to unique
+// plain-assignment microtasks (see the file header). The default path is
+// byte-identical to v1.
+bool blockV2Enabled() {
+  const char* value = std::getenv("GSIM_MT_NODE_SINK_BLOCK_V2");
+  return value != nullptr && value[0] == '1';
+}
+double cloneBudgetCap() {
+  const char* value = std::getenv("GSIM_MT_NODE_SINK_CLONE_CAP");
+  if (value == nullptr || value[0] == '\0') return 1.25;
+  char* end = nullptr;
+  const double parsed = std::strtod(value, &end);
+  return end != value && *end == '\0' && parsed >= 1.0 && parsed <= 16.0
+             ? parsed : 1.25;
 }
 
 // Pure-computation block statement cap. Default 140; overridden for
@@ -75,6 +98,14 @@ size_t nodeArrayElements(const Node* node) {
     elements *= static_cast<size_t>(upperPower2(dimension));
   }
   return elements;
+}
+size_t nodeCloneArrayCap() {
+  const char* value = std::getenv("GSIM_MT_NODE_SINK_ARRAY_CAP");
+  if (value == nullptr || value[0] == '\0') return 32;
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  return end != value && *end == '\0' && parsed >= 1 && parsed <= 1000000
+             ? static_cast<size_t>(parsed) : 32;
 }
 
 // Replace full C++ identifiers, including '$', without touching strings or
@@ -224,6 +255,7 @@ class NodeSinkPlanner {
       else ++reportUnique_;
     }
     const PlanMetrics before = measure();
+    reportV2_ = blockV2Enabled();
     if (coarsenEnabled() && !tasks_.empty()) {
       coarsenChains();
       finalizeOrder();
@@ -287,6 +319,9 @@ class NodeSinkPlanner {
     long long reportBlockRebalancePreMakespan_ = 0;
     long long reportBlockRebalancePostMakespan_ = 0;
     long long reportRebalancePostMakespan_ = 0;
+  bool reportV2_ = false;
+  size_t reportV2MergedUnique_ = 0;
+  std::map<std::string, size_t> reportV2Pinned_;
   bool coarsened_ = false;
   std::string reportPartitioner_ = "lpt";
 
@@ -308,13 +343,56 @@ class NodeSinkPlanner {
     // Sparse register destinations lower to pending-write publications.
     if (plan_.sparseRegisterByDestination_.count(node) != 0) return false;
     if (node->assignTree.empty()) return false;
-    if (!node->dimension.empty() && nodeArrayElements(node) > 32) return false;
+    if (!node->dimension.empty() && nodeArrayElements(node) > nodeCloneArrayCap()) return false;
     // Only nodes whose assignments write exactly their own storage are pure.
     for (ExpTree* tree : node->assignTree) {
       ENode* lval = tree->getlval();
       if (lval == nullptr || lval->nodePtr != node) return false;
     }
     return true;
+  }
+
+  // Block-v2 admission for a unique microtask's members: plain storage
+  // writes only. NODE_REG_DST carries the register next-value assignment
+  // (the state task commits it later, so the write itself is a plain
+  // persistent-storage store); NODE_OTHERS/NODE_INFER covers pure
+  // combinational nodes that are pinned only by the clone rules (foreign
+  // lval, large array, reset-cone input). Every side-effect class stays a
+  // singleton: memory ports, register resets, printf/assert, ext nodes,
+  // sparse pending publications and REG_SRC storage.
+  bool v2MergeableNode(Node* node) const {
+    if (node->status != VALID_NODE) return false;
+    if (node->isReset() || node->isClock) return false;
+    // Sparse register destinations lower to pending-write publications.
+    if (plan_.sparseRegisterByDestination_.count(node) != 0) return false;
+    if (node->type == NODE_REG_DST) return true;
+    return node->type == NODE_OTHERS || node->type == NODE_INFER;
+  }
+
+  // A unique (non-pure, non-clone) microtask may join a v2 block when every
+  // member passes v2MergeableNode.
+  bool v2UniqueMergeable(int taskId) const {
+    for (Node* member : tasks_[taskId].members) {
+      if (!v2MergeableNode(member)) return false;
+    }
+    return true;
+  }
+
+  // Why a unique microtask stayed a singleton under v2 (report only).
+  const char* v2PinClass(const MtTask& task) const {
+    if (task.kind == MtTaskKind::ExtModule) return "ext";
+    for (Node* member : task.members) {
+      if (member->isExt()) return "ext";
+      if (member->type == NODE_SPECIAL) return "special";
+      if (member->type == NODE_READER || member->type == NODE_WRITER ||
+          member->type == NODE_READWRITER) {
+        return "memory";
+      }
+      if (member->type == NODE_REG_RESET || member->isReset()) return "reset";
+      if (plan_.sparseRegisterByDestination_.count(member) != 0) return "sparse";
+      if (member->type == NODE_REG_SRC) return "reg_src";
+    }
+    return "other";
   }
 
   void formNodeTasks() {
@@ -1028,7 +1106,7 @@ class NodeSinkPlanner {
     long long total = 0;
     for (int cost : cost_) total += cost;
     reportFairShare_ = (total + workers_ - 1) / workers_;
-    reportBudget_ = reportFairShare_ + reportFairShare_ / 4;  // cap 1.25x
+    reportBudget_ = static_cast<long long>(reportFairShare_ * cloneBudgetCap());
     for (int id = 0; id < count; ++id) {
       owner_[id] = taskParts[id].front();
       load_[owner_[id]] += cost_[id];
@@ -1421,7 +1499,7 @@ class NodeSinkPlanner {
     long long total = 0;
     for (int cost : cost_) total += cost;
     reportFairShare_ = (total + workers_ - 1) / workers_;
-    reportBudget_ = reportFairShare_ + reportFairShare_ / 4;  // cap 1.25x
+    reportBudget_ = static_cast<long long>(reportFairShare_ * cloneBudgetCap());
 
     const int originalCount = static_cast<int>(tasks_.size());
     for (int id = 0; id < originalCount; ++id) {
@@ -1453,18 +1531,20 @@ class NodeSinkPlanner {
     Assert(!source.members.empty(), "cannot clone an empty task");
     std::vector<Node*> copies;
     std::unordered_map<Node*, Node*> replacements;
-    std::map<std::string, std::string> names;
-    for (Node* original : source.members) {
+        for (Node* original : source.members) {
       Node* copy = original->dup(NODE_OTHERS,
                                  original->name + "$MT_NS$" +
                                      std::to_string(cloneCounter_++));
       copy->nodeIsRoot = true;
       replacements[original] = copy;
-      names.emplace(original->name, copy->name);
-      copies.push_back(copy);
+            copies.push_back(copy);
     }
     std::unordered_map<Node*, Node*> producerMap = cloneOn_[worker];
     producerMap.insert(replacements.begin(), replacements.end());
+    std::map<std::string, std::string> instructionNames;
+    for (const auto& entry : producerMap) {
+      instructionNames.emplace(entry.first->name, entry.second->name);
+    }
     for (size_t index = 0; index < source.members.size(); ++index) {
       Node* original = source.members[index];
       Node* copy = copies[index];
@@ -1489,7 +1569,7 @@ class NodeSinkPlanner {
     MtTask cloneTask;
     cloneTask.members = copies;
     cloneTask.insts = new std::vector<InstInfo>(*source.insts);
-    redirectInstructions(*cloneTask.insts, names);
+    redirectInstructions(*cloneTask.insts, instructionNames);
     cloneTask.owner = worker;
     cloneTask.kind = MtTaskKind::Normal;
     cloneTask.globalNodeCount = source.globalNodeCount;
@@ -1513,7 +1593,7 @@ class NodeSinkPlanner {
     for (int consumer : consumers) {
       // The consumer now reads the local copies: same worker, so the edge
       // keeps the chain order (local wait) instead of a ready token.
-      redirectInstructions(*tasks_[consumer].insts, names);
+      redirectInstructions(*tasks_[consumer].insts, instructionNames);
       Node* consumerNode = taskNode_[consumer];
       std::vector<Node*> consumerNodes;
       if (consumerNode != nullptr) {
@@ -1579,11 +1659,16 @@ class NodeSinkPlanner {
 
     std::vector<int> statements(count, 0);
     for (int id = 0; id < count; ++id) statements[id] = statementCount(tasks_[id]);
+    const bool v2 = blockV2Enabled();
     auto mergeable = [&](int id) {
       // Pure SuperNode groups (taskNode_ == nullptr) merge like any other
       // pure computation; ext microtasks carry kind ExtModule and never do.
-      return tasks_[id].kind == MtTaskKind::Normal &&
-             (pure_[id] != 0 || isClone_[id] != 0);
+      if (tasks_[id].kind != MtTaskKind::Normal) return false;
+      if (pure_[id] != 0 || isClone_[id] != 0) return true;
+      // Block v2 (default off): unique plain-assignment microtasks join the
+      // intervals too. They keep pure_ == 0, so the clone machinery never
+      // touches the merged block and the state-commit owner stays unique.
+      return v2 && v2UniqueMergeable(id);
     };
 
     std::vector<MtTask> blocks;
@@ -1673,6 +1758,10 @@ class NodeSinkPlanner {
         const int blockId = static_cast<int>(blocks.size());
         if (interval.first == interval.second) {
           const int task = chain[interval.first];
+          if (v2 && pure_[task] == 0 && isClone_[task] == 0 &&
+              !mergeable(task)) {
+            ++reportV2Pinned_[v2PinClass(tasks_[task])];
+          }
           blocks.push_back(std::move(tasks_[task]));
           blockOwner.push_back(w);
           oldToBlock[task] = blockId;
@@ -1684,6 +1773,9 @@ class NodeSinkPlanner {
         std::set<Node*> memberNodes;
         for (int index = interval.first; index <= interval.second; ++index) {
           const int task = chain[index];
+          if (v2 && pure_[task] == 0 && isClone_[task] == 0) {
+            ++reportV2MergedUnique_;
+          }
           MtTask& member = tasks_[task];
           block.members.insert(block.members.end(), member.members.begin(),
                                member.members.end());
@@ -1768,11 +1860,17 @@ class NodeSinkPlanner {
   // NODE_OTHERS whose every live consumer is inside the block (or outside the
   // compute phase) can live in the block's stack frame.
   void collectBlockLocalNodes(MtTask& block, const std::set<Node*>& memberNodes) {
+    if (blockV2Enabled()) return;
     for (Node* node : memberNodes) {
       if (node->status != VALID_NODE || node->type != NODE_OTHERS ||
           node->isReset() || resetDependencies_.count(node) != 0) {
         continue;
       }
+      // V2 blocks can contain pinned arrays larger than the clone cap; those
+      // stay class storage instead of a per-cycle stack frame. Pure members
+      // are already capped at 32 elements by isPureCloneable, so this is a
+      // no-op for the default path.
+      if (nodeArrayElements(node) > 32) continue;
       bool local = true;
       for (Node* next : node->next) {
         const auto consumer = taskOf_.find(next);
@@ -1961,6 +2059,18 @@ class NodeSinkPlanner {
             coarsened_ ? "on" : "off", before_.tasks, view.tasks,
             before_.tokenGroups, view.tokenGroups, before_.makespan,
             view.makespan, nodeSinkBlockMaxInsts());
+    if (reportV2_) {
+      size_t pinnedTotal = 0;
+      for (const auto& entry : reportV2Pinned_) pinnedTotal += entry.second;
+      std::string pinned;
+      for (const auto& entry : reportV2Pinned_) {
+        pinned += " " + entry.first + "=" + std::to_string(entry.second);
+      }
+      fprintf(stderr,
+              "[cppEmitter-mt] node-sink block-v2 merged-unique=%zu "
+              "pinned-singletons=%zu%s\n",
+              reportV2MergedUnique_, pinnedTotal, pinned.c_str());
+    }
     if (globalConfig.OutputDir.empty()) return;
     FILE* out = std::fopen((globalConfig.OutputDir + "/mt-node-sink.csv").c_str(), "w");
     Assert(out != nullptr, "cannot write node-sink report");
@@ -2012,6 +2122,16 @@ class NodeSinkPlanner {
     fprintf(out, "coarsen_post_tokens,%zu\n", view.tokenGroups);
     fprintf(out, "coarsen_pre_makespan,%lld\n", before_.makespan);
     fprintf(out, "coarsen_post_makespan,%lld\n", view.makespan);
+    if (reportV2_) {
+      size_t pinnedTotal = 0;
+      for (const auto& entry : reportV2Pinned_) pinnedTotal += entry.second;
+      fprintf(out, "block_v2,1\n");
+      fprintf(out, "v2_merged_unique_tasks,%zu\n", reportV2MergedUnique_);
+      fprintf(out, "v2_pinned_singletons,%zu\n", pinnedTotal);
+      for (const auto& entry : reportV2Pinned_) {
+        fprintf(out, "v2_pinned_%s,%zu\n", entry.first.c_str(), entry.second);
+      }
+    }
     for (int worker = 0; worker < workers_; ++worker) {
       long long cost = 0;
       size_t count = 0;

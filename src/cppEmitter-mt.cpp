@@ -46,6 +46,13 @@ void appendValues(std::string& text, const std::vector<int>& values) {
     text += std::to_string(values[i]);
   }
 }
+
+// 32-bit activation mask as a C++ hexadecimal literal.
+std::string hexBits(uint32_t bits) {
+  char buffer[16];
+  std::snprintf(buffer, sizeof(buffer), "0x%xu", bits);
+  return buffer;
+}
 void collectReferencedNodes(ENode* root, std::set<Node*>& nodes) {
   if (root == nullptr) return;
   std::vector<ENode*> pending{root};
@@ -78,7 +85,11 @@ CppEmitterMt::CppEmitterMt(graph& graph)
       resetChunk_(resetChunkSize()),
       lookaheadWindow_(globalConfig.MtLookaheadWindow),
       lookaheadStats_(globalConfig.MtLookaheadStats),
-      nodeSinkEmission_(MtNodeSinkPlanner::enabled()) {}
+      nodeSinkEmission_(MtNodeSinkPlanner::enabled()),
+      joinStateEnabled_(positiveEnv("GSIM_MT_NODE_SINK_JOIN_STATE", 0) != 0),
+      bitmapDispatchEnabled_(positiveEnv("GSIM_MT_EVENT_BITMAP", 0) != 0),
+      mirrorEnabled_(nodeSinkEmission_ &&
+                     positiveEnv("GSIM_MT_NODE_SINK_MIRROR", 0) != 0) {}
 
 bool CppEmitterMt::enabled() const { return enabled_; }
 
@@ -162,6 +173,7 @@ void CppEmitterMt::buildActivationPlan() {
     eventPhaseCount_ = tasks_.empty() ? 0 : 1;
     std::vector<int> indegree(tasks_.size(), 0);
     std::set<int> ready;
+    eventTopoOrder_.clear();
     for (size_t task = 0; task < tasks_.size(); ++task) {
       indegree[task] = static_cast<int>(tasks_[task].predecessors.size());
       if (indegree[task] == 0) ready.insert(static_cast<int>(task));
@@ -171,6 +183,7 @@ void CppEmitterMt::buildActivationPlan() {
       const int task = *ready.begin();
       ready.erase(ready.begin());
       ++visited;
+      eventTopoOrder_.push_back(static_cast<int>(task));
       for (int successor : tasks_[static_cast<size_t>(task)].successors) {
         const int cross = tasks_[static_cast<size_t>(successor)].owner !=
                           tasks_[static_cast<size_t>(task)].owner;
@@ -184,7 +197,144 @@ void CppEmitterMt::buildActivationPlan() {
     eventPhaseCap_ = positiveEnv("GSIM_MT_NODE_SINK_PHASE_CAP", 0);
     fprintf(stderr, "[cppEmitter-mt] node-sink cross-phases=%d cap=%d\n",
             eventPhaseCount_, eventPhaseCap_);
+    buildMirrorPlan();
   }
+}
+
+// Replays the scheduler's ready-token grouping (MtWorkerBuilder::build) and
+// marks the slots whose values the phase chain already orders without tokens:
+// a token group is dropped only when every cross-worker source of the group
+// sits in a strictly earlier capped phase than its consumer, so the phase
+// barrier publishes the shared class storage before the consumer's phase
+// pulls it. Groups with any same-capped-phase source keep the original
+// wait/publish protocol. The replay must reproduce the installed waits and
+// stores exactly; any mismatch disables the mirror entirely.
+void CppEmitterMt::buildMirrorPlan() {
+  mirrorDroppedSlot_.assign(static_cast<size_t>(readySlotCount_), 0);
+  mirrorDroppedTokens_ = 0;
+  mirrorKeptTokens_ = 0;
+  if (!mirrorEnabled_) return;
+  if (eventPhaseCap_ <= 0 || lookaheadWindow_ > 0) {
+    fprintf(stderr, "[cppEmitter-mt] node-sink mirror inactive (cap=%d lookahead=%d)\n",
+            eventPhaseCap_, lookaheadWindow_);
+    return;
+  }
+
+  std::vector<int> workerPosition(tasks_.size(), -1);
+  for (int worker = 0; worker < workerCount_; ++worker) {
+    const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
+    for (size_t position = 0; position < chain.size(); ++position) {
+      workerPosition[static_cast<size_t>(chain[position])] = static_cast<int>(position);
+    }
+  }
+
+  struct TokenGroup {
+    int producerOwner = -1;
+    int consumerOwner = -1;
+    int consumer = -1;
+    int publisher = -1;
+    int slot = -1;
+  };
+  std::vector<TokenGroup> groups;
+  for (size_t consumer = 0; consumer < tasks_.size(); ++consumer) {
+    std::map<int, std::vector<int>> sourcesByOwner;
+    for (int predecessor : tasks_[consumer].predecessors) {
+      if (tasks_[static_cast<size_t>(predecessor)].owner != tasks_[consumer].owner) {
+        sourcesByOwner[tasks_[static_cast<size_t>(predecessor)].owner].push_back(
+            predecessor);
+      }
+    }
+    for (const auto& entry : sourcesByOwner) {
+      TokenGroup group;
+      group.producerOwner = entry.first;
+      group.consumerOwner = tasks_[consumer].owner;
+      group.consumer = static_cast<int>(consumer);
+      group.publisher = *std::max_element(entry.second.begin(), entry.second.end(),
+                                          [&](int lhs, int rhs) {
+        return workerPosition[static_cast<size_t>(lhs)] <
+               workerPosition[static_cast<size_t>(rhs)];
+      });
+      groups.push_back(group);
+    }
+  }
+  // The phase chain only exists without lookahead, which is exactly when the
+  // scheduler compresses groups; replay that compression in the same order.
+  {
+    std::vector<std::vector<int>> groupsByConsumer(tasks_.size());
+    for (size_t groupId = 0; groupId < groups.size(); ++groupId) {
+      groupsByConsumer[static_cast<size_t>(groups[groupId].consumer)].push_back(
+          static_cast<int>(groupId));
+    }
+    std::vector<TokenGroup> compressed;
+    compressed.reserve(groups.size());
+    for (int consumerOwner = 0; consumerOwner < workerCount_; ++consumerOwner) {
+      std::vector<int> completedPosition(static_cast<size_t>(workerCount_), -1);
+      for (int consumer : workerTasks_[static_cast<size_t>(consumerOwner)]) {
+        for (int groupId : groupsByConsumer[static_cast<size_t>(consumer)]) {
+          const TokenGroup& group = groups[static_cast<size_t>(groupId)];
+          const int publisherPosition =
+              workerPosition[static_cast<size_t>(group.publisher)];
+          int& completed = completedPosition[static_cast<size_t>(group.producerOwner)];
+          if (publisherPosition <= completed) continue;
+          completed = publisherPosition;
+          compressed.push_back(group);
+        }
+      }
+    }
+    groups.swap(compressed);
+  }
+  std::map<std::pair<int, int>, std::vector<int>> groupsByOwnerPair;
+  for (size_t groupId = 0; groupId < groups.size(); ++groupId) {
+    const TokenGroup& group = groups[static_cast<size_t>(groupId)];
+    groupsByOwnerPair[{group.producerOwner, group.consumerOwner}].push_back(
+        static_cast<int>(groupId));
+  }
+  int nextSlot = 0;
+  for (const auto& bank : groupsByOwnerPair) {
+    nextSlot = (nextSlot + 63) & ~63;
+    for (int groupId : bank.second) groups[static_cast<size_t>(groupId)].slot = nextSlot++;
+    nextSlot = (nextSlot + 63) & ~63;
+  }
+
+  std::vector<std::vector<int>> waits(tasks_.size()), stores(tasks_.size());
+  for (const TokenGroup& group : groups) {
+    waits[static_cast<size_t>(group.consumer)].push_back(group.slot);
+    stores[static_cast<size_t>(group.publisher)].push_back(group.slot);
+  }
+  for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) {
+    if (waits[taskId] == tasks_[taskId].waits && stores[taskId] == tasks_[taskId].stores) {
+      continue;
+    }
+    mirrorDroppedSlot_.assign(static_cast<size_t>(readySlotCount_), 0);
+    mirrorKeptTokens_ = groups.size();
+    fprintf(stderr,
+            "[cppEmitter-mt] node-sink mirror disabled: token replay mismatch at task %zu\n",
+            taskId);
+    return;
+  }
+
+  auto cappedPhase = [&](int taskId) {
+    return std::min(eventTaskPhase_[static_cast<size_t>(taskId)], eventPhaseCap_ - 1);
+  };
+  for (const TokenGroup& group : groups) {
+    const int consumerPhase = cappedPhase(group.consumer);
+    bool earlier = true;
+    for (int predecessor : tasks_[static_cast<size_t>(group.consumer)].predecessors) {
+      if (tasks_[static_cast<size_t>(predecessor)].owner == group.producerOwner &&
+          cappedPhase(predecessor) >= consumerPhase) {
+        earlier = false;
+        break;
+      }
+    }
+    if (earlier) {
+      mirrorDroppedSlot_[static_cast<size_t>(group.slot)] = 1;
+      ++mirrorDroppedTokens_;
+    } else {
+      ++mirrorKeptTokens_;
+    }
+  }
+  fprintf(stderr, "[cppEmitter-mt] node-sink mirror groups=%zu dropped=%zu kept=%zu\n",
+          groups.size(), mirrorDroppedTokens_, mirrorKeptTokens_);
 }
 void CppEmitterMt::writeTaskPhaseReport() const {
   const std::string phasesPath = globalConfig.OutputDir + "/mt-task-phases.csv";
@@ -294,6 +444,12 @@ void CppEmitterMt::buildRegisterStorageNames() {
     Assert(packedRegisterNamesByText_.emplace(destination->name, sparse.source->name).second,
            "duplicate sparse register destination name %s", destination->name.c_str());
   }
+  for (const auto& entry : workerLocalOwners_) {
+    Node* node = entry.first;
+    const std::string mapped = "mtWorkerStateW" + std::to_string(entry.second) + "." + node->name;
+    Assert(packedRegisterNamesByText_.emplace(node->name, mapped).second,
+           "duplicate worker-local name %s", node->name.c_str());
+  }
 }
 
 std::string CppEmitterMt::mapRegisterNames(const std::string& input) const {
@@ -369,6 +525,7 @@ void CppEmitterMt::emitClassMembers(FILE* header) const {
           workerCount_);
   fprintf(header, "MtDoneFlag mtStateDoneFlags[%d];\n", std::max(1, workerCount_ - 1));
   fprintf(header, "MtDoneFlag mtStateReady;\n");
+  fprintf(header, "bool mtJoinStateFirst[kMtWorkerCount] = {};\n");
   fprintf(header, "std::vector<std::thread> mtThreads;\n");
   fprintf(header, "alignas(64) std::atomic<uint64_t> mtGeneration{0};\n");
   fprintf(header, "alignas(64) std::atomic<int> mtReadyWorkers{0};\n");
@@ -845,34 +1002,6 @@ void CppEmitterMt::emitTask(const Task& task, int taskId, int indent) {
     }
   }
 
-  auto byId = [](const Node* lhs, const Node* rhs) { return lhs->id < rhs->id; };
-  std::set<Node*, decltype(byId)> workerLocals(byId);
-  for (Node* node : task.members) {
-    if (isWorkerLocal(node) && workerLocalOwner(node) == task.owner) workerLocals.insert(node);
-    for (ExpTree* tree : node->assignTree) {
-      std::set<Node*> referenced;
-      collectReferencedNodes(tree->getRoot(), referenced);
-      collectReferencedNodes(tree->getlval(), referenced);
-      for (Node* reference : referenced) {
-        if (isWorkerLocal(reference) && workerLocalOwner(reference) == task.owner) {
-          workerLocals.insert(reference);
-        }
-      }
-    }
-  }
-  for (Node* node : workerLocals) {
-    const std::string state = "mtWorkerStateW" + std::to_string(task.owner) + "." + node->name;
-    if (node->dimension.empty()) {
-      emitText(indent, false, widthUType(node->width) + "& " + node->name + " = " + state + ";\n");
-    } else {
-      std::string alias = widthUType(node->width) + " (&" + node->name + ")";
-      for (int dimension : node->dimension) {
-        alias += "[" + std::to_string(upperPower2(dimension)) + "]";
-      }
-      emitText(indent, false, alias + " = " + state + ";\n");
-    }
-  }
-
   static const std::vector<ActivationWatch> noWatches;
   const auto& watches = eventGeneration_
       ? activationWatches_[static_cast<size_t>(taskId)] : noWatches;
@@ -931,17 +1060,26 @@ void CppEmitterMt::emitWorkerChainFunction(const std::string& className,
     }
     for (size_t begin = 0; begin < phaseChain.size(); begin += 32) {
       const size_t end = std::min(begin + 32, phaseChain.size());
-      std::set<int> actWords, waitSlots, storeSlots;
+      std::set<int> waitSlots, storeSlots;
       bool needsReady = false;
+      // Phase-mirrored slots are published through the barrier-ordered class
+      // storage, so their ready tokens are neither awaited nor published.
+      auto tokenKept = [&](int slot) {
+        return static_cast<size_t>(slot) >= mirrorDroppedSlot_.size() ||
+               mirrorDroppedSlot_[static_cast<size_t>(slot)] == 0;
+      };
       for (size_t position = begin; position < end; ++position) {
         const Task& task = tasks_[static_cast<size_t>(phaseChain[position])];
-        actWords.insert(phaseChain[position] >> 5);
         if (eventPhaseCap_ > 0 &&
             eventTaskPhase_[static_cast<size_t>(phaseChain[position])] >= eventPhaseCap_ - 1) {
           needsReady = true;
-          waitSlots.insert(task.waits.begin(), task.waits.end());
+          for (int slot : task.waits) {
+            if (tokenKept(slot)) waitSlots.insert(slot);
+          }
         }
-        storeSlots.insert(task.stores.begin(), task.stores.end());
+        for (int slot : task.stores) {
+          if (tokenKept(slot)) storeSlots.insert(slot);
+        }
       }
       if (needsReady) {
         for (int slot : waitSlots) {
@@ -952,32 +1090,105 @@ void CppEmitterMt::emitWorkerChainFunction(const std::string& className,
         emitText(1, false,
                  "do { if (mtBubbleProfile) mtBpTick(worker, mtBpSpinReady); } while (0);\n");
       }
-      const std::string groupActive = "mtGroupActive" + std::to_string(phase) + "_" +
-                                      std::to_string(begin);
-      if (eventGeneration_) {
-        emitText(1, false, "bool " + groupActive + " = !mtEventEnabled;\n");
-        for (int word : actWords) {
-          emitText(1, false, groupActive + " |= (mtAct[" + std::to_string(worker) + "][" +
-                                 std::to_string(word) + "] | mtRemoteAct[" +
-                                 std::to_string(worker) + "][" + std::to_string(word) +
-                                 "].load(std::memory_order_acquire)) != 0;\n");
-        }
-      } else {
-        emitText(1, false, "const bool " + groupActive + " = true;\n");
-      }
-      emitText(1, false, "if (" + groupActive + ") {\n");
-      for (size_t position = begin; position < end; ++position) {
-        const int taskId = phaseChain[position];
-        emitText(2, false, "mtTask" + std::to_string(taskId) + "();\n");
-        emitText(2, false,
+      auto emitTaskCall = [&](int indent, int taskId) {
+        emitText(indent, false, "mtTask" + std::to_string(taskId) + "();\n");
+        emitText(indent, false,
                  "do { if (mtBubbleProfile) { mtBubble[worker].taskCalls++; "
                  "const unsigned long long mtBpTaskT0 = mtBubble[worker].lastTsc; "
                  "mtBpTick(worker, mtBpTaskCompute); if (mtBubbleTaskTimes) { "
                  "++mtBubbleTaskCalls[worker][" + std::to_string(taskId) +
                  "]; mtBubbleTaskTsc[worker][" + std::to_string(taskId) +
                  "] += mtBubble[worker].lastTsc - mtBpTaskT0; } } } while (0);\n");
+      };
+      auto emitGroupCalls = [&](int indent) {
+        for (size_t position = begin; position < end; ++position)
+          emitTaskCall(indent, phaseChain[position]);
+      };
+      if (!eventGeneration_ || !bitmapDispatchEnabled_) {
+        const std::string groupActive = "mtGroupActive" + std::to_string(phase) + "_" +
+                                        std::to_string(begin);
+        emitText(1, false, "const bool " + groupActive + " = true;\n");
+        emitText(1, false, "if (" + groupActive + ") {\n");
+        emitGroupCalls(2);
+        emitText(1, false, "}\n");
+      } else {
+        // Event bitmap dispatch. Node-sink chains are ascending subsequences
+        // of the global topological task order, so scanning the group's
+        // mtAct|mtRemoteAct words in ascending order and executing the
+        // lowest not-yet-seen active bit per round reproduces the sequential
+        // chain order exactly while skipping inactive task entries. Bits are
+        // consumed by the task prologues; each round re-reads the words so a
+        // bit raised by an earlier task of this scan (same-worker
+        // activations are strictly forward, so they can only raise bits) is
+        // dispatched in the same cycle. mtSeen caps the scan at one dispatch
+        // per task per cycle: no missed activation, no re-run, no livelock.
+        // Ext-module tasks (kind 2) have no prologue bit and stay
+        // permanently dispatched via a constant mask; kind-1 tasks also wake
+        // on mtSpecialHot, mirroring their prologue condition.
+        std::map<int, std::vector<int>> wordTasks;
+        std::map<int, uint32_t> alwaysBits, specialBits;
+        int previousTaskId = -1;
+        for (size_t position = begin; position < end; ++position) {
+          const int taskId = phaseChain[position];
+          Assert(taskId > previousTaskId,
+                 "event bitmap dispatch needs ascending task ids in a group");
+          previousTaskId = taskId;
+          wordTasks[taskId >> 5].push_back(taskId);
+          const uint8_t kind = taskAlwaysActive_[static_cast<size_t>(taskId)];
+          if (kind == 1) specialBits[taskId >> 5] |= uint32_t{1} << (taskId & 31);
+          if (kind == 2) alwaysBits[taskId >> 5] |= uint32_t{1} << (taskId & 31);
+        }
+        emitText(1, false, "if (!mtEventEnabled) {\n");
+        emitGroupCalls(2);
+        emitText(1, false, "} else {\n");
+        for (const auto& wordEntry : wordTasks) {
+          const int word = wordEntry.first;
+          uint32_t groupMask = 0;
+          for (int taskId : wordEntry.second) groupMask |= uint32_t{1} << (taskId & 31);
+          const std::string act = "mtAct[" + std::to_string(worker) + "][" +
+                                  std::to_string(word) + "]";
+          const std::string remote = "mtRemoteAct[" + std::to_string(worker) + "][" +
+                                     std::to_string(word) + "]";
+          emitText(2, false, "{\n");
+          emitText(3, false, "uint32_t mtSeen = 0;\n");
+          const auto special = specialBits.find(word);
+          if (special != specialBits.end()) {
+            std::string hot = "const uint32_t mtSpecialHotBits = 0u";
+            for (int taskId : wordEntry.second) {
+              if ((special->second & (uint32_t{1} << (taskId & 31))) == 0) continue;
+              hot += " | (mtSpecialHot[" + std::to_string(taskId) +
+                     "] ? (uint32_t{1} << " + std::to_string(taskId & 31) + ") : 0u)";
+            }
+            emitText(3, false, hot + ";\n");
+          }
+          emitText(3, false, "uint32_t mtPending = (" + act + " | " + remote +
+                                 ".load(std::memory_order_acquire)) & " +
+                                 hexBits(groupMask) + ";\n");
+          const auto always = alwaysBits.find(word);
+          if (always != alwaysBits.end())
+            emitText(3, false, "mtPending |= " + hexBits(always->second) + ";\n");
+          if (special != specialBits.end())
+            emitText(3, false, "mtPending |= mtSpecialHotBits;\n");
+          emitText(3, false, "mtPending &= ~mtSeen;\n");
+          for (int taskId : wordEntry.second) {
+            const std::string bit = hexBits(uint32_t{1} << (taskId & 31));
+            emitText(3, false, "if (mtPending & " + bit + ") {\n");
+            emitText(4, false, "mtSeen |= " + bit + ";\n");
+            emitTaskCall(4, taskId);
+            emitText(4, false, "mtPending = (" + act + " | " + remote +
+                                   ".load(std::memory_order_acquire)) & " +
+                                   hexBits(groupMask) + ";\n");
+            if (always != alwaysBits.end())
+              emitText(4, false, "mtPending |= " + hexBits(always->second) + ";\n");
+            if (special != specialBits.end())
+              emitText(4, false, "mtPending |= mtSpecialHotBits;\n");
+            emitText(4, false, "mtPending &= ~mtSeen;\n");
+            emitText(3, false, "}\n");
+          }
+          emitText(2, false, "}\n");
+        }
+        emitText(1, false, "}\n");
       }
-      emitText(1, false, "}\n");
       if (eventPhaseCap_ > 0) {
         for (int slot : storeSlots) {
           emitText(1, false, "mtReadyTokens[" + std::to_string(slot) +
@@ -1098,8 +1309,9 @@ void CppEmitterMt::emitDefinitions() {
   emitText(2, false, "}\n");
     emitText(1, false, "}\n");
   }
-  for (size_t taskId = 0; taskId < tasks_.size(); ++taskId) {
-    if (tasks_[taskId].kind == MtTaskKind::ExtModule) continue;
+  const std::vector<int>& resetOrder = nodeSinkEmission_ ? eventTopoOrder_ : taskEmissionOrder;
+  for (int taskId : resetOrder) {
+    if (tasks_[static_cast<size_t>(taskId)].kind == MtTaskKind::ExtModule) continue;
     emitText(1, false, "mtTask" + std::to_string(taskId) + "();\n");
   }
   emitText(0, false, "}\n");
@@ -1236,8 +1448,11 @@ void CppEmitterMt::emitDefinitions() {
       "      mtBubbleTaskTimesPath = taskTimes;\n"
       "      fprintf(stderr, \"[mt-bubble] per-task timing enabled, CSV -> %s\\n\", taskTimes);\n"
       "    }\n"
-      "  }\n"
-      "  mtEnabled = true;\n}\n";
+      "  }\n";
+  if (joinStateEnabled_) {
+    runtime += "    for (int w = 0; w < kMtWorkerCount; ++w) mtJoinStateFirst[w] = true;\n";
+  }
+  runtime += "  mtEnabled = true;\n}\n";
 
   runtime += "void " + className + "::mtPinWorker(int worker) {\n";
   runtime += "  const char* affinity = getenv(\"GSIM_MT_CPU_AFFINITY\");\n";
@@ -1424,27 +1639,47 @@ void CppEmitterMt::emitDefinitions() {
   }
   runtime += "void " + className + "::mtRunWorker(int worker, uint8_t parity) {\n";
   runtime += "  MTBP_TICK(worker, mtBpProtocolOther);\n";
-  runtime += "  switch (worker) {\n";
-  for (int worker = 0; worker < workerCount_; ++worker) {
-    runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +
-               std::to_string(worker) + "(); break;\n";
+  if (joinStateEnabled_ && nodeSinkEmission_ && lookaheadWindow_ <= 0) {
+    runtime += "  if (mtJoinStateFirst[worker]) {\n";
+    runtime += "    switch (worker) {\n";
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +
+                 std::to_string(worker) + "(); break;\n";
+    }
+    runtime += "    default: abort();\n  }\n";
+    runtime += "    mtJoinStateFirst[worker] = false;\n";
+    runtime += "  }\n";
+    runtime += "  MTBP_TICK(worker, mtBpStateUpdate);\n";
+    runtime += "  switch (worker) {\n";
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      runtime += "    case " + std::to_string(worker) + ": mtRunWorkerChainW" +
+                 std::to_string(worker) + "(worker, parity); break;\n";
+    }
+    runtime += "    default: abort();\n  }\n";
+    runtime += "}\n";
+  } else {
+    runtime += "  switch (worker) {\n";
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      runtime += "    case " + std::to_string(worker) + ": mtUpdateStateW" +
+                 std::to_string(worker) + "(); break;\n";
+    }
+    runtime += "    default: abort();\n  }\n";
+    runtime += "  MTBP_TICK(worker, mtBpStateUpdate);\n";
+    runtime +=
+        "  if (worker == 0) {\n"
+        "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
+        "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
+        "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    }\n"
+        "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
+        "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
+        "  } else {\n"
+        "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
+        "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
+        "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
+        "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
+        "  }\n";
   }
-  runtime += "    default: abort();\n  }\n";
-  runtime += "  MTBP_TICK(worker, mtBpStateUpdate);\n";
-  runtime +=
-      "  if (worker == 0) {\n"
-      "    for (int other = 1; other < kMtWorkerCount; ++other) {\n"
-      "      while (mtStateDoneFlags[other - 1].parity.load(std::memory_order_acquire) != parity)\n"
-      "        __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    }\n"
-      "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
-      "    mtStateReady.parity.store(parity, std::memory_order_release);\n"
-      "  } else {\n"
-      "    mtStateDoneFlags[worker - 1].parity.store(parity, std::memory_order_release);\n"
-      "    while (mtStateReady.parity.load(std::memory_order_acquire) != parity)\n"
-      "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
-      "    MTBP_TICK(worker, mtBpSpinStateBarrier);\n"
-      "  }\n";
   if (lookaheadWindow_ <= 0 && !nodeSinkEmission_) {
     // Strict fixed-order fast path. This is the baseline protocol and avoids
     // all per-task ready scanning when lookahead is disabled.
@@ -1476,7 +1711,7 @@ void CppEmitterMt::emitDefinitions() {
         "      mtReadyTokens[mtStoreSlots[i]].value.store(parity, std::memory_order_release);\n"
         "  }\n"
         "}\n";
-  } else if (lookaheadWindow_ <= 0) {
+  } else if (lookaheadWindow_ <= 0 && !(joinStateEnabled_ && nodeSinkEmission_)) {
     // Node sink strict path: one direct call into the per-worker chain
     // function that was emitted beside its task definitions.
     runtime += "  switch (worker) {\n";
@@ -1485,7 +1720,7 @@ void CppEmitterMt::emitDefinitions() {
                  std::to_string(worker) + "(worker, parity); return;\n";
     }
     runtime += "    default: abort();\n  }\n}\n";
-  } else {
+  } else if (!(joinStateEnabled_ && nodeSinkEmission_)) {
     runtime += "  switch (worker) {\n";
     for (int worker = 0; worker < workerCount_; ++worker) {
       const std::vector<int>& chain = workerTasks_[static_cast<size_t>(worker)];
@@ -1575,6 +1810,12 @@ void CppEmitterMt::emitDefinitions() {
       "      __asm__ __volatile__(\"pause\" ::: \"memory\");\n"
       "  }\n"
       "  MTBP_TICK(0, mtBpSpinJoin);\n";
+  if (joinStateEnabled_) {
+    for (int worker = 0; worker < workerCount_; ++worker) {
+      runtime += "  mtUpdateStateW" + std::to_string(worker) + "();\n";
+    }
+    runtime += "  MTBP_TICK(0, mtBpStateUpdate);\n";
+  }
   runtime +=
       "  if (mtAnyAsyncResetAsserted()) {\n"
       "    for (int worker = 0; worker < kMtWorkerCount; ++worker)\n"

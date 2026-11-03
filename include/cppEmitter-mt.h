@@ -61,6 +61,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   void emitWorkerChainFunction(const std::string& className, int worker);
   void buildRegisterStorageNames();
   void buildActivationPlan();
+  void buildMirrorPlan();
   void writeTaskPhaseReport() const;
   std::string mapRegisterNames(const std::string& text) const;
   void emitTaskActivation(const std::vector<int>& consumers, int sourceWorker, int indent);
@@ -74,8 +75,17 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   int lookaheadWindow_ = 128;
   bool lookaheadStats_ = false;
   bool nodeSinkEmission_ = false;
+  bool joinStateEnabled_ = false;
+  bool bitmapDispatchEnabled_ = true;
+  // GSIM_MT_NODE_SINK_MIRROR=1: for cross-worker token groups whose sources
+  // all sit in earlier capped phases than the consumer, the phase barrier
+  // already orders the shared-storage publish/pull; drop the ready token.
+  bool mirrorEnabled_ = false;
   std::map<Node*, std::string> packedRegisterNames_;
   std::unordered_map<std::string, std::string> packedRegisterNamesByText_;
+  std::vector<uint8_t> mirrorDroppedSlot_;
+  size_t mirrorDroppedTokens_ = 0;
+  size_t mirrorKeptTokens_ = 0;
   struct ActivationWatch {
     Node* node = nullptr;
     std::vector<int> consumers;
@@ -85,6 +95,7 @@ class CppEmitterMt : private MtTaskPlan, private MtWorkerPlan {
   std::unordered_map<Node*, std::vector<int>> inputActivationTasks_;
   std::vector<uint8_t> taskAlwaysActive_;
   std::vector<int> eventTaskPhase_;
+  std::vector<int> eventTopoOrder_;
   int eventPhaseCount_ = 0;
   int eventPhaseCap_ = 0;
 };

@@ -73,7 +73,8 @@ def run(command, env):
 
 class NodeSinkTest(unittest.TestCase):
     def generate(self, out, design, workers, extra=(), node_sink=True,
-                 event=False, lookahead=0, coarsen=True, kahypar=None):
+                 event=False, lookahead=0, coarsen=True, kahypar=None,
+                 mirror=False, phase_cap=None):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
@@ -85,9 +86,16 @@ class NodeSinkTest(unittest.TestCase):
             env['GSIM_MT_EVENT_GENERATE'] = '1'
         if kahypar:
             env['GSIM_MT_NODE_SINK_KAHYPAR'] = str(kahypar)
-        run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
-             f'--mt-lookahead-window={lookahead}', *extra,
-             '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
+        if mirror:
+            env['GSIM_MT_NODE_SINK_MIRROR'] = '1'
+        if phase_cap is not None:
+            env['GSIM_MT_NODE_SINK_PHASE_CAP'] = str(phase_cap)
+        result = run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
+                      f'--mt-lookahead-window={lookahead}', *extra,
+                      '--dir', out, ROOT / 'test' / f'{design}.fir'], env)
+        self.last_mirror_report = re.search(
+            r'node-sink mirror groups=(\d+) dropped=(\d+) kept=(\d+)',
+            result.stderr)
         return env
 
     def model_output(self, out, design, env):
@@ -144,6 +152,53 @@ class NodeSinkTest(unittest.TestCase):
                 dense = self.model_output(out, design, dense_env)
                 event = self.model_output(out, design, event_env)
                 self.assertEqual(event, dense)
+
+    def test_phase_mirror_keeps_traces_and_reports_tokens(self):
+        # GSIM_MT_NODE_SINK_MIRROR=1 lets provably cross-phase values cross
+        # workers through the barrier-ordered class storage instead of ready
+        # tokens: groups whose sources all sit in earlier capped phases are
+        # dropped, same-capped-phase groups keep the token protocol. Every
+        # configuration must stay trace-identical to the no-mirror baseline
+        # for both executors, and the mirror report must account for every
+        # token group (cap=1 keeps all, cap=2 drops the cross-phase ones).
+        for design, extra in DESIGNS:
+            for workers in (2, 4):
+                with self.subTest(design=design, workers=workers), \
+                        tempfile.TemporaryDirectory(
+                            prefix='mt-node-sink-mirror-') as directory:
+                    root = Path(directory)
+                    baseline = root / 'baseline'
+                    baseline.mkdir()
+                    base_env = self.generate(baseline, design, workers, extra)
+                    reference = self.model_output(baseline, design, base_env)
+                    self.assertTrue(reference)
+                    for cap in (1, 2):
+                        out = root / f'mirror-cap{cap}'
+                        out.mkdir()
+                        env = self.generate(out, design, workers, extra,
+                                            event=True, mirror=True,
+                                            phase_cap=cap)
+                        self.assertEqual(
+                            self.model_output(out, design, env), reference)
+                        event_env = env.copy()
+                        event_env['GSIM_MT_EXECUTOR'] = 'event'
+                        self.assertEqual(
+                            self.model_output(out, design, event_env),
+                            reference)
+                        report = self.last_mirror_report
+                        if report is not None:
+                            groups, dropped, kept = (
+                                int(value) for value in report.groups())
+                            self.assertEqual(groups, dropped + kept)
+                            if groups:
+                                if cap == 1:
+                                    # One capped phase proves nothing: every
+                                    # token must stay on the fallback path.
+                                    self.assertEqual(dropped, 0)
+                                    self.assertEqual(kept, groups)
+                                elif design == 'mt-memory-commit':
+                                    self.assertGreater(dropped, 0)
+
 
     def test_fanout_clone_reported_and_token_free(self):
         # Coarsening off isolates the replication mechanics: with it on, the
