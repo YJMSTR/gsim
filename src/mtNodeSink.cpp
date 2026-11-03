@@ -54,6 +54,11 @@ bool nodeSinkRebalanceEnabled() {
 
 // Coarsening is on by default; GSIM_MT_NODE_SINK_COARSEN=0 disables it (used
 // to verify the un-coarsened clone mechanics in isolation).
+bool nodeSinkBlockRebalanceEnabled() {
+  const char* value = std::getenv("GSIM_MT_NODE_SINK_BLOCK_REBALANCE");
+  return nodeSinkRebalanceEnabled() && value != nullptr && value[0] == '1';
+}
+
 bool coarsenEnabled() {
   const char* value = std::getenv("GSIM_MT_NODE_SINK_COARSEN");
   return value == nullptr || value[0] != '0';
@@ -269,7 +274,7 @@ class NodeSinkPlanner {
     if (coarsenEnabled() && !tasks_.empty()) {
       coarsenChains();
       finalizeOrder();
-      if (nodeSinkRebalanceEnabled()) rebalanceBlockClosures();
+      if (nodeSinkBlockRebalanceEnabled()) rebalanceBlockClosures();
     }
     before_ = before;
     rebuildPlanMetadata();
@@ -1125,7 +1130,7 @@ class NodeSinkPlanner {
     // Closure replication: copy pure tasks into every extra part that needs
     // them, under the 1.25x budget. Unique microtasks (side effect, state
     // commit, memory, reset, ext) stay single-instance by construction.
-    for (int id = 0; id < count; ++id) {
+    if (nodeCloneEnabled()) for (int id = 0; id < count; ++id) {
       if (pure_[id] == 0 || taskParts[id].size() < 2) continue;
       for (size_t index = 1; index < taskParts[id].size(); ++index) {
         const int worker = taskParts[id][index];

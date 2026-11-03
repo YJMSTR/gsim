@@ -1053,13 +1053,15 @@ void CppEmitterMt::emitWorkerChainFunction(const std::string& className,
         ? std::min(eventTaskPhase_[static_cast<size_t>(taskId)], eventPhaseCap_ - 1)
         : eventTaskPhase_[static_cast<size_t>(taskId)];
   };
+  const size_t eventChunkSize = static_cast<size_t>(
+      std::max(1, positiveEnv("GSIM_MT_EVENT_CHUNK", 32)));
   for (int phase = 0; phase < phaseCount; ++phase) {
     std::vector<int> phaseChain;
     for (int taskId : chain) {
       if (cappedPhase(taskId) == phase) phaseChain.push_back(taskId);
     }
-    for (size_t begin = 0; begin < phaseChain.size(); begin += 32) {
-      const size_t end = std::min(begin + 32, phaseChain.size());
+    for (size_t begin = 0; begin < phaseChain.size(); begin += eventChunkSize) {
+      const size_t end = std::min(begin + eventChunkSize, phaseChain.size());
       std::set<int> waitSlots, storeSlots;
       bool needsReady = false;
       // Phase-mirrored slots are published through the barrier-ordered class
