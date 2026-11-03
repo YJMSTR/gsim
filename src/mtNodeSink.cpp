@@ -99,6 +99,16 @@ size_t nodeArrayElements(const Node* node) {
   }
   return elements;
 }
+bool nodeCloneEnabled() {
+  const char* value = std::getenv("GSIM_MT_NODE_SINK_CLONE");
+  return value != nullptr && value[0] != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
+bool nodePureGroupingEnabled() {
+  const char* value = std::getenv("GSIM_MT_NODE_SINK_GROUP_PURE");
+  return value != nullptr && value[0] != '\0' && std::strtol(value, nullptr, 10) != 0;
+}
+
 size_t nodeCloneArrayCap() {
   const char* value = std::getenv("GSIM_MT_NODE_SINK_ARRAY_CAP");
   if (value == nullptr || value[0] == '\0') return 32;
@@ -241,7 +251,7 @@ class NodeSinkPlanner {
     if (workers_ > 1) {
       if (!assignBySinkHypergraphPartition()) {
         assignSinkAwareLpt();
-        replicatePureNodes();
+        if (nodeCloneEnabled()) replicatePureNodes();
       }
       finalizeOrder();
     } else {
@@ -460,7 +470,7 @@ class NodeSinkPlanner {
       lowerNodeTask(plan_, node, task);
       if (task.insts->empty() && keepDespiteEmpty_.count(node) == 0) return;
       std::vector<Node*> members{node};
-      registerTask(std::move(task), members, false);
+      registerTask(std::move(task), members, isPureCloneable(node));
     };
 
     for (SuperNode* super : graph_.sortedSuper) {
@@ -489,7 +499,7 @@ class NodeSinkPlanner {
       for (Node* node : super->member) {
         if (mtIsCycleStartRegisterUpdate(node)) continue;
         if (taskOf_.count(node) != 0) continue;
-        if (isPureCloneable(node)) {
+        if (nodePureGroupingEnabled() && isPureCloneable(node)) {
           group.push_back(node);
           continue;
         }
@@ -1529,6 +1539,7 @@ class NodeSinkPlanner {
     // single-node microtasks and pure SuperNode groups alike.
     MtTask& source = tasks_[originalTask];
     Assert(!source.members.empty(), "cannot clone an empty task");
+    Node* const sourceFront = source.members.front();
     std::vector<Node*> copies;
     std::unordered_map<Node*, Node*> replacements;
         for (Node* original : source.members) {
@@ -1638,7 +1649,7 @@ class NodeSinkPlanner {
                               succs_[cloneTaskId].end());
 
     for (const auto& entry : replacements) cloneOn_[worker][entry.first] = entry.second;
-    clones_.push_back({source.members.front(), copies.front(), worker,
+    clones_.push_back({sourceFront, copies.front(), worker,
                        static_cast<int>(consumers.size())});
   }
 
