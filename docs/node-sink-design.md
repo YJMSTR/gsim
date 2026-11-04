@@ -187,6 +187,8 @@ reader/memory/reset provenance 与顺序，再讨论性能；跨 worker 的语�
 
 - 并行 join、共享 ready token、原子计数 MPSC、静态相位、hot-cold 自适应和 LA0。
 - 只为对齐 P2SIM 而做的逐点等价协议、无定量依据的 cap/clone-budget/O3/LTO 扫参。
+- 按本 worker 活跃度跳过 state commit 的 quiet-worker：下一状态可由其他 worker
+  的下游计算驱动，BOOM 会漏提交；quiet-range 必须按共享状态范围/依赖判定。
 
 每轮记录：当前瓶颈、证据、假设、改动、正确性门、同场性能、是否保留。被拒绝探针
 完整回退；有效增量也必须在后续协议中重新证明语义，不因进入清单而免除差分。
