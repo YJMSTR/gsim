@@ -2482,7 +2482,7 @@ void graph::cppEmitterMt() {
   emitBodyLock(0, "}\n");
 
   for (size_t part = 0; part < mtEmitter.initPartCount(); ++part) {
-    emitFuncDecl(0, "void S%s::initPart%zu() {\n", name.c_str(), part);
+    emitFuncDecl(0, "__attribute__((noinline)) void S%s::initPart%zu() {\n", name.c_str(), part);
     const size_t begin = part * CppEmitterMt::kInitNodesPerPart;
     const size_t end = std::min(begin + CppEmitterMt::kInitNodesPerPart,
                                 mtEmitter.emissionNodes().size());
