@@ -161,3 +161,32 @@ saved(n,w) = removed_ready_tokens(n,w) * (tokenLatency + remoteCheck + remotePub
 3. 小模型差分通过后，才允许 BOOM 生成和 50k 哈希。
 4. BOOM 500k 达到 1.20× p2sim 后才进入 KMH；未达标继续按阶段画像定位，不能
   用 KMH 或较弱 dense 掩盖 BOOM 差距。
+
+## 测量驱动的架构探索（2026-11-04 用户路线约束）
+
+不做 P2SIM 的等价复刻。等价协议只用于理解瓶颈，最终协议必须在结构上可区分。
+P2SIM 仅承担两个角色：性能对照标尺，以及 sink 闭包复制、WritePre/WritePost CHG
+等思想参考。每一轮先取得 profiling、阶段画像或定量归因，再只针对当前最大瓶颈
+设计和验证优化；禁止因为某个旋钮与 P2SIM 相似就默认它有效。
+
+优先探索自己的机制：依赖驱动权重分区、quiet-range 提交、面向实测热点的大块融合、
+以及能降低关键路径而非只降低静态 makespan 的调度。复制、合并和提交必须先保持
+reader/memory/reset provenance 与顺序，再讨论性能；跨 worker 的语义闭包和运行时
+负载均衡是两个独立约束，不能互相冒充。
+
+### 增量维护清单
+
+有效，继续维护：
+
+- 组掩码：用少量组级测试跳过绝大多数空任务 prologue。
+- 读口闭包复制：保留并扩展该方向，但每个副本必须保留 original reader/memory
+  provenance、memory 唤醒和 memory-order 边；不能把曾经出现断言的实现直接视为
+  已验收版本。
+
+无效，不重复投入：
+
+- 并行 join、共享 ready token、原子计数 MPSC、静态相位、hot-cold 自适应和 LA0。
+- 只为对齐 P2SIM 而做的逐点等价协议、无定量依据的 cap/clone-budget/O3/LTO 扫参。
+
+每轮记录：当前瓶颈、证据、假设、改动、正确性门、同场性能、是否保留。被拒绝探针
+完整回退；有效增量也必须在后续协议中重新证明语义，不因进入清单而免除差分。
