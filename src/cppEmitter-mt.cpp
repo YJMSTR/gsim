@@ -1109,7 +1109,32 @@ void CppEmitterMt::emitWorkerChainFunction(const std::string& className,
       if (!eventGeneration_ || !bitmapDispatchEnabled_) {
         const std::string groupActive = "mtGroupActive" + std::to_string(phase) + "_" +
                                         std::to_string(begin);
-        emitText(1, false, "const bool " + groupActive + " = true;\n");
+        if (positiveEnv("GSIM_MT_EVENT_GROUP_MASK", 0) != 0) {
+          std::map<int, uint32_t> bits;
+          bool always = false;
+          std::vector<int> special;
+          for (size_t position = begin; position < end; ++position) {
+            const int taskId = phaseChain[position];
+            bits[taskId >> 5] |= uint32_t{1} << (taskId & 31);
+            const uint8_t kind = taskAlwaysActive_[static_cast<size_t>(taskId)];
+            always |= kind == 2;
+            if (kind == 1) special.push_back(taskId);
+          }
+          std::string active = always ? "true" : "false";
+          for (const auto& entry : bits) {
+            active += " | ((mtAct[" + std::to_string(worker) + "][" +
+                      std::to_string(entry.first) + "] | mtRemoteAct[" +
+                      std::to_string(worker) + "][" + std::to_string(entry.first) +
+                      "].load(std::memory_order_acquire)) & " + hexBits(entry.second) + ")";
+          }
+          for (int taskId : special) {
+            active += " | mtSpecialHot[" + std::to_string(taskId) + "]";
+          }
+          emitText(1, false, "const bool " + groupActive + " = !mtEventEnabled || (" +
+                             active + ");\n");
+        } else {
+          emitText(1, false, "const bool " + groupActive + " = true;\n");
+        }
         emitText(1, false, "if (" + groupActive + ") {\n");
         emitGroupCalls(2);
         emitText(1, false, "}\n");

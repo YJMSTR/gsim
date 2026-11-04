@@ -74,7 +74,8 @@ def run(command, env):
 class NodeSinkTest(unittest.TestCase):
     def generate(self, out, design, workers, extra=(), node_sink=True,
                  event=False, lookahead=0, coarsen=True, kahypar=None,
-                 mirror=False, phase_cap=None, clone=False, chunk=None):
+                 mirror=False, phase_cap=None, clone=False, chunk=None,
+                 group_mask=False):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith('GSIM_MT_')}
         env.update(GSIM_THREADS=str(workers), GSIM_MT_EXECUTOR='dense')
@@ -92,6 +93,8 @@ class NodeSinkTest(unittest.TestCase):
             env['GSIM_MT_NODE_SINK_CLONE'] = '1'
         if chunk is not None:
             env['GSIM_MT_EVENT_CHUNK'] = str(chunk)
+        if group_mask:
+            env['GSIM_MT_EVENT_GROUP_MASK'] = '1'
         if phase_cap is not None:
             env['GSIM_MT_NODE_SINK_PHASE_CAP'] = str(phase_cap)
         result = run([GSIM, '--mt-mode=on', '--mt-target-tasks=64',
@@ -156,6 +159,17 @@ class NodeSinkTest(unittest.TestCase):
                 dense = self.model_output(out, design, dense_env)
                 event = self.model_output(out, design, event_env)
                 self.assertEqual(event, dense)
+
+    def test_event_group_mask_keeps_traces(self):
+        with tempfile.TemporaryDirectory(prefix='mt-node-sink-group-mask-') as directory:
+            out = Path(directory)
+            env = self.generate(out, 'mt-state-tasks', 2, event=True,
+                                phase_cap=1, chunk=8, group_mask=True)
+            reference = self.model_output(out, 'mt-state-tasks', env)
+            event_env = env.copy()
+            event_env['GSIM_MT_EXECUTOR'] = 'event'
+            self.assertEqual(self.model_output(out, 'mt-state-tasks', event_env),
+                             reference)
 
     def test_event_chunk_keeps_traces(self):
         with tempfile.TemporaryDirectory(prefix='mt-node-sink-chunk-') as directory:
