@@ -185,6 +185,9 @@ reader/memory/reset provenance 与顺序，再讨论性能；跨 worker 的语�
 - 活动集中 fast path：画像活动集顺序执行并跳过旁观线程，T32 500k 实测 8.68s；
   reader-less WPre/WPost 消隐在同条件另有约 7% 收益。fast path 必须使用同源画像，
   reset-bearing part 无条件计入活动集，跨生成画像不得复用。
+- 同源 PGO：`-fprofile-generate` 50k 采样后 `-fprofile-use` 重建，同窗基线收益 27.3%；
+  在干净 0-31 核段实测 T32 500k **5.40s**（p2sim 3.13s），低于 dense 6.55s，
+  标志 BOOM 阶段进入同一性能量级并可转 KMH 移植。
 
 无效，不重复投入：
 
