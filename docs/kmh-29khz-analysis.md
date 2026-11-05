@@ -22,6 +22,27 @@ T96 使预算恰好放大 3 倍。原先“稠密执行被数学排除”的结�
   不能按单 socket 成本外推。友商若在 T96 仍达到 29kHz，说明其通信/提交结构在
   多 socket 下也能扩展，这比绝对频率更值得研究。
 
+## T96 实测标尺与跨 socket 惩罚（2026-11-05）
+
+已生成并验证 T96 dense KMH 模型，生成器 `gsim-state-compute-hybrid@db0b1ba`：
+`GSIM_THREADS=96`、`--mt-target-tasks=7200`、`--mt-lookahead-window=64`、
+`GSIM_MT_CONE_ACTIVITY=1`。模型 419 个 C++ 文件，emu 约 44.9MB，CoreMark 每轮端点均为
+67944/50000，difftest 开启。
+
+| 核段 | 拓扑 | 三轮 wall (s) | 中位频率 | 相对 29kHz |
+|---|---|---:|---:|---:|
+| 0-95 | 单 socket/package 0 | 3.66 / 3.76 / 3.73 | **13.45kHz** | 2.16× |
+| 0-47,96-143 | 两个 socket | 5.63 / 5.71 / 5.60 | **8.83kHz** | 3.29× |
+
+结论：
+
+- T96 相对 4.43s 的 T32 冠军确有提升，但不是线性扩展；同 socket 也只到 13.45kHz，
+  与竞品 29kHz 仍差约 2.16×。稠密执行是可达方向，但现有调度/通信实现不足。
+- 跨 socket wall 增加约 52%，说明多 socket 同步与访存是第一优先级，而不是继续增加
+  线程。友商若在 T96 达到 29kHz，其同步结构必须远优于当前 ready/state 协议。
+- 复现模型：`profile/state-graph-hybrid/cells/dense-t96/gsim-compile/emu`；日志：
+  `/tmp/dense-t96-coremark-{1,2,3}.log`、`/tmp/dense-t96-dual-{1,2,3}.log`。
+
 修订后的 H1–H5 优先级：
 
 1. **先做 dense-T96 KMH CoreMark 实测**，建立同线程数直接标尺；当前 T32 二进制不能
