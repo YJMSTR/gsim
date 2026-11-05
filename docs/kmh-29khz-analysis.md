@@ -43,6 +43,15 @@ T96 使预算恰好放大 3 倍。原先“稠密执行被数学排除”的结�
 - 复现模型：`profile/state-graph-hybrid/cells/dense-t96/gsim-compile/emu`；日志：
   `/tmp/dense-t96-coremark-{1,2,3}.log`、`/tmp/dense-t96-dual-{1,2,3}.log`。
 
+T96 bubble 进一步分解：
+
+- 单 socket：task_compute 35.44%、spin_ready 36.78%、gen_idle 14.16%、state_barrier
+  4.11%；zero-wait bound **2.121s**（23.6kHz），相对实测 3.709s 有 **1.75×** 上限空间。
+- 跨 socket：task_compute 39.03%、spin_ready 35.19%、gen_idle 11.97%；zero-wait bound
+  3.674s（13.6kHz），相对实测 6.289s 有 **1.71×** 上限空间。
+- 因此后续优化顺序明确为：先消除 ready 等待和负载尾差，再谈 SIMD/位打包。若能逼近
+  zero-wait bound，单 socket 的 29kHz 在理论上可达；跨 socket 还需要额外通信优化。
+
 修订后的 H1–H5 优先级：
 
 1. **先做 dense-T96 KMH CoreMark 实测**，建立同线程数直接标尺；当前 T32 二进制不能
