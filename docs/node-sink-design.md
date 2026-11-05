@@ -182,11 +182,16 @@ reader/memory/reset provenance 与顺序，再讨论性能；跨 worker 的语�
 - 读口闭包复制：保留并扩展该方向，但每个副本必须保留 original reader/memory
   provenance、memory 唤醒和 memory-order 边；不能把曾经出现断言的实现直接视为
   已验收版本。
+- 活动集中 fast path：画像活动集顺序执行并跳过旁观线程，T32 500k 实测 8.68s；
+  reader-less WPre/WPost 消隐在同条件另有约 7% 收益。fast path 必须使用同源画像，
+  reset-bearing part 无条件计入活动集，跨生成画像不得复用。
 
 无效，不重复投入：
 
 - 并行 join、共享 ready token、原子计数 MPSC、静态相位、hot-cold 自适应和 LA0。
 - 只为对齐 P2SIM 而做的逐点等价协议、无定量依据的 cap/clone-budget/O3/LTO 扫参。
+- L1 乐观并发：30 轮修复仍无法在同拍锥上收敛，不能用缩小正确块集来宣称加速；
+  路线关闭，代码默认关闭。
 - 按本 worker 活跃度跳过 state commit 的 quiet-worker：下一状态可由其他 worker
   的下游计算驱动，BOOM 会漏提交；quiet-range 必须按共享状态范围/依赖判定。
 - 将活动计数线性替换为静态 cost 的分区：无论 coarsen 后 ID 映射还是原始任务画像，
